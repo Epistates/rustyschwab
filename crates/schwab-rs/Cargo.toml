@@ -1,0 +1,99 @@
+[package]
+name = "schwab-rs"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+documentation = { workspace = true }
+readme = "README.md"
+keywords = { workspace = true }
+categories = { workspace = true }
+description = "Production-grade Rust SDK for Charles Schwab Trading and Market Data APIs"
+
+[dependencies]
+# Core dependencies
+schwab-types = { path = "../schwab-types", version = "0.1.0" }
+
+# Random number generation (for jitter in backoff)
+rand = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+
+# HTTP and networking
+reqwest = { workspace = true }
+hyper = { workspace = true }
+url = { workspace = true }
+headers = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+serde_with = { workspace = true }
+
+# Auth and encoding
+base64 = { workspace = true }
+axum = { version = "0.7", optional = true }
+urlencoding = "2.1"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging and tracing
+log = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time and date
+chrono = { workspace = true }
+humantime-serde = { workspace = true }
+
+# Utilities
+once_cell = { workspace = true }
+parking_lot = { workspace = true }
+pin-project = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+
+# Security
+ring = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+chacha20poly1305 = { workspace = true }
+keyring = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# Rate limiting and retry
+governor = "0.7"
+tower = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+mockito = { workspace = true }
+mockall = { workspace = true }
+tokio-test = "0.4"
+pretty_assertions = "1.4"
+test-log = { version = "0.2", features = ["trace"] }
+env_logger = "0.11"  # log implementation for tests/examples
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3.15"
+
+[features]
+default = ["rustls"]
+rustls = ["reqwest/rustls", "tokio-tungstenite/rustls"]
+native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
+callback-server = ["axum"]
+full = ["rustls", "callback-server"]
+keychain-store = []

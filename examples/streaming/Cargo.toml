@@ -1,0 +1,31 @@
+[package]
+name = "streaming-examples"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+schwab-rs = { path = "../../crates/schwab-rs", features = ["full"] }
+tokio = { workspace = true }
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+env_logger = "0.11"
+
+[features]
+default = ["callback-server"]
+callback-server = ["schwab-rs/callback-server"]
+
+[[bin]]
+name = "streaming_demo"
+path = "src/bin/demo.rs"
+
+[[bin]]
+name = "streaming_quotes"
+path = "src/bin/quotes.rs"
+
+[[bin]]
+name = "streaming_processing"
+path = "src/bin/processing.rs"

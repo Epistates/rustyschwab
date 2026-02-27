@@ -1,0 +1,63 @@
+# Rust build artifacts
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Environment and secrets
+.env
+.env.local
+.env.*.local
+schwab_tokens.json
+tokens.json
+*.pem
+*.key
+*.crt
+*.pfx
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug files
+*.log
+*.pid
+*.seed
+
+# Test coverage
+*.lcov
+coverage/
+tarpaulin-report.html
+
+# Documentation build
+docs/_build/
+docs/_site/
+
+# Temporary and backup files
+tmp/
+temp/
+*.tmp
+*.bak
+*.bak*
+*.rs.bak*
+*.bak[0-9]*
+
+# OAuth tokens and credentials
+*_tokens.json
+*_credentials.json
+auth_cache/
+
+# Cloudflared tunnel config
+.cloudflared/
+tunnel.yml
+
+# Python virtualenv (if using Python tools)
+venv/
+.venv/
+__pycache__/
+
+.strategy

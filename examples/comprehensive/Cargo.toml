@@ -1,0 +1,18 @@
+[package]
+name = "comprehensive"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+schwab-rs = { path = "../../crates/schwab-rs", features = ["full"] }
+tokio = { workspace = true }
+dotenvy = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+default = ["callback-server"]
+callback-server = ["schwab-rs/callback-server"]

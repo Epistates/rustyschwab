@@ -1,0 +1,102 @@
+[workspace]
+members = [
+    "crates/schwab-rs",
+    "crates/schwab-types",
+    "examples/*",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Nick Paterno"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/epistates/rustyschwab"
+homepage = "https://github.com/epistates/rustyschwab"
+documentation = "https://docs.rs/schwab-rs"
+readme = "README.md"
+keywords = ["schwab", "trading", "api", "finance", "market-data"]
+categories = ["api-bindings", "finance"]
+
+[workspace.dependencies]
+# Random number generation (for jitter in backoff)
+rand = "0.10"
+
+# Async runtime
+tokio = { version = "1.49", features = ["full"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls"] }
+futures-util = "0.3"
+async-trait = "0.1"
+
+# HTTP and networking
+reqwest = { version = "0.13", features = ["json", "rustls", "cookies", "stream", "form", "query"] }
+hyper = "1.6"
+url = "2.5"
+headers = "0.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_urlencoded = "0.7"
+serde_with = "3.14"
+
+# OAuth2
+oauth2 = "5.0"
+base64 = "0.22"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging (facade pattern - user chooses implementation)
+log = "0.4"
+
+# Tracing (structured observability - preferred over log)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Time and date
+chrono = { version = "0.4", features = ["serde"] }
+humantime-serde = "1.1"
+
+# Utilities
+once_cell = "1.21"
+parking_lot = "0.12"
+pin-project = "1.1"
+bytes = "1.10"
+uuid = { version = "1.15", features = ["v4", "serde"] }
+
+# Testing
+wiremock = "0.6"
+mockito = "1.7"
+mockall = "0.13"
+tower = "0.5"
+
+# Security - Best-in-class 2026
+ring = "0.17"
+rustls = "0.23"
+webpki-roots = "1.0"
+# Encryption at rest (ChaCha20Poly1305 AEAD - audited by NCC Group)
+chacha20poly1305 = "0.10"
+# Cross-platform secure credential storage
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
+# Memory-safe secret handling with automatic zeroization
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1.8", features = ["derive", "aarch64"] }
+
+# CLI and configuration
+clap = { version = "4.5", features = ["derive", "env"] }
+config = "0.14"
+dotenvy = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 0

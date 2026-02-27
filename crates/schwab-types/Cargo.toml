@@ -1,0 +1,22 @@
+[package]
+name = "schwab-types"
+version = { workspace = true }
+edition = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+documentation = "https://docs.rs/schwab-types"
+description = "Type definitions for Schwab Trading and Market Data APIs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+pretty_assertions = "1.4"
