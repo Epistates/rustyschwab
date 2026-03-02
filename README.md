@@ -211,7 +211,7 @@ export SCHWAB_APP_KEY="your_32_char_key"
 export SCHWAB_APP_SECRET="your_16_char_secret"
 
 # Or use a secret management service
-# - AWS শর্ Secrets Manager
+# - AWS KMS Secrets Manager
 # - HashiCorp Vault
 # - Azure Key Vault
 ```
