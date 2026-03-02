@@ -65,9 +65,9 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - Custom field selection per service
   - All 13 streaming services fully implemented
 
-## 🔒 Security
+## Security
 
-This SDK implements **world-class security** with multiple layers of protection, significantly exceeding typical OAuth 2.0 implementations.
+This SDK implements **world-class security** with multiple layers of protection, significantly exceeding *typical* OAuth 2.0 implementations.
 
 ### Security Features Comparison
 
