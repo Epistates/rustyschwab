@@ -647,7 +647,7 @@ This SDK is not affiliated with, endorsed by, or officially connected with Charl
 
 For issues and questions:
 - GitHub Issues: [Project Issues](../../issues)
-- Documentation: [docs.rs/schwab-rs](https://docs.rs/schwab-rs)
+- Documentation: [/docs](/docs)
 
 ## Development
 
