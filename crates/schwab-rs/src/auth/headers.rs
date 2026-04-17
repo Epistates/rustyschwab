@@ -3,7 +3,7 @@
 //! Provides functions to create properly formatted authorization headers
 //! for different authentication schemes (Bearer, Basic).
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 /// Create a Bearer token authorization header value
 ///

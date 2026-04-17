@@ -5,11 +5,11 @@
 //! code verifiers and challenges.
 
 use crate::error::{AuthError, Error, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL, Engine};
-use ring::{digest, rand as ring_rand};
-use ring::rand::SecureRandom;
-use std::collections::HashSet;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use parking_lot::RwLock;
+use ring::rand::SecureRandom;
+use ring::{digest, rand as ring_rand};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -57,17 +57,18 @@ impl PkceSession {
     /// # Returns
     /// The verifier if available, error if none exists or already used
     pub fn take_verifier(&self) -> Result<String> {
-        let verifier = self.current_verifier.write().take()
-            .ok_or_else(|| Error::Auth(AuthError::OAuthFlow(
-                "PKCE enabled but no code verifier found. Call authorize() first.".to_string()
-            )))?;
+        let verifier = self.current_verifier.write().take().ok_or_else(|| {
+            Error::Auth(AuthError::OAuthFlow(
+                "PKCE enabled but no code verifier found. Call authorize() first.".to_string(),
+            ))
+        })?;
 
         // Add to history to detect any attempts to reuse
         if !self.used_verifiers.write().insert(verifier.clone()) {
             // Verifier was already in history - possible replay attack
             warn!("Attempted reuse of PKCE verifier - possible replay attack detected");
             return Err(Error::Auth(AuthError::OAuthFlow(
-                "PKCE verifier already used - possible replay attack".to_string()
+                "PKCE verifier already used - possible replay attack".to_string(),
             )));
         }
 
@@ -92,13 +93,14 @@ impl PkceSession {
         // Generate 96 bytes of random data
         let rng = ring_rand::SystemRandom::new();
         let mut bytes = [0u8; 96];
-        rng.fill(&mut bytes)
-            .map_err(|_| Error::Auth(AuthError::OAuthFlow(
-                "Failed to generate PKCE verifier - cryptographic RNG unavailable".to_string()
-            )))?;
+        rng.fill(&mut bytes).map_err(|_| {
+            Error::Auth(AuthError::OAuthFlow(
+                "Failed to generate PKCE verifier - cryptographic RNG unavailable".to_string(),
+            ))
+        })?;
 
         // Base64url encode to get 128 characters (RFC 7636 allows up to 128)
-        Ok(BASE64_URL.encode(&bytes))
+        Ok(BASE64_URL.encode(bytes))
     }
 
     /// Generate code challenge using S256 method (SHA256)
