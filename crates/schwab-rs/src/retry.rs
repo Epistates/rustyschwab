@@ -77,9 +77,7 @@ impl RetryPolicy {
                     if !self.should_retry(&error, retries) {
                         debug!(
                             "Not retrying: {:?} (attempt {} of {})",
-                            error,
-                            retries,
-                            self.config.max_retries
+                            error, retries, self.config.max_retries
                         );
                         return Err(error);
                     }
@@ -120,9 +118,7 @@ impl RetryPolicy {
 
         match error {
             // Retry on specific HTTP status codes
-            Error::Http { status, .. } => {
-                self.config.retry_on_status.contains(&status.as_u16())
-            }
+            Error::Http { status, .. } => self.config.retry_on_status.contains(&status.as_u16()),
             // Use generic retryability for other error types
             _ => error.is_retryable(),
         }
@@ -206,13 +202,14 @@ mod tests {
         let result: Result<i32> = policy
             .execute(|| {
                 attempts += 1;
-                async move {
-                    Err(Error::InvalidParameter("bad param".to_string()))
-                }
+                async move { Err(Error::InvalidParameter("bad param".to_string())) }
             })
             .await;
 
-        assert!(result.is_err(), "Should fail immediately for invalid parameter");
+        assert!(
+            result.is_err(),
+            "Should fail immediately for invalid parameter"
+        );
         assert_eq!(attempts, 1, "Should only attempt once");
     }
 
@@ -241,9 +238,6 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "Should fail after max retries");
-        assert_eq!(
-            attempts, 3,
-            "Should attempt initial + 2 retries = 3 total"
-        );
+        assert_eq!(attempts, 3, "Should attempt initial + 2 retries = 3 total");
     }
 }

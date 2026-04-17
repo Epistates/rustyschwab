@@ -21,8 +21,8 @@
 
 use crate::error::{AuthError, Error, Result};
 use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
@@ -72,9 +72,12 @@ impl EncryptedToken {
         let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
 
         // Encrypt with AEAD
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|e| Error::Auth(AuthError::EncryptionFailed(format!("ChaCha20Poly1305 encrypt failed: {}", e))))?;
+        let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| {
+            Error::Auth(AuthError::EncryptionFailed(format!(
+                "ChaCha20Poly1305 encrypt failed: {}",
+                e
+            )))
+        })?;
 
         // Prepend nonce to ciphertext (required for decryption)
         let mut data = nonce.to_vec();
@@ -117,9 +120,12 @@ impl EncryptedToken {
         let cipher = ChaCha20Poly1305::new(key.into());
 
         // Decrypt with AEAD authentication
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext)
-            .map_err(|e| Error::Auth(AuthError::DecryptionFailed(format!("ChaCha20Poly1305 decrypt failed: {}", e))))?;
+        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+            Error::Auth(AuthError::DecryptionFailed(format!(
+                "ChaCha20Poly1305 decrypt failed: {}",
+                e
+            )))
+        })?;
 
         // Wrap in SecretBox<Vec<u8>> for automatic zeroization (requires Box)
         Ok(SecretBox::new(Box::new(plaintext)))
@@ -149,8 +155,8 @@ pub fn derive_key_from_password(password: &SecretString, salt: &[u8]) -> Zeroizi
 
     const ITERATIONS: u32 = 600_000; // OWASP 2023 recommendation
     // SAFETY: ITERATIONS is a non-zero constant, so this will never panic
-    let iterations = NonZeroU32::new(ITERATIONS)
-        .expect("ITERATIONS constant is non-zero and will never panic");
+    let iterations =
+        NonZeroU32::new(ITERATIONS).expect("ITERATIONS constant is non-zero and will never panic");
 
     let mut key = Zeroizing::new([0u8; KEY_SIZE]);
     pbkdf2::derive(
@@ -184,10 +190,11 @@ pub fn generate_random_key() -> Result<Zeroizing<[u8; KEY_SIZE]>> {
 
     let rng = SystemRandom::new();
     let mut key = Zeroizing::new([0u8; KEY_SIZE]);
-    rng.fill(&mut *key)
-        .map_err(|_| Error::Auth(AuthError::EncryptionFailed(
-            "Cryptographic RNG unavailable - system may be compromised".to_string()
-        )))?;
+    rng.fill(&mut *key).map_err(|_| {
+        Error::Auth(AuthError::EncryptionFailed(
+            "Cryptographic RNG unavailable - system may be compromised".to_string(),
+        ))
+    })?;
 
     Ok(key)
 }
@@ -217,15 +224,21 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    // Write to temp file with secure permissions set ATOMICALLY at creation
-    let temp_path = path.with_extension("tmp");
+    // Randomized temp suffix prevents collisions between concurrent writers
+    // and stale temp files from prior crashed writes.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let mut temp_name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    temp_name.push(format!(".{}.tmp", suffix));
+    let temp_path = path.with_file_name(temp_name);
 
     // CRITICAL: Set permissions at creation time (no race window)
     let mut file = std::fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .write(true)
-        .truncate(true)
-        .mode(0o600)  // Owner read/write only - set atomically!
+        .mode(0o600) // Owner read/write only - set atomically!
         .open(&temp_path)
         .map_err(|e| AuthError::TokenFileError(format!("Failed to create temp file: {}", e)))?;
 
@@ -246,7 +259,7 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     // Verify final permissions (defense in depth)
     verify_file_permissions(path)?;
 
-    log::debug!("Secure file write completed: {:?}", path);
+    tracing::debug!("Secure file write completed: {:?}", path);
     Ok(())
 }
 
@@ -256,7 +269,7 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::write(path, data)
         .map_err(|e| AuthError::TokenFileError(format!("Failed to write file: {}", e)))?;
 
-    log::warn!(
+    tracing::warn!(
         "File permission enforcement not available on this platform. \
          Ensure file is protected: {:?}",
         path
@@ -354,7 +367,10 @@ mod tests {
         let key1 = derive_key_from_password(&password, salt);
         let key2 = derive_key_from_password(&password, salt);
 
-        assert_eq!(&*key1, &*key2, "Same password + salt should produce same key");
+        assert_eq!(
+            &*key1, &*key2,
+            "Same password + salt should produce same key"
+        );
     }
 
     #[test]
@@ -366,7 +382,10 @@ mod tests {
         let key1 = derive_key_from_password(&password1, salt);
         let key2 = derive_key_from_password(&password2, salt);
 
-        assert_ne!(&*key1, &*key2, "Different passwords should produce different keys");
+        assert_ne!(
+            &*key1, &*key2,
+            "Different passwords should produce different keys"
+        );
     }
 
     #[test]

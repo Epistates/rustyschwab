@@ -234,7 +234,7 @@ impl CircuitBreaker {
         let mut state = self.state.write();
         *state = CircuitState::Open;
         self.update_failure_time();
-        log::warn!(
+        tracing::warn!(
             "Circuit breaker opened after {} failures",
             self.failure_count.load(Ordering::Relaxed)
         );
@@ -246,7 +246,7 @@ impl CircuitBreaker {
             *state = CircuitState::HalfOpen;
             self.half_open_requests.store(0, Ordering::Relaxed);
             self.success_count.store(0, Ordering::Relaxed);
-            log::info!("Circuit breaker transitioned to half-open");
+            tracing::info!("Circuit breaker transitioned to half-open");
         }
     }
 
@@ -256,7 +256,7 @@ impl CircuitBreaker {
         self.failure_count.store(0, Ordering::Relaxed);
         self.success_count.store(0, Ordering::Relaxed);
         self.half_open_requests.store(0, Ordering::Relaxed);
-        log::info!("Circuit breaker closed - service recovered");
+        tracing::info!("Circuit breaker closed - service recovered");
     }
 
     fn update_failure_time(&self) {
@@ -272,7 +272,12 @@ impl CircuitBreaker {
         }
         // For simplicity, we track elapsed seconds since program start
         // A production implementation might use SystemTime
-        Duration::from_secs(Instant::now().elapsed().as_secs().saturating_sub(last_failure))
+        Duration::from_secs(
+            Instant::now()
+                .elapsed()
+                .as_secs()
+                .saturating_sub(last_failure),
+        )
     }
 
     /// Manually resets the circuit breaker to closed state.
