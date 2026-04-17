@@ -2,8 +2,6 @@
 //!
 //! Provides strongly-typed configuration for OAuth, HTTP client, streaming, and retry policies.
 
-#![allow(missing_docs)] // Config fields are self-documenting via Schwab API docs
-
 use crate::auth::{OAuthConfig, TokenStoreKind};
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -159,7 +157,7 @@ impl Default for StreamConfig {
             websocket_url: "wss://streamer.schwabapi.com/ws".to_string(),
             reconnect: ReconnectConfig::default(),
             heartbeat_interval: Duration::from_secs(20), // WebSocket heartbeat interval
-            ping_timeout: Duration::from_secs(30), // WebSocket ping timeout
+            ping_timeout: Duration::from_secs(30),       // WebSocket ping timeout
             max_subscriptions: 500,
             #[allow(deprecated)]
             buffer_size: 10000, // Deprecated, kept for backward compatibility
@@ -184,9 +182,9 @@ impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_retries: None, // No retry limit by default
+            max_retries: None,                       // No retry limit by default
             initial_backoff: Duration::from_secs(2), // Initial reconnection delay
-            max_backoff: Duration::from_secs(128), // Maximum reconnection delay
+            max_backoff: Duration::from_secs(128),   // Maximum reconnection delay
             backoff_multiplier: 2.0,
         }
     }
@@ -223,7 +221,10 @@ impl SchwabConfig {
             .map_err(|e| Error::Config(format!("Invalid URL for {}: {}", field_name, e)))?;
 
         let host = url.host_str().ok_or_else(|| {
-            Error::Config(format!("No host found in URL for {}: {}", field_name, url_str))
+            Error::Config(format!(
+                "No host found in URL for {}: {}",
+                field_name, url_str
+            ))
         })?;
 
         let scheme = url.scheme();
@@ -252,7 +253,7 @@ impl SchwabConfig {
             }
         } else {
             if scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss" {
-                 return Err(Error::Config(format!(
+                return Err(Error::Config(format!(
                     "Invalid scheme '{}' for localhost in {}.",
                     scheme, field_name
                 )));
@@ -289,7 +290,11 @@ impl SchwabConfig {
             pkce_enabled: env::var("SCHWAB_PKCE_ENABLED")
                 .map(|v| v.parse().unwrap_or(true))
                 .unwrap_or(true),
-            token_store_kind: match env::var("SCHWAB_TOKEN_STORE").unwrap_or_else(|_| "file".to_string()).to_lowercase().as_str() {
+            token_store_kind: match env::var("SCHWAB_TOKEN_STORE")
+                .unwrap_or_else(|_| "file".to_string())
+                .to_lowercase()
+                .as_str()
+            {
                 "keychain" => TokenStoreKind::Keychain,
                 _ => TokenStoreKind::File,
             },

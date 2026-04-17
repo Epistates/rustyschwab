@@ -2,19 +2,23 @@
 //!
 //! Provides authenticated access to accounts, trading, market data, and quotes.
 
-#![allow(missing_docs)] // Internal implementation details
-
 use crate::auth::{AuthManager, create_bearer_header};
 use crate::config::{ClientConfig, SchwabConfig};
 use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
-use crate::types::*;
-use crate::transport::HttpTransport;
 use crate::streaming::SubscriptionManager;
+use crate::transport::HttpTransport;
+use crate::types::accounts::{Account, AccountNumberHash, UserPreferences};
+use crate::types::market_data::{
+    ContractType, ExpirationChainResponse, ExpirationMonth, FrequencyType, Instrument,
+    InstrumentsResponse, MarketHours, MoverSort, MoversResponse, OptionChainResponse,
+    OptionStrategy, PeriodType, PriceHistoryResponse, Projection, QuoteItem, QuotesResponse, Range,
+};
+use crate::types::trading::{Order, OrderResponse, Transaction};
 use chrono::NaiveDate;
 use governor::{Quota, RateLimiter};
 use reqwest::{Client as HttpClient, Method, Response, StatusCode};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 use url::Url;
@@ -29,7 +33,15 @@ struct ClientInner {
     auth_manager: AuthManager,
     config: ClientConfig,
     transport: HttpTransport,
-    rate_limiter: Option<Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>>,
+    rate_limiter: Option<
+        Arc<
+            RateLimiter<
+                governor::state::NotKeyed,
+                governor::state::InMemoryState,
+                governor::clock::DefaultClock,
+            >,
+        >,
+    >,
     retry_policy: RetryPolicy,
     #[allow(dead_code)] // Reserved for streaming subscription integration
     subscriptions: Arc<SubscriptionManager>,
@@ -39,8 +51,7 @@ impl SchwabClient {
     pub fn new(config: SchwabConfig) -> Result<Self> {
         config.validate()?;
 
-        let auth_manager = AuthManager::new(config.oauth)
-            .map_err(|e| Error::Auth(e))?;
+        let auth_manager = AuthManager::new(config.oauth).map_err(Error::Auth)?;
 
         // Build transport with validated base URL and timeout
         let _ = Url::parse(&config.client.base_url)
@@ -83,27 +94,53 @@ impl SchwabClient {
         Ok(())
     }
 
+    /// Borrow the client's shared `AuthManager` (Arc-backed).
+    ///
+    /// Useful when building ancillary clients — e.g. a `StreamClient` — that
+    /// need to reuse the same token refresh loop and on-disk token store.
+    pub fn auth_manager(&self) -> AuthManager {
+        self.inner.auth_manager.clone()
+    }
+
+    /// Borrow the HTTP client config (base URL, retry policy, etc.).
+    pub fn client_config(&self) -> &ClientConfig {
+        &self.inner.config
+    }
+
     pub(crate) async fn request<T>(&self, method: Method, path: &str) -> Result<T>
     where
         T: DeserializeOwned,
     {
-        self.request_with_options::<T, ()>(method, path, None::<&()>, None::<&()>).await
+        self.request_with_options::<T, ()>(method, path, None::<&()>, None::<&()>)
+            .await
     }
 
-    pub(crate) async fn request_with_query<T, Q>(&self, method: Method, path: &str, query: &Q) -> Result<T>
+    pub(crate) async fn request_with_query<T, Q>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &Q,
+    ) -> Result<T>
     where
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        self.request_with_options(method, path, Some(query), None::<&()>).await
+        self.request_with_options(method, path, Some(query), None::<&()>)
+            .await
     }
 
-    pub(crate) async fn request_with_body<T, B>(&self, method: Method, path: &str, body: &B) -> Result<T>
+    pub(crate) async fn request_with_body<T, B>(
+        &self,
+        method: Method,
+        path: &str,
+        body: &B,
+    ) -> Result<T>
     where
         T: DeserializeOwned,
         B: Serialize,
     {
-        self.request_with_options::<T, ()>(method, path, None::<&()>, Some(body)).await
+        self.request_with_options::<T, ()>(method, path, None::<&()>, Some(body))
+            .await
     }
 
     pub(crate) async fn request_with_options<T, Q>(
@@ -141,19 +178,16 @@ impl SchwabClient {
                 .retry_policy
                 .execute(|| {
                     let headers = vec![
-                        ("Authorization".to_string(), create_bearer_header(&access_token)),
+                        (
+                            "Authorization".to_string(),
+                            create_bearer_header(&access_token),
+                        ),
                         ("Accept".to_string(), "application/json".to_string()),
                     ];
                     async {
                         self.inner
                             .transport
-                            .request::<T>(
-                                method.clone(),
-                                path,
-                                headers,
-                                query,
-                                body,
-                            )
+                            .request::<T>(method.clone(), path, headers, query, body)
                             .await
                     }
                 })
@@ -161,7 +195,9 @@ impl SchwabClient {
 
             match result {
                 Ok(value) => return Ok(value),
-                Err(Error::Http { status, .. }) if status == reqwest::StatusCode::UNAUTHORIZED && !attempted_refresh => {
+                Err(Error::Http { status, .. })
+                    if status == reqwest::StatusCode::UNAUTHORIZED && !attempted_refresh =>
+                {
                     warn!("401 Unauthorized received, attempting token refresh and retry");
                     self.inner
                         .auth_manager
@@ -182,12 +218,15 @@ impl SchwabClient {
         T: DeserializeOwned,
     {
         let status = response.status();
-        
+
         if status.is_success() {
             response.json().await.map_err(Error::from)
         } else {
-            let body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
             match status {
                 StatusCode::UNAUTHORIZED => {
                     warn!("Received 401 Unauthorized, token may be expired");
@@ -200,22 +239,25 @@ impl SchwabClient {
                     let retry_after = 60; // Default to 60 seconds
                     Err(Error::RateLimit { retry_after })
                 }
-                _ => {
-                    Err(crate::error::parse_api_error(status, &body))
-                }
+                _ => Err(crate::error::parse_api_error(status, &body)),
             }
         }
     }
 
     // ==================== Market Data Endpoints ====================
-    
+
     /// Get quotes for multiple symbols
     pub async fn get_quotes(&self, symbols: &[&str]) -> Result<QuotesResponse> {
         self.get_quotes_with_options(symbols, None, None).await
     }
 
     /// Get quotes for multiple symbols with advanced options
-    pub async fn get_quotes_with_options(&self, symbols: &[&str], fields: Option<&str>, indicative: Option<bool>) -> Result<QuotesResponse> {
+    pub async fn get_quotes_with_options(
+        &self,
+        symbols: &[&str],
+        fields: Option<&str>,
+        indicative: Option<bool>,
+    ) -> Result<QuotesResponse> {
         if symbols.is_empty() {
             return Err(Error::InvalidParameter("No symbols provided".to_string()));
         }
@@ -226,43 +268,74 @@ impl SchwabClient {
         if let Some(i) = indicative {
             params.push(("indicative", i.to_string()));
         }
-        self.request_with_query(Method::GET, "/marketdata/v1/quotes", &params).await
+        self.request_with_query(Method::GET, "/marketdata/v1/quotes", &params)
+            .await
     }
 
     /// Get quote for a single symbol
     pub async fn get_quote(&self, symbol: &str) -> Result<QuoteItem> {
         let encoded_symbol = urlencoding::encode(symbol);
-        self.request(Method::GET, &format!("/marketdata/v1/{}/quotes", encoded_symbol)).await
+        self.request(
+            Method::GET,
+            &format!("/marketdata/v1/{}/quotes", encoded_symbol),
+        )
+        .await
     }
 
     /// Get quote for a single symbol with advanced options
-    pub async fn get_quote_with_options(&self, symbol: &str, fields: Option<&str>) -> Result<QuoteItem> {
+    pub async fn get_quote_with_options(
+        &self,
+        symbol: &str,
+        fields: Option<&str>,
+    ) -> Result<QuoteItem> {
         let mut params = Vec::new();
         if let Some(f) = fields {
             params.push(("fields", f.to_string()));
         }
         let encoded_symbol = urlencoding::encode(symbol);
-        self.request_with_query(Method::GET, &format!("/marketdata/v1/{}/quotes", encoded_symbol), &params).await
+        self.request_with_query(
+            Method::GET,
+            &format!("/marketdata/v1/{}/quotes", encoded_symbol),
+            &params,
+        )
+        .await
     }
 
     /// Get price history for a symbol
-    pub async fn get_price_history(&self, params: &PriceHistoryParams) -> Result<PriceHistoryResponse> {
-        self.request_with_query(Method::GET, "/marketdata/v1/pricehistory", params).await
+    pub async fn get_price_history(
+        &self,
+        params: &PriceHistoryParams,
+    ) -> Result<PriceHistoryResponse> {
+        self.request_with_query(Method::GET, "/marketdata/v1/pricehistory", params)
+            .await
     }
 
     /// Get option chain for a symbol
-    pub async fn get_option_chain(&self, params: &OptionChainParams) -> Result<OptionChainResponse> {
-        self.request_with_query(Method::GET, "/marketdata/v1/chains", params).await
+    pub async fn get_option_chain(
+        &self,
+        params: &OptionChainParams,
+    ) -> Result<OptionChainResponse> {
+        self.request_with_query(Method::GET, "/marketdata/v1/chains", params)
+            .await
     }
 
     /// Get option expiration dates for a symbol
-    pub async fn get_option_expiration_chain(&self, symbol: &str) -> Result<ExpirationChainResponse> {
+    pub async fn get_option_expiration_chain(
+        &self,
+        symbol: &str,
+    ) -> Result<ExpirationChainResponse> {
         let params = [("symbol", symbol)];
-        self.request_with_query(Method::GET, "/marketdata/v1/expirationchain", &params).await
+        self.request_with_query(Method::GET, "/marketdata/v1/expirationchain", &params)
+            .await
     }
 
     /// Get market movers for an index
-    pub async fn get_movers(&self, index: &str, sort: Option<MoverSort>, frequency: Option<i32>) -> Result<MoversResponse> {
+    pub async fn get_movers(
+        &self,
+        index: &str,
+        sort: Option<MoverSort>,
+        frequency: Option<i32>,
+    ) -> Result<MoversResponse> {
         let mut params = Vec::new();
         if let Some(s) = sort {
             params.push(("sort", format!("{:?}", s).to_uppercase()));
@@ -270,56 +343,77 @@ impl SchwabClient {
         if let Some(f) = frequency {
             params.push(("frequency", f.to_string()));
         }
-        
+
         let encoded_index = urlencoding::encode(index);
         self.request_with_query(
             Method::GET,
             &format!("/marketdata/v1/movers/{}", encoded_index),
-            &params
-        ).await
+            &params,
+        )
+        .await
     }
 
     /// Search for instruments
-    pub async fn search_instruments(&self, symbol: &str, projection: Projection) -> Result<InstrumentsResponse> {
+    pub async fn search_instruments(
+        &self,
+        symbol: &str,
+        projection: Projection,
+    ) -> Result<InstrumentsResponse> {
         let params = [
             ("symbol", symbol.to_string()),
             ("projection", format!("{:?}", projection).to_uppercase()),
         ];
-        self.request_with_query(Method::GET, "/marketdata/v1/instruments", &params).await
+        self.request_with_query(Method::GET, "/marketdata/v1/instruments", &params)
+            .await
     }
 
     /// Get instrument details by CUSIP
     pub async fn get_instrument(&self, cusip: &str) -> Result<Instrument> {
-        self.request(Method::GET, &format!("/marketdata/v1/instruments/{}", cusip)).await
+        self.request(
+            Method::GET,
+            &format!("/marketdata/v1/instruments/{}", cusip),
+        )
+        .await
     }
 
     /// Get market hours for multiple markets
-    pub async fn get_markets(&self, markets: &[&str], date: Option<&str>) -> Result<std::collections::HashMap<String, Vec<crate::types::market_data::MarketHours>>> {
+    pub async fn get_markets(
+        &self,
+        markets: &[&str],
+        date: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, Vec<MarketHours>>> {
         let mut params = vec![("markets", markets.join(","))];
         if let Some(d) = date {
             params.push(("date", d.to_string()));
         }
-        self.request_with_query(Method::GET, "/marketdata/v1/markets", &params).await
+        self.request_with_query(Method::GET, "/marketdata/v1/markets", &params)
+            .await
     }
 
     /// Get market hours for a single market
-    pub async fn get_market(&self, market_id: &str, date: Option<&str>) -> Result<Vec<crate::types::market_data::MarketHours>> {
+    pub async fn get_market(
+        &self,
+        market_id: &str,
+        date: Option<&str>,
+    ) -> Result<Vec<MarketHours>> {
         let mut params = Vec::new();
         if let Some(d) = date {
             params.push(("date", d.to_string()));
         }
         self.request_with_query(
-            Method::GET, 
+            Method::GET,
             &format!("/marketdata/v1/markets/{}", market_id),
-            &params
-        ).await
+            &params,
+        )
+        .await
     }
 
     // ==================== Account & Trading Endpoints ====================
-    
+
     /// Get all linked account numbers
     pub async fn get_account_numbers(&self) -> Result<Vec<AccountNumberHash>> {
-        self.request(Method::GET, "/trader/v1/accounts/accountNumbers").await
+        self.request(Method::GET, "/trader/v1/accounts/accountNumbers")
+            .await
     }
 
     /// Get all account details
@@ -329,11 +423,16 @@ impl SchwabClient {
         } else {
             vec![]
         };
-        self.request_with_query(Method::GET, "/trader/v1/accounts", &params).await
+        self.request_with_query(Method::GET, "/trader/v1/accounts", &params)
+            .await
     }
 
     /// Get specific account details
-    pub async fn get_account(&self, account_hash: &str, include_positions: bool) -> Result<Account> {
+    pub async fn get_account(
+        &self,
+        account_hash: &str,
+        include_positions: bool,
+    ) -> Result<Account> {
         let params = if include_positions {
             vec![("fields", "positions")]
         } else {
@@ -342,8 +441,9 @@ impl SchwabClient {
         self.request_with_query(
             Method::GET,
             &format!("/trader/v1/accounts/{}", account_hash),
-            &params
-        ).await
+            &params,
+        )
+        .await
     }
 
     /// Get orders for an account
@@ -368,12 +468,13 @@ impl SchwabClient {
         if let Some(s) = status {
             params.push(("status", s.to_string()));
         }
-        
+
         self.request_with_query(
             Method::GET,
             &format!("/trader/v1/accounts/{}/orders", account_hash),
-            &params
-        ).await
+            &params,
+        )
+        .await
     }
 
     /// Place an order
@@ -381,24 +482,27 @@ impl SchwabClient {
         self.request_with_body(
             Method::POST,
             &format!("/trader/v1/accounts/{}/orders", account_hash),
-            order
-        ).await
+            order,
+        )
+        .await
     }
 
     /// Get a specific order
     pub async fn get_order(&self, account_hash: &str, order_id: &str) -> Result<Order> {
         self.request(
             Method::GET,
-            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id)
-        ).await
+            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
+        )
+        .await
     }
 
     /// Cancel an order
     pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {
         self.request(
             Method::DELETE,
-            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id)
-        ).await
+            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
+        )
+        .await
     }
 
     /// Replace an order
@@ -406,26 +510,24 @@ impl SchwabClient {
         &self,
         account_hash: &str,
         order_id: &str,
-        order: &Order
+        order: &Order,
     ) -> Result<OrderResponse> {
         self.request_with_body(
             Method::PUT,
             &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
-            order
-        ).await
+            order,
+        )
+        .await
     }
 
     /// Preview an order
-    pub async fn preview_order(
-        &self,
-        account_hash: &str,
-        order: &Order
-    ) -> Result<OrderResponse> {
+    pub async fn preview_order(&self, account_hash: &str, order: &Order) -> Result<OrderResponse> {
         self.request_with_body(
             Method::POST,
             &format!("/trader/v1/accounts/{}/previewOrder", account_hash),
-            order
-        ).await
+            order,
+        )
+        .await
     }
 
     /// Get all orders across all accounts
@@ -449,8 +551,9 @@ impl SchwabClient {
         if let Some(s) = status {
             params.push(("status", s.to_string()));
         }
-        
-        self.request_with_query(Method::GET, "/trader/v1/orders", &params).await
+
+        self.request_with_query(Method::GET, "/trader/v1/orders", &params)
+            .await
     }
 
     /// Get account transactions
@@ -475,24 +578,29 @@ impl SchwabClient {
         if let Some(end) = end_date {
             params.push(("endDate", end.to_string()));
         }
-        
+
         self.request_with_query(
             Method::GET,
             &format!("/trader/v1/accounts/{}/transactions", account_hash),
-            &params
-        ).await
+            &params,
+        )
+        .await
     }
 
     /// Get a specific transaction
     pub async fn get_transaction(
         &self,
         account_hash: &str,
-        transaction_id: &str
+        transaction_id: &str,
     ) -> Result<Transaction> {
         self.request(
             Method::GET,
-            &format!("/trader/v1/accounts/{}/transactions/{}", account_hash, transaction_id)
-        ).await
+            &format!(
+                "/trader/v1/accounts/{}/transactions/{}",
+                account_hash, transaction_id
+            ),
+        )
+        .await
     }
 
     /// Get user preferences
@@ -533,7 +641,8 @@ impl SchwabClientBuilder {
     }
 
     pub fn build(self) -> Result<SchwabClient> {
-        let config = self.config
+        let config = self
+            .config
             .or_else(|| SchwabConfig::from_env().ok())
             .ok_or_else(|| Error::Config("No configuration provided".to_string()))?;
 
@@ -549,7 +658,8 @@ impl Default for SchwabClientBuilder {
 
 // Parameter structs for complex queries
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PriceHistoryParams {
     pub symbol: String,
@@ -571,7 +681,8 @@ pub struct PriceHistoryParams {
     pub need_previous_close: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OptionChainParams {
     pub symbol: String,
@@ -611,8 +722,8 @@ pub struct OptionChainParams {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path, header};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn test_get_quotes() {
@@ -621,15 +732,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/marketdata/v1/quotes"))
             .and(header("Authorization", "Bearer test_token"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "quotes": [{
-                        "symbol": "AAPL",
-                        "quote": {
-                            "lastPrice": 150.00
-                        }
-                    }]
-                })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "quotes": [{
+                    "symbol": "AAPL",
+                    "quote": {
+                        "lastPrice": 150.00
+                    }
+                }]
+            })))
             .mount(&mock_server)
             .await;
 
