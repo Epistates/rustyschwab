@@ -2,8 +2,6 @@
 //!
 //! All SDK operations return `Result<T>` which is an alias for `std::result::Result<T, Error>`.
 //! Each error variant includes recovery guidance for handling different failure scenarios.
-
-#![allow(missing_docs)] // Error variants and fields are self-documenting
 //!
 //! # Error Recovery Strategies
 //!
@@ -84,7 +82,7 @@ pub enum Error {
     ///
     /// **Recovery**: Reconnect using StreamClient's automatic reconnection (if enabled)
     #[error("WebSocket error: {0}")]
-    WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
+    WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
 
     /// JSON serialization/deserialization error
     ///
@@ -128,7 +126,7 @@ pub enum Error {
     ///
     /// **Recovery**: Check network connectivity and retry
     #[error("Network error: {0}")]
-    Network(#[from] reqwest::Error),
+    Network(#[from] Box<reqwest::Error>),
 
     /// Invalid parameter passed to SDK function
     ///
@@ -167,10 +165,31 @@ pub enum Error {
     Unknown(String),
 }
 
+// Manual From impls so callers using `?` don't need to box themselves.
+// The variants are boxed to keep `Error` small (Result<T, Error> stays cheap).
+impl From<reqwest::Error> for Error {
+    fn from(err: reqwest::Error) -> Self {
+        Error::Network(Box::new(err))
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for Error {
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Error::WebSocket(Box::new(err))
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum AuthError {
     #[error("Token expired")]
     TokenExpired,
+
+    /// Refresh token has less runway than our safety threshold (Schwabdev's
+    /// 60.5 min). Callers must run a fresh OAuth flow rather than attempting
+    /// to refresh — Schwab does not renew the refresh token itself; it is
+    /// only issued during the initial auth-code exchange.
+    #[error("Refresh token expiring soon ({seconds_remaining}s remaining) — full OAuth flow required")]
+    RefreshTokenExpiring { seconds_remaining: i64 },
 
     #[error("OAuth flow failed: {0}")]
     OAuthFlow(String),
@@ -298,9 +317,7 @@ impl Error {
 
     pub fn retry_after(&self) -> Option<std::time::Duration> {
         match self {
-            Error::RateLimit { retry_after } => {
-                Some(std::time::Duration::from_secs(*retry_after))
-            }
+            Error::RateLimit { retry_after } => Some(std::time::Duration::from_secs(*retry_after)),
             _ => None,
         }
     }
@@ -352,11 +369,13 @@ mod tests {
         assert!(Error::Auth(AuthError::TokenExpired).is_auth_error());
 
         // 401 Unauthorized HTTP status should be auth error
-        assert!(Error::Http {
-            status: reqwest::StatusCode::UNAUTHORIZED,
-            message: "Unauthorized".to_string()
-        }
-        .is_auth_error());
+        assert!(
+            Error::Http {
+                status: reqwest::StatusCode::UNAUTHORIZED,
+                message: "Unauthorized".to_string()
+            }
+            .is_auth_error()
+        );
 
         // Timeout is NOT an auth error
         assert!(!Error::Timeout { duration: 30 }.is_auth_error());
