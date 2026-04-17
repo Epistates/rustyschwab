@@ -1,7 +1,5 @@
 //! Subscription management for streaming services.
 
-#![allow(missing_docs)] // Internal subscription management
-
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
@@ -28,19 +26,17 @@ impl SubscriptionManager {
 
     pub fn add_subscription(&self, service: String, symbols: Vec<String>, fields: String) {
         let mut subs = self.subscriptions.write();
-        
-        let entry = subs.entry(service.clone()).or_insert_with(|| {
-            Subscription {
-                service,
-                symbols: HashSet::new(),
-                fields: Vec::new(),
-            }
+
+        let entry = subs.entry(service.clone()).or_insert_with(|| Subscription {
+            service,
+            symbols: HashSet::new(),
+            fields: Vec::new(),
         });
 
         for symbol in symbols {
             entry.symbols.insert(symbol);
         }
-        
+
         // Update fields if provided (use comma-separated string)
         if !fields.is_empty() {
             entry.fields = fields.split(',').map(|s| s.to_string()).collect();
@@ -49,7 +45,7 @@ impl SubscriptionManager {
 
     pub fn remove_subscription(&self, service: String, symbols: Vec<String>) {
         let mut subs = self.subscriptions.write();
-        
+
         if let Some(subscription) = subs.get_mut(&service) {
             for symbol in symbols {
                 subscription.symbols.remove(&symbol);
@@ -69,12 +65,7 @@ impl SubscriptionManager {
         self.subscriptions
             .read()
             .iter()
-            .map(|(service, sub)| {
-                (
-                    service.clone(),
-                    sub.symbols.iter().cloned().collect(),
-                )
-            })
+            .map(|(service, sub)| (service.clone(), sub.symbols.iter().cloned().collect()))
             .collect()
     }
 
@@ -143,10 +134,7 @@ mod tests {
         assert_eq!(manager.get_symbol_count(), 3);
 
         // Remove subscription
-        manager.remove_subscription(
-            "LEVELONE_EQUITIES".to_string(),
-            vec!["AAPL".to_string()],
-        );
+        manager.remove_subscription("LEVELONE_EQUITIES".to_string(), vec!["AAPL".to_string()]);
 
         assert!(!manager.is_subscribed("LEVELONE_EQUITIES", "AAPL"));
         assert!(manager.is_subscribed("LEVELONE_EQUITIES", "GOOGL"));

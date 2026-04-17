@@ -15,13 +15,12 @@
 //! - `CHART_EQUITY` - Real-time chart data
 //! - `ACCT_ACTIVITY` - Account activity notifications
 
-#![allow(missing_docs)] // DTO fields are self-documenting via Schwab API docs
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamRequest {
     pub requestid: String,
@@ -35,12 +34,14 @@ pub struct StreamRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamRequests {
     pub requests: Vec<StreamRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "UPPERCASE")]
 pub enum StreamCommand {
     Login,
@@ -52,6 +53,7 @@ pub enum StreamCommand {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamParameters {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,13 +62,20 @@ pub struct StreamParameters {
     pub fields: Option<String>,
     #[serde(rename = "Authorization", skip_serializing_if = "Option::is_none")]
     pub authorization: Option<String>,
-    #[serde(rename = "SchwabClientChannel", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "SchwabClientChannel",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub schwab_client_channel: Option<String>,
-    #[serde(rename = "SchwabClientFunctionId", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "SchwabClientFunctionId",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub schwab_client_function_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum StreamMessage {
     Response(StreamResponse),
@@ -75,11 +84,13 @@ pub enum StreamMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamResponse {
     pub response: Vec<ResponseItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseItem {
     pub service: String,
@@ -92,17 +103,20 @@ pub struct ResponseItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ResponseContent {
     pub code: i32,
     pub msg: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamData {
     pub data: Vec<DataItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DataItem {
     pub service: String,
@@ -112,6 +126,7 @@ pub struct DataItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DataContent {
     pub key: String,
     pub delayed: bool,
@@ -126,17 +141,20 @@ pub struct DataContent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamNotify {
     pub notify: Vec<NotifyItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct NotifyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamService {
     Admin,
@@ -234,7 +252,10 @@ impl LevelOneEquityFields {
     pub const POST_MARKET_CHANGE_PERCENT: u32 = 51;
 
     pub fn all_fields() -> String {
-        (0..=51).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        (0..=51)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn default_fields() -> String {
@@ -308,7 +329,10 @@ impl LevelOneOptionFields {
     pub const TRADE_TIME_MILLIS: u32 = 39;
 
     pub fn default_fields() -> String {
-        (0..=39).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+        (0..=39)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

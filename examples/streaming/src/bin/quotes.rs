@@ -12,11 +12,10 @@
 ///
 /// cargo run --example streaming_quotes --features callback-server
 /// ```
-
 use schwab_rs::{
+    StreamClient, StreamMessage,
     auth::{AuthManager, OAuthConfig},
     config::StreamConfig,
-    StreamClient, StreamMessage,
     types::streaming::StreamService,
 };
 use std::collections::HashMap;
@@ -26,7 +25,11 @@ use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     println!("\n╔═══════════════════════════════════════╗");
     println!("║   Real-Time Stock Quotes Streamer    ║");
@@ -72,7 +75,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Connected!\n");
 
     // Define watchlist
-    let watchlist = vec!["AAPL".to_string(), "MSFT".to_string(), "GOOGL".to_string(), "TSLA".to_string(), "AMD".to_string(), "NVDA".to_string()];
+    let watchlist = vec![
+        "AAPL".to_string(),
+        "MSFT".to_string(),
+        "GOOGL".to_string(),
+        "TSLA".to_string(),
+        "AMD".to_string(),
+        "NVDA".to_string(),
+    ];
 
     // Request only essential fields for quotes
     stream_client.set_service_fields(

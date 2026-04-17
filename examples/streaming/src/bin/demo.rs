@@ -24,11 +24,10 @@
 /// - ✅ Custom field selection for bandwidth optimization
 /// - ✅ Message handling (Data, Response, Notify)
 /// - ✅ Graceful shutdown after time limit
-
 use schwab_rs::{
+    StreamClient, StreamMessage,
     auth::{AuthManager, OAuthConfig},
     config::StreamConfig,
-    StreamClient, StreamMessage,
     types::streaming::StreamService,
 };
 use std::env;
@@ -37,8 +36,11 @@ use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     println!("═══════════════════════════════════════════════════");
     println!("  Schwab Streaming Demo - All 13 Services");
@@ -46,12 +48,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("═══════════════════════════════════════════════════\n");
 
     // Load configuration from environment
-    let app_key = env::var("SCHWAB_APP_KEY")
-        .expect("SCHWAB_APP_KEY must be set (32 characters)");
-    let app_secret = env::var("SCHWAB_APP_SECRET")
-        .expect("SCHWAB_APP_SECRET must be set (16 characters)");
-    let callback_url = env::var("SCHWAB_CALLBACK_URL")
-        .unwrap_or_else(|_| "https://localhost:8080".to_string());
+    let app_key = env::var("SCHWAB_APP_KEY").expect("SCHWAB_APP_KEY must be set (32 characters)");
+    let app_secret =
+        env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET must be set (16 characters)");
+    let callback_url =
+        env::var("SCHWAB_CALLBACK_URL").unwrap_or_else(|_| "https://localhost:8080".to_string());
 
     // Validate key lengths
     if app_key.len() != 32 {
@@ -121,7 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "0,1,2,3,4,5,6,7,8".to_string(),
     );
     stream_client
-        .subscribe(StreamService::LeveloneEquities, vec!["AMD".into(), "INTC".into()])
+        .subscribe(
+            StreamService::LeveloneEquities,
+            vec!["AMD".into(), "INTC".into()],
+        )
         .await?;
     println!("   ✓ Subscribed\n");
 
@@ -199,7 +203,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SERVICE 13: Account Activity
     // ═══════════════════════════════════════════════════════
     println!("📊 [13/13] Subscribing to Account Activity");
-    stream_client.subscribe(StreamService::AcctActivity, vec![]).await?;
+    stream_client
+        .subscribe(StreamService::AcctActivity, vec![])
+        .await?;
     println!();
 
     println!("═══════════════════════════════════════════════════");
@@ -241,7 +247,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 if message_count % 500 == 0 {
-                    println!("\n📈 Summary: {} messages ({} data, {} resp, {} heart)\n",
+                    println!(
+                        "\n📈 Summary: {} messages ({} data, {} resp, {} heart)\n",
                         message_count, data_count, response_count, notify_count
                     );
                 }

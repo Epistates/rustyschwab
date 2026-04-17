@@ -6,12 +6,11 @@
 //! - Position information
 //! - User preferences and streamer info
 
-#![allow(missing_docs)] // DTO fields are self-documenting via Schwab API docs
-
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AccountNumberHash {
     pub account_number: String,
@@ -20,6 +19,7 @@ pub struct AccountNumberHash {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub securities_account: SecuritiesAccount,
@@ -27,6 +27,7 @@ pub struct Account {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SecuritiesAccount {
     pub account_number: String,
@@ -42,6 +43,7 @@ pub struct SecuritiesAccount {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub short_quantity: Option<f64>,
@@ -68,6 +70,7 @@ pub struct Position {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PositionInstrument {
     pub asset_type: String,
@@ -80,6 +83,7 @@ pub struct PositionInstrument {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Balance {
     pub accrued_interest: Option<f64>,
@@ -115,12 +119,14 @@ pub struct Balance {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsResponse {
     pub accounts: Vec<Account>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UserPreferences {
     pub accounts: Option<Vec<AccountPreferences>>,
@@ -129,6 +135,7 @@ pub struct UserPreferences {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AccountPreferences {
     pub account_number: String,
@@ -140,6 +147,7 @@ pub struct AccountPreferences {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamerInfo {
     pub streamer_socket_url: String,
@@ -150,6 +158,7 @@ pub struct StreamerInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Offer {
     pub level2_permissions: bool,

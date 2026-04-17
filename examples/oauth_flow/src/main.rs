@@ -1,20 +1,17 @@
 use anyhow::Result;
 use schwab_rs::prelude::*;
 use std::io::{self, Write};
-use tracing::{info, Level};
-use tracing_subscriber;
+use tracing::{Level, info};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_max_level(Level::INFO)
-        .init();
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     // Load .env file if it exists
-    if let Ok(_) = dotenvy::from_filename("../../.env") {
+    if dotenvy::from_filename("../../.env").is_ok() {
         info!("Loaded environment variables from .env file");
-    } else if let Ok(_) = dotenvy::dotenv() {
+    } else if dotenvy::dotenv().is_ok() {
         info!("Loaded environment variables from default .env location");
     }
 
@@ -50,40 +47,40 @@ async fn main() -> Result<()> {
         info!("Found existing valid tokens, skipping OAuth flow");
     } else {
         info!("No valid tokens found, starting OAuth flow");
-        
+
         // Start OAuth flow
         let (auth_url, captured_code) = auth_manager.authorize().await?;
-        
+
         println!("\n🔐 OAuth Authorization Required");
         println!("================================");
-        
+
         if !captured_code.is_empty() {
             println!("\n✅ Authorization successful!");
             println!("Code captured automatically by built-in server.");
         } else {
             println!("\nPlease open this URL in your browser:");
             println!("\n{}\n", auth_url);
-            
+
             println!("After authorizing, you'll be redirected to your callback URL.");
             println!("Copy the 'code' parameter from the redirect URL.");
             println!("Example: https://127.0.0.1:8080?code=YOUR_CODE_HERE\n");
-            
+
             print!("Enter the authorization code: ");
             io::stdout().flush()?;
-            
+
             let mut code = String::new();
             io::stdin().read_line(&mut code)?;
             let code = code.trim().to_string();
-            
+
             if code.is_empty() {
                 eprintln!("Error: No code provided");
                 std::process::exit(1);
             }
-            
+
             println!("\n🔄 Exchanging authorization code for tokens...");
             auth_manager.exchange_code(code).await?;
         }
-        
+
         info!("✅ OAuth flow completed successfully!");
     }
 
@@ -95,7 +92,7 @@ async fn main() -> Result<()> {
     // Test the client with a simple API call
     info!("\n🔍 Testing API access...");
     println!("\nFetching quotes for SPY, AAPL...\n");
-    
+
     match client.get_quotes(&["SPY", "AAPL"]).await {
         Ok(quotes) => {
             println!("📈 Market Quotes:");
@@ -106,7 +103,11 @@ async fn main() -> Result<()> {
                         "{}: ${:.2} ({}${:.2})",
                         quote.symbol,
                         q.last_price.unwrap_or(0.0),
-                        if q.net_change.unwrap_or(0.0) >= 0.0 { "+" } else { "" },
+                        if q.net_change.unwrap_or(0.0) >= 0.0 {
+                            "+"
+                        } else {
+                            ""
+                        },
                         q.net_change.unwrap_or(0.0)
                     );
                 }

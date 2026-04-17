@@ -1,13 +1,9 @@
 //! WebSocket transport using tokio-tungstenite.
 
-#![allow(missing_docs)] // Internal WebSocket transport
-
 use crate::error::{Error, Result, StreamError};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream,
-};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info};
 use url::Url;
 
@@ -24,7 +20,9 @@ impl WebSocketTransport {
             .map_err(|e| Error::Config(format!("Invalid WebSocket URL: {}", e)))?;
 
         if !url.scheme().starts_with("ws") {
-            return Err(Error::Config("WebSocket URL must use ws:// or wss:// scheme".to_string()));
+            return Err(Error::Config(
+                "WebSocket URL must use ws:// or wss:// scheme".to_string(),
+            ));
         }
 
         Ok(Self { url })
@@ -47,7 +45,7 @@ impl WebSocketTransport {
         stream
             .send(Message::Text(message.into()))
             .await
-            .map_err(|e| Error::WebSocket(e))
+            .map_err(Error::from)
     }
 
     pub async fn receive_message(stream: &mut WsStream) -> Result<Option<String>> {
@@ -55,11 +53,9 @@ impl WebSocketTransport {
             // In tokio-tungstenite 0.26+, Text contains Utf8Bytes which implements ToString
             Some(Ok(Message::Text(text))) => Ok(Some(text.to_string())),
             // In tokio-tungstenite 0.26+, Binary contains Bytes
-            Some(Ok(Message::Binary(bin))) => {
-                String::from_utf8(bin.to_vec())
-                    .map(Some)
-                    .map_err(|e| Error::Stream(StreamError::InvalidMessage(e.to_string())))
-            }
+            Some(Ok(Message::Binary(bin))) => String::from_utf8(bin.to_vec())
+                .map(Some)
+                .map_err(|e| Error::Stream(StreamError::InvalidMessage(e.to_string()))),
             Some(Ok(Message::Ping(_))) => {
                 // Auto-pong is handled by tungstenite
                 Ok(None)
@@ -72,7 +68,7 @@ impl WebSocketTransport {
             Some(Ok(Message::Frame(_))) => Ok(None),
             Some(Err(e)) => {
                 error!("WebSocket error: {}", e);
-                Err(Error::WebSocket(e))
+                Err(Error::from(e))
             }
             None => {
                 debug!("WebSocket stream ended");
@@ -82,9 +78,6 @@ impl WebSocketTransport {
     }
 
     pub async fn close(mut stream: WsStream) -> Result<()> {
-        stream
-            .close(None)
-            .await
-            .map_err(|e| Error::WebSocket(e))
+        stream.close(None).await.map_err(Error::from)
     }
 }

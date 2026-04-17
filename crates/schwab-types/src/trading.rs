@@ -13,14 +13,13 @@
 //! - TrailingStop, TrailingStopLimit
 //! - Various complex strategies (spreads, straddles, etc.)
 
-#![allow(missing_docs)] // DTO fields are self-documenting via Schwab API docs
-
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Order {
     pub order_id: Option<String>,
@@ -45,6 +44,7 @@ pub struct Order {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderLeg {
     pub order_leg_type: OrderLegType,
@@ -56,6 +56,7 @@ pub struct OrderLeg {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderInstrument {
     pub asset_type: String,
@@ -65,6 +66,7 @@ pub struct OrderInstrument {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderSession {
     #[default]
@@ -75,6 +77,7 @@ pub enum OrderSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderDuration {
     #[default]
@@ -88,6 +91,7 @@ pub enum OrderDuration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderType {
     #[default]
@@ -108,6 +112,7 @@ pub enum OrderType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ComplexOrderStrategyType {
     None,
@@ -134,6 +139,7 @@ pub enum ComplexOrderStrategyType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStrategyType {
     Single,
@@ -142,6 +148,7 @@ pub enum OrderStrategyType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
     Awaiting,
@@ -167,6 +174,7 @@ pub enum OrderStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderLegType {
     #[default]
@@ -180,6 +188,7 @@ pub enum OrderLegType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderInstruction {
     #[default]
@@ -196,6 +205,7 @@ pub enum OrderInstruction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PositionEffect {
     Opening,
@@ -205,6 +215,7 @@ pub enum PositionEffect {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
     pub order_id: String,
@@ -217,6 +228,7 @@ pub struct OrderResponse {
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
     pub activity_id: Option<i64>,
@@ -238,6 +250,7 @@ pub struct Transaction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionUser {
     pub cd_domain_id: String,
@@ -251,6 +264,7 @@ pub struct TransactionUser {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionInstrument {
     pub symbol: String,

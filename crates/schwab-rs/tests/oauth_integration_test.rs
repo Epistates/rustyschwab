@@ -6,21 +6,23 @@
 //! - Token refresh
 //! - Error handling
 
-use schwab_rs::auth::{AuthManager, PkceSession};
-use schwab_rs::config::{SchwabConfig, ClientConfig, RetryConfig, RateLimitConfig, CircuitBreakerConfig};
 use schwab_rs::auth::OAuthConfig;
 use schwab_rs::auth::TokenStoreKind;
-use std::time::Duration;
+use schwab_rs::auth::{AuthManager, PkceSession};
+use schwab_rs::config::{
+    CircuitBreakerConfig, ClientConfig, RateLimitConfig, RetryConfig, SchwabConfig,
+};
 use std::path::PathBuf;
-use wiremock::{MockServer, Mock, ResponseTemplate};
-use wiremock::matchers::{method, path, header, body_string_contains};
+use std::time::Duration;
+use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Helper to create test OAuth config pointing to mock server
 fn create_test_config(mock_server_uri: &str) -> SchwabConfig {
     SchwabConfig {
         oauth: OAuthConfig {
             app_key: "12345678901234567890123456789012".to_string(), // 32 chars (valid length)
-            app_secret: "1234567890123456".to_string(), // 16 chars (valid length)
+            app_secret: "1234567890123456".to_string(),              // 16 chars (valid length)
             callback_url: "https://127.0.0.1:8080/callback".to_string(),
             auth_url: format!("{}/oauth/authorize", mock_server_uri),
             token_url: format!("{}/oauth/token", mock_server_uri),
@@ -51,13 +53,19 @@ async fn test_oauth_authorize_url_generation() {
     let config = create_test_config(&mock_server.uri());
 
     let auth_manager = AuthManager::new(config.oauth).expect("Failed to create AuthManager");
-    let (auth_url, _state) = auth_manager.authorize().await.expect("Failed to generate authorize URL");
+    let (auth_url, _state) = auth_manager
+        .authorize()
+        .await
+        .expect("Failed to generate authorize URL");
 
     // Verify URL structure
     assert!(auth_url.starts_with(&format!("{}/oauth/authorize", mock_server.uri())));
     assert!(auth_url.contains("client_id=12345678901234567890123456789012"));
     assert!(auth_url.contains("redirect_uri="));
-    assert!(auth_url.contains("state="), "URL should contain CSRF state parameter");
+    assert!(
+        auth_url.contains("state="),
+        "URL should contain CSRF state parameter"
+    );
 }
 
 #[tokio::test]
@@ -66,7 +74,10 @@ async fn test_oauth_authorize_url_with_pkce() {
     let config = create_test_config(&mock_server.uri());
 
     let auth_manager = AuthManager::new(config.oauth).expect("Failed to create AuthManager");
-    let (auth_url, _state) = auth_manager.authorize().await.expect("Failed to generate authorize URL");
+    let (auth_url, _state) = auth_manager
+        .authorize()
+        .await
+        .expect("Failed to generate authorize URL");
 
     // Verify PKCE parameters are present
     assert!(auth_url.contains("code_challenge="));
@@ -100,10 +111,15 @@ async fn test_token_exchange_success() {
     let (_auth_url, _state) = auth_manager.authorize().await.expect("Failed to authorize");
 
     // Exchange authorization code for tokens
-    let result = auth_manager.exchange_code("test_auth_code_abc".to_string()).await;
+    let result = auth_manager
+        .exchange_code("test_auth_code_abc".to_string())
+        .await;
 
     // Should succeed with mocked response
-    assert!(result.is_ok(), "Token exchange should succeed with valid mock");
+    assert!(
+        result.is_ok(),
+        "Token exchange should succeed with valid mock"
+    );
 }
 
 #[tokio::test]
@@ -130,7 +146,10 @@ async fn test_token_exchange_invalid_code() {
     let result = auth_manager.exchange_code("invalid_code".to_string()).await;
 
     // Should fail due to invalid code
-    assert!(result.is_err(), "Token exchange should fail with invalid code");
+    assert!(
+        result.is_err(),
+        "Token exchange should fail with invalid code"
+    );
 }
 
 // NOTE: Token refresh tests would require setting up existing tokens first
@@ -161,9 +180,19 @@ async fn test_pkce_verifier_generation() {
     let (verifier, challenge) = result.unwrap();
 
     // Verify RFC 7636 compliance
-    assert!(verifier.len() >= 43, "Verifier must be at least 43 characters");
-    assert!(verifier.len() <= 128, "Verifier must not exceed 128 characters");
-    assert_eq!(challenge.len(), 43, "S256 challenge should be 43 characters");
+    assert!(
+        verifier.len() >= 43,
+        "Verifier must be at least 43 characters"
+    );
+    assert!(
+        verifier.len() <= 128,
+        "Verifier must not exceed 128 characters"
+    );
+    assert_eq!(
+        challenge.len(),
+        43,
+        "S256 challenge should be 43 characters"
+    );
 
     // Verify base64url encoding (no +, /, or =)
     assert!(!verifier.contains('+'));
@@ -181,15 +210,25 @@ async fn test_oauth_state_parameter_generated() {
     let (auth_url, _state) = auth_manager.authorize().await.expect("Failed to authorize");
 
     // Verify state parameter is present for CSRF protection
-    assert!(auth_url.contains("state="), "URL should contain state parameter");
+    assert!(
+        auth_url.contains("state="),
+        "URL should contain state parameter"
+    );
 
     // Extract state parameter from URL
     let state_start = auth_url.find("state=").unwrap() + 6;
-    let state_end = auth_url[state_start..].find('&').unwrap_or(auth_url[state_start..].len());
+    let state_end = auth_url[state_start..]
+        .find('&')
+        .unwrap_or(auth_url[state_start..].len());
     let extracted_state = &auth_url[state_start..state_start + state_end];
 
     // State should be a UUID (36 chars including hyphens)
-    assert_eq!(extracted_state.len(), 36, "State should be UUID format (got {})", extracted_state);
+    assert_eq!(
+        extracted_state.len(),
+        36,
+        "State should be UUID format (got {})",
+        extracted_state
+    );
 }
 
 #[tokio::test]

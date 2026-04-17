@@ -445,6 +445,70 @@ export SCHWAB_CALLBACK_URL="https://your-callback-url"
 export SCHWAB_TOKENS_FILE="schwab_tokens.json"
 ```
 
+## MCP Server (`schwab-mcp`)
+
+The `schwab-mcp` crate wraps the full SDK as a [Model Context Protocol](https://modelcontextprotocol.io/)
+server — every REST endpoint and every streaming subscription becomes a tool
+an LLM agent (Claude Desktop, IDEs, custom clients) can invoke.
+
+### Build & run
+
+```bash
+# STDIO transport (default — for Claude Desktop, mcp-inspector, etc.)
+cargo run -p schwab-mcp --release
+
+# HTTP transport
+SCHWAB_MCP_TRANSPORT=http SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwab-mcp --release
+
+# WebSocket transport
+SCHWAB_MCP_TRANSPORT=websocket SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwab-mcp --release
+```
+
+Tokens must already exist on disk (run the `oauth_flow` example first, or any
+`AuthManager`-based flow that persists to `SCHWAB_TOKENS_FILE`).
+
+### Guardrail for real trades
+
+Write-side order tools (`place_order`, `cancel_order`, `replace_order`) are
+**disabled by default**. Set `SCHWAB_MCP_ALLOW_TRADING=1` to enable them.
+`preview_order` is always available.
+
+### Tool surface
+
+- **Market data** — `get_quotes`, `get_quote`, `get_price_history`,
+  `get_option_chain`, `get_option_expiration_chain`, `get_movers`,
+  `search_instruments`, `get_instrument`, `get_markets`, `get_market`
+- **Accounts** — `get_account_numbers`, `get_accounts`, `get_account`,
+  `get_user_preferences`
+- **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`
+- **Orders (write)** — `preview_order`, `place_order`, `cancel_order`,
+  `replace_order` *(last three gated)*
+- **Transactions** — `get_transactions`, `get_transaction`
+- **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
+  `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
+  `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
+
+### Claude Desktop config
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS) — adjust paths to your checkout:
+
+```json
+{
+  "mcpServers": {
+    "schwab": {
+      "command": "/path/to/rustyschwab/target/release/schwab-mcp",
+      "env": {
+        "SCHWAB_APP_KEY": "…",
+        "SCHWAB_APP_SECRET": "…",
+        "SCHWAB_CALLBACK_URL": "https://127.0.0.1:8080",
+        "SCHWAB_TOKENS_FILE": "/Users/you/.config/schwab/tokens.json"
+      }
+    }
+  }
+}
+```
+
 ## Examples
 
 See the `examples/` directory for working examples:

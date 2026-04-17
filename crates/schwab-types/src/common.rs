@@ -8,11 +8,10 @@
 //! - Response headers
 //! - Pagination info
 
-#![allow(missing_docs)] // DTO fields are self-documenting via Schwab API docs
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ResponseHeaders {
     #[serde(rename = "Schwab-Client-CorrelId")]
@@ -22,6 +21,7 @@ pub struct ResponseHeaders {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AssetType {
     Bond,
@@ -40,6 +40,7 @@ pub enum AssetType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AssetSubType {
     Adr,
@@ -56,6 +57,7 @@ pub enum AssetSubType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MarketType {
     Equity,
@@ -66,6 +68,7 @@ pub enum MarketType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PageInfo {
     pub page_size: i32,

@@ -1,7 +1,12 @@
 use anyhow::Result;
-use schwab_rs::prelude::*;
 use schwab_rs::auth::{AuthManager, OAuthConfig, TokenNotification, TokenStoreKind};
+use schwab_rs::prelude::*;
 use schwab_rs::streaming::{StreamClient, StreamMessage};
+use schwab_rs::types::streaming::StreamService;
+use schwab_rs::types::trading::{
+    Order, OrderDuration, OrderInstruction, OrderInstrument, OrderLeg, OrderLegType, OrderSession,
+    OrderStrategyType, OrderType, PositionEffect,
+};
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{error, info, warn};
@@ -13,16 +18,16 @@ async fn main() -> Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("schwab_rs=debug".parse()?)
-                .add_directive("comprehensive=debug".parse()?)
+                .add_directive("comprehensive=debug".parse()?),
         )
         .init();
 
     info!("Starting comprehensive Schwab SDK example");
 
     // Load .env file if it exists
-    if let Ok(_) = dotenvy::from_filename("../../.env") {
+    if dotenvy::from_filename("../../.env").is_ok() {
         info!("Loaded environment variables from .env file");
-    } else if let Ok(_) = dotenvy::dotenv() {
+    } else if dotenvy::dotenv().is_ok() {
         info!("Loaded environment variables from default .env location");
     }
 
@@ -43,23 +48,24 @@ async fn main() -> Result<()> {
         refresh_buffer_seconds: 61,
         // PKCE is enabled by default in v0.1.0+
         token_store_kind: TokenStoreKind::File,
-        on_token_notification: Some(Arc::new(|notification| {
-            match notification {
-                TokenNotification::AccessTokenExpiring { seconds_remaining } => {
-                    info!("⏰ Access token expiring in {} seconds", seconds_remaining);
-                }
-                TokenNotification::RefreshTokenExpiring { hours_remaining } => {
-                    warn!("⚠️ Refresh token expiring in {} hours! Re-authenticate soon.", hours_remaining);
-                }
-                TokenNotification::RefreshTokenExpired => {
-                    error!("❌ Refresh token expired! Full OAuth flow required.");
-                }
-                TokenNotification::TokenFileCorrupted => {
-                    warn!("⚠️ Token file was corrupted, recreating...");
-                }
-                TokenNotification::SessionRecreated => {
-                    info!("🔄 HTTP session recreated after token refresh");
-                }
+        on_token_notification: Some(Arc::new(|notification| match notification {
+            TokenNotification::AccessTokenExpiring { seconds_remaining } => {
+                info!("⏰ Access token expiring in {} seconds", seconds_remaining);
+            }
+            TokenNotification::RefreshTokenExpiring { hours_remaining } => {
+                warn!(
+                    "⚠️ Refresh token expiring in {} hours! Re-authenticate soon.",
+                    hours_remaining
+                );
+            }
+            TokenNotification::RefreshTokenExpired => {
+                error!("❌ Refresh token expired! Full OAuth flow required.");
+            }
+            TokenNotification::TokenFileCorrupted => {
+                warn!("⚠️ Token file was corrupted, recreating...");
+            }
+            TokenNotification::SessionRecreated => {
+                info!("🔄 HTTP session recreated after token refresh");
             }
         })),
         ..OAuthConfig::default()
@@ -67,24 +73,24 @@ async fn main() -> Result<()> {
 
     // Pre-run OAuth if needed using AuthManager directly
     let auth_manager = AuthManager::new(oauth_config.clone())?;
-    
+
     if !auth_manager.has_valid_tokens() {
         info!("Starting OAuth flow...");
         let (auth_url, captured_code) = auth_manager.authorize().await?;
-        
+
         if captured_code.is_empty() {
             println!("\nPlease visit this URL to authorize:");
             println!("{}", auth_url);
             println!("\nAfter authorization, copy the code from the callback URL");
-            
+
             print!("Enter authorization code: ");
             use std::io::{self, Write};
             io::stdout().flush()?;
-            
+
             let mut code = String::new();
             io::stdin().read_line(&mut code)?;
             let code = code.trim().to_string();
-            
+
             auth_manager.exchange_code(code).await?;
         }
         info!("✅ Authentication successful");
@@ -92,9 +98,10 @@ async fn main() -> Result<()> {
         info!("✅ Found existing valid tokens");
     }
 
-    // Prepare overall SDK config
-    let mut config = SchwabConfig::default();
-    config.oauth = oauth_config;
+    let config = SchwabConfig {
+        oauth: oauth_config,
+        ..Default::default()
+    };
 
     info!("Creating Schwab client...");
     let client = SchwabClient::new(config)?;
@@ -102,7 +109,7 @@ async fn main() -> Result<()> {
 
     // Demonstrate API usage
     info!("Testing API endpoints...");
-    
+
     // 1. Get quotes
     match client.get_quotes(&["AAPL", "MSFT", "GOOGL"]).await {
         Ok(quotes) => {
@@ -123,7 +130,7 @@ async fn main() -> Result<()> {
             if let Some(account) = accounts.first() {
                 let hash = &account.securities_account.account_number; // This is actually the hash in API
                 info!("Using account hash: {}", hash);
-                
+
                 // 3. Preview an order
                 let order = Order {
                     order_type: OrderType::Limit,
@@ -146,11 +153,14 @@ async fn main() -> Result<()> {
                     }],
                     ..Default::default()
                 };
-                
+
                 info!("Previewing order...");
                 match client.preview_order(hash, &order).await {
                     Ok(resp) => info!("✅ Order preview success: {}", resp.status),
-                    Err(e) => warn!("Order preview failed (expected if sandbox or no funds): {}", e),
+                    Err(e) => warn!(
+                        "Order preview failed (expected if sandbox or no funds): {}",
+                        e
+                    ),
                 }
             }
         }
@@ -160,7 +170,7 @@ async fn main() -> Result<()> {
     // 4. Demonstrate streaming
     if let Some(stream_config) = SchwabConfig::default().streaming {
         info!("Setting up streaming connection...");
-        
+
         // In a real app, you'd get the customer_id from account info
         let stream_client = StreamClient::new(
             stream_config,
@@ -172,19 +182,29 @@ async fn main() -> Result<()> {
         match stream_client.connect().await {
             Ok(_) => {
                 info!("✅ Stream connected");
-                stream_client.subscribe(StreamService::LeveloneEquities, vec!["AAPL".into(), "MSFT".into()]).await?;
-                
+                stream_client
+                    .subscribe(
+                        StreamService::LeveloneEquities,
+                        vec!["AAPL".into(), "MSFT".into()],
+                    )
+                    .await?;
+
                 if let Some(mut receiver) = stream_client.get_receiver() {
                     info!("Listening for messages (5 seconds)...");
                     let _ = tokio::time::timeout(Duration::from_secs(5), async {
                         while let Some(msg) = receiver.recv().await {
                             match msg {
-                                StreamMessage::Data(data) => info!("📊 Market data: {} items", data.data.len()),
-                                StreamMessage::Response(resp) => info!("📨 Stream response: {:?}", resp),
+                                StreamMessage::Data(data) => {
+                                    info!("📊 Market data: {} items", data.data.len())
+                                }
+                                StreamMessage::Response(resp) => {
+                                    info!("📨 Stream response: {:?}", resp)
+                                }
                                 StreamMessage::Notify(_) => info!("💓 Heartbeat"),
                             }
                         }
-                    }).await;
+                    })
+                    .await;
                 }
             }
             Err(e) => error!("Failed to connect stream: {}", e),

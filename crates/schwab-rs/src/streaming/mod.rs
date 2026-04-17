@@ -1,9 +1,9 @@
 mod client;
-mod subscription;
 pub mod message_handler;
+mod subscription;
 
-pub use client::{MessageReceiver, StreamClient, StreamClientBuilder, MessageSender};
+pub use client::{MessageReceiver, MessageSender, StreamClient, StreamClientBuilder};
+pub use message_handler::{MessageHandler, OutgoingMessage};
 pub use subscription::{Subscription, SubscriptionManager};
-pub use message_handler::{OutgoingMessage, MessageHandler};
 
 pub use crate::types::streaming::*;

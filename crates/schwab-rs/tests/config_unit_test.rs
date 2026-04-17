@@ -2,10 +2,10 @@
 //!
 //! Tests domain validation, URL parsing, config loading from env/file
 
+use once_cell::sync::Lazy;
 use schwab_rs::config::SchwabConfig;
 use std::env;
 use std::sync::Mutex;
-use once_cell::sync::Lazy;
 
 // Mutex to ensure tests that modify environment variables run sequentially
 static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
@@ -16,8 +16,14 @@ fn test_domain_validation_allowed_schwab_api() {
     unsafe {
         env::set_var("SCHWAB_APP_KEY", "test_key");
         env::set_var("SCHWAB_APP_SECRET", "test_secret");
-        env::set_var("SCHWAB_OAUTH_AUTH_URL", "https://api.schwabapi.com/v1/oauth/authorize");
-        env::set_var("SCHWAB_OAUTH_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token");
+        env::set_var(
+            "SCHWAB_OAUTH_AUTH_URL",
+            "https://api.schwabapi.com/v1/oauth/authorize",
+        );
+        env::set_var(
+            "SCHWAB_OAUTH_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        );
         env::set_var("SCHWAB_CLIENT_BASE_URL", "https://api.schwabapi.com");
     }
 
@@ -40,9 +46,18 @@ fn test_domain_validation_allowed_localhost() {
     unsafe {
         env::set_var("SCHWAB_APP_KEY", "test_key");
         env::set_var("SCHWAB_APP_SECRET", "test_secret");
-        env::set_var("SCHWAB_OAUTH_CALLBACK_URL", "https://127.0.0.1:8080/callback");
-        env::set_var("SCHWAB_OAUTH_AUTH_URL", "https://api.schwabapi.com/v1/oauth/authorize");
-        env::set_var("SCHWAB_OAUTH_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token");
+        env::set_var(
+            "SCHWAB_OAUTH_CALLBACK_URL",
+            "https://127.0.0.1:8080/callback",
+        );
+        env::set_var(
+            "SCHWAB_OAUTH_AUTH_URL",
+            "https://api.schwabapi.com/v1/oauth/authorize",
+        );
+        env::set_var(
+            "SCHWAB_OAUTH_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        );
         env::set_var("SCHWAB_CLIENT_BASE_URL", "https://api.schwabapi.com");
     }
 
@@ -67,7 +82,10 @@ fn test_domain_validation_denied_external_domain() {
         env::set_var("SCHWAB_APP_KEY", "test_key");
         env::set_var("SCHWAB_APP_SECRET", "test_secret");
         env::set_var("SCHWAB_OAUTH_AUTH_URL", "https://evil.com/oauth/authorize");
-        env::set_var("SCHWAB_OAUTH_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token");
+        env::set_var(
+            "SCHWAB_OAUTH_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        );
         env::set_var("SCHWAB_CLIENT_BASE_URL", "https://api.schwabapi.com");
     }
 
@@ -76,8 +94,11 @@ fn test_domain_validation_denied_external_domain() {
 
     if let Err(e) = result {
         let error_msg = format!("{}", e);
-        assert!(error_msg.contains("domain") || error_msg.contains("allowed"),
-                "Error should mention domain validation: {}", error_msg);
+        assert!(
+            error_msg.contains("domain") || error_msg.contains("allowed"),
+            "Error should mention domain validation: {}",
+            error_msg
+        );
     }
 
     // Cleanup
@@ -131,7 +152,10 @@ fn test_config_validation_invalid_url() {
         env::set_var("SCHWAB_APP_KEY", "test_key");
         env::set_var("SCHWAB_APP_SECRET", "test_secret");
         env::set_var("SCHWAB_OAUTH_AUTH_URL", "not-a-valid-url");
-        env::set_var("SCHWAB_OAUTH_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token");
+        env::set_var(
+            "SCHWAB_OAUTH_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        );
         env::set_var("SCHWAB_CLIENT_BASE_URL", "https://api.schwabapi.com");
     }
 
@@ -155,15 +179,24 @@ fn test_config_defaults() {
         env::set_var("SCHWAB_APP_KEY", "test_key");
         env::set_var("SCHWAB_APP_SECRET", "test_secret");
         env::remove_var("SCHWAB_OAUTH_CALLBACK_URL");
-        env::set_var("SCHWAB_OAUTH_AUTH_URL", "https://api.schwabapi.com/v1/oauth/authorize");
-        env::set_var("SCHWAB_OAUTH_TOKEN_URL", "https://api.schwabapi.com/v1/oauth/token");
+        env::set_var(
+            "SCHWAB_OAUTH_AUTH_URL",
+            "https://api.schwabapi.com/v1/oauth/authorize",
+        );
+        env::set_var(
+            "SCHWAB_OAUTH_TOKEN_URL",
+            "https://api.schwabapi.com/v1/oauth/token",
+        );
         env::set_var("SCHWAB_CLIENT_BASE_URL", "https://api.schwabapi.com");
     }
 
     let result = SchwabConfig::from_env();
     if let Ok(config) = result {
         // Verify defaults are set
-        assert!(!config.oauth.callback_url.is_empty(), "Should have default callback URL");
+        assert!(
+            !config.oauth.callback_url.is_empty(),
+            "Should have default callback URL"
+        );
     } else {
         println!("Note: Config might require all fields, defaults not yet implemented");
     }

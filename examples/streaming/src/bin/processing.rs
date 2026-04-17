@@ -12,23 +12,25 @@
 ///
 /// cargo run --example streaming_processing --features callback-server
 /// ```
-
 use schwab_rs::{
+    StreamClient, StreamMessage,
     auth::{AuthManager, OAuthConfig},
     config::{ChannelKind, StreamConfig},
-    StreamClient, StreamMessage,
     types::streaming::StreamService,
 };
+use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
     println!("═══════════════════════════════════════════════════");
     println!("  Streaming Data Processing Pattern");
@@ -37,8 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load configuration
     let app_key = env::var("SCHWAB_APP_KEY").expect("SCHWAB_APP_KEY required");
     let app_secret = env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET required");
-    let callback_url = env::var("SCHWAB_CALLBACK_URL")
-        .unwrap_or_else(|_| "https://127.0.0.1:8080".to_string());
+    let callback_url =
+        env::var("SCHWAB_CALLBACK_URL").unwrap_or_else(|_| "https://127.0.0.1:8080".to_string());
 
     // Create OAuth config
     let oauth_config = OAuthConfig {
@@ -68,8 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Authenticated!\n");
 
     // Create streaming client with BOUNDED channel for backpressure
-    let mut stream_config = StreamConfig::default();
-    stream_config.channel_kind = ChannelKind::Bounded(1000);
+    let stream_config = StreamConfig {
+        channel_kind: ChannelKind::Bounded(1000),
+        ..Default::default()
+    };
 
     let stream_client = StreamClient::builder()
         .config(stream_config)
@@ -80,7 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect and subscribe
     stream_client.connect().await?;
     stream_client
-        .subscribe(StreamService::LeveloneEquities, vec!["AMD".into(), "INTC".into()])
+        .subscribe(
+            StreamService::LeveloneEquities,
+            vec!["AMD".into(), "INTC".into()],
+        )
         .await?;
 
     // Create processing channel

@@ -2,8 +2,6 @@
 //!
 //! Low-level network transports for REST and streaming APIs.
 
-#![allow(missing_docs)] // Internal transport implementation
-
 pub mod http;
 pub mod websocket;
 

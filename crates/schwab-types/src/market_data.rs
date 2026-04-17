@@ -14,8 +14,6 @@
 //! All fields use `camelCase` serialization to match the Schwab API exactly.
 //! Rust fields use `snake_case` as per Rust conventions.
 
-#![allow(missing_docs)] // DTO fields are self-documenting via Schwab API docs
-
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -24,6 +22,7 @@ use std::collections::HashMap;
 /// Response containing multiple quote items.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuotesResponse {
     pub quotes: Vec<QuoteItem>,
@@ -32,6 +31,7 @@ pub struct QuotesResponse {
 /// A single quote item containing various quote data components.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteItem {
     pub symbol: String,
@@ -45,6 +45,7 @@ pub struct QuoteItem {
 /// Core quote data including bid/ask, last price, and volume.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteQuote {
     #[serde(rename = "52WeekHigh")]
@@ -83,6 +84,7 @@ pub struct QuoteQuote {
 /// Fundamental data including ratios, dividends, and financial metrics.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteFundamental {
     pub avg10_days_volume: Option<i32>,
@@ -122,6 +124,7 @@ pub struct QuoteFundamental {
 /// Extended hours trading data.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteExtended {
     pub extended_price: Option<f64>,
@@ -135,6 +138,7 @@ pub struct QuoteExtended {
 /// Reference data including symbol description and exchange info.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteReference {
     pub cusip: Option<String>,
@@ -148,6 +152,7 @@ pub struct QuoteReference {
 /// Regular market session data.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteRegular {
     pub regular_market_last_price: Option<f64>,
@@ -158,6 +163,7 @@ pub struct QuoteRegular {
 
 /// Historical price data response with OHLCV candles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct PriceHistoryResponse {
     pub symbol: String,
@@ -169,6 +175,7 @@ pub struct PriceHistoryResponse {
 
 /// A single OHLCV candlestick data point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Candle {
     pub open: f64,
@@ -181,6 +188,7 @@ pub struct Candle {
 
 /// Options chain response with calls and puts organized by expiration and strike.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OptionChainResponse {
     pub symbol: String,
@@ -200,6 +208,7 @@ pub type ExpDateStrikeMap = HashMap<String, HashMap<String, Vec<OptionContract>>
 /// Quote data for the underlying security of an options chain.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct UnderlyingQuote {
     pub ask: Option<f64>,
@@ -228,6 +237,7 @@ pub struct UnderlyingQuote {
 /// A single option contract with pricing and Greeks.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OptionContract {
     pub put_call: String,
@@ -270,6 +280,7 @@ pub struct OptionContract {
 /// Option Greeks for risk assessment.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Greeks {
     pub delta: Option<f64>,
@@ -281,6 +292,7 @@ pub struct Greeks {
 
 /// Response containing available option expirations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ExpirationChainResponse {
     pub symbol: String,
@@ -289,6 +301,7 @@ pub struct ExpirationChainResponse {
 
 /// A single option expiration date entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ExpirationItem {
     pub expiration_date: NaiveDate,
@@ -299,6 +312,7 @@ pub struct ExpirationItem {
 
 /// Response containing market movers/screener results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MoversResponse {
     pub screeners: Vec<MoverItem>,
@@ -306,6 +320,7 @@ pub struct MoversResponse {
 
 /// A single market mover item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MoverItem {
     pub symbol: String,
@@ -318,6 +333,7 @@ pub struct MoverItem {
 
 /// Direction of price movement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
     /// Price moving up
@@ -328,11 +344,13 @@ pub enum Direction {
 
 /// Response containing instrument search results.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct InstrumentsResponse(pub Vec<Instrument>);
 
 /// An instrument (security) with basic info and optional fundamentals.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Instrument {
     pub asset_type: Option<String>,
@@ -347,6 +365,7 @@ pub struct Instrument {
 /// Fundamental data for an instrument.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct InstrumentFundamental {
     pub symbol: String,
@@ -367,6 +386,7 @@ pub struct InstrumentFundamental {
 
 /// Period type for price history requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PeriodType {
     /// Daily period
@@ -381,6 +401,7 @@ pub enum PeriodType {
 
 /// Frequency type for price history candles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum FrequencyType {
     /// Minute bars
@@ -395,6 +416,7 @@ pub enum FrequencyType {
 
 /// Option contract type filter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContractType {
     /// Call options only
@@ -407,6 +429,7 @@ pub enum ContractType {
 
 /// Option strategy type for chain requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OptionStrategy {
     /// Single leg options
@@ -437,6 +460,7 @@ pub enum OptionStrategy {
 
 /// Option moneyness range filter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Range {
     /// In the money
@@ -457,6 +481,7 @@ pub enum Range {
 
 /// Expiration month filter for options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExpirationMonth {
     /// January
@@ -489,6 +514,7 @@ pub enum ExpirationMonth {
 
 /// Sort criteria for market movers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MoverSort {
     /// Sort by volume
@@ -503,6 +529,7 @@ pub enum MoverSort {
 
 /// Projection type for instrument searches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Projection {
     /// Symbol search
@@ -521,6 +548,7 @@ pub enum Projection {
 
 /// API error response item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ApiError {
     pub id: Option<String>,
     pub status: Option<String>,
@@ -531,6 +559,7 @@ pub struct ApiError {
 
 /// Source location of an API error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ErrorSource {
     pub pointer: Option<Vec<String>>,
     pub parameter: Option<String>,
@@ -539,6 +568,7 @@ pub struct ErrorSource {
 
 /// Collection of API errors.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ApiErrors {
     pub errors: Vec<ApiError>,
 }
@@ -546,6 +576,7 @@ pub struct ApiErrors {
 /// Trading session time window.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
     pub start: Option<String>,
@@ -555,6 +586,7 @@ pub struct Session {
 /// Session hours for pre-market, regular, and post-market.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SessionHours {
     pub pre_market: Option<Vec<Session>>,
@@ -565,6 +597,7 @@ pub struct SessionHours {
 /// Market hours for a specific date and product.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MarketHours {
     pub date: Option<String>,

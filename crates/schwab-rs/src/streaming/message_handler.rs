@@ -4,6 +4,7 @@
 //! manages heartbeat/pong monitoring, and routes messages to subscribers.
 
 use crate::error::{Error, Result, StreamError};
+use crate::transport::websocket::WsStream;
 use crate::types::streaming::{StreamMessage, StreamResponseCode};
 use futures_util::StreamExt;
 use futures_util::stream::SplitStream;
@@ -12,9 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
-use tokio::time::{interval, Instant};
+use tokio::time::{Instant, interval};
 use tracing::{debug, error, info, warn};
-use crate::transport::websocket::WsStream;
 
 /// Messages that can be sent over the WebSocket
 #[derive(Debug, Clone)]
@@ -51,23 +51,24 @@ impl MessageHandler {
             if let Some(item) = resp.response.first() {
                 let req_id = item.requestid.clone();
                 if let Some(tx) = self.pending_acks.write().remove(&req_id) {
-                    let outcome = if let Some(code) = StreamResponseCode::from_code(item.content.code) {
-                        if code.is_success() {
-                            Ok(())
+                    let outcome =
+                        if let Some(code) = StreamResponseCode::from_code(item.content.code) {
+                            if code.is_success() {
+                                Ok(())
+                            } else {
+                                Err(Error::Stream(StreamError::SubscriptionFailed {
+                                    service: item.service.clone(),
+                                    code: item.content.code,
+                                    message: item.content.msg.clone(),
+                                }))
+                            }
                         } else {
                             Err(Error::Stream(StreamError::SubscriptionFailed {
                                 service: item.service.clone(),
-                                code: item.content.code,
-                                message: item.content.msg.clone(),
+                                code: -1,
+                                message: "Unknown response code".to_string(),
                             }))
-                        }
-                    } else {
-                        Err(Error::Stream(StreamError::SubscriptionFailed {
-                            service: item.service.clone(),
-                            code: -1,
-                            message: "Unknown response code".to_string(),
-                        }))
-                    };
+                        };
                     let _ = tx.send(outcome);
                 }
             }
@@ -166,7 +167,7 @@ pub async fn process_message_loop(
         match msg {
             Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                 // In tokio-tungstenite 0.26+, text is Utf8Bytes, convert to String
-                if let Ok(stream_msg) = serde_json::from_str::<StreamMessage>(&text.to_string()) {
+                if let Ok(stream_msg) = serde_json::from_str::<StreamMessage>(text.as_ref()) {
                     // Resolve acks for response frames
                     let _ = message_handler.process_response(&stream_msg);
 
@@ -184,7 +185,7 @@ pub async fn process_message_loop(
             }
             Err(e) => {
                 error!("WebSocket error: {}", e);
-                return Err(Error::WebSocket(e));
+                return Err(Error::from(e));
             }
             _ => {}
         }

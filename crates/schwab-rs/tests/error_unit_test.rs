@@ -2,8 +2,8 @@
 //!
 //! Tests error classification, parsing, formatting, and helper methods
 
-use schwab_rs::error::{Error, AuthError, StreamError, parse_api_error};
 use reqwest::StatusCode;
+use schwab_rs::error::{AuthError, Error, StreamError, parse_api_error};
 use std::time::Duration;
 
 #[test]
@@ -51,7 +51,10 @@ fn test_retry_after_returns_duration_for_rate_limit() {
 
     let retry_duration = error.retry_after();
 
-    assert!(retry_duration.is_some(), "RateLimit error should have retry_after duration");
+    assert!(
+        retry_duration.is_some(),
+        "RateLimit error should have retry_after duration"
+    );
     assert_eq!(retry_duration.unwrap(), Duration::from_secs(120));
 }
 
@@ -61,7 +64,10 @@ fn test_retry_after_returns_none_for_non_retryable() {
 
     let retry_duration = error.retry_after();
 
-    assert!(retry_duration.is_none(), "InvalidParameter should not have retry_after duration");
+    assert!(
+        retry_duration.is_none(),
+        "InvalidParameter should not have retry_after duration"
+    );
 }
 
 #[test]
@@ -78,7 +84,10 @@ fn test_error_is_retryable_for_500_series() {
         message: "Service unavailable".to_string(),
     };
 
-    assert!(error_503.is_retryable(), "HTTP 503 errors should be retryable");
+    assert!(
+        error_503.is_retryable(),
+        "HTTP 503 errors should be retryable"
+    );
 }
 
 #[test]
@@ -88,14 +97,20 @@ fn test_error_is_not_retryable_for_400_series() {
         message: "Bad request".to_string(),
     };
 
-    assert!(!error.is_retryable(), "HTTP 400 errors should not be retryable");
+    assert!(
+        !error.is_retryable(),
+        "HTTP 400 errors should not be retryable"
+    );
 
     let error_404 = Error::Http {
         status: StatusCode::NOT_FOUND,
         message: "Not found".to_string(),
     };
 
-    assert!(!error_404.is_retryable(), "HTTP 404 errors should not be retryable");
+    assert!(
+        !error_404.is_retryable(),
+        "HTTP 404 errors should not be retryable"
+    );
 }
 
 #[test]
@@ -138,7 +153,10 @@ fn test_error_conversions_from_auth_error() {
     let error: Error = Error::from(auth_error);
 
     assert!(error.is_auth_error(), "Should be recognized as auth error");
-    assert_eq!(error.to_string(), "Authentication error: Invalid credentials");
+    assert_eq!(
+        error.to_string(),
+        "Authentication error: Invalid credentials"
+    );
 }
 
 #[test]

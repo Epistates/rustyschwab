@@ -1,10 +1,8 @@
 //! HTTP transport using reqwest.
 
-#![allow(missing_docs)] // Internal HTTP transport
-
 use crate::error::{Error, Result};
 use reqwest::{Client, Method, Response};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
 use url::Url;
@@ -58,7 +56,7 @@ impl HttpTransport {
 
         debug!("Sending HTTP request");
 
-        let response = request.send().await.map_err(Error::Network)?;
+        let response = request.send().await.map_err(Error::from)?;
 
         self.handle_response(response).await
     }
@@ -72,7 +70,10 @@ impl HttpTransport {
         if status.is_success() {
             response.json().await.map_err(Error::from)
         } else {
-            let body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             Err(crate::error::parse_api_error(status, &body))
         }
     }

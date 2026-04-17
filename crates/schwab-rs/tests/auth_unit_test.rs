@@ -2,7 +2,29 @@
 //!
 //! Tests token management, OAuth2 flow, PKCE, CSRF protection, and header generation
 
-use schwab_rs::auth::{create_basic_header, create_bearer_header, PkceSession};
+use schwab_rs::auth::{OAuthConfig, PkceSession, TokenStoreKind, create_basic_header, create_bearer_header};
+
+#[test]
+fn oauth_config_default_disables_pkce() {
+    // Schwab + Schwabdev don't use PKCE; defaulting it on caused spurious
+    // `invalid_request` responses in some app configs. Lock the default off.
+    let cfg = OAuthConfig::default();
+    assert!(!cfg.pkce_enabled, "PKCE must be opt-in, not on by default");
+}
+
+#[test]
+fn oauth_config_default_uses_platform_token_store() {
+    // Previously hardcoded to `File`, defeating the per-OS `Default for
+    // TokenStoreKind` (Keychain on macOS, EncryptedFile elsewhere).
+    let cfg = OAuthConfig::default();
+    let platform_default = TokenStoreKind::default();
+    // Enum doesn't derive PartialEq; compare via Debug formatting.
+    assert_eq!(
+        format!("{:?}", cfg.token_store_kind),
+        format!("{:?}", platform_default),
+        "OAuthConfig::default() should inherit TokenStoreKind::default()"
+    );
+}
 
 #[test]
 fn test_bearer_header_format() {
@@ -162,8 +184,16 @@ fn test_pkce_verifier_length() {
     let (verifier, _) = session.generate().expect("Failed to generate");
 
     // RFC 7636: verifier must be 43-128 characters
-    assert!(verifier.len() >= 43, "Verifier too short: {}", verifier.len());
-    assert!(verifier.len() <= 128, "Verifier too long: {}", verifier.len());
+    assert!(
+        verifier.len() >= 43,
+        "Verifier too short: {}",
+        verifier.len()
+    );
+    assert!(
+        verifier.len() <= 128,
+        "Verifier too long: {}",
+        verifier.len()
+    );
 }
 
 #[test]
@@ -175,5 +205,9 @@ fn test_pkce_challenge_format() {
     assert_eq!(challenge.len(), 43, "Challenge should be 43 chars");
 
     // Should only contain base64url characters
-    assert!(challenge.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_'));
+    assert!(
+        challenge
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    );
 }

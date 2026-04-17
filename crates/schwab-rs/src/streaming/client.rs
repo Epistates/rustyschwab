@@ -2,24 +2,22 @@
 //!
 //! Provides subscription-based access to quotes, charts, and account activity.
 
-#![allow(missing_docs)] // Internal streaming implementation
-
 use crate::auth::AuthManager;
 use crate::config::{ChannelKind, StreamConfig};
 use crate::error::{Error, Result, StreamError};
-use crate::streaming::subscription::SubscriptionManager;
 use crate::streaming::message_handler::OutgoingMessage;
+use crate::streaming::subscription::SubscriptionManager;
 use crate::transport::websocket::{WebSocketTransport, WsStream};
 use crate::types::streaming::*;
-use futures_util::{SinkExt, StreamExt};
 use futures_util::stream::SplitStream;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use std::collections::HashMap;
 use serde_json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{interval, sleep, Instant};
+use tokio::time::{Instant, interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -168,7 +166,8 @@ impl StreamClient {
     /// Convenience: unsubscribe from Level One Equities for given symbols
     pub async fn unsubscribe_level_one_equities(&self, symbols: &[&str]) -> Result<()> {
         let syms: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
-        self.unsubscribe(StreamService::LeveloneEquities, syms).await
+        self.unsubscribe(StreamService::LeveloneEquities, syms)
+            .await
     }
 
     /// Convenience: subscribe to Level One Options
@@ -196,12 +195,14 @@ impl StreamClient {
     /// Convenience: subscribe to Level One Futures Options
     pub async fn subscribe_level_one_futures_options(&self, symbols: &[&str]) -> Result<()> {
         let syms: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
-        self.subscribe(StreamService::LeveloneFuturesOptions, syms).await
+        self.subscribe(StreamService::LeveloneFuturesOptions, syms)
+            .await
     }
 
     pub async fn unsubscribe_level_one_futures_options(&self, symbols: &[&str]) -> Result<()> {
         let syms: Vec<String> = symbols.iter().map(|s| s.to_string()).collect();
-        self.unsubscribe(StreamService::LeveloneFuturesOptions, syms).await
+        self.unsubscribe(StreamService::LeveloneFuturesOptions, syms)
+            .await
     }
 
     /// Convenience: subscribe to Level One Forex
@@ -290,11 +291,19 @@ impl StreamClient {
 
     /// Convenience: account activity (fixed key)
     pub async fn subscribe_account_activity(&self) -> Result<()> {
-        self.subscribe(StreamService::AcctActivity, vec!["Account Activity".to_string()]).await
+        self.subscribe(
+            StreamService::AcctActivity,
+            vec!["Account Activity".to_string()],
+        )
+        .await
     }
 
     pub async fn unsubscribe_account_activity(&self) -> Result<()> {
-        self.unsubscribe(StreamService::AcctActivity, vec!["Account Activity".to_string()]).await
+        self.unsubscribe(
+            StreamService::AcctActivity,
+            vec!["Account Activity".to_string()],
+        )
+        .await
     }
 
     pub fn builder() -> StreamClientBuilder {
@@ -342,7 +351,8 @@ impl StreamClient {
         }
 
         let request_id = Uuid::new_v4().to_string();
-        let fields = self.inner
+        let fields = self
+            .inner
             .subscriptions
             .get_service_fields(service.as_str())
             .unwrap_or_else(|| match service {
@@ -402,10 +412,9 @@ impl StreamClient {
             },
         };
 
-        self.inner.subscriptions.remove_subscription(
-            service.as_str().to_string(),
-            symbols,
-        );
+        self.inner
+            .subscriptions
+            .remove_subscription(service.as_str().to_string(), symbols);
 
         self.send_request_with_retry(request).await
     }
@@ -431,13 +440,20 @@ impl StreamClient {
                 .insert(request.requestid.clone(), tx);
         }
 
-        let json = serde_json::to_string(&StreamRequests { requests: vec![request] })?;
+        let json = serde_json::to_string(&StreamRequests {
+            requests: vec![request],
+        })?;
         if let Some(sender) = self.inner.outgoing_tx.read().clone() {
-            sender
-                .send(OutgoingMessage::Text(json))
-                .map_err(|e| Error::Stream(StreamError::ConnectionFailed(format!("Failed to queue request: {}", e))))?
+            sender.send(OutgoingMessage::Text(json)).map_err(|e| {
+                Error::Stream(StreamError::ConnectionFailed(format!(
+                    "Failed to queue request: {}",
+                    e
+                )))
+            })?
         } else {
-            return Err(Error::Stream(StreamError::ConnectionFailed("No active connection".to_string())));
+            return Err(Error::Stream(StreamError::ConnectionFailed(
+                "No active connection".to_string(),
+            )));
         }
         // Wait briefly for ack (non-blocking long-term; fast-fail only)
         let timeout = Duration::from_secs(5);
@@ -445,7 +461,9 @@ impl StreamClient {
         match result {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(e))) => Err(e),
-            Ok(Err(_canceled)) => Err(Error::Stream(StreamError::ConnectionFailed("Ack channel canceled".to_string()))),
+            Ok(Err(_canceled)) => Err(Error::Stream(StreamError::ConnectionFailed(
+                "Ack channel canceled".to_string(),
+            ))),
             Err(_elapsed) => {
                 warn!("Stream request ack timeout");
                 Ok(())
@@ -476,13 +494,19 @@ impl StreamClient {
                     }
 
                     if let Some(max) = reconnect.max_retries {
-                        if attempt >= max { return Err(e); }
+                        if attempt >= max {
+                            return Err(e);
+                        }
                     }
 
-                    warn!("Stream request retrying in {:?} (attempt {})", delay, attempt + 1);
+                    warn!(
+                        "Stream request retrying in {:?} (attempt {})",
+                        delay,
+                        attempt + 1
+                    );
                     sleep(delay).await;
-                    let next = (delay.mul_f64(reconnect.backoff_multiplier))
-                        .min(reconnect.max_backoff);
+                    let next =
+                        (delay.mul_f64(reconnect.backoff_multiplier)).min(reconnect.max_backoff);
                     delay = next;
                     attempt += 1;
                 }
@@ -517,11 +541,13 @@ impl StreamClientInner {
                 }
                 Err(e) => {
                     error!("Stream connection error: {}", e);
-                    
+
                     // Check for 90-second crash detection
                     let elapsed = connection_start.elapsed();
                     if elapsed <= Duration::from_secs(90) {
-                        warn!("Stream crashed within 90 seconds, likely no subscriptions, invalid login, or lost connection (not restarting)");
+                        warn!(
+                            "Stream crashed within 90 seconds, likely no subscriptions, invalid login, or lost connection (not restarting)"
+                        );
                         return Err(Error::Stream(StreamError::ConnectionFailed(
                             "Stream failed within 90 seconds of connecting".to_string(),
                         )));
@@ -541,13 +567,17 @@ impl StreamClientInner {
                     }
 
                     let backoff = *self.backoff_delay.read();
-                    warn!("Stream connection lost, reconnecting in {:?} (attempt {})", backoff, retry_count + 1);
+                    warn!(
+                        "Stream connection lost, reconnecting in {:?} (attempt {})",
+                        backoff,
+                        retry_count + 1
+                    );
                     sleep(backoff).await;
 
                     // Exponential backoff: double the delay, cap at 128 seconds
                     let mut delay = self.backoff_delay.write();
                     *delay = (*delay * 2).min(Duration::from_secs(128));
-                    
+
                     retry_count += 1;
                 }
             }
@@ -576,8 +606,12 @@ impl StreamClientInner {
             while let Some(msg) = rx.recv().await {
                 let ws_msg = match msg {
                     // In tokio-tungstenite 0.26+, Message::Text accepts Into<Utf8Bytes>
-                    OutgoingMessage::Text(text) => tokio_tungstenite::tungstenite::Message::Text(text.into()),
-                    OutgoingMessage::Ping => tokio_tungstenite::tungstenite::Message::Ping(vec![].into()),
+                    OutgoingMessage::Text(text) => {
+                        tokio_tungstenite::tungstenite::Message::Text(text.into())
+                    }
+                    OutgoingMessage::Ping => {
+                        tokio_tungstenite::tungstenite::Message::Ping(vec![].into())
+                    }
                 };
 
                 if let Err(e) = write_half.send(ws_msg).await {
@@ -602,7 +636,9 @@ impl StreamClientInner {
         let result = self.message_loop_read(&mut read_half).await;
 
         heartbeat_task.abort();
-        if let Some(handle) = self.writer_task.write().take() { handle.abort(); }
+        if let Some(handle) = self.writer_task.write().take() {
+            handle.abort();
+        }
         *self.outgoing_tx.write() = None;
 
         *self.connection_state.write() = ConnectionState::Disconnected;
@@ -613,7 +649,10 @@ impl StreamClientInner {
     // Legacy authenticate kept for compatibility; not used in new connect path
     // Authenticate using the read half; login is sent via writer channel
     async fn authenticate_read(&self, read_half: &mut SplitStream<WsStream>) -> Result<()> {
-        let access_token = self.auth_manager.get_access_token().await
+        let access_token = self
+            .auth_manager
+            .get_access_token()
+            .await
             .map_err(Error::Auth)?;
 
         let login_request = StreamRequest {
@@ -632,12 +671,21 @@ impl StreamClientInner {
         };
 
         if let Some(sender) = self.outgoing_tx.read().clone() {
-            let request_json = serde_json::to_string(&StreamRequests { requests: vec![login_request] })?;
+            let request_json = serde_json::to_string(&StreamRequests {
+                requests: vec![login_request],
+            })?;
             sender
                 .send(OutgoingMessage::Text(request_json))
-                .map_err(|e| Error::Stream(StreamError::ConnectionFailed(format!("Failed to send login: {}", e))))?;
+                .map_err(|e| {
+                    Error::Stream(StreamError::ConnectionFailed(format!(
+                        "Failed to send login: {}",
+                        e
+                    )))
+                })?;
         } else {
-            return Err(Error::Stream(StreamError::ConnectionFailed("No active writer".to_string())));
+            return Err(Error::Stream(StreamError::ConnectionFailed(
+                "No active writer".to_string(),
+            )));
         }
 
         // Wait for login response on read half
@@ -645,22 +693,23 @@ impl StreamClientInner {
         let start = Instant::now();
 
         while start.elapsed() < timeout {
-            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = read_half.next().await {
+            if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) =
+                read_half.next().await
+            {
                 // In tokio-tungstenite 0.26+, text is Utf8Bytes, convert to String
-                if let Ok(msg) = serde_json::from_str::<StreamMessage>(&text.to_string()) {
-                    if let StreamMessage::Response(response) = msg {
-                        if let Some(item) = response.response.first() {
-                            if item.service == "ADMIN" && item.command == "LOGIN" {
-                                if item.content.code == 0 {
-                                    info!("Authentication successful");
-                                    return Ok(());
-                                } else {
-                                    return Err(Error::Stream(StreamError::AuthenticationFailed(
-                                        item.content.msg.clone(),
-                                    )));
-                                }
-                            }
-                        }
+                if let Ok(StreamMessage::Response(response)) =
+                    serde_json::from_str::<StreamMessage>(text.as_ref())
+                    && let Some(item) = response.response.first()
+                    && item.service == "ADMIN"
+                    && item.command == "LOGIN"
+                {
+                    if item.content.code == 0 {
+                        info!("Authentication successful");
+                        return Ok(());
+                    } else {
+                        return Err(Error::Stream(StreamError::AuthenticationFailed(
+                            item.content.msg.clone(),
+                        )));
                     }
                 }
             }
@@ -675,11 +724,13 @@ impl StreamClientInner {
         let subscriptions = self.subscriptions.get_all_subscriptions();
         let mut requests = Vec::new();
         for (service, symbols) in subscriptions {
-            if symbols.is_empty() { continue; }
+            if symbols.is_empty() {
+                continue;
+            }
             let fields = self
                 .subscriptions
                 .get_service_fields(&service)
-                .unwrap_or_else(|| LevelOneEquityFields::default_fields());
+                .unwrap_or_else(LevelOneEquityFields::default_fields);
             let request = StreamRequest {
                 requestid: Uuid::new_v4().to_string(),
                 service: service.clone(),
@@ -701,7 +752,12 @@ impl StreamClientInner {
                 let request_json = serde_json::to_string(&StreamRequests { requests })?;
                 sender
                     .send(OutgoingMessage::Text(request_json))
-                    .map_err(|e| Error::Stream(StreamError::ConnectionFailed(format!("Failed to send resubscribe: {}", e))))?;
+                    .map_err(|e| {
+                        Error::Stream(StreamError::ConnectionFailed(format!(
+                            "Failed to send resubscribe: {}",
+                            e
+                        )))
+                    })?;
             }
         }
         Ok(())
@@ -712,13 +768,15 @@ impl StreamClientInner {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
                     // In tokio-tungstenite 0.26+, text is Utf8Bytes, convert to String
-                    if let Ok(stream_msg) = serde_json::from_str::<StreamMessage>(&text.to_string()) {
+                    if let Ok(stream_msg) = serde_json::from_str::<StreamMessage>(text.as_ref()) {
                         // Resolve acks for response frames
                         if let StreamMessage::Response(resp) = &stream_msg {
                             if let Some(item) = resp.response.first() {
                                 let req_id = item.requestid.clone();
                                 if let Some(tx) = self.pending_acks.write().remove(&req_id) {
-                                    let outcome = if let Some(code) = StreamResponseCode::from_code(item.content.code) {
+                                    let outcome = if let Some(code) =
+                                        StreamResponseCode::from_code(item.content.code)
+                                    {
                                         if code.is_success() {
                                             Ok(())
                                         } else {
@@ -756,7 +814,7 @@ impl StreamClientInner {
                 }
                 Err(e) => {
                     error!("WebSocket error: {}", e);
-                    return Err(Error::WebSocket(e));
+                    return Err(Error::from(e));
                 }
                 _ => {}
             }
@@ -842,14 +900,16 @@ impl StreamClientBuilder {
     }
 
     pub fn build(self) -> Result<StreamClient> {
-        let config = self.config
+        let config = self
+            .config
             .ok_or_else(|| Error::Config("Stream config required".to_string()))?;
-        let auth_manager = self.auth_manager
+        let auth_manager = self
+            .auth_manager
             .ok_or_else(|| Error::Config("Auth manager required".to_string()))?;
-        let customer_id = self.customer_id
+        let customer_id = self
+            .customer_id
             .ok_or_else(|| Error::Config("Customer ID required".to_string()))?;
-        let correl_id = self.correl_id
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let correl_id = self.correl_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
         StreamClient::new(config, auth_manager, customer_id, correl_id)
     }
@@ -871,7 +931,7 @@ mod tests {
         let oauth_config = OAuthConfig {
             // App key must be 32 or 48 characters, app secret must be 16 or 64 characters
             app_key: "12345678901234567890123456789012".to_string(), // 32 chars
-            app_secret: "1234567890123456".to_string(), // 16 chars
+            app_secret: "1234567890123456".to_string(),              // 16 chars
             callback_url: "https://localhost:8080".to_string(),
             ..Default::default()
         };
@@ -950,19 +1010,24 @@ mod tests {
             .correl_id(correl_id)
             .build();
 
-        assert!(result.is_ok(), "Builder should succeed with custom correl_id");
+        assert!(
+            result.is_ok(),
+            "Builder should succeed with custom correl_id"
+        );
     }
 
     #[test]
     fn test_unbounded_channel_creation() {
-        let mut config = StreamConfig::default();
-        config.channel_kind = ChannelKind::Unbounded;
+        let config = StreamConfig {
+            channel_kind: ChannelKind::Unbounded,
+            ..Default::default()
+        };
 
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Verify we can get a receiver
         let receiver = client.get_receiver();
@@ -978,14 +1043,16 @@ mod tests {
 
     #[test]
     fn test_bounded_channel_creation() {
-        let mut config = StreamConfig::default();
-        config.channel_kind = ChannelKind::Bounded(1000);
+        let config = StreamConfig {
+            channel_kind: ChannelKind::Bounded(1000),
+            ..Default::default()
+        };
 
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Verify we can get a receiver
         let receiver = client.get_receiver();
@@ -1005,8 +1072,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // First call should succeed
         let receiver1 = client.get_receiver();
@@ -1014,7 +1081,10 @@ mod tests {
 
         // Second call should return None
         let receiver2 = client.get_receiver();
-        assert!(receiver2.is_none(), "Second get_receiver should return None");
+        assert!(
+            receiver2.is_none(),
+            "Second get_receiver should return None"
+        );
     }
 
     #[test]
@@ -1063,8 +1133,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Initial state should be Disconnected
         let state = client.inner.connection_state.read().clone();
@@ -1081,8 +1151,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Verify subscription manager exists and is empty initially
         let subs = client.inner.subscriptions.get_all_subscriptions();
@@ -1181,8 +1251,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Initial backoff should be 2 seconds
         let backoff = *client.inner.backoff_delay.read();
@@ -1199,8 +1269,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Pending acks should be empty initially
         let acks = client.inner.pending_acks.read();
@@ -1213,8 +1283,8 @@ mod tests {
         let auth_manager = create_test_auth_manager();
         let customer_id = "test_customer_id".to_string();
 
-        let client = StreamClient::new(config, auth_manager, customer_id, "correl".to_string())
-            .unwrap();
+        let client =
+            StreamClient::new(config, auth_manager, customer_id, "correl".to_string()).unwrap();
 
         // Last pong should be initialized to "now"
         let last_pong = *client.inner.last_pong.read();

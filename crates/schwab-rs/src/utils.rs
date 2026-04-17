@@ -156,8 +156,11 @@ mod tests {
     #[test]
     fn test_format_time_iso8601() {
         // 2024-10-26 15:30:00.123456 UTC
-        let dt = Utc.with_ymd_and_hms(2024, 10, 26, 15, 30, 0).unwrap()
-            .with_nanosecond(123456789).unwrap();
+        let dt = Utc
+            .with_ymd_and_hms(2024, 10, 26, 15, 30, 0)
+            .unwrap()
+            .with_nanosecond(123456789)
+            .unwrap();
 
         let result = format_time(Some(dt), TimeFormat::Iso8601);
         assert!(result.is_some());

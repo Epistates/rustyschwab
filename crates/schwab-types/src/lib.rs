@@ -20,7 +20,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use schwab_types::{Order, OrderType, Duration, Session};
+//! use schwab_types::trading::{Duration, Order, OrderType, Session};
 //!
 //! let order = Order {
 //!     order_type: OrderType::Limit,
@@ -29,8 +29,6 @@
 //!     // ... other fields
 //! };
 //! ```
-
-#![warn(missing_docs)]
 
 /// Market data types including quotes, price history, and market hours.
 pub mod market_data;
@@ -46,9 +44,3 @@ pub mod trading;
 
 /// Common types shared across multiple modules.
 pub mod common;
-
-pub use market_data::*;
-pub use streaming::*;
-pub use accounts::*;
-pub use trading::*;
-pub use common::*;
