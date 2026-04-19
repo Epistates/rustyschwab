@@ -388,34 +388,39 @@ if let Some(mut receiver) = stream_client.get_receiver() {
 
 Note: Streaming authentication, reconnection, and subscription handling are fully implemented.
 
-## OAuth Callback URL Options
+## OAuth Callback URL
 
-For development, you need an HTTPS callback URL. Options:
+Schwab requires an HTTPS callback URL. For every normal development
+and agent-on-dev-machine setup, use:
 
-### 1. Cloudflared Tunnel (Recommended)
 ```bash
-# Install cloudflared
-brew install cloudflared  # macOS
-
-# Create tunnel to local port 8080
-cloudflared tunnel --url http://localhost:8080
-
-# Use the generated HTTPS URL as your callback_url
+SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
 ```
 
-### 2. ngrok
-```bash
-ngrok http 8080
-# Use the HTTPS URL provided
-```
+Register that exact string in the Schwab Developer Portal, enable the
+built-in callback server (`cargo run --features callback-server`),
+click through your browser's self-signed-cert warning on first run,
+and you're done. No tunnel, no external binary, no rotating URL.
 
-### 3. Self-Signed Certificate
-```bash
-# Generate certificate
-openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes
+### Advanced: public HTTPS tunnels
 
-# Configure in your app to use HTTPS
-```
+You only need a tunnel (ngrok, cloudflared, a reverse proxy in front
+of a VM, etc.) if the machine running the OAuth flow can't host the
+browser doing the Schwab consent dance — e.g. headless servers, or
+corporate networks that block localhost callbacks.
+
+In that case:
+
+1. Stand up your tunnel however you like, pointing at local port
+   `8080` (or wherever you're binding the callback server).
+2. Register the resulting public HTTPS URL in the Developer Portal.
+   Free `trycloudflare.com` URLs rotate each launch, so prefer a
+   named / stable tunnel.
+3. Set `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true` so the built-in server
+   binds to `0.0.0.0` instead of `127.0.0.1`.
+
+This is genuinely an advanced case — 127.0.0.1 is the supported
+happy path.
 
 ## Token Management
 
@@ -487,6 +492,61 @@ Write-side order tools (`place_order`, `cancel_order`, `replace_order`) are
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
   `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
+
+### Metrics (Prometheus)
+
+Metrics are **opt-in**. Set `SCHWAB_METRICS_BIND=127.0.0.1:9090` and the
+MCP will spawn a dedicated Prometheus scrape listener on that address;
+unset, no listener and every `metrics::counter!`/`histogram!` call is
+a no-op (the SDK depends only on the `metrics` facade, so library-only
+consumers are free to install their own recorder — StatsD, OTLP, etc.).
+
+```bash
+SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
+# in another shell
+curl http://127.0.0.1:9090/metrics
+```
+
+**Metric catalog:**
+
+| Name | Kind | Labels | Description |
+|------|------|--------|-------------|
+| `schwab_http_requests_total` | counter | `op`, `method`, `status` | Logical request completions. `status` is a class bucket (`2xx`/`4xx`/`5xx`/`network`/`auth`). |
+| `schwab_http_request_duration_seconds` | histogram | `op`, `method` | Wall-clock per request (includes retries + token refresh). |
+| `schwab_retry_attempts_total` | counter | `outcome` | `succeeded` / `exhausted`. Sums the retries that were *actually fired*. |
+| `schwab_circuit_state` | gauge | — | `0=Closed`, `1=HalfOpen`, `2=Open`. |
+| `schwab_circuit_transitions_total` | counter | `from`, `to` | State changes. |
+| `schwab_token_refresh_total` | counter | `outcome`, `grant` | `success`/`failure` × `refresh_token`/`auto_refresh`. |
+| `schwab_stream_connects_total` | counter | `outcome` | `success` / `failure` per connection attempt. |
+| `schwab_stream_reconnects_total` | counter | — | Reconnect loop iterations. |
+| `schwab_stream_connected` | gauge | — | `1` while authenticated, `0` otherwise. |
+| `schwab_stream_messages_total` | counter | `service`, `kind` | `kind ∈ {data, response, notify}`. Control frames use `service="_control"`. |
+| `schwab_mcp_tool_calls_total` | counter | `tool`, `outcome` | `ok` / `error` per MCP tool invocation. |
+| `schwab_mcp_tool_call_duration_seconds` | histogram | `tool` | End-to-end latency per tool. |
+
+**Starter PromQL:**
+
+```promql
+# 5xx error rate per operation
+sum by (op) (rate(schwab_http_requests_total{status="5xx"}[5m]))
+
+# p99 latency by op (Prometheus histogram quantile)
+histogram_quantile(0.99,
+  sum by (le, op) (rate(schwab_http_request_duration_seconds_bucket[5m])))
+
+# Tool call error ratio
+sum by (tool) (rate(schwab_mcp_tool_calls_total{outcome="error"}[5m]))
+ / sum by (tool) (rate(schwab_mcp_tool_calls_total[5m]))
+
+# Circuit breaker currently open (alert on > 0)
+max_over_time(schwab_circuit_state[1m]) == 2
+
+# Stream healthy (alert on = 0 during market hours)
+schwab_stream_connected
+
+# Token refresh failures — if this is non-zero sustained, wake someone up
+increase(schwab_token_refresh_total{outcome="failure"}[15m])
+```
 
 ### Claude Desktop config
 
