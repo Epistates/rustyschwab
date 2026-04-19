@@ -287,16 +287,32 @@ impl SchwabConfig {
             refresh_buffer_seconds: env::var("SCHWAB_REFRESH_BUFFER")
                 .map(|v| v.parse().unwrap_or(61))
                 .unwrap_or(61),
+            // Schwab's public OAuth docs + the Schwabdev reference client
+            // do NOT use PKCE. Match `OAuthConfig::default()` and default
+            // to `false` — only opt in via env if the user has verified
+            // Schwab accepts their `code_challenge`.
             pkce_enabled: env::var("SCHWAB_PKCE_ENABLED")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true),
-            token_store_kind: match env::var("SCHWAB_TOKEN_STORE")
-                .unwrap_or_else(|_| "file".to_string())
-                .to_lowercase()
-                .as_str()
-            {
-                "keychain" => TokenStoreKind::Keychain,
-                _ => TokenStoreKind::File,
+                .map(|v| v.parse().unwrap_or(false))
+                .unwrap_or(false),
+            token_store_kind: match env::var("SCHWAB_TOKEN_STORE").ok() {
+                // Unset → platform-appropriate default (Keychain on macOS,
+                // EncryptedFile elsewhere). Setting this env var to an
+                // unrecognized value now fails loudly rather than silently
+                // downgrading to plaintext `File`.
+                None => TokenStoreKind::default(),
+                Some(raw) => match raw.to_lowercase().as_str() {
+                    "keychain" => TokenStoreKind::Keychain,
+                    "encrypted" | "encryptedfile" | "encrypted_file" => {
+                        TokenStoreKind::EncryptedFile
+                    }
+                    "file" => TokenStoreKind::File,
+                    other => {
+                        return Err(Error::Config(format!(
+                            "SCHWAB_TOKEN_STORE={other:?} not recognized \
+                             (valid: keychain | encrypted | file)"
+                        )));
+                    }
+                },
             },
             allow_external_callback: env::var("SCHWAB_ALLOW_EXTERNAL_CALLBACK")
                 .map(|v| v.parse().unwrap_or(false))

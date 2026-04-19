@@ -17,6 +17,7 @@ use schwab_types::trading::Order;
 use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
+use crate::redact;
 use crate::stream_cache::{StreamCache, spawn_cache_feeder};
 
 /// Env var that unlocks the write-side order tools
@@ -98,13 +99,18 @@ impl SchwabMcp {
         fields: Option<String>,
         indicative: Option<bool>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_quotes");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
         let resp = self
             .client
             .get_quotes_with_options(&refs, fields.as_deref(), indicative)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get a quote for a single symbol. Optional `fields` restricts sections.
@@ -114,12 +120,17 @@ impl SchwabMcp {
         symbol: String,
         fields: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_quote");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_quote_with_options(&symbol, fields.as_deref())
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get OHLCV price history candles for a symbol.
@@ -129,12 +140,17 @@ impl SchwabMcp {
         &self,
         params: PriceHistoryParams,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_price_history");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_price_history(&params)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get the options chain for a symbol — calls and puts across expirations.
@@ -143,12 +159,17 @@ impl SchwabMcp {
         &self,
         params: OptionChainParams,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_option_chain");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_option_chain(&params)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get the list of option expiration dates for a symbol.
@@ -157,12 +178,17 @@ impl SchwabMcp {
         &self,
         symbol: String,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_option_expiration_chain");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_option_expiration_chain(&symbol)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get top market movers for an index (e.g. `$SPX`, `$COMPX`, `$DJI`).
@@ -174,12 +200,17 @@ impl SchwabMcp {
         sort: Option<MoverSort>,
         frequency: Option<i32>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_movers");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_movers(&index, sort, frequency)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Search instruments by symbol, regex, description, or fundamentals.
@@ -189,19 +220,29 @@ impl SchwabMcp {
         symbol: String,
         projection: Projection,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("search_instruments");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .search_instruments(&symbol, projection)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Look up an instrument by its CUSIP.
     #[tool]
     async fn get_instrument(&self, cusip: String) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_instrument");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self.client.get_instrument(&cusip).await.map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get market hours for multiple markets (`equity,option,future,bond,forex`).
@@ -212,13 +253,18 @@ impl SchwabMcp {
         markets: Vec<String>,
         date: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_markets");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let refs: Vec<&str> = markets.iter().map(String::as_str).collect();
         let resp = self
             .client
             .get_markets(&refs, date.as_deref())
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get market hours for a single market.
@@ -228,12 +274,17 @@ impl SchwabMcp {
         market_id: String,
         date: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_market");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_market(&market_id, date.as_deref())
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -244,20 +295,30 @@ impl SchwabMcp {
     /// (required by every other account/trading endpoint).
     #[tool]
     async fn get_account_numbers(&self) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_account_numbers");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self.client.get_account_numbers().await.map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get full details for every linked account.
     /// Set `include_positions=true` to include current positions.
     #[tool]
     async fn get_accounts(&self, include_positions: bool) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_accounts");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_accounts(include_positions)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get details for a single account by its hashed ID.
@@ -267,20 +328,30 @@ impl SchwabMcp {
         account_hash: String,
         include_positions: bool,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_account");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_account(&account_hash, include_positions)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Get user preferences including streaming credentials
     /// (`schwabClientCustomerId`, `schwabClientCorrelId`).
     #[tool]
     async fn get_user_preferences(&self) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_user_preferences");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self.client.get_user_preferences().await.map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -294,12 +365,17 @@ impl SchwabMcp {
         account_hash: String,
         order_id: String,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_order");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_order(&account_hash, &order_id)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// List orders for a specific account.
@@ -314,6 +390,8 @@ impl SchwabMcp {
         max_results: Option<i32>,
         status: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_account_orders");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_account_orders(
@@ -325,7 +403,10 @@ impl SchwabMcp {
             )
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// List orders across all linked accounts in a time window.
@@ -337,6 +418,8 @@ impl SchwabMcp {
         max_results: Option<i32>,
         status: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_all_orders");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_all_orders(
@@ -347,7 +430,10 @@ impl SchwabMcp {
             )
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -366,6 +452,8 @@ impl SchwabMcp {
         start_date: Option<String>,
         end_date: Option<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_transactions");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_transactions(
@@ -377,7 +465,10 @@ impl SchwabMcp {
             )
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Fetch a specific transaction by ID.
@@ -387,12 +478,17 @@ impl SchwabMcp {
         account_hash: String,
         transaction_id: String,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("get_transaction");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .get_transaction(&account_hash, &transaction_id)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -408,12 +504,17 @@ impl SchwabMcp {
         account_hash: String,
         order: Order,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("preview_order");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let resp = self
             .client
             .preview_order(&account_hash, &order)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -428,13 +529,18 @@ impl SchwabMcp {
         account_hash: String,
         order: Order,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("place_order");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         require_trading_enabled("place_order")?;
         let resp = self
             .client
             .place_order(&account_hash, &order)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Cancel a working order. **Requires** `SCHWAB_MCP_ALLOW_TRADING=1`.
@@ -444,16 +550,21 @@ impl SchwabMcp {
         account_hash: String,
         order_id: String,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("cancel_order");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         require_trading_enabled("cancel_order")?;
         self.client
             .cancel_order(&account_hash, &order_id)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": "canceled",
             "account_hash": account_hash,
             "order_id": order_id,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Replace a working order with a new order spec (Schwab atomically
@@ -466,13 +577,18 @@ impl SchwabMcp {
         order_id: String,
         order: Order,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("replace_order");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         require_trading_enabled("replace_order")?;
         let resp = self
             .client
             .replace_order(&account_hash, &order_id, &order)
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::to_value(resp).unwrap_or_default()))
+        Ok(redact::json_response(resp))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     // ============================================================
@@ -487,9 +603,11 @@ impl SchwabMcp {
     /// Idempotent — if already connected, returns the current status.
     #[tool]
     async fn stream_connect(&self) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_connect");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let mut guard = self.stream.write().await;
         if guard.is_some() {
-            return Ok(Json(serde_json::json!({
+            return Ok(redact::json_value(serde_json::json!({
                 "status": "already_connected",
             })));
         }
@@ -526,24 +644,41 @@ impl SchwabMcp {
         *self.feeder.write().await = Some(handle);
 
         *guard = Some(client);
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": "connected",
             "websocket_url": streamer.streamer_socket_url,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Disconnect the streaming client, abort the cache feeder, and drop
     /// cached snapshots. Idempotent.
     #[tool]
     async fn stream_disconnect(&self) -> McpResult<Json<serde_json::Value>> {
-        let existed = self.stream.write().await.take().is_some();
+        let timer = crate::metrics::ToolTimer::start("stream_disconnect");
+        let result: McpResult<Json<serde_json::Value>> = (async {
+        // Take the client out of the slot first and call its explicit
+        // `disconnect()` so the reconnect loop stops and the inner
+        // tokio tasks are aborted — previously we just dropped the
+        // Arc, leaving the background connection loop running until
+        // the process exited.
+        let taken = self.stream.write().await.take();
+        let existed = taken.is_some();
+        if let Some(client) = taken {
+            client.disconnect().await;
+        }
         if let Some(handle) = self.feeder.write().await.take() {
             handle.abort();
         }
         self.cache.clear();
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": if existed { "disconnected" } else { "was_not_connected" },
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Subscribe to a streaming service for the given keys (symbols, contracts,
@@ -555,6 +690,8 @@ impl SchwabMcp {
         service: StreamService,
         keys: Vec<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_subscribe");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         self.ensure_connected().await?;
         let guard = self.stream.read().await;
         let client = guard
@@ -564,11 +701,14 @@ impl SchwabMcp {
             .subscribe(service.clone(), keys.clone())
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": "subscribed",
             "service": service.as_str(),
             "keys": keys,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Unsubscribe from a streaming service for specific keys.
@@ -578,6 +718,8 @@ impl SchwabMcp {
         service: StreamService,
         keys: Vec<String>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_unsubscribe");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let guard = self.stream.read().await;
         let client = guard
             .as_ref()
@@ -586,11 +728,14 @@ impl SchwabMcp {
             .unsubscribe(service.clone(), keys.clone())
             .await
             .map_err(map_err)?;
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": "unsubscribed",
             "service": service.as_str(),
             "keys": keys,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Override the field bitmap (comma-separated field IDs) sent on the
@@ -602,16 +747,21 @@ impl SchwabMcp {
         service: StreamService,
         fields_csv: String,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_set_service_fields");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let guard = self.stream.read().await;
         let client = guard
             .as_ref()
             .ok_or_else(|| McpError::invalid_params("not connected — call stream_connect first"))?;
         client.set_service_fields(service.clone(), fields_csv.clone());
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "status": "updated",
             "service": service.as_str(),
             "fields": fields_csv,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Read the most recent streaming snapshot for `service`. If `keys` is
@@ -623,21 +773,31 @@ impl SchwabMcp {
         service: StreamService,
         keys: Option<Vec<String>>,
     ) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_snapshot");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let snap = self.cache.snapshot(service.as_str(), keys.as_deref());
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "service": service.as_str(),
             "count": snap.len(),
             "data": snap,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 
     /// Report whether the stream is currently connected.
     #[tool]
     async fn stream_status(&self) -> McpResult<Json<serde_json::Value>> {
+        let timer = crate::metrics::ToolTimer::start("stream_status");
+        let result: McpResult<Json<serde_json::Value>> = (async {
         let connected = self.stream.read().await.is_some();
-        Ok(Json(serde_json::json!({
+        Ok(redact::json_value(serde_json::json!({
             "connected": connected,
         })))
+    }).await;
+        if result.is_ok() { timer.success(); }
+        result
     }
 }
 

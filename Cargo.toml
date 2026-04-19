@@ -56,6 +56,13 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Metrics facade + Prometheus exporter.
+# The SDK only depends on the `metrics` facade (no-op when no recorder is
+# installed); the MCP binary pulls in the Prometheus exporter and
+# spawns its own scrape listener when `SCHWAB_METRICS_BIND` is set.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+
 # Time and date
 chrono = { version = "0.4", features = ["serde"] }
 humantime-serde = "1.1"

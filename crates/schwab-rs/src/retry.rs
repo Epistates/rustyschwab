@@ -72,13 +72,33 @@ impl RetryPolicy {
 
         loop {
             match f().await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if retries > 0 {
+                        metrics::counter!(
+                            crate::metrics::RETRY_ATTEMPTS_TOTAL,
+                            "outcome" => "succeeded",
+                        )
+                        .increment(retries as u64);
+                    }
+                    return Ok(result);
+                }
                 Err(error) => {
                     if !self.should_retry(&error, retries) {
                         debug!(
                             "Not retrying: {:?} (attempt {} of {})",
                             error, retries, self.config.max_retries
                         );
+                        // Attribute any retries we *did* make to the
+                        // exhausted bucket — if `retries == 0` this is
+                        // a first-attempt non-retryable error and we
+                        // record nothing.
+                        if retries > 0 {
+                            metrics::counter!(
+                                crate::metrics::RETRY_ATTEMPTS_TOTAL,
+                                "outcome" => "exhausted",
+                            )
+                            .increment(retries as u64);
+                        }
                         return Err(error);
                     }
 

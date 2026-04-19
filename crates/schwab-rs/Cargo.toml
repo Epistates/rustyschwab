@@ -50,6 +50,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# Metrics facade — no-op when no recorder is installed, so this doesn't
+# force any runtime overhead on SDK-only consumers.
+metrics = { workspace = true }
+
 # Time and date
 chrono = { workspace = true }
 humantime-serde = { workspace = true }

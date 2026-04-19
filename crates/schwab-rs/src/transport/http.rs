@@ -1,7 +1,7 @@
 //! HTTP transport using reqwest.
 
 use crate::error::{Error, Result};
-use reqwest::{Client, Method, Response};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 use tracing::debug;
@@ -68,7 +68,20 @@ impl HttpTransport {
         let status = response.status();
 
         if status.is_success() {
-            response.json().await.map_err(Error::from)
+            // Schwab returns 204 No Content (or an empty body) on DELETE
+            // endpoints like `cancel_order`. `response.json()` would fail
+            // against an empty buffer, so fall through to a null payload
+            // which deserializes cleanly into `()` for no-body callers
+            // while still erroring loudly for typed responses that really
+            // expected a body.
+            if status == StatusCode::NO_CONTENT {
+                return serde_json::from_str("null").map_err(Error::from);
+            }
+            let bytes = response.bytes().await.map_err(Error::from)?;
+            if bytes.is_empty() {
+                return serde_json::from_str("null").map_err(Error::from);
+            }
+            serde_json::from_slice(&bytes).map_err(Error::from)
         } else {
             let body = response
                 .text()

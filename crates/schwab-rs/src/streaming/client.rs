@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep};
@@ -103,6 +104,19 @@ struct StreamClientInner {
     pending_acks: Arc<RwLock<HashMap<String, oneshot::Sender<Result<()>>>>>,
     /// Last time a Pong frame was received (for heartbeat timeout detection)
     last_pong: Arc<RwLock<Instant>>,
+    /// Oneshot that `connect_and_run` fires once — the first time
+    /// authentication succeeds. `connect()` awaits this instead of
+    /// polling `is_authenticated()` at 100 ms cadence, which used to
+    /// race when the socket flipped Authenticated → Disconnected inside
+    /// one tick.
+    initial_auth_tx: Arc<RwLock<Option<oneshot::Sender<()>>>>,
+    /// Shutdown flag — set by `disconnect()` so the reconnect loop
+    /// stops resurrecting the connection after the peer tears it down.
+    shutting_down: Arc<AtomicBool>,
+    /// Handle for the outer connection loop task (one per `connect()`
+    /// call), so `disconnect()` can abort it cleanly instead of leaking
+    /// the task for the lifetime of the process.
+    connection_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -153,6 +167,9 @@ impl StreamClient {
                 writer_task: Arc::new(RwLock::new(None)),
                 pending_acks: Arc::new(RwLock::new(HashMap::new())),
                 last_pong: Arc::new(RwLock::new(Instant::now())),
+                initial_auth_tx: Arc::new(RwLock::new(None)),
+                shutting_down: Arc::new(AtomicBool::new(false)),
+                connection_task: Arc::new(RwLock::new(None)),
             }),
         })
     }
@@ -318,29 +335,65 @@ impl StreamClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        // Reject concurrent connect() calls so we don't spawn two
+        // reconnect loops competing for the same socket / auth slot.
+        {
+            let guard = self.inner.connection_task.read();
+            if let Some(handle) = guard.as_ref() {
+                if !handle.is_finished() {
+                    return Err(Error::Stream(StreamError::ConnectionFailed(
+                        "connect() already in progress".into(),
+                    )));
+                }
+            }
+        }
+
+        self.inner.shutting_down.store(false, Ordering::SeqCst);
         self.set_state(ConnectionState::Connecting);
 
+        // Subscribe to the first-auth signal BEFORE spawning so the
+        // loop can't complete auth before we're listening.
+        let (tx, rx) = oneshot::channel::<()>();
+        *self.inner.initial_auth_tx.write() = Some(tx);
+
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = inner.connection_loop().await {
                 error!("Connection loop failed: {}", e);
             }
         });
+        *self.inner.connection_task.write() = Some(handle);
 
-        // Wait for authentication
-        let start = Instant::now();
-        let timeout = Duration::from_secs(10);
-
-        while start.elapsed() < timeout {
-            if self.is_authenticated() {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100)).await;
+        // The loop either fires `tx` on successful auth or drops it on
+        // terminal failure — in both cases we unblock. Timeout guards
+        // against network hangs that never produce either outcome.
+        match tokio::time::timeout(Duration::from_secs(10), rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(Error::Stream(StreamError::AuthenticationFailed(
+                "connection loop exited before authenticating \
+                 (check logs for the underlying cause)"
+                    .into(),
+            ))),
+            Err(_) => Err(Error::Stream(StreamError::ConnectionFailed(
+                "Authentication timeout".into(),
+            ))),
         }
+    }
 
-        Err(Error::Stream(StreamError::ConnectionFailed(
-            "Authentication timeout".to_string(),
-        )))
+    /// Stop the reconnect loop and close the underlying socket.
+    ///
+    /// Idempotent. After calling `disconnect`, a subsequent `connect`
+    /// will spin up a fresh loop.
+    pub async fn disconnect(&self) {
+        self.inner.shutting_down.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.inner.connection_task.write().take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.inner.writer_task.write().take() {
+            handle.abort();
+        }
+        *self.inner.outgoing_tx.write() = None;
+        self.set_state(ConnectionState::Disconnected);
     }
 
     pub async fn subscribe(&self, service: StreamService, symbols: Vec<String>) -> Result<()> {
@@ -431,13 +484,13 @@ impl StreamClient {
     }
 
     async fn send_request(&self, request: StreamRequest) -> Result<()> {
-        // Track ack
+        // Track ack. Keep a local copy of the id so we can clean up
+        // the pending-ack entry on timeout without needing the
+        // now-moved request back.
+        let request_id = request.requestid.clone();
         let (tx, rx) = oneshot::channel::<Result<()>>();
         {
-            self.inner
-                .pending_acks
-                .write()
-                .insert(request.requestid.clone(), tx);
+            self.inner.pending_acks.write().insert(request_id.clone(), tx);
         }
 
         let json = serde_json::to_string(&StreamRequests {
@@ -465,8 +518,18 @@ impl StreamClient {
                 "Ack channel canceled".to_string(),
             ))),
             Err(_elapsed) => {
+                // Previously returned Ok(()) on timeout, which silently
+                // masked lost subscriptions and prevented
+                // `send_request_with_retry` from ever retrying.
+                // Surfacing ConnectionFailed lets the retry loop fire
+                // and lets the caller see the failure.
                 warn!("Stream request ack timeout");
-                Ok(())
+                // Remove the pending-ack entry so a late response
+                // doesn't try to signal a dropped receiver.
+                self.inner.pending_acks.write().remove(&request_id);
+                Err(Error::Stream(StreamError::ConnectionFailed(
+                    "stream request ack timeout".to_string(),
+                )))
             }
         }
     }
@@ -523,11 +586,56 @@ impl StreamClient {
     }
 }
 
+/// Emit `schwab_stream_messages_total{service, kind}` for each
+/// inbound frame. Response/Notify frames have no per-service payload,
+/// so they get `service="_control"` rather than inflating real
+/// service labels.
+fn record_stream_frame(msg: &StreamMessage) {
+    match msg {
+        StreamMessage::Data(data) => {
+            for item in &data.data {
+                metrics::counter!(
+                    crate::metrics::STREAM_MESSAGES_TOTAL,
+                    "service" => item.service.clone(),
+                    "kind" => "data",
+                )
+                .increment(item.content.len() as u64);
+            }
+        }
+        StreamMessage::Response(_) => {
+            metrics::counter!(
+                crate::metrics::STREAM_MESSAGES_TOTAL,
+                "service" => "_control",
+                "kind" => "response",
+            )
+            .increment(1);
+        }
+        StreamMessage::Notify(_) => {
+            metrics::counter!(
+                crate::metrics::STREAM_MESSAGES_TOTAL,
+                "service" => "_control",
+                "kind" => "notify",
+            )
+            .increment(1);
+        }
+    }
+}
+
 impl StreamClientInner {
     async fn connection_loop(&self) -> Result<()> {
         let mut retry_count = 0;
+        let mut is_reconnect = false;
 
         loop {
+            if self.shutting_down.load(Ordering::SeqCst) {
+                info!("Stream shutdown requested; exiting reconnect loop");
+                return Ok(());
+            }
+
+            if is_reconnect {
+                metrics::counter!(crate::metrics::STREAM_RECONNECTS_TOTAL).increment(1);
+            }
+
             // Record connection start time for 90-second crash detection
             let connection_start = Instant::now();
             *self.connection_start.write() = Some(connection_start);
@@ -535,9 +643,21 @@ impl StreamClientInner {
             match self.connect_and_run().await {
                 Ok(_) => {
                     info!("Stream connection closed normally");
-                    // Reset backoff on successful connection
+                    // Reset backoff on any clean close.
                     *self.backoff_delay.write() = Duration::from_secs(2);
-                    break;
+
+                    // Clean close ≠ shutdown. If the peer closed while
+                    // reconnect is enabled (and we weren't asked to
+                    // stop), spin the loop rather than exiting silently
+                    // and leaving the caller with a dead client.
+                    if self.shutting_down.load(Ordering::SeqCst)
+                        || !self.config.reconnect.enabled
+                    {
+                        return Ok(());
+                    }
+                    retry_count = 0;
+                    is_reconnect = true;
+                    continue;
                 }
                 Err(e) => {
                     error!("Stream connection error: {}", e);
@@ -548,18 +668,24 @@ impl StreamClientInner {
                         warn!(
                             "Stream crashed within 90 seconds, likely no subscriptions, invalid login, or lost connection (not restarting)"
                         );
+                        // Drop the auth signal so `connect()` unblocks
+                        // with an AuthenticationFailed error instead of
+                        // hanging until the 10 s timeout.
+                        drop(self.initial_auth_tx.write().take());
                         return Err(Error::Stream(StreamError::ConnectionFailed(
                             "Stream failed within 90 seconds of connecting".to_string(),
                         )));
                     }
 
                     if !self.config.reconnect.enabled {
+                        drop(self.initial_auth_tx.write().take());
                         return Err(e);
                     }
 
                     if let Some(max_retries) = self.config.reconnect.max_retries {
                         if retry_count >= max_retries {
                             error!("Maximum reconnection attempts reached");
+                            drop(self.initial_auth_tx.write().take());
                             return Err(Error::Stream(StreamError::ConnectionFailed(
                                 "Maximum reconnection attempts exceeded".to_string(),
                             )));
@@ -579,11 +705,10 @@ impl StreamClientInner {
                     *delay = (*delay * 2).min(Duration::from_secs(128));
 
                     retry_count += 1;
+                    is_reconnect = true;
                 }
             }
         }
-
-        Ok(())
     }
 
     async fn connect_and_run(&self) -> Result<()> {
@@ -623,8 +748,31 @@ impl StreamClientInner {
         *self.writer_task.write() = Some(writer);
 
         // Authenticate using read half
-        self.authenticate_read(&mut read_half).await?;
+        match self.authenticate_read(&mut read_half).await {
+            Ok(()) => {
+                metrics::counter!(
+                    crate::metrics::STREAM_CONNECTS_TOTAL,
+                    "outcome" => "success",
+                )
+                .increment(1);
+            }
+            Err(e) => {
+                metrics::counter!(
+                    crate::metrics::STREAM_CONNECTS_TOTAL,
+                    "outcome" => "failure",
+                )
+                .increment(1);
+                return Err(e);
+            }
+        }
         *self.connection_state.write() = ConnectionState::Authenticated;
+        metrics::gauge!(crate::metrics::STREAM_CONNECTED).set(1.0);
+
+        // Fire the one-shot `connect()` is awaiting. This is take()-ed,
+        // so reconnects after the first success are no-ops.
+        if let Some(tx) = self.initial_auth_tx.write().take() {
+            let _ = tx.send(());
+        }
 
         // Resubscribe to existing subscriptions using channel
         self.resubscribe_via_channel().await?;
@@ -642,6 +790,7 @@ impl StreamClientInner {
         *self.outgoing_tx.write() = None;
 
         *self.connection_state.write() = ConnectionState::Disconnected;
+        metrics::gauge!(crate::metrics::STREAM_CONNECTED).set(0.0);
 
         result
     }
@@ -797,6 +946,11 @@ impl StreamClientInner {
                                 }
                             }
                         }
+
+                        // Bucket the frame by (service, kind) before
+                        // consuming — Data frames carry per-service
+                        // payloads; Response/Notify are control-plane.
+                        record_stream_frame(&stream_msg);
 
                         if let Err(e) = self.message_tx.send(stream_msg) {
                             warn!("Failed to send message to receiver: {}", e);

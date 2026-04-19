@@ -3,6 +3,7 @@
 //! Provides authenticated access to accounts, trading, market data, and quotes.
 
 use crate::auth::{AuthManager, create_bearer_header};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{ClientConfig, SchwabConfig};
 use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
@@ -43,6 +44,7 @@ struct ClientInner {
         >,
     >,
     retry_policy: RetryPolicy,
+    circuit_breaker: Arc<CircuitBreaker>,
     #[allow(dead_code)] // Reserved for streaming subscription integration
     subscriptions: Arc<SubscriptionManager>,
 }
@@ -71,6 +73,8 @@ impl SchwabClient {
         };
 
         let retry_policy = RetryPolicy::new(&config.client.retry);
+        let circuit_breaker =
+            Arc::new(CircuitBreaker::new(config.client.circuit_breaker.clone()));
 
         Ok(Self {
             inner: Arc::new(ClientInner {
@@ -79,6 +83,7 @@ impl SchwabClient {
                 transport,
                 rate_limiter,
                 retry_policy,
+                circuit_breaker,
                 subscriptions: Arc::new(SubscriptionManager::new()),
             }),
         })
@@ -107,16 +112,17 @@ impl SchwabClient {
         &self.inner.config
     }
 
-    pub(crate) async fn request<T>(&self, method: Method, path: &str) -> Result<T>
+    pub(crate) async fn request<T>(&self, op: &'static str, method: Method, path: &str) -> Result<T>
     where
         T: DeserializeOwned,
     {
-        self.request_with_options::<T, ()>(method, path, None::<&()>, None::<&()>)
+        self.request_with_options::<T, ()>(op, method, path, None::<&()>, None::<&()>)
             .await
     }
 
     pub(crate) async fn request_with_query<T, Q>(
         &self,
+        op: &'static str,
         method: Method,
         path: &str,
         query: &Q,
@@ -125,12 +131,13 @@ impl SchwabClient {
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
-        self.request_with_options(method, path, Some(query), None::<&()>)
+        self.request_with_options(op, method, path, Some(query), None::<&()>)
             .await
     }
 
     pub(crate) async fn request_with_body<T, B>(
         &self,
+        op: &'static str,
         method: Method,
         path: &str,
         body: &B,
@@ -139,12 +146,13 @@ impl SchwabClient {
         T: DeserializeOwned,
         B: Serialize,
     {
-        self.request_with_options::<T, ()>(method, path, None::<&()>, Some(body))
+        self.request_with_options::<T, ()>(op, method, path, None::<&()>, Some(body))
             .await
     }
 
     pub(crate) async fn request_with_options<T, Q>(
         &self,
+        op: &'static str,
         method: Method,
         path: &str,
         query: Option<&Q>,
@@ -154,6 +162,20 @@ impl SchwabClient {
         T: DeserializeOwned,
         Q: Serialize + ?Sized,
     {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let method_label: &'static str = match method {
+            Method::GET => "GET",
+            Method::POST => "POST",
+            Method::PUT => "PUT",
+            Method::DELETE => "DELETE",
+            Method::PATCH => "PATCH",
+            Method::HEAD => "HEAD",
+            Method::OPTIONS => "OPTIONS",
+            _ => "OTHER",
+        };
+
         // Apply rate limiting
         if let Some(ref rate_limiter) = self.inner.rate_limiter {
             rate_limiter.until_ready().await;
@@ -173,28 +195,53 @@ impl SchwabClient {
 
             debug!("Making request to {}{}", self.inner.config.base_url, path);
 
+            // Circuit breaker wraps the full retry loop so a transient
+            // 5xx that `retry_policy` recovers from does not trip the
+            // breaker — only a logical request that fails after its
+            // retry budget is exhausted counts as a failure.
             let result: Result<T> = self
                 .inner
-                .retry_policy
-                .execute(|| {
-                    let headers = vec![
-                        (
-                            "Authorization".to_string(),
-                            create_bearer_header(&access_token),
-                        ),
-                        ("Accept".to_string(), "application/json".to_string()),
-                    ];
-                    async {
-                        self.inner
-                            .transport
-                            .request::<T>(method.clone(), path, headers, query, body)
-                            .await
-                    }
+                .circuit_breaker
+                .call(|| async {
+                    self.inner
+                        .retry_policy
+                        .execute(|| {
+                            let headers = vec![
+                                (
+                                    "Authorization".to_string(),
+                                    create_bearer_header(&access_token),
+                                ),
+                                ("Accept".to_string(), "application/json".to_string()),
+                            ];
+                            async {
+                                self.inner
+                                    .transport
+                                    .request::<T>(method.clone(), path, headers, query, body)
+                                    .await
+                            }
+                        })
+                        .await
                 })
                 .await;
 
             match result {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    metrics::counter!(
+                        crate::metrics::HTTP_REQUESTS_TOTAL,
+                        "op" => op,
+                        "method" => method_label,
+                        "status" => "2xx",
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        crate::metrics::HTTP_REQUEST_DURATION,
+                        "op" => op,
+                        "method" => method_label,
+                    )
+                    .record(elapsed);
+                    return Ok(value);
+                }
                 Err(Error::Http { status, .. })
                     if status == reqwest::StatusCode::UNAUTHORIZED && !attempted_refresh =>
                 {
@@ -207,7 +254,32 @@ impl SchwabClient {
                     attempted_refresh = true;
                     continue; // rebuild request with new token
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let status_label = match &err {
+                        Error::Http { status, .. } => crate::metrics::status_class(status.as_u16()),
+                        Error::RateLimit { .. } => "4xx",
+                        Error::Timeout { .. } | Error::Network(_) | Error::ConnectionClosed => {
+                            "network"
+                        }
+                        Error::Auth(_) => "auth",
+                        _ => "error",
+                    };
+                    metrics::counter!(
+                        crate::metrics::HTTP_REQUESTS_TOTAL,
+                        "op" => op,
+                        "method" => method_label,
+                        "status" => status_label,
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        crate::metrics::HTTP_REQUEST_DURATION,
+                        "op" => op,
+                        "method" => method_label,
+                    )
+                    .record(elapsed);
+                    return Err(err);
+                }
             }
         }
     }
@@ -268,7 +340,7 @@ impl SchwabClient {
         if let Some(i) = indicative {
             params.push(("indicative", i.to_string()));
         }
-        self.request_with_query(Method::GET, "/marketdata/v1/quotes", &params)
+        self.request_with_query("get_quotes_with_options", Method::GET, "/marketdata/v1/quotes", &params)
             .await
     }
 
@@ -276,6 +348,7 @@ impl SchwabClient {
     pub async fn get_quote(&self, symbol: &str) -> Result<QuoteItem> {
         let encoded_symbol = urlencoding::encode(symbol);
         self.request(
+            "get_quote",
             Method::GET,
             &format!("/marketdata/v1/{}/quotes", encoded_symbol),
         )
@@ -294,6 +367,7 @@ impl SchwabClient {
         }
         let encoded_symbol = urlencoding::encode(symbol);
         self.request_with_query(
+            "get_quote_with_options",
             Method::GET,
             &format!("/marketdata/v1/{}/quotes", encoded_symbol),
             &params,
@@ -306,7 +380,7 @@ impl SchwabClient {
         &self,
         params: &PriceHistoryParams,
     ) -> Result<PriceHistoryResponse> {
-        self.request_with_query(Method::GET, "/marketdata/v1/pricehistory", params)
+        self.request_with_query("get_price_history", Method::GET, "/marketdata/v1/pricehistory", params)
             .await
     }
 
@@ -315,7 +389,7 @@ impl SchwabClient {
         &self,
         params: &OptionChainParams,
     ) -> Result<OptionChainResponse> {
-        self.request_with_query(Method::GET, "/marketdata/v1/chains", params)
+        self.request_with_query("get_option_chain", Method::GET, "/marketdata/v1/chains", params)
             .await
     }
 
@@ -325,7 +399,7 @@ impl SchwabClient {
         symbol: &str,
     ) -> Result<ExpirationChainResponse> {
         let params = [("symbol", symbol)];
-        self.request_with_query(Method::GET, "/marketdata/v1/expirationchain", &params)
+        self.request_with_query("get_option_expiration_chain", Method::GET, "/marketdata/v1/expirationchain", &params)
             .await
     }
 
@@ -346,6 +420,7 @@ impl SchwabClient {
 
         let encoded_index = urlencoding::encode(index);
         self.request_with_query(
+            "get_movers",
             Method::GET,
             &format!("/marketdata/v1/movers/{}", encoded_index),
             &params,
@@ -363,13 +438,14 @@ impl SchwabClient {
             ("symbol", symbol.to_string()),
             ("projection", format!("{:?}", projection).to_uppercase()),
         ];
-        self.request_with_query(Method::GET, "/marketdata/v1/instruments", &params)
+        self.request_with_query("search_instruments", Method::GET, "/marketdata/v1/instruments", &params)
             .await
     }
 
     /// Get instrument details by CUSIP
     pub async fn get_instrument(&self, cusip: &str) -> Result<Instrument> {
         self.request(
+            "get_instrument",
             Method::GET,
             &format!("/marketdata/v1/instruments/{}", cusip),
         )
@@ -386,21 +462,28 @@ impl SchwabClient {
         if let Some(d) = date {
             params.push(("date", d.to_string()));
         }
-        self.request_with_query(Method::GET, "/marketdata/v1/markets", &params)
+        self.request_with_query("get_markets", Method::GET, "/marketdata/v1/markets", &params)
             .await
     }
 
-    /// Get market hours for a single market
+    /// Get market hours for a single market.
+    ///
+    /// The Schwab `/markets/{marketId}` endpoint returns the same nested
+    /// shape as `/markets` — a map keyed by market type (e.g. `equity`)
+    /// — with just the requested market populated, not a bare list.
+    /// Earlier versions declared `Vec<MarketHours>` here and would fail
+    /// JSON deserialization in practice.
     pub async fn get_market(
         &self,
         market_id: &str,
         date: Option<&str>,
-    ) -> Result<Vec<MarketHours>> {
+    ) -> Result<std::collections::HashMap<String, Vec<MarketHours>>> {
         let mut params = Vec::new();
         if let Some(d) = date {
             params.push(("date", d.to_string()));
         }
         self.request_with_query(
+            "get_market",
             Method::GET,
             &format!("/marketdata/v1/markets/{}", market_id),
             &params,
@@ -412,7 +495,7 @@ impl SchwabClient {
 
     /// Get all linked account numbers
     pub async fn get_account_numbers(&self) -> Result<Vec<AccountNumberHash>> {
-        self.request(Method::GET, "/trader/v1/accounts/accountNumbers")
+        self.request("get_account_numbers", Method::GET, "/trader/v1/accounts/accountNumbers")
             .await
     }
 
@@ -423,7 +506,7 @@ impl SchwabClient {
         } else {
             vec![]
         };
-        self.request_with_query(Method::GET, "/trader/v1/accounts", &params)
+        self.request_with_query("get_accounts", Method::GET, "/trader/v1/accounts", &params)
             .await
     }
 
@@ -439,6 +522,7 @@ impl SchwabClient {
             vec![]
         };
         self.request_with_query(
+            "get_account",
             Method::GET,
             &format!("/trader/v1/accounts/{}", account_hash),
             &params,
@@ -470,6 +554,7 @@ impl SchwabClient {
         }
 
         self.request_with_query(
+            "get_account_orders",
             Method::GET,
             &format!("/trader/v1/accounts/{}/orders", account_hash),
             &params,
@@ -480,6 +565,7 @@ impl SchwabClient {
     /// Place an order
     pub async fn place_order(&self, account_hash: &str, order: &Order) -> Result<OrderResponse> {
         self.request_with_body(
+            "place_order",
             Method::POST,
             &format!("/trader/v1/accounts/{}/orders", account_hash),
             order,
@@ -490,6 +576,7 @@ impl SchwabClient {
     /// Get a specific order
     pub async fn get_order(&self, account_hash: &str, order_id: &str) -> Result<Order> {
         self.request(
+            "get_order",
             Method::GET,
             &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
         )
@@ -499,6 +586,7 @@ impl SchwabClient {
     /// Cancel an order
     pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {
         self.request(
+            "cancel_order",
             Method::DELETE,
             &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
         )
@@ -513,6 +601,7 @@ impl SchwabClient {
         order: &Order,
     ) -> Result<OrderResponse> {
         self.request_with_body(
+            "replace_order",
             Method::PUT,
             &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
             order,
@@ -523,6 +612,7 @@ impl SchwabClient {
     /// Preview an order
     pub async fn preview_order(&self, account_hash: &str, order: &Order) -> Result<OrderResponse> {
         self.request_with_body(
+            "preview_order",
             Method::POST,
             &format!("/trader/v1/accounts/{}/previewOrder", account_hash),
             order,
@@ -552,7 +642,7 @@ impl SchwabClient {
             params.push(("status", s.to_string()));
         }
 
-        self.request_with_query(Method::GET, "/trader/v1/orders", &params)
+        self.request_with_query("get_all_orders", Method::GET, "/trader/v1/orders", &params)
             .await
     }
 
@@ -580,6 +670,7 @@ impl SchwabClient {
         }
 
         self.request_with_query(
+            "get_transactions",
             Method::GET,
             &format!("/trader/v1/accounts/{}/transactions", account_hash),
             &params,
@@ -594,6 +685,7 @@ impl SchwabClient {
         transaction_id: &str,
     ) -> Result<Transaction> {
         self.request(
+            "get_transaction",
             Method::GET,
             &format!(
                 "/trader/v1/accounts/{}/transactions/{}",
@@ -605,7 +697,7 @@ impl SchwabClient {
 
     /// Get user preferences
     pub async fn get_user_preferences(&self) -> Result<UserPreferences> {
-        self.request(Method::GET, "/trader/v1/userPreference").await
+        self.request("get_user_preferences", Method::GET, "/trader/v1/userPreference").await
     }
 }
 

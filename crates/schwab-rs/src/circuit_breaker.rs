@@ -41,38 +41,12 @@
 //! }).await;
 //! ```
 
+use crate::config::CircuitBreakerConfig;
 use crate::error::{Error, Result};
 use parking_lot::RwLock;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
-
-/// Configuration for the circuit breaker.
-#[derive(Debug, Clone)]
-pub struct CircuitBreakerConfig {
-    /// Whether the circuit breaker is enabled. Default: true
-    pub enabled: bool,
-    /// Number of failures before opening the circuit. Default: 5
-    pub failure_threshold: u32,
-    /// Number of successes in half-open state to close the circuit. Default: 3
-    pub success_threshold: u32,
-    /// Duration to wait in open state before transitioning to half-open. Default: 30s
-    pub open_duration: Duration,
-    /// Maximum number of requests to allow through in half-open state. Default: 1
-    pub half_open_max_requests: u32,
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            failure_threshold: 5,
-            success_threshold: 3,
-            open_duration: Duration::from_secs(30),
-            half_open_max_requests: 1,
-        }
-    }
-}
 
 /// The current state of the circuit breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +69,12 @@ pub struct CircuitBreaker {
     failure_count: AtomicU32,
     success_count: AtomicU32,
     half_open_requests: AtomicU32,
-    last_failure_time: AtomicU64,
+    /// Wall-clock moment of the most recent failure, or `None` if the
+    /// circuit has never tripped. `Instant` is monotonic and the natural
+    /// fit for "how long ago did we fail" math — prior implementations
+    /// used `AtomicU64` with `Instant::now().elapsed()`, which always
+    /// returned ~0 and left the breaker stuck open forever.
+    last_failure_time: RwLock<Option<Instant>>,
 }
 
 impl CircuitBreaker {
@@ -107,7 +86,7 @@ impl CircuitBreaker {
             failure_count: AtomicU32::new(0),
             success_count: AtomicU32::new(0),
             half_open_requests: AtomicU32::new(0),
-            last_failure_time: AtomicU64::new(0),
+            last_failure_time: RwLock::new(None),
         }
     }
 
@@ -232,12 +211,14 @@ impl CircuitBreaker {
 
     fn transition_to_open(&self) {
         let mut state = self.state.write();
+        let from = *state;
         *state = CircuitState::Open;
         self.update_failure_time();
         tracing::warn!(
             "Circuit breaker opened after {} failures",
             self.failure_count.load(Ordering::Relaxed)
         );
+        record_transition(from, CircuitState::Open);
     }
 
     fn transition_to_half_open(&self) {
@@ -247,37 +228,30 @@ impl CircuitBreaker {
             self.half_open_requests.store(0, Ordering::Relaxed);
             self.success_count.store(0, Ordering::Relaxed);
             tracing::info!("Circuit breaker transitioned to half-open");
+            record_transition(CircuitState::Open, CircuitState::HalfOpen);
         }
     }
 
     fn transition_to_closed(&self) {
         let mut state = self.state.write();
+        let from = *state;
         *state = CircuitState::Closed;
         self.failure_count.store(0, Ordering::Relaxed);
         self.success_count.store(0, Ordering::Relaxed);
         self.half_open_requests.store(0, Ordering::Relaxed);
         tracing::info!("Circuit breaker closed - service recovered");
+        record_transition(from, CircuitState::Closed);
     }
 
     fn update_failure_time(&self) {
-        let now = Instant::now().elapsed().as_secs();
-        self.last_failure_time.store(now, Ordering::Relaxed);
+        *self.last_failure_time.write() = Some(Instant::now());
     }
 
     fn elapsed_since_failure(&self) -> Duration {
-        // Use a more reliable timestamp approach
-        let last_failure = self.last_failure_time.load(Ordering::Relaxed);
-        if last_failure == 0 {
-            return Duration::ZERO;
+        match *self.last_failure_time.read() {
+            Some(ts) => ts.elapsed(),
+            None => Duration::ZERO,
         }
-        // For simplicity, we track elapsed seconds since program start
-        // A production implementation might use SystemTime
-        Duration::from_secs(
-            Instant::now()
-                .elapsed()
-                .as_secs()
-                .saturating_sub(last_failure),
-        )
     }
 
     /// Manually resets the circuit breaker to closed state.
@@ -285,12 +259,28 @@ impl CircuitBreaker {
     /// Use this when you know the downstream service has recovered.
     pub fn reset(&self) {
         let mut state = self.state.write();
+        let from = *state;
         *state = CircuitState::Closed;
         self.failure_count.store(0, Ordering::Relaxed);
         self.success_count.store(0, Ordering::Relaxed);
         self.half_open_requests.store(0, Ordering::Relaxed);
-        self.last_failure_time.store(0, Ordering::Relaxed);
+        *self.last_failure_time.write() = None;
+        if from != CircuitState::Closed {
+            record_transition(from, CircuitState::Closed);
+        }
     }
+}
+
+/// Emit the transition counter + state gauge. Split out so the
+/// transition_to_* methods don't each duplicate the metric glue.
+fn record_transition(from: CircuitState, to: CircuitState) {
+    metrics::counter!(
+        crate::metrics::CIRCUIT_TRANSITIONS_TOTAL,
+        "from" => crate::metrics::circuit_state_name(from),
+        "to" => crate::metrics::circuit_state_name(to),
+    )
+    .increment(1);
+    metrics::gauge!(crate::metrics::CIRCUIT_STATE).set(crate::metrics::circuit_state_value(to));
 }
 
 impl Default for CircuitBreaker {
@@ -431,5 +421,33 @@ mod tests {
         } else {
             panic!("Expected Http error");
         }
+    }
+
+    /// Regression: the previous `update_failure_time` implementation
+    /// stored `Instant::now().elapsed()` (always ~0), which left the
+    /// breaker stuck Open forever. Verify a short `open_duration`
+    /// elapses into HalfOpen and allows a probe request through.
+    #[tokio::test]
+    async fn test_open_transitions_to_half_open_after_timeout() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_duration: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let breaker = CircuitBreaker::new(config);
+
+        breaker.record_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        assert!(!breaker.is_allowed());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        // First is_allowed() call after timeout should transition to
+        // HalfOpen and allow exactly `half_open_max_requests` probes.
+        assert!(
+            breaker.is_allowed(),
+            "breaker should flip to HalfOpen once open_duration elapses"
+        );
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
     }
 }

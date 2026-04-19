@@ -75,9 +75,15 @@ pub struct OAuthConfig {
     /// Token storage backend
     #[serde(default)]
     pub token_store_kind: TokenStoreKind,
-    /// Allow callback server to bind to 0.0.0.0 (all interfaces).
-    /// **Security Warning:** Only enable for cloudflared tunneling.
-    /// Default: false (binds to localhost only)
+    /// Allow callback server to bind to `0.0.0.0` (all interfaces).
+    ///
+    /// Default: `false` — binds to `127.0.0.1` only, which is what you
+    /// want for the standard dev-machine flow.
+    ///
+    /// Only enable this if you're terminating TLS in front of this
+    /// process with an HTTPS tunnel or reverse proxy (ngrok,
+    /// cloudflared, an L7 LB, etc.). Exposes the callback port to
+    /// your LAN/WAN while enabled.
     #[serde(default)]
     pub allow_external_callback: bool,
     /// Callback function when tokens need user intervention (e.g., refresh token expiring)
@@ -430,9 +436,20 @@ impl AuthManager {
             *self.tokens.write() = Some(tokens);
         }
 
-        // Start auto-refresh task if enabled
+        // Start auto-refresh task if enabled. Guard with a finished()
+        // check so multiple `start()` calls (e.g. re-inits from an
+        // embedding server) don't stack extra refresh tasks; prior
+        // versions silently leaked the previous one.
         if self.config.auto_refresh {
-            self.start_refresh_task().await;
+            let already_running = self
+                .refresh_task
+                .read()
+                .as_ref()
+                .map(|h| !h.is_finished())
+                .unwrap_or(false);
+            if !already_running {
+                self.start_refresh_task().await;
+            }
         }
 
         Ok(())
@@ -537,6 +554,12 @@ impl AuthManager {
                     *self.tokens.write() = Some(new_tokens);
                     self.save_tokens()?;
                     *self.needs_client_recreation.write() = true;
+                    metrics::counter!(
+                        crate::metrics::TOKEN_REFRESH_TOTAL,
+                        "outcome" => "success",
+                        "grant" => "refresh_token",
+                    )
+                    .increment(1);
                     Ok(())
                 }
                 Err(e) => {
@@ -545,6 +568,12 @@ impl AuthManager {
                     // Callers that care can still match on TokenExpired or
                     // RefreshTokenExpiring explicitly.
                     warn!("Token refresh failed: {}", e);
+                    metrics::counter!(
+                        crate::metrics::TOKEN_REFRESH_TOTAL,
+                        "outcome" => "failure",
+                        "grant" => "refresh_token",
+                    )
+                    .increment(1);
                     Err(e)
                 }
             }
@@ -865,9 +894,21 @@ impl AuthManager {
                             *tokens.write() = Some(new_tokens);
                             *needs_recreation.write() = true; // Mark for client recreation
                             info!("Token auto-refreshed successfully");
+                            metrics::counter!(
+                                crate::metrics::TOKEN_REFRESH_TOTAL,
+                                "outcome" => "success",
+                                "grant" => "auto_refresh",
+                            )
+                            .increment(1);
                         }
                         Err(e) => {
                             warn!("Auto-refresh failed: {}", e);
+                            metrics::counter!(
+                                crate::metrics::TOKEN_REFRESH_TOTAL,
+                                "outcome" => "failure",
+                                "grant" => "auto_refresh",
+                            )
+                            .increment(1);
                         }
                     }
                 }
@@ -975,7 +1016,8 @@ impl AuthManager {
         let addr = if self.config.allow_external_callback {
             warn!(
                 "⚠️  SECURITY: OAuth callback server binding to 0.0.0.0:{} (all network interfaces). \
-                 This exposes the callback to your LAN/WAN. Only enable for cloudflared tunneling!",
+                 This exposes the callback to your LAN/WAN — only enable when terminating TLS in \
+                 front of this process (ngrok / cloudflared / reverse proxy).",
                 port
             );
             std::net::SocketAddr::from(([0, 0, 0, 0], port))

@@ -10,8 +10,10 @@
 //! - `websocket` — bind `SCHWAB_MCP_BIND` (default `127.0.0.1:8765`)
 
 use anyhow::Context;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use schwab_mcp::SchwabMcp;
 use schwab_rs::{SchwabClient, SchwabConfig};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use turbomcp::prelude::*;
@@ -26,6 +28,25 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
+
+    // Install the Prometheus recorder + scrape listener when the user
+    // opts in via `SCHWAB_METRICS_BIND=host:port`. Kept opt-in so
+    // stdio-transport deployments (Claude Desktop etc.) don't
+    // accidentally expose a network port.
+    if let Ok(bind) = std::env::var("SCHWAB_METRICS_BIND") {
+        let addr: SocketAddr = bind
+            .parse()
+            .with_context(|| format!("SCHWAB_METRICS_BIND={bind:?} is not a valid host:port"))?;
+        PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .install()
+            .context("failed to install Prometheus metrics recorder / listener")?;
+        tracing::info!(%addr, "metrics: Prometheus scrape endpoint live at http://<bind>/metrics");
+    } else {
+        tracing::debug!(
+            "metrics: disabled (set SCHWAB_METRICS_BIND=127.0.0.1:9090 to expose Prometheus scrape endpoint)"
+        );
+    }
 
     let config = SchwabConfig::from_env()
         .context("failed to load SchwabConfig from environment (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.)")?;
