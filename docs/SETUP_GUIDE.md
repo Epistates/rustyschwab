@@ -27,17 +27,29 @@ SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
 
 ## 3. Local HTTPS for Callbacks
 
-Schwab requires an HTTPS callback URL. Since you are likely developing on `localhost`, you have a few options:
+Schwab requires an HTTPS callback URL.
 
-### Option A: Cloudflared (Recommended)
-This creates a secure tunnel to your local machine with a valid HTTPS certificate.
+### Option A: Localhost with built-in self-signed cert (Recommended)
 
-1.  `brew install cloudflared` (on macOS) or download from Cloudflare.
-2.  Run: `cloudflared tunnel --url http://localhost:8080`
-3.  Use the generated `.trycloudflare.com` URL as your **Callback URL** in the Schwab portal and your `.env`.
+Register `https://127.0.0.1:8080` in the Schwab portal and set the
+same value in `SCHWAB_OAUTH_CALLBACK_URL`. The SDK's built-in
+callback server (feature `callback-server`) terminates TLS locally;
+your browser will warn about the self-signed cert once — click
+"Advanced" → "Proceed anyway" and you're in. No tunnel, no external
+binary.
 
-### Option B: Localhost with self-signed cert
-If you use `https://127.0.0.1:8080`, your browser will warn you about an insecure certificate. You can usually click "Advanced" -> "Proceed anyway".
+### Option B: Public HTTPS tunnel (advanced)
+
+Only needed when the machine running the OAuth flow can't host the
+browser doing the Schwab consent dance (headless servers, locked-down
+corporate networks). Examples: cloudflared, ngrok, or a reverse proxy
+in front of a VM.
+
+1.  Point the tunnel at local port `8080`.
+2.  Register the resulting public HTTPS URL in the Schwab portal and
+    `SCHWAB_OAUTH_CALLBACK_URL`.
+3.  Set `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true` so the callback server
+    binds to `0.0.0.0` instead of `127.0.0.1`.
 
 ## 4. Your First Authentication
 

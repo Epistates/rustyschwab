@@ -132,7 +132,10 @@ pub struct TokenSet {
 
 ### PKCE Support (RFC 7636)
 
-Protect against authorization code interception attacks:
+PKCE is implemented (S256) but **opt-in** — Schwab's public OAuth docs
+and the Schwabdev Python reference client do not use it, so we default
+to `pkce_enabled: false`. Turn it on only if you've verified your
+Schwab app accepts `code_challenge` / `code_verifier`:
 
 ```rust,ignore
 use schwab_rs::auth::OAuthConfig;
@@ -141,17 +144,14 @@ let oauth = OAuthConfig {
     app_key: "YOUR_APP_KEY".into(),
     app_secret: "YOUR_SECRET".into(),
     callback_url: "https://127.0.0.1:8080".into(),
-
-    pkce_enabled: true,  // Enabled by default (OAuth 2.1 compliant)
+    pkce_enabled: true,  // opt in after verifying Schwab accepts it
     ..Default::default()
 };
 ```
 
-**PKCE Security Benefits:**
-- **Code verifier:** 256-bit random value (OS CSPRNG)
-- **Code challenge:** SHA-256 hash with base64url encoding
-- **Method:** S256 (cryptographically secure)
-- **Protection:** Prevents authorization code interception/replay attacks
+When enabled, the flow uses a cryptographically-random verifier and
+an `S256` (SHA-256) challenge to mitigate authorization-code
+interception.
 
 ### Security Best Practices
 
@@ -219,7 +219,6 @@ export SCHWAB_APP_SECRET="your_16_char_secret"
 **4. Production Deployment Checklist**
 
 - [ ] Use `EncryptedFile` or `Keychain` storage backend
-- [ ] Ensure PKCE is enabled (`pkce_enabled: true`, default)
 - [ ] Set up token expiry notifications
 - [ ] Configure proper file permissions (0600 on Unix)
 - [ ] Use HTTPS-only callback URLs
@@ -246,20 +245,6 @@ export SCHWAB_APP_SECRET="your_16_char_secret"
 - Confidentiality: ChaCha20 stream cipher (256-bit key)
 - Authenticity: Poly1305 MAC (128-bit tag)
 - Tamper detection: Any modification causes decryption failure
-```
-
-**PKCE Code Verifier/Challenge (RFC 7636)**
-
-```text
-// Code verifier generation
-1. Generate 32 bytes random (256 bits) from OS CSPRNG
-2. Base64URL encode without padding
-3. Result: 43-character verifier string
-
-// Code challenge generation
-1. SHA-256 hash of verifier
-2. Base64URL encode without padding
-3. Method: S256 (required by OAuth 2.1)
 ```
 
 ### Vulnerability Reporting
@@ -443,12 +428,31 @@ cargo run -- --app-key YOUR_KEY --app-secret YOUR_SECRET status
 
 ## Environment Variables
 
+Required:
+
 ```bash
 export SCHWAB_APP_KEY="your_32_character_app_key"
 export SCHWAB_APP_SECRET="your_16_char_secret"
-export SCHWAB_CALLBACK_URL="https://your-callback-url"
-export SCHWAB_TOKENS_FILE="schwab_tokens.json"
+export SCHWAB_OAUTH_CALLBACK_URL="https://127.0.0.1:8080"
 ```
+
+Common optional overrides:
+
+```bash
+# Token persistence (defaults to ./schwab_tokens.json; platform-secure backend chosen automatically)
+export SCHWAB_TOKENS_FILE="$HOME/.config/schwab/tokens.json"
+export SCHWAB_TOKEN_STORE="keychain"   # keychain | encrypted | file
+
+# OAuth tuning
+export SCHWAB_PKCE_ENABLED=false       # Schwab's reference client does not use PKCE
+export SCHWAB_REFRESH_BUFFER=61        # seconds before expiry to refresh
+
+# MCP observability + PII
+export SCHWAB_METRICS_BIND=127.0.0.1:9090
+export SCHWAB_MCP_REDACT_PII=1
+```
+
+See `.env.example` for the full, commented catalog.
 
 ## MCP Server (`schwab-mcp`)
 
@@ -561,7 +565,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
       "env": {
         "SCHWAB_APP_KEY": "…",
         "SCHWAB_APP_SECRET": "…",
-        "SCHWAB_CALLBACK_URL": "https://127.0.0.1:8080",
+        "SCHWAB_OAUTH_CALLBACK_URL": "https://127.0.0.1:8080",
         "SCHWAB_TOKENS_FILE": "/Users/you/.config/schwab/tokens.json"
       }
     }
@@ -688,8 +692,7 @@ match client.get_quotes(&["AAPL"]).await {
 7. **Token Notifications**: Optional callbacks for expiry warnings and session events
 
 Known limitations and notes:
-- Endpoints under `crates/schwab-rs/src/endpoints/` now delegate to `SchwabClient` methods (thin wrappers)
-- Optional PKCE can be enabled via `OAuthConfig.pkce_enabled`
+- Optional PKCE can be enabled via `OAuthConfig.pkce_enabled` (off by default)
 - `SchwabClient` uses `transport::http::HttpTransport` for REST
 
 ## Streaming: Advanced Features (v0.2.0)
@@ -782,14 +785,14 @@ Set required environment variables (or place in `.env`):
 ```bash
 export SCHWAB_APP_KEY=...
 export SCHWAB_APP_SECRET=...
-export SCHWAB_CALLBACK_URL=https://127.0.0.1:8080
+export SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
 ```
 
 Optional:
 
 ```bash
 export SCHWAB_PKCE_ENABLED=false
-export SCHWAB_TOKEN_STORE=file          # Options: file, encrypted_file, keychain
+export SCHWAB_TOKEN_STORE=keychain      # Options: keychain | encrypted | file
 ```
 
 ### Examples

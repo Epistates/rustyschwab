@@ -62,3 +62,23 @@ tokio::spawn(async move {
 ### Unresponsive async tasks
 *   **Cause:** Blocking the thread in an async function.
 *   **Fix:** Avoid `std::thread::sleep` or long-running synchronous loops. Use `tokio::time::sleep` and ensure your message processing loops are efficient.
+
+## MCP Server Issues
+
+### Tool responses missing account numbers or streamer credentials
+*   **Cause:** `schwab-mcp` redacts PII from every tool response by default — account numbers are masked to the last four digits and `schwabClientCustomerId` / `schwabClientCorrelId` fields are stripped.
+*   **Fix (local debugging only):** Set `SCHWAB_MCP_REDACT_PII=0` (or `false` / `no`) before starting the server. Leave it enabled anywhere LLM output may be logged.
+
+### `SCHWAB_TOKEN_STORE=<value> not recognized`
+*   **Cause:** The env var was set to something other than `keychain`, `encrypted` (alias: `encryptedfile` / `encrypted_file`), or `file`. Previous versions silently downgraded unknown values to plaintext `File`; the current version errors loudly instead.
+*   **Fix:** Set one of the accepted values, or unset to let the SDK pick the platform-secure default (Keychain on macOS, EncryptedFile elsewhere).
+
+### Circuit breaker returned `CircuitBreakerOpen`
+*   **Cause:** The SDK's circuit breaker tripped after repeated upstream failures — typically a Schwab-side outage or malformed requests.
+*   **Fix:** Wait for `open_duration` (default 30 s) to elapse; the breaker will probe with a single HalfOpen request and recover automatically on success. Watch `schwab_circuit_state` and `schwab_circuit_transitions_total` if you have the Prometheus scrape enabled.
+
+## Observability
+
+### Metrics endpoint returns 404 or connection refused
+*   **Cause:** `SCHWAB_METRICS_BIND` is unset — the MCP binary skips installing the Prometheus recorder entirely, so no HTTP listener is bound.
+*   **Fix:** Export `SCHWAB_METRICS_BIND=127.0.0.1:9090` (or wherever you want to scrape) before starting `schwab-mcp`. The server logs `metrics: Prometheus scrape endpoint live at http://<bind>/metrics` on startup when the listener is active.

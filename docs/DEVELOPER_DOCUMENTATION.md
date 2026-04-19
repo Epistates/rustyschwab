@@ -151,13 +151,20 @@ rustyschwab/
 ├── crates/
 │   ├── schwab-rs/                # Main SDK crate
 │   │   ├── src/
-│   │   │   ├── auth/             # OAuth 2.0 & OIDC implementation
-│   │   │   ├── endpoints/        # REST API implementations
+│   │   │   ├── auth/             # OAuth 2.0, optional PKCE, token stores
 │   │   │   ├── streaming/        # WebSocket streaming engine
 │   │   │   ├── transport/        # Low-level HTTP/WS transport
+│   │   │   ├── client.rs         # SchwabClient: all REST endpoint methods
 │   │   │   ├── circuit_breaker.rs # Resilience patterns
 │   │   │   ├── retry.rs          # Backoff logic
+│   │   │   ├── metrics.rs        # Metric catalog + label helpers
 │   │   │   └── security.rs       # Encryption & memory safety
+│   │   │
+│   ├── schwab-mcp/               # MCP server wrapping the SDK
+│   │   └── src/
+│   │       ├── server.rs         # #[tool] definitions
+│   │       ├── metrics.rs        # ToolTimer + tool-call metrics
+│   │       └── redact.rs         # PII masking for tool responses
 │   │
 │   └── schwab-types/             # Shared data models
 │       └── src/                  # Accounts, Trading, MarketData, Streaming

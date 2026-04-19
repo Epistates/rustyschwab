@@ -1,6 +1,6 @@
 # Rustyschwab Documentation Index
 
-**Last Updated:** February 26, 2026
+**Last Updated:** April 19, 2026
 
 ## 📖 User Guides (Start Here)
 
@@ -51,9 +51,6 @@ Comprehensive technical design, component interactions, and security layer detai
 ### [Contributing](../CONTRIBUTING.md)
 Contribution guidelines, code style, and release process.
 
-### [Security Audit Summary](SECURITY_AUDIT_SUMMARY.md)
-Results from the latest independent security audit (Grade: A+).
-
 ---
 
 ## Navigation Tips
@@ -68,7 +65,7 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) section on Authentication.
 See [QUICK_START.md](QUICK_START.md) section on Feature Addition.
 
 **"I need help with callback URLs..."**
-See [SETUP_GUIDE.md](SETUP_GUIDE.md) section on Cloudflared or [APP_CALLBACK.md](APP_CALLBACK.md).
+See [SETUP_GUIDE.md](SETUP_GUIDE.md) section on Local HTTPS or [APP_CALLBACK.md](APP_CALLBACK.md).
 
 **"Where are the examples?"**
 Check the `examples/` directory:

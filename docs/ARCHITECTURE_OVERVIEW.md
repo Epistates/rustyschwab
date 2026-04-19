@@ -189,16 +189,8 @@ schwab-rs/
 │   │       ├─ Message send/receive operations
 │   │       └─ Stream splitting for concurrent read/write
 │   │
-│   └── endpoints/ (101 LOC - Thin wrappers)
-│       ├── mod.rs (7 LOC)
-│       ├── accounts.rs (16 LOC) → SchwabClient methods
-│       ├── instruments.rs (15 LOC) → SchwabClient methods
-│       ├── market_data.rs (18 LOC) → SchwabClient methods
-│       ├── movers.rs (14 LOC) → SchwabClient methods
-│       ├── options.rs (11 LOC) → SchwabClient methods
-│       ├── price_history.rs (11 LOC) → SchwabClient methods
-│       ├── quotes.rs (11 LOC) → SchwabClient methods
-│       └── trading.rs (14 LOC) → SchwabClient methods
+│   └── (all REST endpoints consolidated into client.rs — no separate
+│       endpoints/ directory since the module was inlined)
 │
 └── Cargo.toml
     ├─ Dependencies version: 0.1.0
@@ -381,20 +373,12 @@ axum = "0.7" (optional, for callback-server feature)
 | `error.rs` | 256 | Error types | Error, AuthError, StreamError enums |
 | `types/streaming.rs` | 308 | WebSocket message types | StreamRequest, StreamMessage, StreamService |
 
-### Lightweight Files (<50 LOC each) - Thin Wrappers
+### Endpoint organization
 
-All endpoint files in `endpoints/` are thin wrappers that delegate to `SchwabClient` methods. This design centralizes logic in the client while maintaining clean separation of concerns:
-
-- `endpoints/accounts.rs` (16 LOC)
-- `endpoints/instruments.rs` (15 LOC)
-- `endpoints/market_data.rs` (18 LOC)
-- `endpoints/movers.rs` (14 LOC)
-- `endpoints/options.rs` (11 LOC)
-- `endpoints/price_history.rs` (11 LOC)
-- `endpoints/quotes.rs` (11 LOC)
-- `endpoints/trading.rs` (14 LOC)
-
-**Design Pattern**: These files exist for API organization but forward calls to methods in `SchwabClient`, keeping implementation centralized.
+All REST endpoint methods live directly on `SchwabClient` in
+`client.rs` — the former `endpoints/` directory of thin wrappers
+has been consolidated so there's a single place to look up any
+endpoint's signature, instrumentation (`op` label), and URL.
 
 ---
 
@@ -614,10 +598,12 @@ pub async fn start(&self) -> AuthResult<()> {
 // 1. Environment variables
 SCHWAB_APP_KEY
 SCHWAB_APP_SECRET
-SCHWAB_CALLBACK_URL
+SCHWAB_OAUTH_CALLBACK_URL
 SCHWAB_TOKENS_FILE
-SCHWAB_TOKEN_STORE (file|encrypted_file|keychain)
-SCHWAB_PKCE_ENABLED
+SCHWAB_TOKEN_STORE           // keychain | encrypted | file (unset = platform default)
+SCHWAB_PKCE_ENABLED          // defaults to false
+SCHWAB_METRICS_BIND          // schwab-mcp: opt-in Prometheus scrape endpoint
+SCHWAB_MCP_REDACT_PII        // schwab-mcp: defaults on
 
 // 2. .env files (via dotenvy crate)
 // 3. Code configuration (SchwabConfig)
@@ -630,9 +616,9 @@ SCHWAB_PKCE_ENABLED
 - **Purpose**: Captures authorization code from redirect
 - **URL**: `https://127.0.0.1:8080` (default) or `https://0.0.0.0:8080` (with `allow_external_callback`)
 - **Use Cases**:
-  - Local development
-  - Cloudflared tunnels
-  - ngrok tunnels
+  - Local development (primary — 127.0.0.1 + self-signed cert)
+  - Public HTTPS tunnel / reverse proxy fronting TLS (advanced,
+    requires `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true`)
 
 #### Manual Code Entry
 ```rust
@@ -807,7 +793,6 @@ Send to WebSocket
 | transport/http.rs | 74 | HTTP transport |
 | transport/websocket.rs | 82 | WebSocket transport |
 | lib.rs | 52 | Module exports |
-| endpoints/* | 101 | Thin wrappers |
 | streaming/mod.rs | 6 | Module exports |
 | transport/mod.rs | 4 | Module exports |
 | **Total** | **5,244** | |

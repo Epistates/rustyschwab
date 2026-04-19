@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Observability** — SDK-side metrics facade via the `metrics` crate
+  (no-op when no recorder is installed) plus opt-in Prometheus scrape
+  listener in the `schwab-mcp` binary (`SCHWAB_METRICS_BIND=host:port`).
+  Full catalog: HTTP request counters/histograms, retry outcomes,
+  circuit-breaker transitions + state gauge, token-refresh outcomes,
+  streaming connect/reconnect/message counters, and MCP tool-level
+  counter + duration histogram.
+- **PII redaction** in `schwab-mcp` tool responses — account numbers
+  masked to last four, streamer credentials + user identity fields
+  stripped. Controlled by `SCHWAB_MCP_REDACT_PII` (default on).
+- Explicit `StreamClient::disconnect()` that stops the reconnect loop
+  and aborts inner tasks, replacing the previous "drop the Arc"
+  idiom that leaked the loop for the life of the process.
+
+### Changed
+- `CircuitBreakerConfig` moved from `circuit_breaker` into `config` and
+  re-exported; it's now wired through `SchwabClient` so the breaker
+  wraps the full retry loop.
+- `SCHWAB_TOKEN_STORE` now errors loudly on unrecognized values instead
+  of silently downgrading to the plaintext `File` backend. Accepted
+  values: `keychain`, `encrypted` (aliases `encryptedfile` /
+  `encrypted_file`), `file`. Unset uses the platform-secure default.
+- `SCHWAB_PKCE_ENABLED` defaults to `false` to match `OAuthConfig` and
+  Schwab's reference client (Schwabdev). Enable only after verifying
+  your Schwab app accepts `code_challenge`.
+- OAuth callback guidance: `https://127.0.0.1:8080` + the built-in
+  callback server is now the recommended path; tunnels (cloudflared,
+  ngrok, etc.) are demoted to an advanced use case.
+
+### Fixed
+- Circuit breaker stored `Instant::now().elapsed()` (~0) in an
+  `AtomicU64`, which left the breaker stuck `Open` forever.
+  Switched to `RwLock<Option<Instant>>`; added regression test for
+  the `Open → HalfOpen` transition after `open_duration` elapses.
+- `HttpTransport` now handles HTTP `204 No Content` and empty bodies
+  by deserializing `null`, unblocking `DELETE` endpoints like
+  `cancel_order` that previously failed JSON parse.
+- `SchwabClient::get_market` return type corrected to the nested map
+  shape Schwab actually returns (was `Vec<MarketHours>`; deserialize
+  used to fail in practice).
+- Streaming: reject concurrent `connect()` calls, switch the auth-wait
+  from polling to a one-shot so `HalfOpen → Disconnected` flips
+  inside a tick can't race, continue the reconnect loop on clean
+  peer close instead of exiting silently, fail `connect()` fast
+  when the loop terminates before auth, and return `ConnectionFailed`
+  on ack timeout instead of silently `Ok(())`.
+- `AuthManager::start()` guards against stacking duplicate
+  auto-refresh tasks when `start()` is called more than once.
+
+### Removed
+- Standalone `auth::PkceSession` helper — no remaining callers; the
+  PKCE verifier lifecycle lives directly in `AuthManager`.
+
 ## [0.1.0] - 2026-02-26
 
 ### Added

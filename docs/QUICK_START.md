@@ -176,7 +176,7 @@ cargo test --test my_test
 - **Contributing:** `CONTRIBUTING.md` - Development guidelines
 - **Index:** `docs/INDEX.md` - All technical guides
 - **Architecture:** `docs/ARCHITECTURE_OVERVIEW.md` - Technical design
-- **Security:** `docs/SECURITY_AUDIT_SUMMARY.md` - Security analysis
+- **Troubleshooting:** `docs/TROUBLESHOOTING.md` - Common issues and fixes
 - **Developer Docs:** `docs/DEVELOPER_DOCUMENTATION.md` - Detailed reference
 
 ### Source Code
@@ -193,12 +193,13 @@ cargo test --test my_test
 # Required for examples
 export SCHWAB_APP_KEY="your_32_char_key"
 export SCHWAB_APP_SECRET="your_16_char_secret"
-export SCHWAB_CALLBACK_URL="https://127.0.0.1:8080"
+export SCHWAB_OAUTH_CALLBACK_URL="https://127.0.0.1:8080"
 
 # Optional
-export SCHWAB_TOKEN_STORE="encrypted_file"  # or: file, keychain
-export SCHWAB_PKCE_ENABLED="true"
-export RUST_LOG="debug"  # For debugging
+export SCHWAB_TOKEN_STORE="keychain"  # keychain | encrypted | file  (unset = platform default)
+export SCHWAB_PKCE_ENABLED="false"    # Schwab's reference client does not use PKCE
+export SCHWAB_METRICS_BIND="127.0.0.1:9090"  # opt-in Prometheus scrape for schwab-mcp
+export RUST_LOG="debug"                # For debugging
 ```
 
 ---
@@ -332,15 +333,16 @@ AuthManager (token refresh)
 
 | Module | Purpose |
 |--------|---------|
-| `auth/` | OAuth 2.0, token management, PKCE |
-| `client/` | Main REST API interface |
-| `config/` | Configuration management |
-| `endpoints/` | Individual API endpoints |
+| `auth/` | OAuth 2.0, token management, optional PKCE |
+| `client.rs` | Main REST API interface (all endpoint methods live here) |
+| `config.rs` | Configuration (env loading, `CircuitBreakerConfig`, etc.) |
 | `streaming/` | WebSocket streaming client |
 | `transport/` | HTTP and WebSocket layers |
-| `security/` | Encryption, key derivation |
-| `error/` | Error types and handling |
-| `retry/` | Exponential backoff |
+| `security.rs` | Encryption, key derivation |
+| `circuit_breaker.rs` | Circuit breaker wrapping the retry loop |
+| `retry.rs` | Exponential backoff with metrics |
+| `metrics.rs` | Metric names, label conventions, helpers |
+| `error.rs` | Error types and handling |
 
 ---
 
