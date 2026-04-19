@@ -8,9 +8,6 @@ mod token_store;
 // HTTP authorization header utilities
 mod headers;
 
-// PKCE (Proof Key for Public Clients) implementation
-mod pkce;
-
 // Re-export token storage types for public API
 pub use token_store::{
     EncryptedFileTokenStore, FileTokenStore, KeychainTokenStore, TokenSet, TokenStore,
@@ -18,9 +15,6 @@ pub use token_store::{
 
 // Re-export header utilities (used internally, but might be useful publicly)
 pub use headers::{create_basic_header, create_bearer_header};
-
-// Re-export PKCE types for advanced usage
-pub use pkce::PkceSession;
 
 use crate::error::AuthError;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};

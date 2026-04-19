@@ -6,9 +6,9 @@
 //! - Token refresh
 //! - Error handling
 
+use schwab_rs::auth::AuthManager;
 use schwab_rs::auth::OAuthConfig;
 use schwab_rs::auth::TokenStoreKind;
-use schwab_rs::auth::{AuthManager, PkceSession};
 use schwab_rs::config::{
     CircuitBreakerConfig, ClientConfig, RateLimitConfig, RetryConfig, SchwabConfig,
 };
@@ -168,37 +168,6 @@ async fn test_token_refresh_success() {
 async fn test_token_refresh_expired_refresh_token() {
     let _mock_server = MockServer::start().await;
     // Mock error response for expired refresh token would go here
-}
-
-#[tokio::test]
-async fn test_pkce_verifier_generation() {
-    let session = PkceSession::new();
-
-    let result = session.generate();
-    assert!(result.is_ok());
-
-    let (verifier, challenge) = result.unwrap();
-
-    // Verify RFC 7636 compliance
-    assert!(
-        verifier.len() >= 43,
-        "Verifier must be at least 43 characters"
-    );
-    assert!(
-        verifier.len() <= 128,
-        "Verifier must not exceed 128 characters"
-    );
-    assert_eq!(
-        challenge.len(),
-        43,
-        "S256 challenge should be 43 characters"
-    );
-
-    // Verify base64url encoding (no +, /, or =)
-    assert!(!verifier.contains('+'));
-    assert!(!verifier.contains('/'));
-    assert!(!challenge.contains('+'));
-    assert!(!challenge.contains('/'));
 }
 
 #[tokio::test]
