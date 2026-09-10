@@ -3,8 +3,8 @@
 A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 authentication, REST API access, and WebSocket streaming capabilities.
 
 > [!WARNING]
-> **RISK WARNING**: This SDK is for advanced users and is provided "as is" without warranty of any kind. Automated trading involves significant risk of financial loss. 
-> **Always test your logic with a test account or "Paper Money" environment before using real capital.** 
+> **RISK WARNING**: This SDK is for advanced users and is provided "as is" without warranty of any kind. Automated trading involves significant risk of financial loss.
+> **Test your logic in isolated simulation before using real capital.** The [paper trading mode](docs/PAPER_TRADING.md) runs locally; it does not connect to thinkorswim paperMoney.
 > Use of this SDK is entirely at your own risk.
 
 ## Documentation
@@ -17,6 +17,8 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 - **[Developer Documentation](docs/DEVELOPER_DOCUMENTATION.md)**: For contributors and architecture review.
 
 ## Features
+
+- **[Paper trading and deterministic replay](docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency and authenticated gateway support. Start with `ops/paper/replay.jsonl`.
 
 - **OAuth2 Authentication**
   - Authorization code flow with built-in callback server
@@ -48,7 +50,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - Transaction history
 
 - **Runtime Resilience**
-  - Rate limiting (120 req/s with burst of 20)
+  - Rate limiting tuned to Schwab's 120 requests/minute limit (2 req/s, burst of 10)
   - Exponential backoff retry logic
   - 90-second crash detection for streaming
   - **WebSocket Ping/Pong heartbeat monitoring** (v0.2.0)
@@ -59,7 +61,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - Type-safe bindings for commonly used endpoints (OpenAPI coverage in progress)
 
 - **Streaming Advanced Features** (v0.2.0)
-  - **Bounded/Unbounded channels** for backpressure control
+  - **Bounded channels** with explicit gap notifications
   - Automatic Ping/Pong heartbeat (20s interval, 30s timeout)
   - Subscription persistence across reconnections
   - Custom field selection per service
@@ -327,8 +329,8 @@ let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
 
 // Advanced quotes: only request specific fields and enable indicative pricing
 let adv_quotes = client.get_quotes_with_options(
-    &["AAPL"], 
-    Some("quote,reference"), 
+    &["AAPL"],
+    Some("quote,reference"),
     Some(true)
 ).await?;
 
@@ -338,8 +340,10 @@ let chain = client.get_option_chain("SPY").await?;
 // Preview an order (validate without executing)
 let preview = client.preview_order("account_hash", &order).await?;
 
-// Place an order
+// Place an order — Schwab returns the new order's ID via the
+// `Location` header (no JSON body)
 let response = client.place_order("account_hash", &order).await?;
+println!("order id: {:?}", response.order_id);
 ```
 
 ### 4. Stream Market Data
@@ -349,10 +353,12 @@ use schwab_rs::streaming::{StreamClient, StreamMessage};
 use schwab_rs::types::streaming::StreamService;
 
 // Build streaming client
+// customer/correl IDs, channel, and function ID come from
+// `get_user_preferences()` → `streamerInfo`
 let stream_client = StreamClient::builder()
     .config(stream_config)
     .auth_manager(auth_manager.clone())
-    .customer_id(customer_id)
+    .streamer_info(&streamer_info)
     .build()?;
 
 // Connect and (attempt to) subscribe
@@ -449,7 +455,8 @@ export SCHWAB_REFRESH_BUFFER=61        # seconds before expiry to refresh
 
 # MCP observability + PII
 export SCHWAB_METRICS_BIND=127.0.0.1:9090
-export SCHWAB_MCP_REDACT_PII=1
+export SCHWAB_MCP_REDACT_PII=1         # account-number masking (creds/identity always dropped)
+export SCHWAB_MCP_ALLOW_REMOTE=0       # allow non-loopback http/ws bind (bearer policy and TLS proxy required)
 ```
 
 See `.env.example` for the full, commented catalog.
@@ -476,11 +483,20 @@ SCHWAB_MCP_TRANSPORT=websocket SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwa
 Tokens must already exist on disk (run the `oauth_flow` example first, or any
 `AuthManager`-based flow that persists to `SCHWAB_TOKENS_FILE`).
 
+Network transports require `SCHWAB_MCP_POLICY_FILE` and a bearer token on
+every request. Principals have explicit account/tool permissions and isolated
+sessions. Remote access also requires a TLS proxy and
+`SCHWAB_MCP_ALLOW_REMOTE=1` for non-loopback binding. See the
+[policy configuration and migration guide](docs/ENTERPRISE_REMEDIATION.md).
+
+
 ### Guardrail for real trades
 
 Write-side order tools (`place_order`, `cancel_order`, `replace_order`) are
-**disabled by default**. Set `SCHWAB_MCP_ALLOW_TRADING=1` to enable them.
-`preview_order` is always available.
+**disabled by default**. Place/replace require `SCHWAB_MCP_ALLOW_TRADING=1`
+and principal policy approval. Cancellation can be enabled independently with
+`SCHWAB_MCP_ALLOW_CANCEL=1`. All policy-bound tools, including preview,
+require an explicit tool permission.
 
 ### Tool surface
 
@@ -649,8 +665,9 @@ let config = SchwabConfig {
         timeout: Duration::from_secs(10),
         rate_limit: RateLimitConfig {
             enabled: true,
-            requests_per_second: 120,
-            burst_size: 20,
+            // Schwab's documented limit is 120 requests per minute
+            requests_per_second: 2,
+            burst_size: 10,
         },
         retry: RetryConfig {
             max_retries: 3,
@@ -684,8 +701,8 @@ match client.get_quotes(&["AAPL"]).await {
 ## Important Notes
 
 1. **Exact Callback URL Match**: Must exactly match registered URL (HTTPS only, no trailing slash)
-2. **Key Lengths**: App key must be 32 chars, secret must be 16 chars
-3. **Rate Limits**: SDK defaults to 120 requests/second with burst of 20
+2. **Key Lengths**: Schwab issues several variants; keys/secrets must be even-length and at least 32 chars combined
+3. **Rate Limits**: Schwab allows 120 requests/minute; the SDK defaults to 2 req/s with a burst of 10
 4. **Token Expiration**: Access tokens expire in ~30 minutes; refresh tokens in ~7 days
 5. **Session Management**: HTTP client is recreated after token refresh
 6. **Token Storage**: Defaults to Keychain (macOS) or EncryptedFile (other platforms)
@@ -706,10 +723,10 @@ use schwab_rs::{StreamConfig, ChannelKind};
 
 let mut config = StreamConfig::default();
 
-// Unbounded (default - no backpressure)
+// Legacy compatibility setting (now capped at 65,536 messages)
 config.channel_kind = ChannelKind::Unbounded;
 
-// Bounded (recommended for production - prevents memory growth)
+// Bounded (default capacity: 4,096; overflow invalidates stream health)
 config.channel_kind = ChannelKind::Bounded(10000); // 10k message buffer
 
 let stream = StreamClient::builder()
@@ -812,3 +829,17 @@ cargo run -p streaming-examples --bin streaming_demo
 cargo run -p streaming-examples --bin streaming_quotes
 cargo run -p streaming-examples --bin streaming_processing
 ```
+
+See [enterprise remediation and migration notes](docs/ENTERPRISE_REMEDIATION.md)
+for execution reconciliation, decimal order requests, principal authorization,
+stream freshness, compiler support, and release validation requirements.
+
+
+The 0.2.0 candidate adds transactional state, reconciliation, shared local
+coordination, short-lived identity, portfolio risk integration and operator
+commands. See [enterprise operations](docs/OPERATIONS.md) for migration,
+configuration and external release gates. This candidate has not been published.
+
+For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](docs/SHARED_AUTHORITY.md).
+
+See the [MCP and LLM integration review](docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper-mode gaps, and the TurboMCP v4 migration criteria.

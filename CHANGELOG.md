@@ -1,11 +1,191 @@
 # Changelog
 
+## Paper trading candidate
+
+- Capture execution mutations atomically for new paper runs, including committed injected rejection and lost acknowledgement.
+- Verify captured execution history from a backup with `schwab-paper-verify --backup`; compare final accounts and complete order history and reject incomplete capture.
+
+- Add `schwab-paper-verify` for isolated bounded transcript verification with final account coverage and integrity checks.
+- Require dedicated paper ingestion roles; operator grants no longer imply quote, calendar, corporate-action or fault injection. Record accepted-event provenance atomically.
+
+- Version the paper model as `equity-bbo-v2`; older runs require their original binary/configuration.
+- Add explicit settlement calendars, durable pending cash, dividend entitlements, split cash-in-lieu and persistent stop triggers.
+- Add opt-in read-only REST quotes/calendar polling, logical integrity checks and backup-backed event payload compaction.
+
+- Add isolated durable long-equity paper execution, replay and wall-clock modes, finite-liquidity partial fills, exact-decimal accounting and injected faults.
+- Share verified gateway approval/lease controls through `TradingBackend`; add paper market ingestion and scoped account reports.
+- Add `schwab-paper` offline replay CLI, example commands, mode-isolation checks and release artifact inclusion.
+
+
+### Enterprise follow-up (0.2 candidate)
+
+- Revalidate risk after admission waits; persist operator halts independently of recovery.
+- Split full order-history windows, follow known old orders by ID, and include external open-order exposure.
+- Add authenticated remote backends and a broker authority/gateway with verified operator roles and fenced risk validation.
+- Deliver audit batches with exact durable acknowledgements and canonical object-key hashing.
+- Bound REST recovery and synthetic delivery gaps; cover shared state, approval replay/revocation and recovery end to end.
+- Existing risk plugins must implement dispatch revalidation; use durable halt APIs for operator control. Review outstanding approvals after canonical digest migration.
+
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased — 0.2.0 candidate]
+
+### Enterprise utility operations
+
+- Replace local JSON execution state with transactional SQLite, preserving legacy intent/deduplication state through migration; add backup/restore and ordered audit export.
+- Add tagged broker reconciliation, generation-aware stream baseline recovery, durable activity observations and retained risk reservations.
+- Add shared local quotas, renewable ownership leases and pluggable execution/coordination/risk backends.
+- Add issuer JWT verification, expiring static credentials, policy reload/revocation and trusted operator approval commands.
+- Add portfolio/readiness checks, Prometheus alert rules, property/crash tests, benchmark/soak harnesses, compatibility checks and release provenance/SBOM generation.
+- This is a breaking pre-1.0 release candidate; see `docs/OPERATIONS.md` before migration. It has not been published.
+
+### Enterprise audit remediation
+
+- Prevent ambiguous order replay with durable intent/reconciliation records.
+- Separate strict decimal order requests from tolerant broker responses; correct protective orders and market-data wire contracts.
+- Coordinate token refresh across processes, validate callback state, and recover rejected access tokens and circuit breakers.
+- Expose stream loss/freshness and gate subscription restoration on acknowledgements.
+- Require network principal authorization, account/tool policy, risk caps and durable execution audit; keep cancellation separately controllable.
+- Add Windows atomic protected file storage, update dependencies and raise the minimum compiler to Rust 1.89.
+- See [migration and validation notes](docs/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
+
+### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
+- **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
+  **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now
+  `{ errors, quotes: HashMap<String, QuoteItem> }` (flattened on the
+  wire); `get_quote` extracts the requested symbol from the map.
+  `QuoteItem` gained `assetMainType`/`assetSubType`/`quoteType`/
+  `realtime`/`ssid` and tolerates missing fields.
+- **Order submission**: Schwab answers `POST .../orders` and
+  `PUT .../orders/{id}` with **201 + empty body** and the order URL in
+  the `Location` header. `place_order`/`replace_order` now return
+  `OrderSubmitResponse { order_id, location }` parsed from that header
+  (previously they tried to deserialize a JSON body and reported
+  *failure on successful submissions*). `preview_order` returns the raw
+  JSON validation payload (`serde_json::Value`) since its shape varies.
+- **Instruments**: `InstrumentsResponse` now matches the
+  `{"instruments": [...]}` wrapper.
+- **Market hours**: `get_markets`/`get_market` return the doubly nested
+  `{market_type: {product: hours}}` map Schwab actually sends.
+- **Transactions**: parameter renamed `type` → `types` (the name Schwab
+  accepts) and `start_date`/`end_date`/`types` are now required
+  arguments, as the API mandates. `get_account_orders`/`get_all_orders`
+  similarly require `fromEnteredTime`/`toEnteredTime`.
+- **User preferences**: `AccountPreferences` field names corrected to
+  the wire format (`primaryAccount`, `nickName`, `displayAcctId`);
+  `TransactionUser`/`Offer` fields made optional for tolerance.
+- Added `crates/schwab-types/tests/response_shapes.rs` — fixture-based
+  deserialization tests so wire-shape regressions fail in CI.
+
+### Fixed — streaming protocol & reliability
+- Subscriptions now use the **`ADD`** command (additive) like the
+  reference client. `SUBS` *replaces* a service's entire key list
+  server-side, so a second `subscribe()` call silently dropped earlier
+  symbols while the local tracker still counted them.
+- Streamer LOGIN sends `SchwabClientChannel`/`SchwabClientFunctionId`
+  from the user-preferences `streamerInfo` (via the new
+  `StreamerIdentity`) instead of hardcoded `N9`/`APIAPP`.
+- Heartbeat timeout now actually tears the connection down: the read
+  loop runs under `tokio::select!` against the heartbeat watchdog, so a
+  silently dead TCP connection reconnects instead of blocking forever.
+- The 90-second crash heuristic only applies to the *first* session
+  after `connect()`; once a session has authenticated, drops always go
+  through backoff-reconnect. Previously any error within 90 s of a
+  (re)connect attempt — e.g. a transient DNS failure during reconnect —
+  permanently killed a stream that had been healthy for hours.
+- Matching Schwabdev 3.0.5: a server close with WebSocket code 1000 is
+  treated as a graceful stop (no reconnect); abnormal closes reconnect.
+- Backoff resets after each successful login (was: only on clean close).
+- Per-service default field lists (books, screeners, futures, forex,
+  chart futures) via `StreamService::default_fields()` — previously all
+  non-equity services fell back to the *equity* field list.
+- `disconnect()` sends a best-effort `ADMIN/LOGOUT` before tearing down.
+- Unparseable stream frames are logged + counted
+  (`schwab_stream_messages_total{service="_unparsed"}`) instead of
+  silently dropped; `DataContent.delayed` is optional for tolerance.
+- `max_subscriptions` is now enforced (`SymbolLimitReached`).
+- Fixed a `pending_acks` entry leak when queuing a request fails.
+
+### Fixed — auth lifecycle
+- Credential validation relaxed to Schwabdev 3.0.4's rule (even-length
+  key + secret, ≥ 32 chars combined) — the previous exact 32/48 + 16/64
+  check rejects newer Schwab-issued credential formats.
+- `AuthManager` is `Clone`, but `Drop` aborted the **shared**
+  auto-refresh task as soon as *any* clone dropped (e.g. via
+  `stream_disconnect`), silently stopping token refresh process-wide.
+  The task is now only aborted when the last clone drops.
+- The OAuth callback server now serves **TLS** with an in-memory
+  self-signed certificate (rcgen + axum-server). Schwab requires an
+  `https://` callback URL, so the previous plain-HTTP listener could
+  never complete the browser handshake and the code was never captured.
+
+### Fixed — client defaults & transport
+- **Rate limiter default corrected to Schwab's actual limit**: 120
+  requests/**minute** (2 req/s, burst 10). The previous default of 120
+  req/s was 60× too permissive and effectively decorative.
+- 429 responses now produce `Error::RateLimit` carrying the server's
+  `Retry-After` value, which the retry policy honors (this path was
+  previously dead code — the header was never parsed).
+- `ClientConfig::user_agent` is actually applied to the HTTP transport.
+- `SchwabConfig::validate()` runs the SSRF URL-domain allowlist for all
+  construction paths (previously only `from_env`/`from_file`).
+- `SchwabConfig::save()` writes via `secure_file_write` (0600, atomic) —
+  the config contains `app_secret` in plaintext.
+- `get_instrument` URL-encodes the CUSIP path segment.
+
+### Changed
+- `StreamClient::new` takes a `StreamerIdentity` (customer/correl IDs +
+  channel/function ID); the builder gains `.channel()`, `.function_id()`
+  and `.streamer_info(&StreamerInfo)`.
+- `SchwabClientBuilder` dropped its `auth_manager()`/`http_client()`
+  setters — `build()` always ignored them.
+- Removed the deprecated `StreamConfig::buffer_size` (use
+  `channel_kind`).
+- `turbomcp` is now a crates.io dependency (was a local path dep that
+  made the repo unbuildable without a sibling checkout); use
+  `[patch.crates-io]` for local development.
+- `schwab-mcp`: `get_transactions`/`get_account_orders`/`get_all_orders`
+  tool params updated to match the required-argument API; tool timing
+  boilerplate collapsed into a `timed()` helper; `stream_connect` and
+  the implicit connect in `stream_subscribe` share one code path.
+- Repo is dual-licensed properly: `LICENSE-MIT` + `LICENSE-APACHE` now
+  both ship, matching the `MIT OR Apache-2.0` manifest declaration.
+
+### Security
+- `cargo update -p rustls-webpki` → 0.103.13 (RUSTSEC-2026-0104,
+  reachable panic in CRL parsing). Remaining `cargo audit` findings are
+  *warnings* in turbomcp's transitive deps (`rustls-pemfile`
+  unmaintained, `rkyv` unsound advisory) — tracked upstream.
+- `schwab-mcp` redaction extended to `ACCT_ACTIVITY` streamer frames
+  cached for `stream_snapshot`: the raw account number in positional
+  field `1` is masked and the JSON activity payload in field `3`
+  (including PascalCase `AccountNumber`) is recursively redacted
+  *before caching*, so no tool can expose the raw frame.
+- `stream_connect` no longer echoes the streamer websocket URL
+  (consistent with `streamerSocketUrl` being stripped from every
+  response), and the `get_user_preferences` tool description no longer
+  advertises the streaming credentials that redaction removes.
+- README now documents that the MCP HTTP/WebSocket transports carry no
+  request authentication (Origin validation only) and must stay on
+  localhost or behind an authenticating reverse proxy.
+- `schwab-mcp` now **refuses to bind** the HTTP/WebSocket transports to a
+  non-loopback address unless `SCHWAB_MCP_ALLOW_REMOTE=1` is set, closing
+  the most dangerous misconfiguration (an unauthenticated tool surface,
+  incl. trading, exposed on `0.0.0.0`). Opting in logs a loud warning,
+  with an extra warning when trading is also enabled. (Per-request bearer
+  auth is deferred to the turbomcp v4 migration rather than wiring the
+  soon-to-be-replaced v3 server auth path.)
+- Redaction hardened so the `SCHWAB_MCP_REDACT_PII` kill switch can
+  **only un-mask account numbers** for local debugging — streamer
+  credentials and user-identity fields are now dropped unconditionally
+  and cannot be re-enabled by any env var.
+- `schwab-rs` no longer embeds the absolute token-file path in the
+  `TokenFileInsecure` error (it could reach an LLM via an MCP tool
+  response); the path is logged for the operator instead.
 
 ### Added
 - **Observability** — SDK-side metrics facade via the `metrics` crate
@@ -121,3 +301,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `chacha20poly1305` (0.10)
 - `keyring` (3.6)
 - `secrecy` (0.10)
+
+### MCP dependency and integration review
+
+- Upgrade stable TurboMCP to 3.3 and refresh compatible locked dependencies.
+- Add behavior hints to all MCP tools and live-execution guidance to discovery.
+- Remove unused dependencies, configure weekly dependency checks, and document LLM integration gaps and v4 migration criteria.
