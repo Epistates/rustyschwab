@@ -1,0 +1,6 @@
+[
+  {"subject":"replace-with-market-data-service-subject","role":"paper_market_data"},
+  {"subject":"replace-with-calendar-service-subject","role":"paper_calendar"},
+  {"subject":"replace-with-corporate-action-service-subject","role":"paper_corporate_actions"},
+  {"subject":"replace-with-test-fault-service-subject","role":"paper_fault"}
+]

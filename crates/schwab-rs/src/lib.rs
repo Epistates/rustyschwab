@@ -10,6 +10,7 @@
 pub const VERSION: &str = concat!("schwab-rs ", env!("CARGO_PKG_VERSION"));
 
 pub mod auth;
+pub mod broker;
 pub mod circuit_breaker;
 pub mod client;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod coordination;
 pub mod error;
 pub mod execution;
 pub mod metrics;
+pub mod paper;
 pub mod readiness;
 pub mod reconciliation;
 pub mod recovery;

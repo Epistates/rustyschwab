@@ -1,0 +1,22 @@
+{
+  "model_version": "equity-bbo-v2",
+  "clock": "replay",
+  "accounts": {
+    "paper-demo": {
+      "initial_cash": "100000",
+      "limits": {
+        "max_open_quantity": "1000",
+        "max_open_notional": "50000",
+        "max_position_quantity": "2000",
+        "max_snapshot_age_ms": 5000
+      }
+    }
+  },
+  "execution_latency_ms": 25,
+  "cancel_latency_ms": 50,
+  "quote_max_age_ms": 5000,
+  "slippage_bps": "1",
+  "market_collar_bps": "100",
+  "fee_per_share": "0.005",
+  "max_working_orders": 1000
+}

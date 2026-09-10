@@ -1,0 +1,8 @@
+{"command":"event","event":{"sequence":1,"at_ms":0,"kind":{"kind":"session","session_id":"synthetic-session-1","open":true}}}
+{"command":"event","event":{"sequence":2,"at_ms":100,"kind":{"kind":"quote","symbol":"ABC","source_at_ms":100,"bid":"99.98","ask":"100","bid_size":"100","ask_size":"100"}}}
+{"command":"place","account":"paper-demo","order":{"tag":"demo-buy-1","orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"101","orderLegCollection":[{"quantity":"5","instruction":"BUY","instrument":{"symbol":"ABC","assetType":"EQUITY"}}]}}
+{"command":"event","event":{"sequence":3,"at_ms":200,"kind":{"kind":"quote","symbol":"ABC","source_at_ms":200,"bid":"99.98","ask":"100","bid_size":"2","ask_size":"2"}}}
+{"command":"snapshot","account":"paper-demo"}
+{"command":"cancel","account":"paper-demo","order_id":"1"}
+{"command":"event","event":{"sequence":4,"at_ms":260,"kind":{"kind":"clock"}}}
+{"command":"snapshot","account":"paper-demo"}

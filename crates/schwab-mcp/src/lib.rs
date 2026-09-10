@@ -4,6 +4,7 @@
 pub mod identity;
 pub mod metrics;
 pub mod network;
+pub mod paper_replay;
 pub mod policy;
 pub mod redact;
 pub mod server;
