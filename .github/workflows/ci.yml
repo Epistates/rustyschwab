@@ -52,7 +52,7 @@ jobs:
         toolchain: [stable]
         include:
           - os: ubuntu-latest
-            toolchain: "1.85" # MSRV gate
+            toolchain: "1.89.0" # MSRV gate
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -60,7 +60,8 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets --locked
-      - run: cargo test --workspace --all-targets --locked
+      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo check -p schwab-rs --no-default-features --locked
 
   audit:
     name: cargo audit
@@ -70,3 +71,29 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  compatibility:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 -m unittest discover -s tools -p 'test_*.py'
+      - run: cargo build -p enterprise-bench --release --locked
+      - run: python3 tools/soak.py --seconds 60 --output soak-fast.json
+      - run: python3 tools/soak.py --seconds 60 --consumer-delay-ms 10 --output soak-slow.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stream-soak-evidence
+          path: soak-*.json

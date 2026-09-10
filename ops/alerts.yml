@@ -1,0 +1,33 @@
+groups:
+  - name: schwab-execution
+    rules:
+      - alert: SchwabUnknownSubmission
+        expr: (schwab_pending_submissions > 0) or (increase(schwab_submission_unknown_total[5m]) > 0)
+        for: 30s
+        labels: {severity: critical}
+        annotations:
+          summary: Pending execution requires broker reconciliation
+          runbook: docs/OPERATIONS.md
+      - alert: SchwabStreamLoss
+        expr: increase(schwab_stream_dropped_messages_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Stream loss detected; verify reconciliation readiness
+          runbook: docs/OPERATIONS.md
+      - alert: SchwabAccountBaselineStale
+        expr: schwab_baseline_age_seconds > 5
+        for: 15s
+        labels: {severity: critical}
+        annotations:
+          summary: Account baseline is too old for trading
+      - alert: SchwabAuthRefreshFailure
+        expr: increase(schwab_token_refresh_total{outcome="failure"}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Authentication refresh failed
+      - alert: SchwabTradingUnavailable
+        expr: schwab_trading_ready == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: Trading readiness has remained false

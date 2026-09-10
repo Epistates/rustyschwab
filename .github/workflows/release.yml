@@ -1,0 +1,44 @@
+name: Release evidence
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  artifacts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo build -p schwab-mcp --bins --release --locked
+      - run: python3 tools/sbom.py target/sbom.cdx.json
+      - run: sha256sum target/release/schwab-mcp target/release/schwab-admin target/release/schwab-authority target/release/schwab-remote target/release/schwab-paper target/release/schwab-paper-verify target/sbom.cdx.json > target/SHA256SUMS
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            target/release/schwab-mcp
+            target/release/schwab-admin
+            target/release/schwab-authority
+            target/release/schwab-remote
+            target/release/schwab-paper
+            target/release/schwab-paper-verify
+            target/sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-evidence
+          path: |
+            target/release/schwab-mcp
+            target/release/schwab-admin
+            target/release/schwab-authority
+            target/release/schwab-remote
+            target/release/schwab-paper
+            target/release/schwab-paper-verify
+            target/sbom.cdx.json
+            target/SHA256SUMS
