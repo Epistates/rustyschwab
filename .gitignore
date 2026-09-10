@@ -60,3 +60,12 @@ venv/
 __pycache__/
 
 .strategy
+# Intentionally public, test-only RSA private key used by JWT regression fixtures.
+!crates/schwab-mcp/tests/fixtures/test-only-signing-key.pem
+
+# Generated qualification evidence (clippy/rustdoc/soak/SBOM output). Produced
+# by tools/ and the qualification workflow; kept out of the repo.
+docs/audit/
+
+# Local project-index metadata, not part of the repo.
+/.claude/state.json
