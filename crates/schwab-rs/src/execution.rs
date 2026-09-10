@@ -1,0 +1,397 @@
+//! Durable submission intent/outcome journal. Pending intents survive task
+//! cancellation and process failure, and block new submissions for that account.
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmissionRecord {
+    pub attempt_id: String,
+    pub account: String,
+    pub operation: String,
+    pub request: serde_json::Value,
+    pub created_at: i64,
+    pub outcome: Option<SubmissionOutcome>,
+    #[serde(default)]
+    pub dedup_key: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SubmissionOutcome {
+    Accepted {
+        order_id: Option<String>,
+    },
+    Rejected,
+    /// Explicit reconciliation by a trusted caller, after querying the broker.
+    Reconciled {
+        evidence: String,
+    },
+}
+#[derive(Debug, Clone)]
+pub struct OrderJournal {
+    database: crate::storage::StateDatabase,
+}
+impl OrderJournal {
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            database: crate::storage::StateDatabase::new(path),
+        }
+    }
+    pub fn database(&self) -> &crate::storage::StateDatabase {
+        &self.database
+    }
+    pub fn path(&self) -> &Path {
+        self.database.path()
+    }
+    pub async fn begin(
+        &self,
+        account: &str,
+        operation: &str,
+        request: serde_json::Value,
+    ) -> Result<String> {
+        self.begin_once(account, operation, request, None).await
+    }
+    pub async fn begin_once(
+        &self,
+        account: &str,
+        operation: &str,
+        request: serde_json::Value,
+        dedup_key: Option<String>,
+    ) -> Result<String> {
+        let account = account.to_owned();
+        let operation = operation.to_owned();
+        self.database.run(move |conn| {
+            use rusqlite::{OptionalExtension, params};
+            use crate::storage::{sql,audit};
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
+            if let Some(key) = &dedup_key {
+                let used: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM consumed_approvals WHERE key=?1)",[key],|r|r.get(0)).map_err(sql)?;
+                if used { return Err(Error::InvalidParameter("Execution intent already consumed".into())); }
+            }
+            let pending: Option<String> = tx.query_row("SELECT id FROM submissions WHERE account=?1 AND outcome IS NULL",[&account],|r|r.get(0)).optional().map_err(sql)?;
+            if let Some(attempt_id) = pending { return Err(Error::ReconciliationRequired { attempt_id }); }
+            if let Some(key)=&dedup_key {
+                let configured:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE digest=?1)",[key],|r|r.get(0)).map_err(sql)?;
+                if configured && tx.execute("UPDATE approvals SET consumed=1 WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0",params![key,account,chrono::Utc::now().timestamp()]).map_err(sql)?!=1 {
+                    return Err(Error::InvalidParameter("Approval expired, revoked or belongs to another principal".into()));
+                }
+            }
+            if let Some(tag)=request.get("tag").and_then(serde_json::Value::as_str) {
+                if tag.trim().is_empty(){return Err(Error::InvalidParameter("Order tag must not be empty".into()));}
+                if tx.execute("INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)",params![account,tag]).map_err(sql)?!=1{return Err(Error::InvalidParameter("Order tag was already used for this account".into()));}
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let record = SubmissionRecord { attempt_id:id.clone(),account,operation,request,created_at:chrono::Utc::now().timestamp_millis(),outcome:None,dedup_key };
+            tx.execute("INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)",params![record.attempt_id,record.account,record.operation,record.created_at,serde_json::to_string(&record.request)?,record.dedup_key]).map_err(sql)?;
+            if let Some(key) = &record.dedup_key { tx.execute("INSERT INTO consumed_approvals VALUES(?1)",[key]).map_err(sql)?; }
+            audit(&tx,"intent",&id,&serde_json::to_value(&record)?)?;
+            tx.commit().map_err(sql)?;
+            Ok(id)
+        }).await
+    }
+    pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
+        if let SubmissionOutcome::Reconciled { evidence } = &outcome
+            && evidence.trim().is_empty()
+        {
+            return Err(Error::InvalidParameter(
+                "Reconciliation evidence is required".into(),
+            ));
+        }
+        let id = id.to_owned();
+        self.database
+            .run(move |conn| {
+                use crate::storage::{audit, sql};
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let changed = tx
+                    .execute(
+                        "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL",
+                        rusqlite::params![serde_json::to_string(&outcome)?, id],
+                    )
+                    .map_err(sql)?;
+                if changed != 1 {
+                    return Err(Error::InvalidParameter(
+                        "Submission is unknown or already resolved".into(),
+                    ));
+                }
+                audit(&tx, "outcome", &id, &serde_json::to_value(&outcome)?)?;
+                tx.commit().map_err(sql)?;
+                Ok(())
+            })
+            .await
+    }
+    pub async fn records(&self) -> Result<Vec<SubmissionRecord>> {
+        self.database.run(|conn| {
+            let mut query = conn.prepare("SELECT id,account,operation,created_at,request,outcome,dedup_key FROM submissions ORDER BY created_at,id").map_err(crate::storage::sql)?;
+            let rows = query.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?))).map_err(crate::storage::sql)?;
+            rows.map(|row| { let (attempt_id,account,operation,created_at,request,outcome,dedup_key) = row.map_err(crate::storage::sql)?; Ok(SubmissionRecord { attempt_id,account,operation,created_at,request:serde_json::from_str(&request)?,outcome:outcome.map(|s|serde_json::from_str(&s)).transpose()?,dedup_key }) }).collect()
+        }).await
+    }
+    /// Ordered, bounded pages for an external immutable audit sink.
+    pub async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
+        self.database.run(move |conn| {
+            let mut stmt = conn.prepare("SELECT sequence,at,kind,subject,payload FROM audit WHERE sequence>?1 ORDER BY sequence LIMIT ?2").map_err(crate::storage::sql)?;
+            let rows = stmt.query_map(rusqlite::params![after,limit.clamp(1,10000)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,String>(4)?))).map_err(crate::storage::sql)?;
+            rows.map(|row|{let(sequence,at,kind,subject,payload)=row.map_err(crate::storage::sql)?; Ok(AuditEvent{sequence,at,kind,subject,payload:serde_json::from_str(&payload)?})}).collect()
+        }).await
+    }
+    /// Explicit retention after durable export acknowledgement. Pending records,
+    /// consumed approval tombstones and all audit events remain intact.
+    pub async fn prune_resolved(&self, before: i64, exported_through: i64) -> Result<usize> {
+        self.database.run(move |conn| {
+            conn.execute("DELETE FROM submissions WHERE outcome IS NOT NULL AND created_at<?1 AND NOT EXISTS(SELECT 1 FROM audit WHERE subject=submissions.id AND sequence>?2) AND NOT EXISTS(SELECT 1 FROM reservations r WHERE r.id=submissions.id AND r.state='held') AND (json_extract(outcome,'$.status') IN ('rejected','reconciled') OR EXISTS(SELECT 1 FROM orders o WHERE o.account=submissions.account AND o.order_id=json_extract(submissions.outcome,'$.order_id') AND json_extract(o.payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')))",rusqlite::params![before,exported_through]).map_err(crate::storage::sql)
+        }).await
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEvent {
+    pub sequence: i64,
+    pub at: i64,
+    pub kind: String,
+    pub subject: String,
+    pub payload: serde_json::Value,
+}
+
+impl OrderJournal {
+    pub async fn approve(
+        &self,
+        principal: &str,
+        digest: &str,
+        operator: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        if principal == operator
+            || operator.trim().is_empty()
+            || digest.len() != 64
+            || !digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(Error::InvalidParameter(
+                "Approval requires a distinct operator and a SHA-256 intent digest".into(),
+            ));
+        }
+        let now = chrono::Utc::now().timestamp();
+        if expires_at <= now || expires_at > now + 3600 {
+            return Err(Error::InvalidParameter(
+                "Approval must expire within one hour".into(),
+            ));
+        }
+        let principal = principal.to_owned();
+        let digest = digest.to_owned();
+        let operator = operator.to_owned();
+        self.database.run(move|c|{
+            let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(crate::storage::sql)?;
+            tx.execute("INSERT INTO approvals(digest,principal,expires_at,operator) VALUES(?1,?2,?3,?4)",rusqlite::params![digest,principal,expires_at,operator]).map_err(crate::storage::sql)?;
+            crate::storage::audit(&tx,"approval_granted",&digest,&serde_json::json!({"principal":principal,"operator":operator,"expires_at":expires_at}))?;
+            tx.commit().map_err(crate::storage::sql)?;Ok(())
+        }).await
+    }
+    pub async fn approval_operator(&self, digest: &str) -> Result<Option<String>> {
+        let digest = digest.to_owned();
+        self.database
+            .run(move |c| {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT operator FROM approvals WHERE digest=?1",
+                    [digest],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(crate::storage::sql)
+            })
+            .await
+    }
+    pub async fn is_approved(&self, principal: &str, digest: &str) -> Result<bool> {
+        let principal = principal.to_owned();
+        let digest = digest.to_owned();
+        self.database.run(move|c|c.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0)",rusqlite::params![digest,principal,chrono::Utc::now().timestamp()],|r|r.get(0)).map_err(crate::storage::sql)).await
+    }
+    pub async fn revoke_approval(&self, digest: &str, operator: &str) -> Result<()> {
+        let digest = digest.to_owned();
+        let operator = operator.to_owned();
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(crate::storage::sql)?;
+                tx.execute("UPDATE approvals SET consumed=1 WHERE digest=?1", [&digest])
+                    .map_err(crate::storage::sql)?;
+                // Tombstone also revokes an approval originally supplied in policy.
+                tx.execute(
+                    "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)",
+                    [&digest],
+                )
+                .map_err(crate::storage::sql)?;
+                crate::storage::audit(
+                    &tx,
+                    "approval_revoked",
+                    &digest,
+                    &serde_json::json!({"operator":operator}),
+                )?;
+                tx.commit().map_err(crate::storage::sql)?;
+                Ok(())
+            })
+            .await
+    }
+}
+
+/// Atomic storage boundary for deployments using a remote transactional ledger.
+/// Implementations must enforce one pending intent per account and permanent
+/// deduplication tombstones in the same transaction as intent insertion.
+#[async_trait::async_trait]
+pub trait ExecutionStore: Send + Sync {
+    async fn begin_once(
+        &self,
+        account: &str,
+        operation: &str,
+        request: serde_json::Value,
+        dedup_key: Option<String>,
+    ) -> Result<String>;
+    async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()>;
+    async fn records(&self) -> Result<Vec<SubmissionRecord>>;
+    async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()>;
+    async fn account_state(
+        &self,
+        account: &str,
+    ) -> Result<Option<crate::reconciliation::AccountState>>;
+    async fn reconcile_snapshot(
+        &self,
+        account: &str,
+        generation: u64,
+        started_at: i64,
+        snapshot: serde_json::Value,
+        orders: Vec<serde_json::Value>,
+    ) -> Result<crate::reconciliation::ReconciliationReport>;
+    async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>>;
+    async fn healthcheck(&self) -> Result<()>;
+    async fn pending_count(&self) -> Result<usize>;
+    async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>>;
+    async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
+    async fn operator_halt(&self) -> Result<Option<String>>;
+    async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()>;
+}
+#[async_trait::async_trait]
+impl ExecutionStore for OrderJournal {
+    async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>> {
+        let account = account.to_owned();
+        self.database.run(move |c| {
+            let mut stmt = c.prepare("SELECT order_id FROM orders WHERE account=?1 AND COALESCE(json_extract(payload,'$.status'),'UNKNOWN') NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') UNION SELECT json_extract(s.outcome,'$.order_id') FROM submissions s WHERE s.account=?1 AND json_extract(s.outcome,'$.order_id') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') AND json_extract(o.payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))").map_err(crate::storage::sql)?;
+            stmt.query_map([account],|r|r.get(0)).map_err(crate::storage::sql)?.collect::<std::result::Result<Vec<_>,_>>().map_err(crate::storage::sql)
+        }).await
+    }
+    async fn track_order(&self, account: &str, order_id: &str) -> Result<()> {
+        if order_id.is_empty() || !order_id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::InvalidParameter(
+                "Numeric broker order ID required".into(),
+            ));
+        }
+        let account = account.to_owned();
+        let id = order_id.to_owned();
+        self.database
+            .run(move |c| {
+                c.execute(
+                    "INSERT OR IGNORE INTO orders VALUES(?1,?2,0,?3)",
+                    rusqlite::params![
+                        account,
+                        id,
+                        serde_json::json!({"orderId":id,"status":"UNKNOWN"}).to_string()
+                    ],
+                )
+                .map_err(crate::storage::sql)?;
+                Ok(())
+            })
+            .await
+    }
+    async fn operator_halt(&self) -> Result<Option<String>> {
+        self.database
+            .run(|c| {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT value FROM meta WHERE key='operator_halt'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(crate::storage::sql)
+            })
+            .await
+    }
+    async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()> {
+        if operator.trim().is_empty() || reason.as_ref().is_some_and(|r| r.trim().is_empty()) {
+            return Err(Error::InvalidParameter(
+                "Operator and halt reason must be nonempty".into(),
+            ));
+        }
+        let operator = operator.to_owned();
+        self.database.run(move |c| {
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(crate::storage::sql)?;
+            if let Some(reason) = &reason {
+                tx.execute("INSERT INTO meta VALUES('operator_halt',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[reason]).map_err(crate::storage::sql)?;
+            } else {tx.execute("DELETE FROM meta WHERE key='operator_halt'",[]).map_err(crate::storage::sql)?;}
+            crate::storage::audit(&tx,"operator_halt_changed",&operator,&serde_json::json!({"reason":reason}))?;
+            tx.commit().map_err(crate::storage::sql)
+        }).await
+    }
+    async fn begin_once(
+        &self,
+        account: &str,
+        operation: &str,
+        request: serde_json::Value,
+        dedup_key: Option<String>,
+    ) -> Result<String> {
+        OrderJournal::begin_once(self, account, operation, request, dedup_key).await
+    }
+    async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
+        OrderJournal::finish(self, id, outcome).await
+    }
+    async fn records(&self) -> Result<Vec<SubmissionRecord>> {
+        OrderJournal::records(self).await
+    }
+    async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
+        self.database.invalidate_account(account, generation).await
+    }
+    async fn account_state(
+        &self,
+        account: &str,
+    ) -> Result<Option<crate::reconciliation::AccountState>> {
+        self.database.account_state(account).await
+    }
+    async fn reconcile_snapshot(
+        &self,
+        account: &str,
+        generation: u64,
+        started_at: i64,
+        snapshot: serde_json::Value,
+        orders: Vec<serde_json::Value>,
+    ) -> Result<crate::reconciliation::ReconciliationReport> {
+        self.database
+            .reconcile_snapshot(account, generation, started_at, snapshot, orders)
+            .await
+    }
+    async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
+        OrderJournal::audit_page(self, after, limit).await
+    }
+    async fn pending_count(&self) -> Result<usize> {
+        self.database
+            .run(|c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM submissions WHERE outcome IS NULL",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n as usize)
+                .map_err(crate::storage::sql)
+            })
+            .await
+    }
+    async fn healthcheck(&self) -> Result<()> {
+        self.database
+            .run(|c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(crate::storage::sql)?;
+                tx.commit().map_err(crate::storage::sql)
+            })
+            .await
+    }
+}

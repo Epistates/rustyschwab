@@ -64,6 +64,35 @@ fn every_expected_tool_is_registered() {
     let server = SchwabMcp::new(Arc::new(dummy));
 
     let tools = server.list_tools();
+    for tool in &tools {
+        let annotations = tool
+            .annotations
+            .as_ref()
+            .expect("explicit LLM behavior hints");
+        let mutates = matches!(
+            tool.name.as_str(),
+            "place_order"
+                | "replace_order"
+                | "cancel_order"
+                | "stream_connect"
+                | "stream_disconnect"
+                | "stream_subscribe"
+                | "stream_unsubscribe"
+                | "stream_set_service_fields"
+        );
+        assert_eq!(annotations.read_only_hint, Some(!mutates), "{}", tool.name);
+        assert_eq!(annotations.destructive_hint, Some(mutates), "{}", tool.name);
+        assert_eq!(annotations.idempotent_hint, Some(!mutates), "{}", tool.name);
+        assert_eq!(
+            annotations.open_world_hint,
+            Some(!matches!(
+                tool.name.as_str(),
+                "stream_status" | "stream_snapshot"
+            ))
+        );
+        let schema = serde_json::to_value(tool).unwrap();
+        assert!(schema["inputSchema"].is_object(), "{}", tool.name);
+    }
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
 
     for expected in EXPECTED_TOOLS {

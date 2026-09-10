@@ -18,13 +18,17 @@ use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Order {
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub order_id: Option<String>,
+    #[serde(default)]
     pub session: OrderSession,
+    #[serde(default)]
     pub duration: OrderDuration,
+    #[serde(default)]
     pub order_type: OrderType,
     pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
     pub quantity: Option<f64>,
@@ -33,6 +37,7 @@ pub struct Order {
     pub requested_destination: Option<String>,
     pub destination_link_name: Option<String>,
     pub price: Option<f64>,
+    #[serde(default)]
     pub order_leg_collection: Vec<OrderLeg>,
     pub order_strategy_type: Option<OrderStrategyType>,
     pub cancelable: Option<bool>,
@@ -40,10 +45,21 @@ pub struct Order {
     pub status: Option<OrderStatus>,
     pub entered_time: Option<String>,
     pub close_time: Option<String>,
+    pub stop_price: Option<f64>,
+    pub stop_price_link_basis: Option<String>,
+    pub stop_price_link_type: Option<String>,
+    pub stop_price_offset: Option<f64>,
+    #[serde(default)]
+    pub child_order_strategies: Vec<Order>,
+    #[serde(default)]
+    pub order_activity_collection: Vec<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub account_number: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderLeg {
@@ -55,7 +71,7 @@ pub struct OrderLeg {
     pub quantity: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderInstrument {
@@ -65,7 +81,7 @@ pub struct OrderInstrument {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderSession {
@@ -76,12 +92,13 @@ pub enum OrderSession {
     Seamless,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderDuration {
     #[default]
     Day,
+    #[serde(rename = "GOOD_TILL_CANCEL")]
     Gtc,
     FillOrKill,
     ImmediateOrCancel,
@@ -90,7 +107,7 @@ pub enum OrderDuration {
     NextEndOfMonth,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderType {
@@ -111,7 +128,7 @@ pub enum OrderType {
     LimitOnClose,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ComplexOrderStrategyType {
@@ -138,16 +155,18 @@ pub enum ComplexOrderStrategyType {
     Custom,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Default)]
 pub enum OrderStrategyType {
+    #[default]
     Single,
     Oco,
     Trigger,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
@@ -170,10 +189,11 @@ pub enum OrderStatus {
     AwaitingReleaseTime,
     PendingAcknowledgement,
     PendingRecall,
+    #[serde(other)]
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderLegType {
@@ -187,7 +207,7 @@ pub enum OrderLegType {
     Currency,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderInstruction {
@@ -204,7 +224,7 @@ pub enum OrderInstruction {
     SellShortExempt,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PositionEffect {
@@ -214,20 +234,24 @@ pub enum PositionEffect {
     Automatic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Result of submitting an order via `POST .../orders` or `PUT .../orders/{id}`.
+///
+/// Schwab returns **201 Created with an empty body**; the only payload is a
+/// `Location` header pointing at the new order resource. The order ID is the
+/// last path segment of that URL. If the order filled immediately, Schwab may
+/// omit the header entirely — hence both fields are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-pub struct OrderResponse {
-    pub order_id: String,
-    pub status: String,
-    pub account_number: String,
-    pub entered_time: String,
-    pub close_time: Option<String>,
-    pub status_description: Option<String>,
+pub struct OrderSubmitResponse {
+    /// Order ID parsed from the `Location` header's last path segment.
+    pub order_id: Option<String>,
+    /// Full `Location` header value, when present.
+    pub location: Option<String>,
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -235,7 +259,9 @@ pub struct Transaction {
     pub time: Option<String>,
     pub user: Option<TransactionUser>,
     pub description: Option<String>,
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub account_number: Option<String>,
+    #[serde(rename = "type")]
     pub type_: Option<String>,
     pub status: Option<String>,
     pub sub_account: Option<String>,
@@ -249,21 +275,23 @@ pub struct Transaction {
     pub instrument: Option<TransactionInstrument>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionUser {
-    pub cd_domain_id: String,
-    pub login: String,
-    pub type_: String,
-    pub user_id: i64,
-    pub system_user_name: String,
-    pub first_name: String,
-    pub last_name: String,
-    pub broker_rep_code: String,
+    pub cd_domain_id: Option<String>,
+    pub login: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub user_id: Option<i64>,
+    pub system_user_name: Option<String>,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub broker_rep_code: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionInstrument {
@@ -277,4 +305,168 @@ pub struct TransactionInstrument {
     pub asset_type: Option<String>,
     pub bond_maturity_date: Option<String>,
     pub bond_interest_rate: Option<f64>,
+}
+
+/// Outgoing orders have a strict schema, separate from tolerant broker responses.
+/// Unsupported fields fail deserialization rather than silently altering a trade.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderRequest {
+    pub session: Option<OrderSession>,
+    pub duration: Option<OrderDuration>,
+    pub order_type: Option<OrderType>,
+    pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub quantity: Option<rust_decimal::Decimal>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub price: Option<rust_decimal::Decimal>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub stop_price: Option<rust_decimal::Decimal>,
+    pub stop_price_link_basis: Option<String>,
+    pub stop_price_link_type: Option<String>,
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    pub stop_price_offset: Option<rust_decimal::Decimal>,
+    pub stop_type: Option<String>,
+    pub price_link_basis: Option<String>,
+    pub price_link_type: Option<String>,
+    pub tax_lot_method: Option<String>,
+    pub tag: Option<String>,
+    pub special_instruction: Option<String>,
+    pub requested_destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub order_leg_collection: Vec<OrderRequestLeg>,
+    pub order_strategy_type: OrderStrategyType,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_order_strategies: Vec<OrderRequest>,
+}
+
+#[skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderRequestLeg {
+    pub instruction: OrderInstruction,
+    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    pub quantity: rust_decimal::Decimal,
+    pub instrument: OrderRequestInstrument,
+    pub position_effect: Option<PositionEffect>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OrderRequestInstrument {
+    pub symbol: String,
+    pub asset_type: String,
+}
+
+impl OrderRequest {
+    /// Validates structural safety without silently rounding prices. Broker
+    /// eligibility, buying power, and asset-specific increments require preview.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_depth(0)
+    }
+    fn validate_depth(&self, depth: usize) -> Result<(), String> {
+        if depth > 8 {
+            return Err("Order strategy nesting exceeds eight levels".into());
+        }
+        for (name, value) in [
+            ("quantity", self.quantity),
+            ("price", self.price),
+            ("stopPrice", self.stop_price),
+            ("stopPriceOffset", self.stop_price_offset),
+        ] {
+            if value.is_some_and(|v| v <= rust_decimal::Decimal::ZERO) {
+                return Err(format!("{name} must be finite and positive"));
+            }
+        }
+        if self.order_strategy_type == OrderStrategyType::Oco {
+            if self.child_order_strategies.len() != 2
+                || !self.order_leg_collection.is_empty()
+                || self.order_type.is_some()
+                || self.price.is_some()
+                || self.stop_price.is_some()
+            {
+                return Err(
+                    "OCO must contain exactly two children and no executable parent".into(),
+                );
+            }
+        } else {
+            if self.order_leg_collection.is_empty()
+                || self.session.is_none()
+                || self.duration.is_none()
+                || self.order_type.is_none()
+            {
+                return Err(
+                    "Executable orders require legs, session, duration, and orderType".into(),
+                );
+            }
+            let kind = self.order_type.as_ref().unwrap();
+            if matches!(
+                kind,
+                OrderType::Limit
+                    | OrderType::StopLimit
+                    | OrderType::TrailingStopLimit
+                    | OrderType::NetDebit
+                    | OrderType::NetCredit
+                    | OrderType::LimitOnClose
+            ) && self.price.is_none()
+            {
+                return Err("This order type requires price".into());
+            }
+            if matches!(kind, OrderType::Stop | OrderType::StopLimit) && self.stop_price.is_none() {
+                return Err("Stop orders require stopPrice".into());
+            }
+            if matches!(kind, OrderType::TrailingStop | OrderType::TrailingStopLimit)
+                && (self.stop_price_offset.is_none()
+                    || self.stop_price_link_basis.is_none()
+                    || self.stop_price_link_type.is_none())
+            {
+                return Err("Trailing stops require offset, basis, and link type".into());
+            }
+            for leg in &self.order_leg_collection {
+                if leg.quantity <= rust_decimal::Decimal::ZERO
+                    || leg.instrument.symbol.trim().is_empty()
+                    || leg.instrument.asset_type.trim().is_empty()
+                {
+                    return Err(
+                        "Leg quantity must be finite/positive and instrument must be specified"
+                            .into(),
+                    );
+                }
+            }
+            if self.order_strategy_type == OrderStrategyType::Single
+                && !self.child_order_strategies.is_empty()
+            {
+                return Err("SINGLE cannot contain child strategies".into());
+            }
+            if self.order_strategy_type == OrderStrategyType::Trigger
+                && self.child_order_strategies.is_empty()
+            {
+                return Err("TRIGGER requires child strategies".into());
+            }
+        }
+        for child in &self.child_order_strategies {
+            child.validate_depth(depth + 1)?;
+        }
+        Ok(())
+    }
+
+    /// Enforce a caller-supplied broker/asset tick size; never round implicitly.
+    pub fn validate_price_increment(&self, tick: rust_decimal::Decimal) -> Result<(), String> {
+        self.validate()?;
+        if tick <= rust_decimal::Decimal::ZERO {
+            return Err("Tick size must be finite and positive".into());
+        }
+        for price in [self.price, self.stop_price].into_iter().flatten() {
+            if price % tick != rust_decimal::Decimal::ZERO {
+                return Err("Price does not match the supplied tick size".into());
+            }
+        }
+        for child in &self.child_order_strategies {
+            child.validate_price_increment(tick)?;
+        }
+        Ok(())
+    }
 }

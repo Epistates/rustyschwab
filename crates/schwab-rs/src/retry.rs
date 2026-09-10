@@ -85,8 +85,8 @@ impl RetryPolicy {
                 Err(error) => {
                     if !self.should_retry(&error, retries) {
                         debug!(
-                            "Not retrying: {:?} (attempt {} of {})",
-                            error, retries, self.config.max_retries
+                            "Not retrying (attempt {} of {})",
+                            retries, self.config.max_retries
                         );
                         // Attribute any retries we *did* make to the
                         // exhausted bucket — if `retries == 0` this is
@@ -138,7 +138,9 @@ impl RetryPolicy {
 
         match error {
             // Retry on specific HTTP status codes
-            Error::Http { status, .. } => self.config.retry_on_status.contains(&status.as_u16()),
+            Error::Http { status, .. } | Error::Broker { status, .. } => {
+                self.config.retry_on_status.contains(&status.as_u16())
+            }
             // Use generic retryability for other error types
             _ => error.is_retryable(),
         }

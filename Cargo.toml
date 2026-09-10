@@ -8,9 +8,9 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 authors = ["Nick Paterno"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/rustyschwab"
@@ -36,6 +36,10 @@ hyper = "1.9"
 url = "2.5"
 headers = "0.4"
 axum = "0.8"
+# TLS for the local OAuth callback server (Schwab requires an https
+# callback URL, so the capture server must terminate TLS itself).
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rcgen = "0.13"
 urlencoding = "2.1"
 
 # Serialization
@@ -80,7 +84,10 @@ tower = "0.5"
 
 # Security - Best-in-class 2026
 ring = "0.17"
-rustls = "0.23"
+# "ring" feature: lets the callback server pick the ring CryptoProvider
+# explicitly — both ring and aws-lc-rs end up in the dependency tree, so
+# rustls cannot auto-select a process-level provider.
+rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1.0"
 # Encryption at rest (ChaCha20Poly1305 AEAD - audited by NCC Group)
 chacha20poly1305 = "0.10"
@@ -99,8 +106,11 @@ dotenvy = "0.15"
 wiremock = "0.6"
 tempfile = "3.27"
 
-# MCP server framework (path dep — local checkout at ../turbomcp)
-turbomcp = { path = "../turbomcp/crates/turbomcp", version = "3.1", default-features = false }
+# MCP server framework. Registry dep so the repo builds anywhere; to
+# develop against a local checkout, add a `[patch.crates-io]` section:
+#   [patch.crates-io]
+#   turbomcp = { path = "../turbomcp/crates/turbomcp" }
+turbomcp = { version = "3.3", default-features = false }
 
 # JSON-Schema for MCP tool parameter schemas (must match turbomcp's schemars version)
 schemars = { version = "1.0", features = ["chrono04"] }

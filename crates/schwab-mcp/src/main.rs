@@ -12,11 +12,33 @@
 use anyhow::Context;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use schwab_mcp::SchwabMcp;
+use schwab_mcp::server::trading_enabled;
 use schwab_rs::{SchwabClient, SchwabConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use turbomcp::prelude::*;
+
+/// Env var that opts a network transport into binding beyond loopback.
+const ALLOW_REMOTE_ENV: &str = "SCHWAB_MCP_ALLOW_REMOTE";
+
+fn remote_bind_allowed() -> bool {
+    matches!(
+        std::env::var(ALLOW_REMOTE_ENV).as_deref(),
+        Ok("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+/// Remote binds require an explicit deployment opt-in and TLS termination.
+/// Every network request is authenticated by `network::router`.
+fn guard_network_bind(transport: &str, addr: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() && !allow_remote {
+        anyhow::bail!(
+            "Remote {transport} bind {addr} requires SCHWAB_MCP_ALLOW_REMOTE=1 and a TLS-terminating proxy"
+        );
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,7 +48,9 @@ async fn main() -> anyhow::Result<()> {
     // MCP uses stdout for protocol traffic — tracing must go to stderr
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     // Install the Prometheus recorder + scrape listener when the user
@@ -51,37 +75,259 @@ async fn main() -> anyhow::Result<()> {
     let config = SchwabConfig::from_env()
         .context("failed to load SchwabConfig from environment (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.)")?;
 
-    let client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
+    let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
+    match std::env::var("SCHWAB_RISK_POLICY_FILE") {
+        Ok(path) => {
+            let accounts = serde_json::from_slice(&std::fs::read(path)?)?;
+            let risk = schwab_rs::risk::PortfolioRisk {
+                database: client.order_journal().database().clone(),
+                accounts,
+            };
+            client = client.with_risk_provider(Arc::new(risk))?;
+        }
+        Err(_) if trading_enabled() => anyhow::bail!(
+            "MCP trading requires SCHWAB_RISK_POLICY_FILE and a reconciled portfolio baseline"
+        ),
+        Err(_) => {}
+    }
     client
         .init()
         .await
         .context("SchwabClient::init failed — are OAuth tokens present at SCHWAB_TOKENS_FILE?")?;
     tracing::info!("Schwab client ready — tokens loaded");
 
-    let mcp = SchwabMcp::new(Arc::new(client));
-
-    let transport = std::env::var("SCHWAB_MCP_TRANSPORT").unwrap_or_else(|_| "stdio".to_string());
-    let bind = std::env::var("SCHWAB_MCP_BIND").unwrap_or_else(|_| "127.0.0.1:8765".to_string());
-
-    match transport.as_str() {
-        "http" => {
-            tracing::info!(%bind, "starting MCP server on HTTP transport");
-            mcp.run_http(&bind).await?;
-        }
-        "websocket" | "ws" => {
-            tracing::info!(%bind, "starting MCP server on WebSocket transport");
-            mcp.run_websocket(&bind).await?;
-        }
-        "stdio" | "" => {
-            tracing::info!("starting MCP server on stdio transport");
-            mcp.run_stdio().await?;
-        }
-        other => {
-            anyhow::bail!(
-                "unsupported SCHWAB_MCP_TRANSPORT={other:?} (expected stdio | http | websocket)"
+    let client = Arc::new(client);
+    let recovery_accounts: Vec<String> = std::env::var("SCHWAB_RECOVERY_ACCOUNTS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect();
+    anyhow::ensure!(
+        !trading_enabled() || !recovery_accounts.is_empty(),
+        "MCP trading requires SCHWAB_RECOVERY_ACCOUNTS"
+    );
+    let _recovery = if recovery_accounts.is_empty() {
+        None
+    } else {
+        Some(schwab_rs::recovery::RecoveryWorker::start(
+            client.clone(),
+            recovery_accounts.clone(),
+            0,
+            std::time::Duration::from_secs(2),
+        ))
+    };
+    let _health = if let Ok(bind) = std::env::var("SCHWAB_HEALTH_BIND") {
+        let addr: SocketAddr = bind.parse()?;
+        anyhow::ensure!(
+            addr.ip().is_loopback(),
+            "Health listener must bind to loopback; expose it through your operations gateway"
+        );
+        let readiness_client = client.clone();
+        let accounts = recovery_accounts.clone();
+        let health = axum::Router::new()
+            .route("/livez", axum::routing::get(|| async { "ok" }))
+            .route(
+                "/readyz",
+                axum::routing::get(move || {
+                    let client = readiness_client.clone();
+                    let accounts = accounts.clone();
+                    async move {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            client.readiness(&accounts, 5000),
+                        )
+                        .await
+                        {
+                            Ok(Ok(report)) => {
+                                let ready = if trading_enabled() {
+                                    report.trading_ready
+                                } else {
+                                    report.reads_ready
+                                };
+                                (
+                                    if ready {
+                                        axum::http::StatusCode::OK
+                                    } else {
+                                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                                    },
+                                    axum::Json(serde_json::to_value(report).unwrap_or_default()),
+                                )
+                            }
+                            _ => (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                axum::Json(
+                                    serde_json::json!({"ready":false,"storage_healthy":false}),
+                                ),
+                            ),
+                        }
+                    }
+                }),
             );
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        Some(tokio::spawn(async move {
+            let _ = axum::serve(listener, health).await;
+        }))
+    } else {
+        None
+    };
+    let transport = std::env::var("SCHWAB_MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into());
+    let policies: Vec<schwab_mcp::policy::PrincipalPolicy> =
+        match std::env::var("SCHWAB_MCP_POLICY_FILE") {
+            Ok(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+            Err(_)
+                if transport == "stdio"
+                    && !trading_enabled()
+                    && !std::env::var("SCHWAB_MCP_ALLOW_CANCEL")
+                        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE")) =>
+            {
+                let inner = SchwabMcp::new(client.clone());
+                inner.run_stdio().await?;
+                return Ok(());
+            }
+            Err(_) => anyhow::bail!("Network access and trading require SCHWAB_MCP_POLICY_FILE"),
+        };
+    anyhow::ensure!(!policies.is_empty(), "At least one principal is required");
+    let mut names = std::collections::HashSet::new();
+    let mut digests = std::collections::HashSet::new();
+    let mut subjects = std::collections::HashSet::new();
+    let mut stream_owners = 0;
+    let mut servers = Vec::new();
+    for policy in policies {
+        policy.validate()?;
+        anyhow::ensure!(
+            names.insert(policy.name.clone())
+                && (policy.token_sha256.is_empty()
+                    || digests.insert(policy.token_sha256.to_ascii_lowercase()))
+                && policy
+                    .identity_subject
+                    .as_ref()
+                    .is_none_or(|subject| subjects.insert(subject.clone())),
+            "Principal names, identity subjects and token digests must be unique"
+        );
+        if policy.tools.iter().any(|t| t.starts_with("stream_")) {
+            stream_owners += 1;
+        }
+        let audit_path = client
+            .auth_manager()
+            .config()
+            .tokens_file
+            .with_extension("orders.json")
+            .with_extension(format!(
+                "{}.audit.json",
+                schwab_mcp::policy::digest(policy.name.as_bytes())
+            ));
+        servers.push(schwab_mcp::policy::AuthorizedServer {
+            inner: SchwabMcp::new(client.clone()),
+            principal: Arc::new(policy),
+            audit: schwab_rs::execution::OrderJournal::new(audit_path),
+        });
+    }
+    anyhow::ensure!(
+        stream_owners <= 1,
+        "Only one principal may own streaming for a Schwab login; share market data through a separate service"
+    );
+    if transport == "stdio" {
+        let principal = std::env::var("SCHWAB_MCP_PRINCIPAL")
+            .context("Set SCHWAB_MCP_PRINCIPAL for policy-controlled stdio")?;
+        let server = servers
+            .into_iter()
+            .find(|s| s.principal.name == principal)
+            .context("Unknown stdio principal")?;
+        server.run_stdio().await?;
+    } else {
+        anyhow::ensure!(
+            matches!(transport.as_str(), "http" | "websocket" | "ws"),
+            "Unsupported MCP transport"
+        );
+        let bind = std::env::var("SCHWAB_MCP_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into());
+        let addr: SocketAddr = bind.parse()?;
+        guard_network_bind(&transport, addr, remote_bind_allowed())?;
+        let identity = match std::env::var("SCHWAB_MCP_IDENTITY_FILE") {
+            Ok(path) => Some(
+                schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(&std::fs::read(
+                    path,
+                )?)?)
+                .await?,
+            ),
+            Err(_) => None,
+        };
+        if identity.is_none() {
+            anyhow::ensure!(
+                servers
+                    .iter()
+                    .all(|s| s.principal.token_expires_at.is_some()
+                        && !s.principal.token_sha256.is_empty()),
+                "Static network credentials require token_expires_at; configure short-lived issuer tokens with SCHWAB_MCP_IDENTITY_FILE"
+            );
+        }
+        let app = schwab_mcp::network::router_reloadable(
+            servers,
+            transport != "http",
+            identity,
+            std::env::var_os("SCHWAB_MCP_POLICY_FILE").map(std::path::PathBuf::from),
+        );
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let serve = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            let _ = stopped.await;
+        });
+        let serving = std::future::IntoFuture::into_future(serve);
+        tokio::pin!(serving);
+        tokio::select! {
+            result = &mut serving => result?,
+            _ = shutdown_signal() => {
+                client.begin_drain();
+                let _ = stop.send(());
+                // Long-lived transports must not prevent bounded process exit.
+                if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serving).await { result?; }
+            }
         }
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("Install SIGTERM handler");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn loopback_binds_pass_regardless_of_opt_in() {
+        assert!(guard_network_bind("HTTP", addr("127.0.0.1:8765"), false).is_ok());
+        assert!(guard_network_bind("HTTP", addr("[::1]:8765"), false).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_refused_without_opt_in() {
+        assert!(guard_network_bind("HTTP", addr("0.0.0.0:8765"), false).is_err());
+        assert!(guard_network_bind("WebSocket", addr("192.168.1.10:8765"), false).is_err());
+    }
+
+    #[test]
+    fn non_loopback_allowed_with_opt_in() {
+        assert!(guard_network_bind("HTTP", addr("0.0.0.0:8765"), true).is_ok());
+    }
 }

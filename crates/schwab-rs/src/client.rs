@@ -6,22 +6,21 @@ use crate::auth::{AuthManager, create_bearer_header};
 use crate::circuit_breaker::CircuitBreaker;
 use crate::config::{ClientConfig, SchwabConfig};
 use crate::error::{Error, Result};
+use crate::request_budget::RequestBudget;
 use crate::retry::RetryPolicy;
-use crate::streaming::SubscriptionManager;
 use crate::transport::HttpTransport;
 use crate::types::accounts::{Account, AccountNumberHash, UserPreferences};
 use crate::types::market_data::{
     ContractType, ExpirationChainResponse, ExpirationMonth, FrequencyType, Instrument,
-    InstrumentsResponse, MarketHours, MoverSort, MoversResponse, OptionChainResponse,
+    InstrumentsResponse, MarketsHoursResponse, MoverSort, MoversResponse, OptionChainResponse,
     OptionStrategy, PeriodType, PriceHistoryResponse, Projection, QuoteItem, QuotesResponse, Range,
 };
-use crate::types::trading::{Order, OrderResponse, Transaction};
+use crate::types::trading::{Order, OrderRequest, OrderSubmitResponse, Transaction};
 use chrono::NaiveDate;
-use governor::{Quota, RateLimiter};
-use reqwest::{Client as HttpClient, Method, Response, StatusCode};
+use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use url::Url;
 use urlencoding;
 
@@ -31,60 +30,73 @@ pub struct SchwabClient {
 }
 
 struct ClientInner {
+    mode_verified: tokio::sync::OnceCell<()>,
+    journal: crate::execution::OrderJournal,
+    execution: Arc<dyn crate::execution::ExecutionStore>,
+    coordinator: Arc<dyn crate::coordination::Coordinator>,
+    quota_key: String,
+    risk: Option<Arc<dyn crate::risk::RiskProvider>>,
+    submission_gate: parking_lot::RwLock<Option<String>>,
+    draining: std::sync::atomic::AtomicBool,
     auth_manager: AuthManager,
     config: ClientConfig,
     transport: HttpTransport,
-    rate_limiter: Option<
-        Arc<
-            RateLimiter<
-                governor::state::NotKeyed,
-                governor::state::InMemoryState,
-                governor::clock::DefaultClock,
-            >,
-        >,
-    >,
+    rate_limiter: Option<Arc<RequestBudget>>,
     retry_policy: RetryPolicy,
     circuit_breaker: Arc<CircuitBreaker>,
-    #[allow(dead_code)] // Reserved for streaming subscription integration
-    subscriptions: Arc<SubscriptionManager>,
 }
 
 impl SchwabClient {
     pub fn new(config: SchwabConfig) -> Result<Self> {
         config.validate()?;
 
+        let journal = crate::execution::OrderJournal::new(
+            config.oauth.tokens_file.with_extension("orders.json"),
+        );
+        let origin = Url::parse(&config.client.base_url)
+            .map_err(|_| Error::Config("Invalid base URL".into()))?
+            .origin()
+            .ascii_serialization();
+        let budget_key = format!("{}:{origin}", config.oauth.app_key);
         let auth_manager = AuthManager::new(config.oauth).map_err(Error::Auth)?;
 
         // Build transport with validated base URL and timeout
         let _ = Url::parse(&config.client.base_url)
             .map_err(|e| Error::Config(format!("Invalid base URL: {}", e)))?;
-        let transport = HttpTransport::new(config.client.base_url.clone(), config.client.timeout)?;
+        let transport = HttpTransport::new(
+            config.client.base_url.clone(),
+            config.client.timeout,
+            config.client.user_agent.clone(),
+        )?;
 
         let rate_limiter = if config.client.rate_limit.enabled {
-            use std::num::NonZeroU32;
-            let rps = NonZeroU32::new(config.client.rate_limit.requests_per_second)
-                .ok_or_else(|| Error::Config("requests_per_second must be > 0".to_string()))?;
-            let burst = NonZeroU32::new(config.client.rate_limit.burst_size)
-                .ok_or_else(|| Error::Config("burst_size must be > 0".to_string()))?;
-            let quota = Quota::per_second(rps).allow_burst(burst);
-            Some(Arc::new(RateLimiter::direct(quota)))
+            Some(RequestBudget::shared(
+                budget_key.clone(),
+                &config.client.rate_limit,
+            )?)
         } else {
             None
         };
 
         let retry_policy = RetryPolicy::new(&config.client.retry);
-        let circuit_breaker =
-            Arc::new(CircuitBreaker::new(config.client.circuit_breaker.clone()));
+        let circuit_breaker = Arc::new(CircuitBreaker::new(config.client.circuit_breaker.clone()));
 
         Ok(Self {
             inner: Arc::new(ClientInner {
+                mode_verified: tokio::sync::OnceCell::new(),
+                coordinator: Arc::new(journal.database().clone()),
+                quota_key: budget_key.clone(),
+                risk: None,
+                submission_gate: parking_lot::RwLock::new(None),
+                draining: std::sync::atomic::AtomicBool::new(false),
+                execution: Arc::new(journal.clone()),
+                journal,
                 auth_manager,
                 config: config.client,
                 transport,
                 rate_limiter,
                 retry_policy,
                 circuit_breaker,
-                subscriptions: Arc::new(SubscriptionManager::new()),
             }),
         })
     }
@@ -93,7 +105,133 @@ impl SchwabClient {
         SchwabClientBuilder::new()
     }
 
+    /// Configure a deployment-owned shared coordinator before cloning the client.
+    /// Install a coherent set of remote enterprise services before cloning.
+    pub fn with_enterprise_backends(
+        mut self,
+        execution: Arc<dyn crate::execution::ExecutionStore>,
+        coordinator: Arc<dyn crate::coordination::Coordinator>,
+        risk: Arc<dyn crate::risk::RiskProvider>,
+    ) -> Result<Self> {
+        let inner = Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| Error::Config("Configure enterprise services before cloning".into()))?;
+        inner.execution = execution;
+        inner.coordinator = coordinator;
+        inner.risk = Some(risk);
+        Ok(self)
+    }
+    /// Suspend new submissions while a required data source is recovering.
+    /// Cancellations and reads remain available.
+    pub fn suspend_submissions(&self, reason: &str) {
+        *self.inner.submission_gate.write() = Some(reason.to_owned());
+    }
+    /// Trusted application recovery must establish readiness before clearing this gate.
+    pub fn resume_submissions(&self) {
+        *self.inner.submission_gate.write() = None;
+    }
+    /// Permanently close submission admission on this client and all its clones.
+    /// Reconciliation and cancellation remain available during process drain.
+    pub fn begin_drain(&self) {
+        self.inner
+            .draining
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub fn submissions_suspended(&self) -> bool {
+        self.inner
+            .draining
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.inner.submission_gate.read().is_some()
+    }
+    /// Persist an operator halt shared by every client using this execution store.
+    /// Recovery cannot clear it; in-flight broker writes still require reconciliation.
+    pub async fn halt_submissions(&self, reason: &str, operator: &str) -> Result<()> {
+        self.inner
+            .execution
+            .set_operator_halt(Some(reason.to_owned()), operator)
+            .await
+    }
+    pub async fn clear_operator_halt(&self, operator: &str) -> Result<()> {
+        self.inner.execution.set_operator_halt(None, operator).await
+    }
+    pub async fn operator_halt(&self) -> Result<Option<String>> {
+        self.inner.execution.operator_halt().await
+    }
+    pub fn execution_store(&self) -> Arc<dyn crate::execution::ExecutionStore> {
+        self.inner.execution.clone()
+    }
+    pub fn with_coordinator(
+        mut self,
+        coordinator: Arc<dyn crate::coordination::Coordinator>,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                Error::Config("Configure coordination before cloning the client".into())
+            })?
+            .coordinator = coordinator;
+        Ok(self)
+    }
+    pub fn with_risk_provider(mut self, risk: Arc<dyn crate::risk::RiskProvider>) -> Result<Self> {
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| Error::Config("Configure risk before cloning the client".into()))?
+            .risk = Some(risk);
+        Ok(self)
+    }
+    pub(crate) fn risk_provider(&self) -> Option<Arc<dyn crate::risk::RiskProvider>> {
+        self.inner.risk.clone()
+    }
+    pub fn circuit_state(&self) -> crate::circuit_breaker::CircuitState {
+        self.inner.circuit_breaker.state()
+    }
+    pub fn coordinator(&self) -> Arc<dyn crate::coordination::Coordinator> {
+        self.inner.coordinator.clone()
+    }
+
+    async fn ensure_live_state(&self) -> Result<()> {
+        self.inner
+            .mode_verified
+            .get_or_try_init(|| async {
+                self.inner
+                    .journal
+                    .database()
+                    .run(|c| {
+                        use rusqlite::OptionalExtension;
+                        let tx = c
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                            .map_err(crate::storage::sql)?;
+                        let paper: bool = tx
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='paper_config')",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .map_err(crate::storage::sql)?;
+                        let mode: Option<String> = tx
+                            .query_row(
+                                "SELECT value FROM meta WHERE key='execution_mode'",
+                                [],
+                                |r| r.get(0),
+                            )
+                            .optional()
+                            .map_err(crate::storage::sql)?;
+                        if paper || mode.as_deref().is_some_and(|m| m != "live") {
+                            return Err(Error::Config(
+                                "Live client cannot use paper execution state".into(),
+                            ));
+                        }
+                        tx.execute(
+                            "INSERT OR IGNORE INTO meta VALUES('execution_mode','live')",
+                            [],
+                        )
+                        .map_err(crate::storage::sql)?;
+                        tx.commit().map_err(crate::storage::sql)
+                    })
+                    .await
+            })
+            .await
+            .map(|_| ())
+    }
     pub async fn init(&self) -> Result<()> {
+        self.ensure_live_state().await?;
         self.inner.auth_manager.start().await.map_err(Error::Auth)?;
         info!("Schwab client initialized successfully");
         Ok(())
@@ -103,6 +241,10 @@ impl SchwabClient {
     ///
     /// Useful when building ancillary clients — e.g. a `StreamClient` — that
     /// need to reuse the same token refresh loop and on-disk token store.
+    pub fn order_journal(&self) -> &crate::execution::OrderJournal {
+        &self.inner.journal
+    }
+
     pub fn auth_manager(&self) -> AuthManager {
         self.inner.auth_manager.clone()
     }
@@ -129,7 +271,7 @@ impl SchwabClient {
     ) -> Result<T>
     where
         T: DeserializeOwned,
-        Q: Serialize + ?Sized,
+        Q: Serialize + ?Sized + Sync,
     {
         self.request_with_options(op, method, path, Some(query), None::<&()>)
             .await
@@ -144,7 +286,7 @@ impl SchwabClient {
     ) -> Result<T>
     where
         T: DeserializeOwned,
-        B: Serialize,
+        B: Serialize + Sync,
     {
         self.request_with_options::<T, ()>(op, method, path, None::<&()>, Some(body))
             .await
@@ -156,164 +298,283 @@ impl SchwabClient {
         method: Method,
         path: &str,
         query: Option<&Q>,
-        body: Option<&(impl Serialize + ?Sized)>,
+        body: Option<&(impl Serialize + ?Sized + Sync)>,
     ) -> Result<T>
     where
         T: DeserializeOwned,
-        Q: Serialize + ?Sized,
+        Q: Serialize + ?Sized + Sync,
     {
-        use std::time::Instant;
-
-        let start = Instant::now();
-        let method_label: &'static str = match method {
-            Method::GET => "GET",
-            Method::POST => "POST",
-            Method::PUT => "PUT",
-            Method::DELETE => "DELETE",
-            Method::PATCH => "PATCH",
-            Method::HEAD => "HEAD",
-            Method::OPTIONS => "OPTIONS",
-            _ => "OTHER",
-        };
-
-        // Apply rate limiting
-        if let Some(ref rate_limiter) = self.inner.rate_limiter {
-            rate_limiter.until_ready().await;
-        }
-
-        // Allow a single refresh-and-retry on 401
-        let mut attempted_refresh = false;
-
-        loop {
-            // Obtain latest access token each attempt
-            let access_token = self
-                .inner
-                .auth_manager
-                .get_access_token()
-                .await
-                .map_err(Error::Auth)?;
-
-            debug!("Making request to {}{}", self.inner.config.base_url, path);
-
-            // Circuit breaker wraps the full retry loop so a transient
-            // 5xx that `retry_policy` recovers from does not trip the
-            // breaker — only a logical request that fails after its
-            // retry budget is exhausted counts as a failure.
-            let result: Result<T> = self
-                .inner
-                .circuit_breaker
-                .call(|| async {
-                    self.inner
-                        .retry_policy
-                        .execute(|| {
-                            let headers = vec![
-                                (
-                                    "Authorization".to_string(),
-                                    create_bearer_header(&access_token),
-                                ),
-                                ("Accept".to_string(), "application/json".to_string()),
-                            ];
-                            async {
-                                self.inner
-                                    .transport
-                                    .request::<T>(method.clone(), path, headers, query, body)
-                                    .await
-                            }
-                        })
-                        .await
-                })
-                .await;
-
-            match result {
-                Ok(value) => {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    metrics::counter!(
-                        crate::metrics::HTTP_REQUESTS_TOTAL,
-                        "op" => op,
-                        "method" => method_label,
-                        "status" => "2xx",
-                    )
-                    .increment(1);
-                    metrics::histogram!(
-                        crate::metrics::HTTP_REQUEST_DURATION,
-                        "op" => op,
-                        "method" => method_label,
-                    )
-                    .record(elapsed);
-                    return Ok(value);
-                }
-                Err(Error::Http { status, .. })
-                    if status == reqwest::StatusCode::UNAUTHORIZED && !attempted_refresh =>
-                {
-                    warn!("401 Unauthorized received, attempting token refresh and retry");
-                    self.inner
-                        .auth_manager
-                        .ensure_valid_tokens()
-                        .await
-                        .map_err(Error::Auth)?;
-                    attempted_refresh = true;
-                    continue; // rebuild request with new token
-                }
-                Err(err) => {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    let status_label = match &err {
-                        Error::Http { status, .. } => crate::metrics::status_class(status.as_u16()),
-                        Error::RateLimit { .. } => "4xx",
-                        Error::Timeout { .. } | Error::Network(_) | Error::ConnectionClosed => {
-                            "network"
-                        }
-                        Error::Auth(_) => "auth",
-                        _ => "error",
-                    };
-                    metrics::counter!(
-                        crate::metrics::HTTP_REQUESTS_TOTAL,
-                        "op" => op,
-                        "method" => method_label,
-                        "status" => status_label,
-                    )
-                    .increment(1);
-                    metrics::histogram!(
-                        crate::metrics::HTTP_REQUEST_DURATION,
-                        "op" => op,
-                        "method" => method_label,
-                    )
-                    .record(elapsed);
-                    return Err(err);
-                }
-            }
-        }
+        let method_label = method_label(&method);
+        debug!(op, "Making API request");
+        let method = &method;
+        self.execute_resilient(op, method_label, None, None, move |token: String| {
+            Box::pin(async move {
+                let headers = vec![
+                    ("Authorization".to_string(), create_bearer_header(&token)),
+                    ("Accept".to_string(), "application/json".to_string()),
+                ];
+                self.inner
+                    .transport
+                    .request::<T>(method.clone(), path, headers, query, body)
+                    .await
+            })
+        })
+        .await
     }
 
-    #[allow(dead_code)] // Reserved for future response handling improvements
-    async fn handle_response<T>(&self, response: Response) -> Result<T>
-    where
-        T: DeserializeOwned,
-    {
-        let status = response.status();
-
-        if status.is_success() {
-            response.json().await.map_err(Error::from)
-        } else {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-
-            match status {
-                StatusCode::UNAUTHORIZED => {
-                    warn!("Received 401 Unauthorized, token may be expired");
-                    Err(Error::Http {
-                        status,
-                        message: "Authentication failed".to_string(),
-                    })
-                }
-                StatusCode::TOO_MANY_REQUESTS => {
-                    let retry_after = 60; // Default to 60 seconds
-                    Err(Error::RateLimit { retry_after })
-                }
-                _ => Err(crate::error::parse_api_error(status, &body)),
-            }
+    /// Submit an order (`POST`/`PUT`) whose success payload is the
+    /// `Location` response header — Schwab returns 201 with an empty body
+    /// for order placement/replacement, carrying the new order's URL in
+    /// `Location`. See [`OrderSubmitResponse`].
+    async fn submit_order_request(
+        &self,
+        op: &'static str,
+        method: Method,
+        path: &str,
+        order: &OrderRequest,
+        fence: Option<&crate::coordination::Lease>,
+    ) -> Result<OrderSubmitResponse> {
+        self.ensure_live_state().await?;
+        order.validate().map_err(Error::InvalidParameter)?;
+        let mut tagged_order = order.clone();
+        if tagged_order.tag.is_none() {
+            tagged_order.tag = Some(format!("rs-{}", uuid::Uuid::new_v4()));
         }
+        let order = &tagged_order;
+        let account = path.split('/').nth(4).unwrap_or_default();
+        if op == "replace_order" {
+            self.inner
+                .execution
+                .track_order(account, path.rsplit('/').next().unwrap_or_default())
+                .await?;
+        }
+        let attempt_id = self
+            .inner
+            .execution
+            .begin_once(account, op, serde_json::to_value(order)?, None)
+            .await?;
+        if let Some(risk) = &self.inner.risk
+            && let Err(error) = risk.reserve(account, &attempt_id, order).await
+        {
+            self.inner
+                .execution
+                .finish(&attempt_id, crate::execution::SubmissionOutcome::Rejected)
+                .await?;
+            return Err(error);
+        }
+        let method_label = method_label(&method);
+        debug!(op, "Submitting order");
+        let method = &method;
+        let result = self
+            .execute_resilient(
+                op,
+                method_label,
+                Some((account, attempt_id.as_str(), order)),
+                fence,
+                move |token: String| {
+                    Box::pin(async move {
+                        let headers = vec![
+                            ("Authorization".to_string(), create_bearer_header(&token)),
+                            ("Accept".to_string(), "application/json".to_string()),
+                        ];
+                        self.inner
+                            .transport
+                            .request_for_location(method.clone(), path, headers, Some(order))
+                            .await
+                    })
+                },
+            )
+            .await;
+
+        let location = match result {
+            Ok(location) => location,
+            Err(Error::SubmissionUnknown { source, .. }) => {
+                return Err(Error::SubmissionUnknown { attempt_id, source });
+            }
+            Err(error) => {
+                // A definite rejection or failure before transmission resolves
+                // the intent. Persistence failure leaves it pending, safely.
+                self.inner
+                    .execution
+                    .finish(&attempt_id, crate::execution::SubmissionOutcome::Rejected)
+                    .await?;
+                if let Some(risk) = &self.inner.risk {
+                    risk.release(&attempt_id).await?;
+                }
+                return Err(error);
+            }
+        };
+        let order_id = location.as_deref().and_then(order_id_from_location);
+
+        self.inner
+            .execution
+            .finish(
+                &attempt_id,
+                crate::execution::SubmissionOutcome::Accepted {
+                    order_id: order_id.clone(),
+                },
+            )
+            .await
+            .map_err(|e| Error::SubmissionUnknown {
+                attempt_id: attempt_id.clone(),
+                source: Box::new(e),
+            })?;
+        Ok(OrderSubmitResponse { order_id, location })
+    }
+
+    /// Run one logical API call through the full resilience stack:
+    /// rate limiter → (token fetch → circuit breaker → retry policy) with a
+    /// single refresh-and-retry on 401, recording request metrics either way.
+    ///
+    /// `call` receives the current access token and performs the actual
+    /// transport request; it is re-invoked on each retry attempt. The
+    /// future is boxed (`BoxFuture`) so its `Send` bound is explicit —
+    /// opaque `AsyncFn` futures trip rustc's "implementation of `Send` is
+    /// not general enough" limitation once embedded in spawned handlers.
+    async fn execute_resilient<'a, T>(
+        &'a self,
+        op: &'static str,
+        method_label: &'static str,
+        risk_context: Option<(&str, &str, &OrderRequest)>,
+        fence: Option<&crate::coordination::Lease>,
+        call: impl Fn(String) -> futures_util::future::BoxFuture<'a, Result<T>> + 'a,
+    ) -> Result<T> {
+        self.ensure_live_state().await?;
+        let start = std::time::Instant::now();
+        let submission = matches!(op, "place_order" | "replace_order");
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let operation = async {
+            let mut refreshed = false;
+            loop {
+                let token = self
+                    .inner
+                    .auth_manager
+                    .get_access_token()
+                    .await
+                    .map_err(Error::Auth)?;
+                let attempt = || async {
+                    if let Some(budget) = &self.inner.rate_limiter {
+                        budget.acquire().await;
+                    }
+                    if self.inner.config.rate_limit.enabled {
+                        loop {
+                            let wait = self
+                                .inner
+                                .coordinator
+                                .quota(
+                                    &self.inner.quota_key,
+                                    self.inner.config.rate_limit.requests_per_second,
+                                    self.inner.config.rate_limit.burst_size,
+                                )
+                                .await?;
+                            if wait.is_zero() {
+                                break;
+                            }
+                            tokio::time::sleep(wait).await;
+                        }
+                    }
+                    if submission && self.inner.execution.operator_halt().await?.is_some() {
+                        return Err(Error::InvalidParameter(
+                            "Operator trading halt is active".into(),
+                        ));
+                    }
+                    if let Some((account, attempt, order)) = risk_context {
+                        if let Some(risk) = &self.inner.risk {
+                            if let Some(lease) = fence {
+                                risk.revalidate_fenced(account, attempt, order, lease)
+                                    .await?;
+                            } else {
+                                risk.revalidate(account, attempt, order).await?;
+                            }
+                        } else if let Some(lease) = fence
+                            && !self.inner.coordinator.valid(lease).await?
+                        {
+                            return Err(Error::OwnershipLost);
+                        }
+                    }
+                    if submission && self.submissions_suspended() {
+                        return Err(Error::InvalidParameter(
+                            "Required data recovery is incomplete; submissions suspended".into(),
+                        ));
+                    }
+                    sent.store(true, std::sync::atomic::Ordering::Relaxed);
+                    call(token.clone()).await
+                };
+                let result = self
+                    .inner
+                    .circuit_breaker
+                    .call(|| async {
+                        if submission {
+                            attempt().await
+                        } else {
+                            self.inner.retry_policy.execute(attempt).await
+                        }
+                    })
+                    .await;
+                // A write never replays, even on 401. Caller can reconcile and
+                // explicitly submit a new intent after credentials recover.
+                if !submission
+                    && result
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| e.http_status() == Some(StatusCode::UNAUTHORIZED))
+                    && !refreshed
+                {
+                    self.inner
+                        .auth_manager
+                        .refresh_rejected_token(&token)
+                        .await
+                        .map_err(Error::Auth)?;
+                    refreshed = true;
+                    continue;
+                }
+                return result;
+            }
+        };
+        let guarded = async {
+            if submission {
+                let mut ownership = crate::coordination::LeaseSession::acquire(
+                    self.inner.coordinator.clone(),
+                    &format!("execution:{}", self.inner.quota_key),
+                )
+                .await?;
+                ownership.run(operation).await
+            } else {
+                operation.await
+            }
+        };
+        let result = tokio::time::timeout(self.inner.config.timeout, guarded)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Timeout {
+                    duration: self.inner.config.timeout.as_secs(),
+                })
+            });
+        let result = result.map_err(|e| {
+            let ambiguous = sent.load(std::sync::atomic::Ordering::Relaxed)
+                && ((e.is_retryable() && !matches!(e, Error::RateLimit { .. }))
+                    || matches!(e, Error::OwnershipLost));
+            if submission && ambiguous {
+                metrics::counter!("schwab_submission_unknown_total").increment(1);
+                Error::SubmissionUnknown {
+                    attempt_id,
+                    source: Box::new(e),
+                }
+            } else {
+                e
+            }
+        });
+        let status = match &result {
+            Ok(_) => "2xx",
+            Err(e) => e
+                .http_status()
+                .map(|s| crate::metrics::status_class(s.as_u16()))
+                .unwrap_or("error"),
+        };
+        metrics::counter!(crate::metrics::HTTP_REQUESTS_TOTAL, "op" => op, "method" => method_label, "status" => status).increment(1);
+        metrics::histogram!(crate::metrics::HTTP_REQUEST_DURATION, "op" => op, "method" => method_label).record(start.elapsed().as_secs_f64());
+        result
     }
 
     // ==================== Market Data Endpoints ====================
@@ -340,19 +601,22 @@ impl SchwabClient {
         if let Some(i) = indicative {
             params.push(("indicative", i.to_string()));
         }
-        self.request_with_query("get_quotes_with_options", Method::GET, "/marketdata/v1/quotes", &params)
-            .await
-    }
-
-    /// Get quote for a single symbol
-    pub async fn get_quote(&self, symbol: &str) -> Result<QuoteItem> {
-        let encoded_symbol = urlencoding::encode(symbol);
-        self.request(
-            "get_quote",
+        self.request_with_query(
+            "get_quotes_with_options",
             Method::GET,
-            &format!("/marketdata/v1/{}/quotes", encoded_symbol),
+            "/marketdata/v1/quotes",
+            &params,
         )
         .await
+    }
+
+    /// Get quote for a single symbol.
+    ///
+    /// Like `/quotes`, the single-symbol endpoint returns a response keyed
+    /// by symbol — `{"AAPL": {...}}` — so we fetch the map and extract the
+    /// requested entry.
+    pub async fn get_quote(&self, symbol: &str) -> Result<QuoteItem> {
+        self.get_quote_with_options(symbol, None).await
     }
 
     /// Get quote for a single symbol with advanced options
@@ -366,13 +630,26 @@ impl SchwabClient {
             params.push(("fields", f.to_string()));
         }
         let encoded_symbol = urlencoding::encode(symbol);
-        self.request_with_query(
-            "get_quote_with_options",
-            Method::GET,
-            &format!("/marketdata/v1/{}/quotes", encoded_symbol),
-            &params,
-        )
-        .await
+        let response: QuotesResponse = self
+            .request_with_query(
+                "get_quote_with_options",
+                Method::GET,
+                &format!("/marketdata/v1/{}/quotes", encoded_symbol),
+                &params,
+            )
+            .await?;
+
+        // The requested symbol should be the only key; fall back to the
+        // first entry in case Schwab normalizes the symbol spelling.
+        response
+            .quotes
+            .get(symbol)
+            .cloned()
+            .or_else(|| response.quotes.into_values().next())
+            .ok_or_else(|| Error::Api {
+                code: "NOT_FOUND".to_string(),
+                message: format!("no quote returned for symbol {symbol}"),
+            })
     }
 
     /// Get price history for a symbol
@@ -380,8 +657,13 @@ impl SchwabClient {
         &self,
         params: &PriceHistoryParams,
     ) -> Result<PriceHistoryResponse> {
-        self.request_with_query("get_price_history", Method::GET, "/marketdata/v1/pricehistory", params)
-            .await
+        self.request_with_query(
+            "get_price_history",
+            Method::GET,
+            "/marketdata/v1/pricehistory",
+            params,
+        )
+        .await
     }
 
     /// Get option chain for a symbol
@@ -389,8 +671,13 @@ impl SchwabClient {
         &self,
         params: &OptionChainParams,
     ) -> Result<OptionChainResponse> {
-        self.request_with_query("get_option_chain", Method::GET, "/marketdata/v1/chains", params)
-            .await
+        self.request_with_query(
+            "get_option_chain",
+            Method::GET,
+            "/marketdata/v1/chains",
+            params,
+        )
+        .await
     }
 
     /// Get option expiration dates for a symbol
@@ -399,8 +686,13 @@ impl SchwabClient {
         symbol: &str,
     ) -> Result<ExpirationChainResponse> {
         let params = [("symbol", symbol)];
-        self.request_with_query("get_option_expiration_chain", Method::GET, "/marketdata/v1/expirationchain", &params)
-            .await
+        self.request_with_query(
+            "get_option_expiration_chain",
+            Method::GET,
+            "/marketdata/v1/expirationchain",
+            &params,
+        )
+        .await
     }
 
     /// Get market movers for an index
@@ -412,7 +704,10 @@ impl SchwabClient {
     ) -> Result<MoversResponse> {
         let mut params = Vec::new();
         if let Some(s) = sort {
-            params.push(("sort", format!("{:?}", s).to_uppercase()));
+            params.push((
+                "sort",
+                serde_json::to_value(s)?.as_str().unwrap().to_owned(),
+            ));
         }
         if let Some(f) = frequency {
             params.push(("frequency", f.to_string()));
@@ -436,48 +731,75 @@ impl SchwabClient {
     ) -> Result<InstrumentsResponse> {
         let params = [
             ("symbol", symbol.to_string()),
-            ("projection", format!("{:?}", projection).to_uppercase()),
+            (
+                "projection",
+                serde_json::to_value(projection)?
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
         ];
-        self.request_with_query("search_instruments", Method::GET, "/marketdata/v1/instruments", &params)
-            .await
-    }
-
-    /// Get instrument details by CUSIP
-    pub async fn get_instrument(&self, cusip: &str) -> Result<Instrument> {
-        self.request(
-            "get_instrument",
+        self.request_with_query(
+            "search_instruments",
             Method::GET,
-            &format!("/marketdata/v1/instruments/{}", cusip),
+            "/marketdata/v1/instruments",
+            &params,
         )
         .await
     }
 
-    /// Get market hours for multiple markets
+    /// Get instrument details by CUSIP
+    pub async fn get_instrument(&self, cusip: &str) -> Result<Instrument> {
+        let encoded_cusip = urlencoding::encode(cusip);
+        let response: InstrumentsResponse = self
+            .request(
+                "get_instrument",
+                Method::GET,
+                &format!("/marketdata/v1/instruments/{}", encoded_cusip),
+            )
+            .await?;
+        response
+            .instruments
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Api {
+                code: "NOT_FOUND".into(),
+                message: "No instrument returned".into(),
+            })
+    }
+
+    /// Get market hours for multiple markets.
+    ///
+    /// Schwab nests the response two levels deep — market type to product
+    /// code to hours: `{"equity": {"EQ": {...}}}`.
     pub async fn get_markets(
         &self,
         markets: &[&str],
         date: Option<&str>,
-    ) -> Result<std::collections::HashMap<String, Vec<MarketHours>>> {
+    ) -> Result<MarketsHoursResponse> {
         let mut params = vec![("markets", markets.join(","))];
         if let Some(d) = date {
             params.push(("date", d.to_string()));
         }
-        self.request_with_query("get_markets", Method::GET, "/marketdata/v1/markets", &params)
-            .await
+        self.request_with_query(
+            "get_markets",
+            Method::GET,
+            "/marketdata/v1/markets",
+            &params,
+        )
+        .await
     }
 
     /// Get market hours for a single market.
     ///
     /// The Schwab `/markets/{marketId}` endpoint returns the same nested
-    /// shape as `/markets` — a map keyed by market type (e.g. `equity`)
-    /// — with just the requested market populated, not a bare list.
-    /// Earlier versions declared `Vec<MarketHours>` here and would fail
-    /// JSON deserialization in practice.
+    /// shape as `/markets` — market type to product code to hours — with
+    /// just the requested market populated.
     pub async fn get_market(
         &self,
         market_id: &str,
         date: Option<&str>,
-    ) -> Result<std::collections::HashMap<String, Vec<MarketHours>>> {
+    ) -> Result<MarketsHoursResponse> {
         let mut params = Vec::new();
         if let Some(d) = date {
             params.push(("date", d.to_string()));
@@ -495,8 +817,12 @@ impl SchwabClient {
 
     /// Get all linked account numbers
     pub async fn get_account_numbers(&self) -> Result<Vec<AccountNumberHash>> {
-        self.request("get_account_numbers", Method::GET, "/trader/v1/accounts/accountNumbers")
-            .await
+        self.request(
+            "get_account_numbers",
+            Method::GET,
+            "/trader/v1/accounts/accountNumbers",
+        )
+        .await
     }
 
     /// Get all account details
@@ -530,22 +856,22 @@ impl SchwabClient {
         .await
     }
 
-    /// Get orders for an account
+    /// Get orders for an account.
+    ///
+    /// `from_entered_time` / `to_entered_time` are **required** by Schwab
+    /// (ISO-8601, e.g. `2025-01-15T00:00:00.000Z`; max range one year).
     pub async fn get_account_orders(
         &self,
         account_hash: &str,
-        from_entered_time: Option<&str>,
-        to_entered_time: Option<&str>,
+        from_entered_time: &str,
+        to_entered_time: &str,
         max_results: Option<i32>,
         status: Option<&str>,
     ) -> Result<Vec<Order>> {
-        let mut params = Vec::new();
-        if let Some(from) = from_entered_time {
-            params.push(("fromEnteredTime", from.to_string()));
-        }
-        if let Some(to) = to_entered_time {
-            params.push(("toEnteredTime", to.to_string()));
-        }
+        let mut params = vec![
+            ("fromEnteredTime", from_entered_time.to_string()),
+            ("toEnteredTime", to_entered_time.to_string()),
+        ];
         if let Some(max) = max_results {
             params.push(("maxResults", max.to_string()));
         }
@@ -562,13 +888,54 @@ impl SchwabClient {
         .await
     }
 
-    /// Place an order
-    pub async fn place_order(&self, account_hash: &str, order: &Order) -> Result<OrderResponse> {
-        self.request_with_body(
+    /// Place an order.
+    ///
+    /// On success Schwab returns 201 with an empty body; the new order's ID
+    /// comes back in the `Location` header (see [`OrderSubmitResponse`]).
+    pub async fn place_order(
+        &self,
+        account_hash: &str,
+        order: &OrderRequest,
+    ) -> Result<OrderSubmitResponse> {
+        self.submit_order_request(
             "place_order",
             Method::POST,
             &format!("/trader/v1/accounts/{}/orders", account_hash),
             order,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch through a gateway-owned lease, checked after queue/auth waits.
+    pub async fn place_order_fenced(
+        &self,
+        account: &str,
+        order: &OrderRequest,
+        lease: &crate::coordination::Lease,
+    ) -> Result<OrderSubmitResponse> {
+        self.submit_order_request(
+            "place_order",
+            Method::POST,
+            &format!("/trader/v1/accounts/{account}/orders"),
+            order,
+            Some(lease),
+        )
+        .await
+    }
+    pub async fn replace_order_fenced(
+        &self,
+        account: &str,
+        id: &str,
+        order: &OrderRequest,
+        lease: &crate::coordination::Lease,
+    ) -> Result<OrderSubmitResponse> {
+        self.submit_order_request(
+            "replace_order",
+            Method::PUT,
+            &format!("/trader/v1/accounts/{account}/orders/{id}"),
+            order,
+            Some(lease),
         )
         .await
     }
@@ -593,24 +960,38 @@ impl SchwabClient {
         .await
     }
 
-    /// Replace an order
+    /// Replace an order.
+    ///
+    /// Schwab atomically cancels the old order and creates a new one; like
+    /// [`place_order`](Self::place_order), the new order's ID is returned
+    /// via the `Location` header.
     pub async fn replace_order(
         &self,
         account_hash: &str,
         order_id: &str,
-        order: &Order,
-    ) -> Result<OrderResponse> {
-        self.request_with_body(
+        order: &OrderRequest,
+    ) -> Result<OrderSubmitResponse> {
+        self.submit_order_request(
             "replace_order",
             Method::PUT,
             &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
             order,
+            None,
         )
         .await
     }
 
-    /// Preview an order
-    pub async fn preview_order(&self, account_hash: &str, order: &Order) -> Result<OrderResponse> {
+    /// Preview an order without submitting it.
+    ///
+    /// Returns the raw JSON validation result (fees, buying-power impact,
+    /// warnings/rejects) — the shape varies by order type and account, so
+    /// it is not modeled as a fixed struct.
+    pub async fn preview_order(
+        &self,
+        account_hash: &str,
+        order: &OrderRequest,
+    ) -> Result<serde_json::Value> {
+        order.validate().map_err(Error::InvalidParameter)?;
         self.request_with_body(
             "preview_order",
             Method::POST,
@@ -620,21 +1001,21 @@ impl SchwabClient {
         .await
     }
 
-    /// Get all orders across all accounts
+    /// Get all orders across all accounts.
+    ///
+    /// `from_entered_time` / `to_entered_time` are **required** by Schwab
+    /// (ISO-8601, e.g. `2025-01-15T00:00:00.000Z`; max range one year).
     pub async fn get_all_orders(
         &self,
-        from_entered_time: Option<&str>,
-        to_entered_time: Option<&str>,
+        from_entered_time: &str,
+        to_entered_time: &str,
         max_results: Option<i32>,
         status: Option<&str>,
     ) -> Result<Vec<Order>> {
-        let mut params = Vec::new();
-        if let Some(from) = from_entered_time {
-            params.push(("fromEnteredTime", from.to_string()));
-        }
-        if let Some(to) = to_entered_time {
-            params.push(("toEnteredTime", to.to_string()));
-        }
+        let mut params = vec![
+            ("fromEnteredTime", from_entered_time.to_string()),
+            ("toEnteredTime", to_entered_time.to_string()),
+        ];
         if let Some(max) = max_results {
             params.push(("maxResults", max.to_string()));
         }
@@ -646,27 +1027,26 @@ impl SchwabClient {
             .await
     }
 
-    /// Get account transactions
+    /// Get account transactions.
+    ///
+    /// `start_date`, `end_date` (ISO-8601, max range one year) and `types`
+    /// (e.g. `TRADE`, `DIVIDEND_OR_INTEREST`, `CASH_RECEIPT`) are
+    /// **required** by Schwab.
     pub async fn get_transactions(
         &self,
         account_hash: &str,
-        transaction_type: Option<&str>,
+        start_date: &str,
+        end_date: &str,
+        types: &str,
         symbol: Option<&str>,
-        start_date: Option<&str>,
-        end_date: Option<&str>,
     ) -> Result<Vec<Transaction>> {
-        let mut params = Vec::new();
-        if let Some(t) = transaction_type {
-            params.push(("type", t.to_string()));
-        }
+        let mut params = vec![
+            ("startDate", start_date.to_string()),
+            ("endDate", end_date.to_string()),
+            ("types", types.to_string()),
+        ];
         if let Some(s) = symbol {
             params.push(("symbol", s.to_string()));
-        }
-        if let Some(start) = start_date {
-            params.push(("startDate", start.to_string()));
-        }
-        if let Some(end) = end_date {
-            params.push(("endDate", end.to_string()));
         }
 
         self.request_with_query(
@@ -697,38 +1077,52 @@ impl SchwabClient {
 
     /// Get user preferences
     pub async fn get_user_preferences(&self) -> Result<UserPreferences> {
-        self.request("get_user_preferences", Method::GET, "/trader/v1/userPreference").await
+        self.request(
+            "get_user_preferences",
+            Method::GET,
+            "/trader/v1/userPreference",
+        )
+        .await
+    }
+}
+
+/// Extract the order ID from a `Location` header value — the last
+/// non-empty path segment of the order resource URL.
+fn order_id_from_location(location: &str) -> Option<String> {
+    location
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Static label for the request method, used in metrics.
+fn method_label(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        _ => "OTHER",
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct SchwabClientBuilder {
     config: Option<SchwabConfig>,
-    auth_manager: Option<AuthManager>,
-    http_client: Option<HttpClient>,
 }
 
 impl SchwabClientBuilder {
     pub fn new() -> Self {
-        Self {
-            config: None,
-            auth_manager: None,
-            http_client: None,
-        }
+        Self { config: None }
     }
 
     pub fn config(mut self, config: SchwabConfig) -> Self {
         self.config = Some(config);
-        self
-    }
-
-    pub fn auth_manager(mut self, auth: AuthManager) -> Self {
-        self.auth_manager = Some(auth);
-        self
-    }
-
-    pub fn http_client(mut self, client: HttpClient) -> Self {
-        self.http_client = Some(client);
         self
     }
 
@@ -817,6 +1211,23 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    #[test]
+    fn order_id_from_location_parses_last_segment() {
+        assert_eq!(
+            super::order_id_from_location(
+                "https://api.schwabapi.com/trader/v1/accounts/ABC123/orders/456789"
+            ),
+            Some("456789".to_string())
+        );
+        assert_eq!(
+            super::order_id_from_location(
+                "https://api.schwabapi.com/trader/v1/accounts/ABC123/orders/456789/"
+            ),
+            Some("456789".to_string())
+        );
+        assert_eq!(super::order_id_from_location(""), None);
+    }
+
     #[tokio::test]
     async fn test_get_quotes() {
         let mock_server = MockServer::start().await;
@@ -825,12 +1236,13 @@ mod tests {
             .and(path("/marketdata/v1/quotes"))
             .and(header("Authorization", "Bearer test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "quotes": [{
+                "AAPL": {
                     "symbol": "AAPL",
+                    "assetMainType": "EQUITY",
                     "quote": {
                         "lastPrice": 150.00
                     }
-                }]
+                }
             })))
             .mount(&mock_server)
             .await;

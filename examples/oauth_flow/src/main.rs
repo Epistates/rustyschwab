@@ -97,11 +97,11 @@ async fn main() -> Result<()> {
         Ok(quotes) => {
             println!("📈 Market Quotes:");
             println!("==================");
-            for quote in quotes.quotes {
+            for (symbol, quote) in quotes.quotes {
                 if let Some(q) = quote.quote {
                     println!(
                         "{}: ${:.2} ({}${:.2})",
-                        quote.symbol,
+                        symbol,
                         q.last_price.unwrap_or(0.0),
                         if q.net_change.unwrap_or(0.0) >= 0.0 {
                             "+"

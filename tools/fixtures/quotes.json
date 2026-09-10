@@ -1,0 +1,1 @@
+{"AAPL":{"symbol":"AAPL","assetMainType":"EQUITY","realtime":true,"quote":{"bidPrice":100.01,"askPrice":100.02,"lastPrice":100.01,"bidSize":5,"askSize":8,"totalVolume":123456789,"quoteTime":1788969600000},"reference":{"symbol":"AAPL","description":"Synthetic fixture"},"fundamental":{"divPayDate":"2026-08-15T00:00:00Z"}}}

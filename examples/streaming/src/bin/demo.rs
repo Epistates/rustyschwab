@@ -226,6 +226,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 message_count += 1;
 
                 match msg {
+                    StreamMessage::State(status) => {
+                        tracing::info!(?status, "Stream lifecycle changed; reconcile after gaps")
+                    }
                     StreamMessage::Data(data) => {
                         data_count += 1;
                         if data_count <= 5 {

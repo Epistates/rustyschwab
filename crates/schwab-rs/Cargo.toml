@@ -14,7 +14,9 @@ categories = { workspace = true }
 description = "Production-grade Rust SDK for Charles Schwab Trading and Market Data APIs"
 
 [dependencies]
-schwab-types = { path = "../schwab-types", version = "0.1.0" }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rust_decimal = { version = "1.43", features = ["serde"] }
+schwab-types = { path = "../schwab-types", version = "0.2.0" }
 schemars = { workspace = true, optional = true }
 
 # Random number generation (for jitter in backoff)
@@ -28,17 +30,16 @@ async-trait = { workspace = true }
 
 # HTTP and networking
 reqwest = { workspace = true }
-hyper = { workspace = true }
 url = { workspace = true }
 headers = { workspace = true }
 axum = { workspace = true, optional = true }
+axum-server = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
 urlencoding = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_urlencoded = { workspace = true }
-serde_with = { workspace = true }
 
 # Auth and encoding
 base64 = { workspace = true }
@@ -61,14 +62,11 @@ humantime-serde = { workspace = true }
 # Utilities
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
-pin-project = { workspace = true }
-bytes = { workspace = true }
 uuid = { workspace = true }
 
 # Security
 ring = { workspace = true }
 rustls = { workspace = true }
-webpki-roots = { workspace = true }
 chacha20poly1305 = { workspace = true }
 keyring = { workspace = true }
 secrecy = { workspace = true }
@@ -76,11 +74,9 @@ zeroize = { workspace = true }
 
 # Configuration
 config = { workspace = true }
-dotenvy = { workspace = true }
 
 # Rate limiting and retry
 governor = { workspace = true }
-tower = { workspace = true }
 
 [dev-dependencies]
 wiremock = { workspace = true }
@@ -90,8 +86,15 @@ tempfile = { workspace = true }
 default = ["rustls"]
 rustls = ["reqwest/rustls", "tokio-tungstenite/rustls"]
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
-callback-server = ["axum"]
+callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen"]
 # JSON-Schema derives on SchwabClient param structs (PriceHistoryParams, OptionChainParams)
 # so the schwab-mcp crate can expose them as strongly-typed MCP tool arguments.
 schemars = ["dep:schemars", "schwab-types/schemars"]
 full = ["rustls", "callback-server", "schemars"]
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
+# Used by serde(with) attributes in configuration types.
+[package.metadata.cargo-machete]
+ignored = ["humantime-serde"]

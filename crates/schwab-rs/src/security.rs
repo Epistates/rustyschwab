@@ -204,7 +204,7 @@ pub fn generate_random_key() -> Result<Zeroizing<[u8; KEY_SIZE]>> {
 /// # Security
 ///
 /// - **Unix**: Sets permissions to 0600 (owner read/write only)
-/// - **Windows**: Uses default ACLs (current user only)
+/// - **Windows**: Protected owner/SYSTEM DACL and atomic replacement
 /// - Atomic write via temp file + rename
 /// - Verifies permissions after write
 ///
@@ -256,6 +256,12 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     std::fs::rename(&temp_path, path)
         .map_err(|e| AuthError::TokenFileError(format!("Failed to rename temp file: {}", e)))?;
 
+    // Persist the directory entry, including the replacement, before reporting success.
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
     // Verify final permissions (defense in depth)
     verify_file_permissions(path)?;
 
@@ -263,18 +269,14 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Windows version - uses default ACLs (current user only)
-#[cfg(not(unix))]
-pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
-    std::fs::write(path, data)
-        .map_err(|e| AuthError::TokenFileError(format!("Failed to write file: {}", e)))?;
+#[cfg(windows)]
+pub use crate::security_windows::secure_file_write;
 
-    tracing::warn!(
-        "File permission enforcement not available on this platform. \
-         Ensure file is protected: {:?}",
-        path
-    );
-    Ok(())
+#[cfg(not(any(unix, windows)))]
+pub fn secure_file_write(_path: &Path, _data: &[u8]) -> Result<()> {
+    Err(Error::Config(
+        "Secure file storage is unsupported on this platform".into(),
+    ))
 }
 
 /// Verifies that a file has secure permissions (Unix: 0600)
@@ -293,26 +295,62 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
 /// Returns `AuthError::TokenFileInsecure` if permissions are too permissive
 #[cfg(unix)]
 pub fn verify_file_permissions(path: &Path) -> Result<()> {
-    let metadata = std::fs::metadata(path)
+    let metadata = std::fs::symlink_metadata(path)
         .map_err(|e| AuthError::TokenFileError(format!("Failed to read file metadata: {}", e)))?;
 
+    if !metadata.file_type().is_file() {
+        return Err(Error::Auth(AuthError::TokenFileInsecure(
+            "Token path must be a regular file".into(),
+        )));
+    }
     let mode = metadata.permissions().mode();
     let perms = mode & 0o777; // Extract permission bits
 
     if perms != 0o600 {
+        // Keep the absolute path out of the error string: this error can
+        // propagate to an MCP tool response (and thus to an LLM), and the
+        // path discloses the home-directory layout / username. The full
+        // path goes to the operator log instead.
+        tracing::error!(
+            ?path,
+            mode = format!("{:o}", perms),
+            "token file has insecure permissions (expected 0600)"
+        );
         return Err(Error::Auth(AuthError::TokenFileInsecure(format!(
-            "File {:?} has insecure permissions: {:o} (expected 0600)",
-            path, perms
+            "token file has insecure permissions {:o} (expected 0600); see server logs for the path",
+            perms
         ))));
     }
 
     Ok(())
 }
 
-#[cfg(not(unix))]
-pub fn verify_file_permissions(_path: &Path) -> Result<()> {
-    // Windows: Cannot reliably check, assume OK
+/// Create a private directory before any database or auxiliary file is opened.
+#[cfg(unix)]
+pub fn ensure_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if !path.exists() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Error::Storage(
+            "State directory must be private (0700) and not a symlink".into(),
+        ));
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+pub use crate::security_windows::verify_file_permissions;
+#[cfg(not(any(unix, windows)))]
+pub fn verify_file_permissions(_path: &Path) -> Result<()> {
+    Err(Error::Config(
+        "Secure file storage is unsupported on this platform".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -404,8 +442,17 @@ mod tests {
         assert_eq!(content, data);
 
         // Verify permissions
-        let metadata = std::fs::metadata(path).unwrap();
+        let metadata = std::fs::symlink_metadata(path).unwrap();
+        assert!(metadata.file_type().is_file());
         let mode = metadata.permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "File should have 0600 permissions");
     }
+}
+#[cfg(windows)]
+pub use crate::security_windows::ensure_private_directory;
+#[cfg(not(any(unix, windows)))]
+pub fn ensure_private_directory(_path: &Path) -> Result<()> {
+    Err(Error::Storage(
+        "Private state directories are unsupported on this platform".into(),
+    ))
 }

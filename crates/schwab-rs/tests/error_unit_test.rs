@@ -21,7 +21,12 @@ fn test_parse_api_error_with_valid_json() {
     let error = parse_api_error(StatusCode::BAD_REQUEST, json_body);
 
     match error {
-        Error::Api { code, message } => {
+        Error::Broker {
+            status, details, ..
+        } => {
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let code = details[0].id.clone().unwrap();
+            let message = details[0].to_string();
             assert_eq!(code, "ERR_123");
             assert!(message.contains("Invalid Symbol"));
         }

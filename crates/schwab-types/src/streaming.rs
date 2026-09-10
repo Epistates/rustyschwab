@@ -78,6 +78,8 @@ pub struct StreamParameters {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum StreamMessage {
+    #[serde(skip_deserializing)]
+    State(StreamStatus),
     Response(StreamResponse),
     Data(StreamData),
     Notify(StreamNotify),
@@ -129,7 +131,8 @@ pub struct DataItem {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DataContent {
     pub key: String,
-    pub delayed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delayed: Option<bool>,
     #[serde(rename = "assetMainType", skip_serializing_if = "Option::is_none")]
     pub asset_main_type: Option<String>,
     #[serde(rename = "assetSubType", skip_serializing_if = "Option::is_none")]
@@ -190,6 +193,59 @@ impl StreamService {
             StreamService::ScreenerEquity => "SCREENER_EQUITY",
             StreamService::ScreenerOption => "SCREENER_OPTION",
             StreamService::AcctActivity => "ACCT_ACTIVITY",
+        }
+    }
+
+    /// Parse a service from its API wire name (e.g. `LEVELONE_EQUITIES`).
+    pub fn from_api_str(s: &str) -> Option<Self> {
+        match s {
+            "ADMIN" => Some(StreamService::Admin),
+            "LEVELONE_EQUITIES" => Some(StreamService::LeveloneEquities),
+            "LEVELONE_OPTIONS" => Some(StreamService::LeveloneOptions),
+            "LEVELONE_FUTURES" => Some(StreamService::LeveloneFutures),
+            "LEVELONE_FUTURES_OPTIONS" => Some(StreamService::LeveloneFuturesOptions),
+            "LEVELONE_FOREX" => Some(StreamService::LeveloneForex),
+            "NYSE_BOOK" => Some(StreamService::NyseBook),
+            "NASDAQ_BOOK" => Some(StreamService::NasdaqBook),
+            "OPTIONS_BOOK" => Some(StreamService::OptionsBook),
+            "CHART_EQUITY" => Some(StreamService::ChartEquity),
+            "CHART_FUTURES" => Some(StreamService::ChartFutures),
+            "SCREENER_EQUITY" => Some(StreamService::ScreenerEquity),
+            "SCREENER_OPTION" => Some(StreamService::ScreenerOption),
+            "ACCT_ACTIVITY" => Some(StreamService::AcctActivity),
+            _ => None,
+        }
+    }
+
+    /// Default subscription field IDs for this service.
+    ///
+    /// Each streamer service has its own field numbering (see Schwab's
+    /// streamer documentation); these defaults cover the full documented
+    /// range for the data-bearing services so subscribers get every field
+    /// unless they narrow the list explicitly.
+    pub fn default_fields(&self) -> String {
+        fn range_csv(max: u32) -> String {
+            (0..=max)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+        match self {
+            StreamService::Admin => String::new(),
+            StreamService::LeveloneEquities => LevelOneEquityFields::default_fields(),
+            StreamService::LeveloneOptions => LevelOneOptionFields::default_fields(),
+            StreamService::LeveloneFutures => range_csv(40),
+            StreamService::LeveloneFuturesOptions => range_csv(35),
+            StreamService::LeveloneForex => range_csv(29),
+            // Book services carry symbol, snapshot time, bid levels, ask levels
+            StreamService::NyseBook | StreamService::NasdaqBook | StreamService::OptionsBook => {
+                range_csv(3)
+            }
+            StreamService::ChartEquity => ChartEquityFields::default_fields(),
+            StreamService::ChartFutures => range_csv(6),
+            // Screener: symbol, timestamp, sort field, frequency, items
+            StreamService::ScreenerEquity | StreamService::ScreenerOption => range_csv(4),
+            StreamService::AcctActivity => AcctActivityFields::default_fields(),
         }
     }
 }
@@ -432,4 +488,15 @@ impl StreamResponseCode {
             Self::UnknownFailure | Self::ServiceNotAvailable | Self::StreamConnNotFound
         )
     }
+}
+
+/// Local lifecycle notification, never accepted from the broker wire.
+/// `lost_messages` is cumulative; any increase requires REST reconciliation
+/// for account activity. A new session does not recover missed executions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct StreamStatus {
+    pub ready: bool,
+    pub generation: u64,
+    pub lost_messages: u64,
 }

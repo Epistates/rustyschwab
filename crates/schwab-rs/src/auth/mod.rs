@@ -3,7 +3,7 @@
 //! Provides complete OAuth flow implementation with automatic token refresh.
 
 // Token storage module with secure backends
-mod token_store;
+pub(crate) mod token_store;
 
 // HTTP authorization header utilities
 mod headers;
@@ -210,7 +210,7 @@ pub struct AuthManager {
     /// Optional PKCE verifier for the current auth session
     pkce_verifier: Arc<RwLock<Option<String>>>,
     /// OAuth state parameter for CSRF protection (RFC 6749 Section 10.12)
-    oauth_state: Arc<RwLock<Option<String>>>,
+    oauth_state: Arc<RwLock<Option<(String, std::time::Instant)>>>,
     /// Pluggable token store
     token_store: Arc<dyn TokenStore + Send + Sync>,
     /// Last "hours-remaining" bucket we fired a `RefreshTokenExpiring`
@@ -304,18 +304,15 @@ async fn post_oauth_token(
                 .map_err(|e| grant.wrap(format!("failed to parse token response: {e}")));
         }
 
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<no body>".to_string());
+        // Do not propagate token endpoint bodies: a proxy can echo credentials.
 
         // 5xx: transient — retry. 4xx: fatal — return immediately.
         if status.is_server_error() {
             warn!(
-                "oauth token endpoint returned {} on attempt {}/{}: {}",
-                status, attempt, OAUTH_TOKEN_RETRY_ATTEMPTS, body
+                "oauth token endpoint returned {} on attempt {}/{}",
+                status, attempt, OAUTH_TOKEN_RETRY_ATTEMPTS
             );
-            last_err = Some(grant.wrap(format!("{status}: {body}")));
+            last_err = Some(grant.wrap(format!("oauth token endpoint returned {status}")));
             if attempt < OAUTH_TOKEN_RETRY_ATTEMPTS {
                 backoff(attempt).await;
                 continue;
@@ -323,7 +320,7 @@ async fn post_oauth_token(
             break;
         }
 
-        return Err(grant.wrap(format!("{status}: {body}")));
+        return Err(grant.wrap(format!("oauth token endpoint returned {status}")));
     }
 
     Err(last_err.unwrap_or_else(|| grant.wrap("oauth token request failed")))
@@ -350,13 +347,17 @@ impl AuthManager {
             ));
         }
 
-        let key_len_ok = matches!(config.app_key.len(), 32 | 48);
-        let secret_len_ok = matches!(config.app_secret.len(), 16 | 64);
-        if !key_len_ok || !secret_len_ok {
+        // Schwab issues several key/secret length variants, but they are
+        // always even-length and at least 32 chars combined — the same
+        // heuristic Schwabdev adopted in 3.0.4 after exact-length checks
+        // started rejecting newly issued credentials.
+        let key_len = config.app_key.len();
+        let secret_len = config.app_secret.len();
+        if !key_len.is_multiple_of(2) || !secret_len.is_multiple_of(2) || key_len + secret_len < 32
+        {
             return Err(AuthError::MissingConfig(format!(
-                "App key length must be 32 or 48 (got {}), and app secret length must be 16 or 64 (got {})",
-                config.app_key.len(),
-                config.app_secret.len()
+                "App key or app secret likely invalid: lengths must be even and total at \
+                 least 32 chars (got key={key_len}, secret={secret_len})"
             )));
         }
 
@@ -378,6 +379,8 @@ impl AuthManager {
             client: Arc::new(RwLock::new(
                 reqwest::Client::builder()
                     .timeout(OAUTH_TOKEN_TIMEOUT)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .retry(reqwest::retry::never())
                     .build()
                     .map_err(|e| AuthError::OAuthFlow(e.to_string()))?,
             )),
@@ -414,7 +417,8 @@ impl AuthManager {
                 *manager.tokens.write() = Some(tokens);
             }
             Err(e) => {
-                warn!("Could not load tokens: {}. Will need to authenticate.", e);
+                warn!("Could not load tokens; authentication may be required");
+                let _ = e;
                 // Notify if token file was corrupted
                 if let Some(ref notify) = config.on_token_notification {
                     notify(TokenNotification::TokenFileCorrupted);
@@ -459,10 +463,11 @@ impl AuthManager {
         // Check if we have valid tokens
         {
             let token_guard = self.tokens.read();
-            if let Some(tokens) = token_guard.as_ref() {
-                if tokens.is_valid() && !tokens.needs_refresh(self.config.refresh_buffer_seconds) {
-                    return tokens.access_token();
-                }
+            if let Some(tokens) = token_guard.as_ref()
+                && tokens.is_valid()
+                && !tokens.needs_refresh(self.config.refresh_buffer_seconds)
+            {
+                return tokens.access_token();
             }
         } // Drop lock before await
 
@@ -477,138 +482,88 @@ impl AuthManager {
     }
 
     pub async fn ensure_valid_tokens(&self) -> AuthResult<()> {
+        self.refresh_if_needed(None).await
+    }
+
+    /// Refresh only if the broker-rejected access token is still current.
+    /// Concurrent 401s reuse the winning refresh instead of rotating again.
+    pub async fn refresh_rejected_token(&self, rejected: &str) -> AuthResult<()> {
+        self.refresh_if_needed(Some(rejected)).await
+    }
+
+    async fn refresh_if_needed(&self, rejected: Option<&str>) -> AuthResult<()> {
         let _lock = self.refresh_lock.lock().await;
-
-        // Check if we need to recreate the HTTP client
-        if *self.needs_client_recreation.read() {
-            self.recreate_http_client().await?;
+        let _process_lock = token_store::refresh_lock(&self.config.tokens_file).await?;
+        // Another process may already have committed a newer token.
+        if let Ok(stored) = self.token_store.load() {
+            let mut current = self.tokens.write();
+            if current
+                .as_ref()
+                .is_none_or(|t| stored.issued_at >= t.issued_at)
+            {
+                *current = Some(stored);
+            }
         }
-
-        // Double-check after acquiring lock and extract needed data
-        let (should_refresh, refresh_token) = {
-            let token_guard = self.tokens.read();
-            let Some(tokens) = token_guard.as_ref() else {
-                // No tokens at all — need a full auth flow
-                return Err(AuthError::TokenExpired);
-            };
-
-            if tokens.is_valid() && !tokens.needs_refresh(self.config.refresh_buffer_seconds) {
+        let old = self.tokens.read().clone().ok_or(AuthError::TokenExpired)?;
+        if let Some(rejected) = rejected {
+            if old.access_token()? != rejected && old.is_valid() {
                 return Ok(());
             }
-
-            // Compute refresh-token runway (falls back to issued_at + 7d if
-            // the server didn't send `refresh_token_expires_at`).
-            let refresh_remaining = tokens
-                .refresh_token_expires_at
-                .unwrap_or(tokens.issued_at + Duration::days(7))
-                - Utc::now();
-            let refresh_remaining_secs = refresh_remaining.num_seconds();
-
-            // Advisory notification if caller wired one up. Dedup per
-            // hour-bucket so back-to-back API calls don't each fire a
-            // notification.
-            if let Some(ref notify) = self.config.on_token_notification {
-                if refresh_remaining_secs < 3600 * 12 {
-                    let hours_remaining = (refresh_remaining_secs / 3600).max(0);
-                    let mut last = self.last_notified_rt_hour.write();
-                    if *last != Some(hours_remaining) {
-                        *last = Some(hours_remaining);
-                        notify(TokenNotification::RefreshTokenExpiring { hours_remaining });
-                    }
-                }
-            }
-
-            // Hard expiry — RT ran past 7 days
-            if tokens.refresh_token_expired() {
-                warn!("Refresh token expired after 7 days, need full OAuth flow");
-                if let Some(ref notify) = self.config.on_token_notification {
-                    notify(TokenNotification::RefreshTokenExpired);
-                }
-                return Err(AuthError::TokenExpired);
-            }
-
-            // Safety buffer — Schwabdev (tokens.py:293) forces a full re-auth
-            // when RT has ≤60.5 min runway. Schwab doesn't mint a new RT on
-            // access-token refresh, so continuing to refresh AT here just
-            // postpones a runtime failure we can predict.
-            if refresh_remaining_secs <= REFRESH_TOKEN_MIN_REMAINING_SECS {
-                warn!(
-                    "refresh token has {}s remaining (< {}s threshold) — full OAuth flow required",
-                    refresh_remaining_secs, REFRESH_TOKEN_MIN_REMAINING_SECS
-                );
-                return Err(AuthError::RefreshTokenExpiring {
-                    seconds_remaining: refresh_remaining_secs.max(0),
-                });
-            }
-
-            let refresh_token_str = tokens.refresh_token().unwrap_or_default();
-            if refresh_token_str.is_empty() {
-                return Err(AuthError::MissingRefreshToken);
-            }
-            (true, refresh_token_str)
-        }; // drop read lock before `.await`
-
-        if should_refresh {
-            match self.refresh_tokens(&refresh_token).await {
-                Ok(new_tokens) => {
-                    *self.tokens.write() = Some(new_tokens);
-                    self.save_tokens()?;
-                    *self.needs_client_recreation.write() = true;
-                    metrics::counter!(
-                        crate::metrics::TOKEN_REFRESH_TOTAL,
-                        "outcome" => "success",
-                        "grant" => "refresh_token",
-                    )
-                    .increment(1);
-                    Ok(())
-                }
-                Err(e) => {
-                    // Preserve the original error variant (RefreshFailed,
-                    // network, etc.) rather than collapsing to TokenExpired.
-                    // Callers that care can still match on TokenExpired or
-                    // RefreshTokenExpiring explicitly.
-                    warn!("Token refresh failed: {}", e);
-                    metrics::counter!(
-                        crate::metrics::TOKEN_REFRESH_TOTAL,
-                        "outcome" => "failure",
-                        "grant" => "refresh_token",
-                    )
-                    .increment(1);
-                    Err(e)
-                }
-            }
-        } else {
-            Err(AuthError::TokenExpired)
+        } else if old.is_valid() && !old.needs_refresh(self.config.refresh_buffer_seconds) {
+            return Ok(());
         }
+        let remaining = (old
+            .refresh_token_expires_at
+            .unwrap_or(old.issued_at + Duration::days(7))
+            - Utc::now())
+        .num_seconds();
+        if remaining <= 0 {
+            return Err(AuthError::TokenExpired);
+        }
+        if remaining <= REFRESH_TOKEN_MIN_REMAINING_SECS {
+            return Err(AuthError::RefreshTokenExpiring {
+                seconds_remaining: remaining,
+            });
+        }
+        let refresh_token = old.refresh_token()?;
+        if refresh_token.is_empty() {
+            return Err(AuthError::MissingRefreshToken);
+        }
+        let mut new_tokens = self.refresh_tokens(&refresh_token).await?;
+        // Schwab's refresh grant does not extend the original authorization's
+        // seven-day lifetime, even if the returned credential string changes.
+        new_tokens.refresh_token_expires_at = Some(
+            old.refresh_token_expires_at
+                .unwrap_or(old.issued_at + Duration::days(7)),
+        );
+        self.token_store.save(&new_tokens)?;
+        *self.tokens.write() = Some(new_tokens);
+        metrics::counter!(crate::metrics::TOKEN_REFRESH_TOTAL, "outcome" => "success", "grant" => "refresh_token").increment(1);
+        Ok(())
     }
 
     pub async fn authorize(&self) -> AuthResult<(String, String)> {
         // Generate OAuth state parameter for CSRF protection (RFC 6749 Section 10.12)
         // Using UUID v4 provides sufficient entropy for secure state tokens
         let state = uuid::Uuid::new_v4().to_string();
-        *self.oauth_state.write() = Some(state.clone());
+        *self.oauth_state.write() = Some((state.clone(), std::time::Instant::now()));
         debug!("Generated OAuth state parameter for CSRF protection");
 
-        // Build auth URL with state parameter
-        let auth_url = if self.config.pkce_enabled {
-            // Generate PKCE code_verifier and code_challenge (S256)
+        let mut url = url::Url::parse(&self.config.auth_url)
+            .map_err(|_| AuthError::OAuthFlow("Invalid authorization URL".into()))?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.config.app_key)
+            .append_pair("redirect_uri", &self.config.callback_url)
+            .append_pair("state", &state);
+        if self.config.pkce_enabled {
             let verifier = Self::generate_code_verifier()?;
             let challenge = Self::code_challenge_s256(&verifier);
             *self.pkce_verifier.write() = Some(verifier);
-            format!(
-                "{}?client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
-                self.config.auth_url,
-                self.config.app_key,
-                self.config.callback_url,
-                challenge,
-                state
-            )
-        } else {
-            format!(
-                "{}?client_id={}&redirect_uri={}&state={}",
-                self.config.auth_url, self.config.app_key, self.config.callback_url, state
-            )
-        };
+            url.query_pairs_mut()
+                .append_pair("code_challenge", &challenge)
+                .append_pair("code_challenge_method", "S256");
+        }
+        let auth_url = url.to_string();
 
         info!("Open this URL in your browser:\n{}", auth_url);
 
@@ -660,6 +615,22 @@ impl AuthManager {
         self.exchange_code_for_tokens(&extracted_code).await
     }
 
+    fn consume_callback_state(&self, supplied: Option<&str>) -> AuthResult<()> {
+        let mut pending = self.oauth_state.write();
+        match pending.as_ref() {
+            Some((expected, created))
+                if supplied == Some(expected.as_str())
+                    && created.elapsed() < std::time::Duration::from_secs(300) =>
+            {
+                *pending = None;
+                Ok(())
+            }
+            _ => Err(AuthError::OAuthFlow(
+                "Missing, invalid, expired, or already consumed OAuth state".into(),
+            )),
+        }
+    }
+
     fn extract_code_from_callback_url(&self, url: &str) -> AuthResult<String> {
         // Parse URL to extract code and state parameters
         let parsed = url::Url::parse(url)
@@ -671,34 +642,7 @@ impl AuthManager {
             .find(|(key, _)| key == "state")
             .map(|(_, value)| value.into_owned());
 
-        if let Some(callback_state) = callback_state {
-            let expected_state = self.oauth_state.read().clone();
-            match expected_state {
-                Some(expected) => {
-                    if callback_state != expected {
-                        warn!("OAuth state mismatch - possible CSRF attack");
-                        return Err(AuthError::OAuthFlow(
-                            "OAuth state parameter mismatch - possible CSRF attack".to_string(),
-                        ));
-                    }
-                    debug!("OAuth state parameter validated successfully");
-                }
-                None => {
-                    warn!("Callback received state parameter but no state was generated");
-                    return Err(AuthError::OAuthFlow(
-                        "Unexpected state parameter in callback".to_string(),
-                    ));
-                }
-            }
-        } else {
-            // State parameter should be present if we generated one
-            if self.oauth_state.read().is_some() {
-                warn!("Callback missing state parameter - possible CSRF attack");
-                return Err(AuthError::OAuthFlow(
-                    "OAuth callback missing required state parameter".to_string(),
-                ));
-            }
-        }
+        self.consume_callback_state(callback_state.as_deref())?;
 
         // Extract code from query parameters.
         //
@@ -772,8 +716,9 @@ impl AuthManager {
 
         let tokens = token_response.into_token_set(Utc::now());
 
+        let _file_lock = token_store::refresh_lock(&self.config.tokens_file).await?;
+        self.token_store.save(&tokens)?;
         *self.tokens.write() = Some(tokens.clone());
-        self.save_tokens()?;
 
         Ok(tokens)
     }
@@ -809,137 +754,48 @@ impl AuthManager {
     }
 
     async fn start_refresh_task(&self) {
-        let tokens = self.tokens.clone();
-        let config = self.config.clone();
-        let client = self.client.clone();
-        let refresh_lock = self.refresh_lock.clone();
-        let needs_recreation = self.needs_client_recreation.clone();
-        let last_notified_rt_hour = self.last_notified_rt_hour.clone();
-
+        // The worker must not own the handle that controls its own lifetime.
+        let mut manager = self.clone();
+        manager.refresh_task = Arc::new(RwLock::new(None));
         let task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // Check every 30 seconds
-
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
-
-                // Check tokens and determine if refresh is needed
-                let (needs_refresh, refresh_token) = {
-                    let token_guard = tokens.read();
-                    if let Some(token_set) = token_guard.as_ref() {
-                        // Check for refresh token expiry warnings.
-                        //
-                        // Fire one notification per "hours_remaining" bucket
-                        // within the final 12 hours. Tracking the last
-                        // bucket we notified for is robust against 30 s
-                        // tick jitter; the old `remaining % 3600 <= 30`
-                        // check could easily miss or double-fire.
-                        if let Some(expires) = token_set.refresh_token_expires_at {
-                            let remaining = (expires - Utc::now()).num_seconds();
-                            if remaining > 30 && remaining <= 43200 {
-                                let hours_remaining = (remaining / 3600).max(0);
-                                let mut last = last_notified_rt_hour.write();
-                                if *last != Some(hours_remaining) {
-                                    *last = Some(hours_remaining);
-                                    if let Some(ref notify) = config.on_token_notification {
-                                        notify(TokenNotification::RefreshTokenExpiring {
-                                            hours_remaining,
-                                        });
-                                    }
-                                }
-                            }
+                let remaining = manager
+                    .tokens
+                    .read()
+                    .as_ref()
+                    .and_then(|t| t.refresh_token_expires_at)
+                    .map(|t| (t - Utc::now()).num_seconds());
+                if let Some(remaining) = remaining {
+                    let hour = (remaining / 3600).max(0);
+                    let notify = {
+                        let mut last = manager.last_notified_rt_hour.write();
+                        let changed = remaining <= 43200 && *last != Some(hour);
+                        if changed {
+                            *last = Some(hour);
                         }
-
-                        // Check if access token needs refresh
-                        let needs_refresh = token_set.needs_refresh(config.refresh_buffer_seconds);
-                        (needs_refresh, token_set.refresh_token().unwrap_or_default())
-                    } else {
-                        (false, String::new())
-                    }
-                }; // Drop read lock here
-
-                if needs_refresh && !refresh_token.is_empty() {
-                    let _lock = refresh_lock.lock().await;
-
-                    // Double-check after acquiring lock
-                    let still_needs_refresh = tokens
-                        .read()
-                        .as_ref()
-                        .map(|t| t.needs_refresh(config.refresh_buffer_seconds))
-                        .unwrap_or(false);
-
-                    if !still_needs_refresh {
-                        continue;
-                    }
-
-                    // Notify about access token expiring
-                    if let Some(ref notify) = config.on_token_notification {
-                        let remaining = tokens
-                            .read()
-                            .as_ref()
-                            .map(|t| (t.expires_at - Utc::now()).num_seconds())
-                            .unwrap_or(0);
-                        notify(TokenNotification::AccessTokenExpiring {
-                            seconds_remaining: remaining.max(0),
+                        changed
+                    };
+                    if notify && let Some(ref callback) = manager.config.on_token_notification {
+                        callback(if remaining <= 0 {
+                            TokenNotification::RefreshTokenExpired
+                        } else {
+                            TokenNotification::RefreshTokenExpiring {
+                                hours_remaining: hour,
+                            }
                         });
                     }
-
-                    debug!("Auto-refreshing token");
-
-                    // Perform refresh
-                    let refresh_result =
-                        Self::refresh_tokens_static(&client, &config, &refresh_token).await;
-
-                    match refresh_result {
-                        Ok(new_tokens) => {
-                            *tokens.write() = Some(new_tokens);
-                            *needs_recreation.write() = true; // Mark for client recreation
-                            info!("Token auto-refreshed successfully");
-                            metrics::counter!(
-                                crate::metrics::TOKEN_REFRESH_TOTAL,
-                                "outcome" => "success",
-                                "grant" => "auto_refresh",
-                            )
-                            .increment(1);
-                        }
-                        Err(e) => {
-                            warn!("Auto-refresh failed: {}", e);
-                            metrics::counter!(
-                                crate::metrics::TOKEN_REFRESH_TOTAL,
-                                "outcome" => "failure",
-                                "grant" => "auto_refresh",
-                            )
-                            .increment(1);
-                        }
-                    }
+                }
+                if manager.ensure_valid_tokens().await.is_err() {
+                    warn!(
+                        "Automatic token refresh failed; authentication may require intervention"
+                    );
+                    metrics::counter!(crate::metrics::TOKEN_REFRESH_TOTAL, "outcome" => "failure", "grant" => "refresh_token").increment(1);
                 }
             }
         });
-
         *self.refresh_task.write() = Some(task);
-    }
-
-    async fn refresh_tokens_static(
-        client: &Arc<RwLock<reqwest::Client>>,
-        config: &OAuthConfig,
-        refresh_token: &str,
-    ) -> AuthResult<TokenSet> {
-        let http_client = client.read().clone();
-        let mut token_response = post_oauth_token(
-            &http_client,
-            config,
-            &[
-                ("grant_type", "refresh_token".to_string()),
-                ("refresh_token", refresh_token.to_string()),
-            ],
-            OAuthGrant::Refresh,
-        )
-        .await?;
-
-        if token_response.refresh_token.is_none() {
-            token_response.refresh_token = Some(refresh_token.to_string());
-        }
-
-        Ok(token_response.into_token_set(Utc::now()))
     }
 
     #[cfg(feature = "callback-server")]
@@ -953,20 +809,29 @@ impl AuthManager {
         // OAuth callback handler
         let callback_handler = {
             let tx = tx.clone();
-            move |Query(params): Query<CallbackParams>| async move {
-                // Extract code and add @ like Python reference does
-                let code_with_at = if !params.code.ends_with('@') {
-                    format!("{}@", params.code)
-                } else {
-                    params.code.clone()
-                };
+            let manager = self.clone();
+            move |Query(params): Query<CallbackParams>| {
+                let manager = manager.clone();
+                async move {
+                    if manager
+                        .consume_callback_state(params.state.as_deref())
+                        .is_err()
+                    {
+                        return Html("Invalid or expired authorization callback".to_string());
+                    }
+                    // Extract code and add @ like Python reference does
+                    let code_with_at = if !params.code.ends_with('@') {
+                        format!("{}@", params.code)
+                    } else {
+                        params.code.clone()
+                    };
 
-                if let Some(tx) = tx.lock().await.take() {
-                    let _ = tx.send(code_with_at);
-                }
+                    if let Some(tx) = tx.lock().await.take() {
+                        let _ = tx.send(code_with_at);
+                    }
 
-                Html(
-                    r#"<!DOCTYPE html>
+                    Html(
+                        r#"<!DOCTYPE html>
                     <html>
                     <head>
                         <title>Authorization Successful</title>
@@ -998,13 +863,16 @@ impl AuthManager {
                         </div>
                     </body>
                     </html>"#
-                        .to_string(),
-                )
+                            .to_string(),
+                    )
+                }
             }
         };
 
         // Build router
-        let app = Router::new().route("/", get(callback_handler));
+        let callback_path = url::Url::parse(&self.config.callback_url)
+            .map_err(|_| AuthError::InvalidCallbackUrl("Invalid URL".into()))?;
+        let app = Router::new().route(callback_path.path(), get(callback_handler));
 
         // Parse callback URL to get port
         let callback_url = url::Url::parse(&self.config.callback_url)
@@ -1030,20 +898,75 @@ impl AuthManager {
             std::net::SocketAddr::from(([127, 0, 0, 1], port))
         };
 
-        // Start server
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| AuthError::OAuthFlow(format!("Failed to bind to port {}: {}", port, e)))?;
+        if self.config.allow_external_callback {
+            // A TLS-terminating tunnel / reverse proxy sits in front of
+            // this process and forwards plain HTTP — serve HTTP here.
+            let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+                AuthError::OAuthFlow(format!("Failed to bind to port {}: {}", port, e))
+            })?;
+            let server = axum::serve(listener, app);
 
-        // Run server and wait for callback
-        let server = axum::serve(listener, app);
-
-        tokio::select! {
-            code = rx => {
-                code.map_err(|_| AuthError::OAuthFlow("Failed to receive authorization code".to_string()))
+            tokio::select! {
+                code = rx => {
+                    code.map_err(|_| AuthError::OAuthFlow("Failed to receive authorization code".to_string()))
+                }
+                result = server => {
+                    Err(AuthError::OAuthFlow(format!(
+                        "Callback server stopped unexpectedly: {result:?}"
+                    )))
+                }
             }
-            _ = server => {
-                Err(AuthError::OAuthFlow("Server stopped unexpectedly".to_string()))
+        } else {
+            // Schwab requires an https:// callback URL, so the browser
+            // opens a TLS connection straight to this server — a plain
+            // HTTP listener would fail the handshake and the code would
+            // never arrive. Generate an in-memory self-signed certificate
+            // for loopback; the browser shows a one-time warning the user
+            // can bypass.
+            let cert = rcgen::generate_simple_self_signed(vec![
+                "127.0.0.1".to_string(),
+                "localhost".to_string(),
+            ])
+            .map_err(|e| {
+                AuthError::OAuthFlow(format!("Failed to generate TLS certificate: {e}"))
+            })?;
+
+            let cert_der = cert.cert.der().to_vec();
+            let key_der = cert.key_pair.serialize_der();
+
+            // Pick the ring provider explicitly: both ring and aws-lc-rs
+            // are in the dependency tree, so rustls cannot auto-select one.
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let server_config = rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| AuthError::OAuthFlow(format!("TLS config error: {e}")))?
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
+                )
+                .map_err(|e| AuthError::OAuthFlow(format!("TLS config error: {e}")))?;
+
+            let rustls_config =
+                axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+
+            info!(
+                "Callback server uses a self-signed certificate — your browser will warn once; \
+                 choose 'Advanced → Proceed' to complete the flow"
+            );
+
+            let server =
+                axum_server::bind_rustls(addr, rustls_config).serve(app.into_make_service());
+
+            tokio::select! {
+                code = rx => {
+                    code.map_err(|_| AuthError::OAuthFlow("Failed to receive authorization code".to_string()))
+                }
+                result = server => {
+                    Err(AuthError::OAuthFlow(format!(
+                        "Callback server stopped unexpectedly: {result:?}"
+                    )))
+                }
             }
         }
     }
@@ -1077,25 +1000,6 @@ impl AuthManager {
             .unwrap_or(false)
     }
 
-    /// Recreate the HTTP client after token refresh
-    async fn recreate_http_client(&self) -> AuthResult<()> {
-        debug!("Recreating HTTP client after token refresh");
-
-        let new_client = reqwest::Client::builder()
-            .timeout(OAUTH_TOKEN_TIMEOUT)
-            .build()
-            .map_err(|e| AuthError::OAuthFlow(e.to_string()))?;
-
-        *self.client.write() = new_client;
-        *self.needs_client_recreation.write() = false;
-
-        if let Some(ref notify) = self.config.on_token_notification {
-            notify(TokenNotification::SessionRecreated);
-        }
-
-        Ok(())
-    }
-
     /// Get the underlying HTTP client (for use by Client)
     pub fn get_http_client(&self) -> Arc<RwLock<reqwest::Client>> {
         self.client.clone()
@@ -1121,8 +1025,86 @@ impl AuthManager {
 
 impl Drop for AuthManager {
     fn drop(&mut self) {
-        if let Some(task) = self.refresh_task.write().take() {
+        // `AuthManager` is `Clone` and every clone shares this Arc.
+        // Only the *last* clone may abort the auto-refresh task —
+        // previously the first dropped clone (e.g. one handed to a
+        // short-lived `StreamClient`) silently killed token refresh
+        // for the whole process.
+        if Arc::strong_count(&self.refresh_task) == 1
+            && let Some(task) = self.refresh_task.write().take()
+        {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_creds(key_len: usize, secret_len: usize) -> OAuthConfig {
+        OAuthConfig {
+            app_key: "k".repeat(key_len),
+            app_secret: "s".repeat(secret_len),
+            callback_url: "https://127.0.0.1:8080".to_string(),
+            // Avoid touching the real keychain/token files in unit tests
+            token_store_kind: TokenStoreKind::File,
+            tokens_file: std::env::temp_dir().join("schwab_auth_validation_test.json"),
+            ..Default::default()
+        }
+    }
+
+    /// Schwab issues several credential length variants; since Schwabdev
+    /// 3.0.4 the accepted rule is "both even-length, combined ≥ 32".
+    #[test]
+    fn credential_validation_matches_upstream_rule() {
+        // Classic 32/16 pair
+        assert!(AuthManager::new(config_with_creds(32, 16)).is_ok());
+        // Newer longer variants
+        assert!(AuthManager::new(config_with_creds(48, 64)).is_ok());
+        // Unusual but even + combined ≥ 32 — accepted under the relaxed rule
+        assert!(AuthManager::new(config_with_creds(28, 8)).is_ok());
+
+        // Odd lengths rejected
+        assert!(AuthManager::new(config_with_creds(31, 16)).is_err());
+        assert!(AuthManager::new(config_with_creds(32, 15)).is_err());
+        // Combined too short
+        assert!(AuthManager::new(config_with_creds(16, 14)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod callback_regressions {
+    use super::*;
+    #[tokio::test]
+    async fn callback_state_is_required_expires_and_is_single_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AuthManager::new(OAuthConfig {
+            app_key: "k".repeat(32),
+            app_secret: "s".repeat(16),
+            token_store_kind: TokenStoreKind::File,
+            tokens_file: dir.path().join("tokens.json"),
+            capture_callback: false,
+            auto_refresh: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let (url, _) = manager.authorize().await.unwrap();
+        let state = url::Url::parse(&url)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        assert!(manager.consume_callback_state(None).is_err());
+        assert!(manager.consume_callback_state(Some("wrong")).is_err());
+        manager.consume_callback_state(Some(&state)).unwrap();
+        assert!(manager.consume_callback_state(Some(&state)).is_err());
+        *manager.oauth_state.write() = Some((
+            state.clone(),
+            std::time::Instant::now() - std::time::Duration::from_secs(301),
+        ));
+        assert!(manager.consume_callback_state(Some(&state)).is_err());
     }
 }

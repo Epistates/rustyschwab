@@ -41,14 +41,13 @@ pub struct ClientConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChannelKind {
-    /// Unbounded channel (default, backward compatible)
-    /// Use when: Guaranteed fast consumer, memory not a concern
-    /// Behavior: No backpressure, can grow unbounded
+    /// Legacy configuration, capped at 65,536 messages by StreamClient.
+    /// Overflow invalidates the session and emits a loss notification.
     Unbounded,
 
     /// Bounded channel with specified buffer size
     /// Use when: Need backpressure, want to limit memory usage
-    /// Behavior: Sender blocks when buffer full (backpressure)
+    /// Behavior: Overflow invalidates the session and emits a loss notification.
     Bounded(usize),
 }
 
@@ -61,10 +60,8 @@ pub struct StreamConfig {
     #[serde(with = "humantime_serde")]
     pub ping_timeout: Duration,
     pub max_subscriptions: usize,
-    #[deprecated(since = "0.2.0", note = "Use channel_kind instead")]
-    pub buffer_size: usize,
-    /// Channel type for message passing (default: Unbounded)
-    /// Set to Bounded(size) to enable backpressure control
+    /// Channel capacity (default: Bounded(4096)).
+    /// Consumers must reconcile on an explicit stream loss notification.
     pub channel_kind: ChannelKind,
 }
 
@@ -159,9 +156,7 @@ impl Default for StreamConfig {
             heartbeat_interval: Duration::from_secs(20), // WebSocket heartbeat interval
             ping_timeout: Duration::from_secs(30),       // WebSocket ping timeout
             max_subscriptions: 500,
-            #[allow(deprecated)]
-            buffer_size: 10000, // Deprecated, kept for backward compatibility
-            channel_kind: ChannelKind::Unbounded, // Default to unbounded for backward compatibility
+            channel_kind: ChannelKind::Bounded(4096), // Bounded with explicit loss/lifecycle notifications
         }
     }
 }
@@ -194,8 +189,11 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            requests_per_second: 120,
-            burst_size: 20,
+            // Schwab's documented limit is 120 requests **per minute**;
+            // 2 req/s sustains exactly that. A small burst absorbs spiky
+            // call patterns without meaningfully exceeding the budget.
+            requests_per_second: 2,
+            burst_size: 10,
         }
     }
 }
@@ -364,11 +362,16 @@ impl SchwabConfig {
         Ok(config)
     }
 
+    /// Persist the config to disk.
+    ///
+    /// Uses [`crate::security::secure_file_write`] (0600 permissions,
+    /// atomic temp-file rename) because the serialized config contains
+    /// `app_secret` in plaintext.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
 
-        std::fs::write(path, json)
+        crate::security::secure_file_write(path.as_ref(), json.as_bytes())
             .map_err(|e| Error::Config(format!("Failed to write config file: {}", e)))?;
 
         Ok(())
@@ -394,6 +397,11 @@ impl SchwabConfig {
                 "Rate limit should not exceed 500 requests per second".to_string(),
             ));
         }
+
+        // SSRF prevention applies regardless of how the config was built
+        // — previously only `from_env`/`from_file` enforced the domain
+        // allowlist, leaving builder-constructed configs unchecked.
+        self.validate_urls()?;
 
         Ok(())
     }

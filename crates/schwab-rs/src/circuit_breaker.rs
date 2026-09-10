@@ -43,231 +43,174 @@
 
 use crate::config::CircuitBreakerConfig;
 use crate::error::{Error, Result};
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use std::future::Future;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
-/// The current state of the circuit breaker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
-    /// Normal operation - requests pass through
     Closed,
-    /// Circuit is open - requests fail immediately
     Open,
-    /// Testing recovery - limited requests allowed
     HalfOpen,
 }
 
-/// Thread-safe circuit breaker with atomic operations.
-///
-/// The circuit breaker protects downstream services from cascading failures
-/// by failing fast when the service is unhealthy.
+struct State {
+    kind: CircuitState,
+    generation: u64,
+    failures: u32,
+    successes: u32,
+    probes: u32,
+    opened: Option<Instant>,
+}
+
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    state: RwLock<CircuitState>,
-    failure_count: AtomicU32,
-    success_count: AtomicU32,
-    half_open_requests: AtomicU32,
-    /// Wall-clock moment of the most recent failure, or `None` if the
-    /// circuit has never tripped. `Instant` is monotonic and the natural
-    /// fit for "how long ago did we fail" math — prior implementations
-    /// used `AtomicU64` with `Instant::now().elapsed()`, which always
-    /// returned ~0 and left the breaker stuck open forever.
-    last_failure_time: RwLock<Option<Instant>>,
+    state: Mutex<State>,
+}
+
+// Returning or cancelling the future releases its probe. Old completions
+// cannot modify a newer recovery generation.
+struct Permit<'a> {
+    breaker: &'a CircuitBreaker,
+    generation: u64,
+    probe: bool,
+}
+impl Drop for Permit<'_> {
+    fn drop(&mut self) {
+        let mut s = self.breaker.state.lock();
+        if self.probe && s.generation == self.generation {
+            s.probes = s.probes.saturating_sub(1);
+        }
+    }
 }
 
 impl CircuitBreaker {
-    /// Creates a new circuit breaker with the given configuration.
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             config,
-            state: RwLock::new(CircuitState::Closed),
-            failure_count: AtomicU32::new(0),
-            success_count: AtomicU32::new(0),
-            half_open_requests: AtomicU32::new(0),
-            last_failure_time: RwLock::new(None),
+            state: Mutex::new(State {
+                kind: CircuitState::Closed,
+                generation: 0,
+                failures: 0,
+                successes: 0,
+                probes: 0,
+                opened: None,
+            }),
         }
     }
-
-    /// Returns the current state of the circuit breaker.
     pub fn state(&self) -> CircuitState {
-        *self.state.read()
+        self.state.lock().kind
     }
-
-    /// Returns the current failure count.
     pub fn failure_count(&self) -> u32 {
-        self.failure_count.load(Ordering::Relaxed)
+        self.state.lock().failures
     }
-
-    /// Returns whether the circuit breaker allows requests.
-    ///
-    /// This method handles state transitions automatically:
-    /// - Open → HalfOpen after timeout
-    pub fn is_allowed(&self) -> bool {
+    fn transition(s: &mut State, next: CircuitState) {
+        let from = s.kind;
+        s.kind = next;
+        s.generation = s.generation.wrapping_add(1);
+        s.probes = 0;
+        s.successes = 0;
+        s.opened = if next == CircuitState::Open {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        if next == CircuitState::Closed {
+            s.failures = 0;
+        }
+        if from != next {
+            record_transition(from, next);
+        }
+    }
+    fn ready(&self, s: &mut State) -> bool {
         if !self.config.enabled {
             return true;
         }
-
-        let state = *self.state.read();
-        match state {
-            CircuitState::Closed => true,
-            CircuitState::Open => {
-                // Check if we should transition to half-open
-                let elapsed = self.elapsed_since_failure();
-                if elapsed >= self.config.open_duration {
-                    self.transition_to_half_open();
-                    true
-                } else {
-                    false
-                }
-            }
-            CircuitState::HalfOpen => {
-                // Allow limited requests in half-open state
-                let current = self.half_open_requests.fetch_add(1, Ordering::SeqCst);
-                current < self.config.half_open_max_requests
-            }
+        if s.kind == CircuitState::Open
+            && s.opened
+                .is_some_and(|t| t.elapsed() >= self.config.open_duration)
+        {
+            Self::transition(s, CircuitState::HalfOpen);
         }
+        s.kind == CircuitState::Closed
+            || (s.kind == CircuitState::HalfOpen
+                && s.probes < self.config.half_open_max_requests.max(1))
     }
-
-    /// Executes the given future with circuit breaker protection.
-    ///
-    /// If the circuit is open, returns an error immediately without executing the future.
-    /// Records success/failure and manages state transitions.
+    /// Advisory check; does not consume a probe. `call` atomically reserves it.
+    pub fn is_allowed(&self) -> bool {
+        self.ready(&mut self.state.lock())
+    }
     pub async fn call<F, Fut, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T>>,
     {
-        if !self.is_allowed() {
-            return Err(Error::Http {
-                status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                message: "Circuit breaker is open".to_string(),
+        let permit = {
+            let mut s = self.state.lock();
+            if !self.ready(&mut s) {
+                return Err(Error::CircuitOpen);
+            }
+            let probe = self.config.enabled && s.kind == CircuitState::HalfOpen;
+            if probe {
+                s.probes += 1;
+            }
+            Permit {
+                breaker: self,
+                generation: s.generation,
+                probe,
+            }
+        };
+        let result = f().await;
+        // A permanent HTTP rejection is evidence that the service responded.
+        // Local validation/auth failures are neutral; the permit still releases.
+        let success = result.is_ok()
+            || result.as_ref().err().is_some_and(|e| {
+                e.http_status().is_some_and(|s| s.is_client_error()) && !e.is_retryable()
             });
-        }
-
-        match f().await {
-            Ok(result) => {
-                self.record_success();
-                Ok(result)
-            }
-            Err(e) => {
-                if e.is_retryable() {
-                    self.record_failure();
-                }
-                Err(e)
-            }
-        }
+        let failure = result.as_ref().err().is_some_and(Error::is_retryable);
+        self.record(permit.generation, success, failure);
+        result
     }
-
-    /// Records a successful operation.
-    fn record_success(&self) {
+    fn record(&self, generation: u64, success: bool, failure: bool) {
         if !self.config.enabled {
             return;
         }
-
-        let state = *self.state.read();
-        match state {
-            CircuitState::Closed => {
-                // Reset failure count on success
-                self.failure_count.store(0, Ordering::Relaxed);
-            }
-            CircuitState::HalfOpen => {
-                let count = self.success_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count >= self.config.success_threshold {
-                    self.transition_to_closed();
+        let mut s = self.state.lock();
+        if s.generation != generation {
+            return;
+        }
+        match s.kind {
+            CircuitState::Closed if failure => {
+                s.failures += 1;
+                if s.failures >= self.config.failure_threshold.max(1) {
+                    Self::transition(&mut s, CircuitState::Open);
                 }
             }
-            CircuitState::Open => {
-                // Shouldn't happen, but handle gracefully
+            CircuitState::Closed if success => s.failures = 0,
+            CircuitState::HalfOpen if failure => Self::transition(&mut s, CircuitState::Open),
+            CircuitState::HalfOpen if success => {
+                s.successes += 1;
+                if s.successes >= self.config.success_threshold.max(1) {
+                    Self::transition(&mut s, CircuitState::Closed);
+                }
             }
+            _ => {}
         }
     }
-
-    /// Records a failed operation.
+    #[cfg(test)]
     fn record_failure(&self) {
-        if !self.config.enabled {
-            return;
-        }
-
-        let state = *self.state.read();
-        match state {
-            CircuitState::Closed => {
-                let count = self.failure_count.fetch_add(1, Ordering::SeqCst) + 1;
-                if count >= self.config.failure_threshold {
-                    self.transition_to_open();
-                }
-            }
-            CircuitState::HalfOpen => {
-                // Any failure in half-open goes back to open
-                self.transition_to_open();
-            }
-            CircuitState::Open => {
-                // Already open, update timestamp
-                self.update_failure_time();
-            }
-        }
+        let g = self.state.lock().generation;
+        self.record(g, false, true);
     }
-
-    fn transition_to_open(&self) {
-        let mut state = self.state.write();
-        let from = *state;
-        *state = CircuitState::Open;
-        self.update_failure_time();
-        tracing::warn!(
-            "Circuit breaker opened after {} failures",
-            self.failure_count.load(Ordering::Relaxed)
-        );
-        record_transition(from, CircuitState::Open);
+    #[cfg(test)]
+    fn record_success(&self) {
+        let g = self.state.lock().generation;
+        self.record(g, true, false);
     }
-
-    fn transition_to_half_open(&self) {
-        let mut state = self.state.write();
-        if *state == CircuitState::Open {
-            *state = CircuitState::HalfOpen;
-            self.half_open_requests.store(0, Ordering::Relaxed);
-            self.success_count.store(0, Ordering::Relaxed);
-            tracing::info!("Circuit breaker transitioned to half-open");
-            record_transition(CircuitState::Open, CircuitState::HalfOpen);
-        }
-    }
-
-    fn transition_to_closed(&self) {
-        let mut state = self.state.write();
-        let from = *state;
-        *state = CircuitState::Closed;
-        self.failure_count.store(0, Ordering::Relaxed);
-        self.success_count.store(0, Ordering::Relaxed);
-        self.half_open_requests.store(0, Ordering::Relaxed);
-        tracing::info!("Circuit breaker closed - service recovered");
-        record_transition(from, CircuitState::Closed);
-    }
-
-    fn update_failure_time(&self) {
-        *self.last_failure_time.write() = Some(Instant::now());
-    }
-
-    fn elapsed_since_failure(&self) -> Duration {
-        match *self.last_failure_time.read() {
-            Some(ts) => ts.elapsed(),
-            None => Duration::ZERO,
-        }
-    }
-
-    /// Manually resets the circuit breaker to closed state.
-    ///
-    /// Use this when you know the downstream service has recovered.
     pub fn reset(&self) {
-        let mut state = self.state.write();
-        let from = *state;
-        *state = CircuitState::Closed;
-        self.failure_count.store(0, Ordering::Relaxed);
-        self.success_count.store(0, Ordering::Relaxed);
-        self.half_open_requests.store(0, Ordering::Relaxed);
-        *self.last_failure_time.write() = None;
-        if from != CircuitState::Closed {
-            record_transition(from, CircuitState::Closed);
-        }
+        Self::transition(&mut self.state.lock(), CircuitState::Closed);
     }
 }
 
@@ -415,12 +358,7 @@ mod tests {
         let result: Result<i32> = breaker.call(|| async { Ok(42) }).await;
 
         assert!(result.is_err());
-        if let Err(Error::Http { status, message }) = result {
-            assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
-            assert!(message.contains("Circuit breaker is open"));
-        } else {
-            panic!("Expected Http error");
-        }
+        assert!(matches!(result, Err(Error::CircuitOpen)));
     }
 
     /// Regression: the previous `update_failure_time` implementation

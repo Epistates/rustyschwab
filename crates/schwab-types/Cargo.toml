@@ -11,12 +11,11 @@ documentation = "https://docs.rs/schwab-types"
 description = "Type definitions for Schwab Trading and Market Data APIs"
 
 [dependencies]
+rust_decimal = { version = "1.43", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
-thiserror = { workspace = true }
 schemars = { workspace = true, optional = true }
 
 [features]
@@ -27,3 +26,4 @@ schemars = ["dep:schemars"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
+proptest = "1.11"

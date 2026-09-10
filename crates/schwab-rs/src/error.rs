@@ -58,6 +58,32 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Each variant includes context about what failed and recovery hints.
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("Durable state failure: {0}")]
+    Storage(String),
+    #[error("Ownership lease lost; reconcile in-flight operations")]
+    OwnershipLost,
+    #[error("Circuit breaker is open")]
+    CircuitOpen,
+    #[error("Reconciliation is required for pending submission {attempt_id}")]
+    ReconciliationRequired { attempt_id: String },
+    /// A submission may have reached the broker. Reconcile before resubmitting.
+    #[error(
+        "Order submission outcome is unknown; reconcile before resubmitting (attempt {attempt_id})"
+    )]
+    SubmissionUnknown {
+        attempt_id: String,
+        #[source]
+        source: Box<Error>,
+    },
+    /// Structured upstream error with status preserved. Details are available to
+    /// trusted SDK callers but deliberately omitted from Display/log output.
+    #[error("Broker HTTP error {status}")]
+    Broker {
+        status: reqwest::StatusCode,
+        details: Vec<ApiError>,
+        request_id: Option<String>,
+    },
+
     /// Authentication-related error (OAuth flow, token refresh, credentials)
     ///
     /// **Recovery**: Initiate a new OAuth2 authentication flow by calling `AuthManager::authorize()`
@@ -188,7 +214,9 @@ pub enum AuthError {
     /// 60.5 min). Callers must run a fresh OAuth flow rather than attempting
     /// to refresh — Schwab does not renew the refresh token itself; it is
     /// only issued during the initial auth-code exchange.
-    #[error("Refresh token expiring soon ({seconds_remaining}s remaining) — full OAuth flow required")]
+    #[error(
+        "Refresh token expiring soon ({seconds_remaining}s remaining) — full OAuth flow required"
+    )]
     RefreshTokenExpiring { seconds_remaining: i64 },
 
     #[error("OAuth flow failed: {0}")]
@@ -296,13 +324,22 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl Error {
+    pub fn http_status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            Self::Http { status, .. } | Self::Broker { status, .. } => Some(*status),
+            Self::RateLimit { .. } => Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            _ => None,
+        }
+    }
     pub fn is_retryable(&self) -> bool {
         match self {
             Error::Network(_)
             | Error::Timeout { .. }
             | Error::RateLimit { .. }
             | Error::ConnectionClosed => true,
-            Error::Http { status, .. } if status.as_u16() >= 500 => true,
+            Error::Http { status, .. } | Error::Broker { status, .. } if status.as_u16() >= 500 => {
+                true
+            }
             _ => false,
         }
     }
@@ -310,7 +347,11 @@ impl Error {
     pub fn is_auth_error(&self) -> bool {
         match self {
             Error::Auth(_) => true,
-            Error::Http { status, .. } if *status == reqwest::StatusCode::UNAUTHORIZED => true,
+            Error::Http { status, .. } | Error::Broker { status, .. }
+                if *status == reqwest::StatusCode::UNAUTHORIZED =>
+            {
+                true
+            }
             _ => false,
         }
     }
@@ -325,12 +366,11 @@ impl Error {
 
 pub fn parse_api_error(status: reqwest::StatusCode, body: &str) -> Error {
     if let Ok(api_errors) = serde_json::from_str::<ApiErrorResponse>(body) {
-        if let Some(first_error) = api_errors.errors.first() {
-            return Error::Api {
-                code: first_error.id.clone().unwrap_or_else(|| status.to_string()),
-                message: first_error.to_string(),
-            };
-        }
+        return Error::Broker {
+            status,
+            details: api_errors.errors,
+            request_id: None,
+        };
     }
 
     Error::Http {

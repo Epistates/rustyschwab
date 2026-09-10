@@ -275,6 +275,8 @@ impl EncryptedFileTokenStore {
     }
 
     fn load_or_generate_key(&self) -> AuthResult<Zeroizing<[u8; 32]>> {
+        let key_lock = open_lock_file(&self.key_path.with_extension("key.lock"))?;
+        key_lock.lock().map_err(AuthError::TokenStorage)?;
         if self.key_path.exists() {
             to_auth_result(verify_file_permissions(&self.key_path))?;
             let key_bytes = std::fs::read(&self.key_path)
@@ -404,6 +406,33 @@ impl TokenStore for KeychainTokenStore {
         );
         Ok(tokens)
     }
+}
+
+/// The guard is held through reload, grant exchange, and persistence. OS locks
+/// release on crash; lock files contain no credentials and are never unlinked.
+pub(crate) async fn refresh_lock(path: &std::path::Path) -> AuthResult<std::fs::File> {
+    let lock_path = path.with_extension("refresh.lock");
+    let file = open_lock_file(&lock_path)?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(AuthError::TokenStorage(e)),
+        }
+    }
+}
+
+pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(AuthError::TokenStorage)
 }
 
 #[cfg(test)]

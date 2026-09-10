@@ -12,7 +12,6 @@ use schwab_rs::auth::TokenStoreKind;
 use schwab_rs::config::{
     CircuitBreakerConfig, ClientConfig, RateLimitConfig, RetryConfig, SchwabConfig,
 };
-use std::path::PathBuf;
 use std::time::Duration;
 use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -26,7 +25,8 @@ fn create_test_config(mock_server_uri: &str) -> SchwabConfig {
             callback_url: "https://127.0.0.1:8080/callback".to_string(),
             auth_url: format!("{}/oauth/authorize", mock_server_uri),
             token_url: format!("{}/oauth/token", mock_server_uri),
-            tokens_file: PathBuf::from("/tmp/test_tokens.json"),
+            tokens_file: std::env::temp_dir()
+                .join(format!("oauth-test-{}.json", uuid::Uuid::new_v4())),
             capture_callback: false,
             auto_refresh: false,
             refresh_buffer_seconds: 60,
@@ -152,24 +152,6 @@ async fn test_token_exchange_invalid_code() {
     );
 }
 
-// NOTE: Token refresh tests would require setting up existing tokens first
-// These are placeholder tests demonstrating the mock setup pattern
-
-#[tokio::test]
-#[ignore] // Ignore until token persistence is fully tested
-async fn test_token_refresh_success() {
-    let _mock_server = MockServer::start().await;
-    // Mock successful token refresh response would go here
-    // Full integration test would require existing tokens
-}
-
-#[tokio::test]
-#[ignore] // Ignore until token persistence is fully tested
-async fn test_token_refresh_expired_refresh_token() {
-    let _mock_server = MockServer::start().await;
-    // Mock error response for expired refresh token would go here
-}
-
 #[tokio::test]
 async fn test_oauth_state_parameter_generated() {
     let mock_server = MockServer::start().await;
@@ -201,9 +183,25 @@ async fn test_oauth_state_parameter_generated() {
 }
 
 #[tokio::test]
-#[ignore] // This test demonstrates mock setup but doesn't call actual code
 async fn test_authorization_header_format() {
-    let _mock_server = MockServer::start().await;
-    // Test would validate that Basic auth header is properly formatted
-    // Requires actual token exchange call to verify header
+    use base64::Engine;
+    let mock = MockServer::start().await;
+    let config = create_test_config(&mock.uri());
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!(
+        "{}:{}",
+        config.oauth.app_key, config.oauth.app_secret
+    ));
+    Mock::given(method("POST"))
+        .and(header("authorization", format!("Basic {basic}")))
+        .respond_with(ResponseTemplate::new(400).set_body_string("secret-marker-do-not-echo"))
+        .expect(1)
+        .mount(&mock)
+        .await;
+    let auth = AuthManager::new(config.oauth).unwrap();
+    auth.authorize().await.unwrap();
+    let error = auth
+        .exchange_code("synthetic_code".into())
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("secret-marker"));
 }

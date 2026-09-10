@@ -1,12 +1,9 @@
 use anyhow::Result;
 use schwab_rs::auth::{AuthManager, OAuthConfig, TokenNotification, TokenStoreKind};
 use schwab_rs::prelude::*;
-use schwab_rs::streaming::{StreamClient, StreamMessage};
+use schwab_rs::streaming::{StreamClient, StreamMessage, StreamerIdentity};
 use schwab_rs::types::streaming::StreamService;
-use schwab_rs::types::trading::{
-    Order, OrderDuration, OrderInstruction, OrderInstrument, OrderLeg, OrderLegType, OrderSession,
-    OrderStrategyType, OrderType, PositionEffect,
-};
+
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{error, info, warn};
@@ -114,9 +111,9 @@ async fn main() -> Result<()> {
     match client.get_quotes(&["AAPL", "MSFT", "GOOGL"]).await {
         Ok(quotes) => {
             info!("✅ Successfully retrieved quotes");
-            for quote in quotes.quotes {
+            for (symbol, quote) in quotes.quotes {
                 if let Some(q) = quote.quote {
-                    println!("{}: ${:.2}", quote.symbol, q.last_price.unwrap_or(0.0));
+                    println!("{}: ${:.2}", symbol, q.last_price.unwrap_or(0.0));
                 }
             }
         }
@@ -132,31 +129,16 @@ async fn main() -> Result<()> {
                 info!("Using account hash: {}", hash);
 
                 // 3. Preview an order
-                let order = Order {
-                    order_type: OrderType::Limit,
-                    session: OrderSession::Normal,
-                    duration: OrderDuration::Day,
-                    price: Some(1.00),
-                    order_strategy_type: Some(OrderStrategyType::Single),
-                    order_leg_collection: vec![OrderLeg {
-                        order_leg_type: OrderLegType::Equity,
-                        instrument: OrderInstrument {
-                            symbol: "AAPL".into(),
-                            asset_type: "EQUITY".into(),
-                            cusip: None,
-                            description: None,
-                        },
-                        instruction: OrderInstruction::Buy,
-                        quantity: 1.0,
-                        position_effect: Some(PositionEffect::Automatic),
-                        leg_id: None,
-                    }],
-                    ..Default::default()
-                };
+                let order: schwab_rs::types::trading::OrderRequest = serde_json::from_value(
+                    serde_json::json!({
+                        "session":"NORMAL", "duration":"DAY", "orderType":"LIMIT", "price":1.0,
+                        "orderStrategyType":"SINGLE", "orderLegCollection":[{"instruction":"BUY", "quantity":1,
+                        "instrument":{"assetType":"EQUITY", "symbol":"AAPL"}}]
+                    }),
+                )?;
 
-                info!("Previewing order...");
                 match client.preview_order(hash, &order).await {
-                    Ok(resp) => info!("✅ Order preview success: {}", resp.status),
+                    Ok(resp) => info!("✅ Order preview success: {}", resp),
                     Err(e) => warn!(
                         "Order preview failed (expected if sandbox or no funds): {}",
                         e
@@ -171,12 +153,13 @@ async fn main() -> Result<()> {
     if let Some(stream_config) = SchwabConfig::default().streaming {
         info!("Setting up streaming connection...");
 
-        // In a real app, you'd get the customer_id from account info
+        // In a real app, build the identity from `get_user_preferences()`
+        // via `StreamerIdentity::from_streamer_info` — the demo values
+        // below will not authenticate against the live streamer.
         let stream_client = StreamClient::new(
             stream_config,
             auth_manager.clone(),
-            "demo_customer_id".to_string(),
-            "demo_correl_id".to_string(),
+            StreamerIdentity::new("demo_customer_id", "demo_correl_id"),
         )?;
 
         match stream_client.connect().await {
@@ -194,6 +177,9 @@ async fn main() -> Result<()> {
                     let _ = tokio::time::timeout(Duration::from_secs(5), async {
                         while let Some(msg) = receiver.recv().await {
                             match msg {
+                                StreamMessage::State(status) => {
+                                    info!(?status, "Stream health changed")
+                                }
                                 StreamMessage::Data(data) => {
                                     info!("📊 Market data: {} items", data.data.len())
                                 }

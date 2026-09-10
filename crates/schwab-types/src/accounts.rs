@@ -31,6 +31,7 @@ pub struct Account {
 #[serde(rename_all = "camelCase")]
 pub struct SecuritiesAccount {
     pub account_number: String,
+    #[serde(rename = "type")]
     pub account_type: Option<String>,
     pub round_trips: Option<i32>,
     pub is_day_trader: Option<bool>,
@@ -134,16 +135,19 @@ pub struct UserPreferences {
     pub offers: Option<Vec<Offer>>,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct AccountPreferences {
-    pub account_number: String,
-    pub primary: bool,
-    pub account_type: String,
-    pub account_color: String,
-    pub display_name: String,
-    pub auto_position_effect: bool,
+    pub account_number: Option<String>,
+    pub primary_account: Option<bool>,
+    #[serde(rename = "type")]
+    pub account_type: Option<String>,
+    pub nick_name: Option<String>,
+    pub account_color: Option<String>,
+    pub display_acct_id: Option<String>,
+    pub auto_position_effect: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,10 +161,11 @@ pub struct StreamerInfo {
     pub schwab_client_function_id: String,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Offer {
-    pub level2_permissions: bool,
-    pub mkt_data_permission: String,
+    pub level2_permissions: Option<bool>,
+    pub mkt_data_permission: Option<String>,
 }

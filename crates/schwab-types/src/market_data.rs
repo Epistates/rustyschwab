@@ -19,13 +19,34 @@ use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
-/// Response containing multiple quote items.
+/// Response from `GET /quotes` and `GET /{symbol}/quotes`.
+///
+/// Schwab keys the response object **by symbol** — `{"AAPL": {...}}` — rather
+/// than wrapping quotes in an array. Invalid identifiers come back under a
+/// reserved `errors` key alongside the symbol entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub struct QuotesResponse {
+    /// Partial-failure report for invalid symbols/cusips/SSIDs in the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errors: Option<QuoteError>,
+    /// Quotes keyed by the symbol they were requested with.
+    #[serde(flatten)]
+    pub quotes: HashMap<String, QuoteItem>,
+}
+
+/// Per-request error report embedded in a quotes response.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-pub struct QuotesResponse {
-    pub quotes: Vec<QuoteItem>,
+pub struct QuoteError {
+    pub invalid_cusips: Option<Vec<String>>,
+    #[serde(rename = "invalidSSIDs")]
+    pub invalid_ssids: Option<Vec<i64>>,
+    pub invalid_symbols: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single quote item containing various quote data components.
@@ -34,12 +55,19 @@ pub struct QuotesResponse {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteItem {
-    pub symbol: String,
+    pub symbol: Option<String>,
+    pub asset_main_type: Option<String>,
+    pub asset_sub_type: Option<String>,
+    pub quote_type: Option<String>,
+    pub realtime: Option<bool>,
+    pub ssid: Option<i64>,
     pub quote: Option<QuoteQuote>,
     pub fundamental: Option<QuoteFundamental>,
     pub extended: Option<QuoteExtended>,
     pub reference: Option<QuoteReference>,
     pub regular: Option<QuoteRegular>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Core quote data including bid/ask, last price, and volume.
@@ -72,13 +100,15 @@ pub struct QuoteQuote {
     pub low_price: Option<f64>,
     pub mark: Option<f64>,
     pub net_change: Option<f64>,
-    pub total_volume: Option<i32>,
+    pub total_volume: Option<i64>,
     pub open_price: Option<f64>,
     pub quote_time: Option<i64>,
     pub trade_time: Option<i64>,
     pub volatility: Option<f64>,
     pub short_interest: Option<i32>,
     pub security_status: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Fundamental data including ratios, dividends, and financial metrics.
@@ -87,13 +117,13 @@ pub struct QuoteQuote {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteFundamental {
-    pub avg10_days_volume: Option<i32>,
-    pub avg30_days_volume: Option<i32>,
-    pub avg90_days_volume: Option<i32>,
+    pub avg10_days_volume: Option<i64>,
+    pub avg30_days_volume: Option<i64>,
+    pub avg90_days_volume: Option<i64>,
     pub div_amount: Option<f64>,
     pub div_yield: Option<f64>,
     pub div_pay_amount: Option<f64>,
-    pub div_pay_date: Option<i64>,
+    pub div_pay_date: Option<String>,
     pub pe_ratio: Option<f64>,
     pub peg_ratio: Option<f64>,
     pub pb_ratio: Option<f64>,
@@ -119,6 +149,8 @@ pub struct QuoteFundamental {
     pub high52: Option<f64>,
     pub low52: Option<f64>,
     pub fundamental_currency_code: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Extended hours trading data.
@@ -132,7 +164,9 @@ pub struct QuoteExtended {
     pub extended_change_percent: Option<f64>,
     pub extended_price_time: Option<i64>,
     pub quote_time: Option<i64>,
-    pub total_volume: Option<i32>,
+    pub total_volume: Option<i64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Reference data including symbol description and exchange info.
@@ -147,6 +181,8 @@ pub struct QuoteReference {
     pub exchange_name: Option<String>,
     pub asset_type: Option<String>,
     pub symbol: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Regular market session data.
@@ -159,6 +195,8 @@ pub struct QuoteRegular {
     pub regular_market_net_change: Option<f64>,
     pub regular_market_trade_time: Option<i64>,
     pub regular_market_percent_change: Option<f64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Historical price data response with OHLCV candles.
@@ -171,6 +209,8 @@ pub struct PriceHistoryResponse {
     pub previous_close: Option<f64>,
     pub previous_close_date: Option<i64>,
     pub candles: Vec<Candle>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single OHLCV candlestick data point.
@@ -184,6 +224,8 @@ pub struct Candle {
     pub close: f64,
     pub volume: i32,
     pub datetime: i64,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Options chain response with calls and puts organized by expiration and strike.
@@ -200,6 +242,8 @@ pub struct OptionChainResponse {
     pub number_of_contracts: Option<i32>,
     pub call_exp_date_map: Option<ExpDateStrikeMap>,
     pub put_exp_date_map: Option<ExpDateStrikeMap>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Map of expiration dates to strike prices to option contracts.
@@ -232,6 +276,8 @@ pub struct UnderlyingQuote {
     pub percent_change: Option<f64>,
     pub quote_time: Option<i64>,
     pub symbol: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single option contract with pricing and Greeks.
@@ -255,7 +301,7 @@ pub struct OptionContract {
     pub low_price: Option<f64>,
     pub open_price: Option<f64>,
     pub close_price: Option<f64>,
-    pub total_volume: Option<i32>,
+    pub total_volume: Option<i64>,
     pub trade_time_in_long: Option<i64>,
     pub quote_time_in_long: Option<i64>,
     pub net_change: Option<f64>,
@@ -264,17 +310,22 @@ pub struct OptionContract {
     pub theoretical_volatility: Option<f64>,
     pub time_value: Option<f64>,
     pub open_interest: Option<i32>,
+    #[serde(rename = "inTheMoney")]
     pub is_in_the_money: Option<bool>,
     pub is_divident: Option<bool>,
     pub strike_price: f64,
-    pub expiration_date: i64,
+    pub expiration_date: String,
     pub expiration_type: Option<String>,
     pub days_to_expiration: Option<i32>,
     pub last_trading_day: Option<i64>,
-    pub multiplier: Option<String>,
+    pub multiplier: Option<f64>,
     pub settlement_type: Option<String>,
-    pub deliverables: Option<Vec<String>>,
-    pub greeks: Option<Greeks>,
+    #[serde(rename = "optionDeliverablesList")]
+    pub deliverables: Option<Vec<serde_json::Value>>,
+    #[serde(flatten)]
+    pub greeks: Greeks,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Option Greeks for risk assessment.
@@ -295,8 +346,11 @@ pub struct Greeks {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ExpirationChainResponse {
-    pub symbol: String,
+    pub symbol: Option<String>,
+    #[serde(rename = "expirationList")]
     pub expirations: Vec<ExpirationItem>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single option expiration date entry.
@@ -308,6 +362,8 @@ pub struct ExpirationItem {
     pub days_to_expiration: i32,
     pub expiration_type: String,
     pub standard: bool,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Response containing market movers/screener results.
@@ -316,6 +372,8 @@ pub struct ExpirationItem {
 #[serde(rename_all = "camelCase")]
 pub struct MoversResponse {
     pub screeners: Vec<MoverItem>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single market mover item.
@@ -328,7 +386,9 @@ pub struct MoverItem {
     pub direction: Direction,
     pub change: Option<f64>,
     pub last: Option<f64>,
-    pub total_volume: Option<i32>,
+    pub total_volume: Option<i64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Direction of price movement.
@@ -343,9 +403,16 @@ pub enum Direction {
 }
 
 /// Response containing instrument search results.
+///
+/// Schwab wraps the result list in an `instruments` key:
+/// `{"instruments": [...]}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct InstrumentsResponse(pub Vec<Instrument>);
+pub struct InstrumentsResponse {
+    pub instruments: Vec<Instrument>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
 
 /// An instrument (security) with basic info and optional fundamentals.
 #[skip_serializing_none]
@@ -360,6 +427,8 @@ pub struct Instrument {
     pub exchange: Option<String>,
     pub exchange_name: Option<String>,
     pub fundamental: Option<InstrumentFundamental>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Fundamental data for an instrument.
@@ -382,6 +451,8 @@ pub struct InstrumentFundamental {
     pub market_cap: Option<f64>,
     pub trade_time_in_long: Option<i64>,
     pub exchange: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Period type for price history requests.
@@ -530,7 +601,7 @@ pub enum MoverSort {
 /// Projection type for instrument searches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "kebab-case")]
 pub enum Projection {
     /// Symbol search
     SymbolSearch,
@@ -555,6 +626,8 @@ pub struct ApiError {
     pub title: Option<String>,
     pub detail: Option<String>,
     pub source: Option<ErrorSource>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Source location of an API error.
@@ -564,6 +637,8 @@ pub struct ErrorSource {
     pub pointer: Option<Vec<String>>,
     pub parameter: Option<String>,
     pub header: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Collection of API errors.
@@ -571,6 +646,8 @@ pub struct ErrorSource {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct ApiErrors {
     pub errors: Vec<ApiError>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Trading session time window.
@@ -581,6 +658,8 @@ pub struct ApiErrors {
 pub struct Session {
     pub start: Option<String>,
     pub end: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Session hours for pre-market, regular, and post-market.
@@ -592,6 +671,8 @@ pub struct SessionHours {
     pub pre_market: Option<Vec<Session>>,
     pub regular_market: Option<Vec<Session>>,
     pub post_market: Option<Vec<Session>>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Market hours for a specific date and product.
@@ -605,7 +686,12 @@ pub struct MarketHours {
     pub product: Option<String>,
     pub is_open: Option<bool>,
     pub session_hours: Option<SessionHours>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Map of market names to their hours entries.
-pub type MarketsHoursResponse = HashMap<String, Vec<MarketHours>>;
+/// Map of market type (e.g. `equity`) to product code (e.g. `EQ`) to hours.
+///
+/// Schwab nests market hours two levels deep:
+/// `{"equity": {"EQ": {"date": ..., "sessionHours": ...}}}`.
+pub type MarketsHoursResponse = HashMap<String, HashMap<String, MarketHours>>;
