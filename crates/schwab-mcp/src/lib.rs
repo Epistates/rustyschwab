@@ -1,6 +1,7 @@
 //! Library surface for `schwab-mcp` — consumed by the binary (`main.rs`)
 //! and integration tests.
 
+pub mod authority;
 pub mod identity;
 pub mod metrics;
 pub mod network;
