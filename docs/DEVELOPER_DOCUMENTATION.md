@@ -65,10 +65,10 @@ Provide developers with a **type-safe, secure, and performant** Rust interface t
    - **Automatic Reconnection**: Intelligent backoff and recovery
    - **Subscription Persistence**: Automatic re-subscription of active services on reconnect
    - Heartbeat monitoring with 90-second crash detection
-   - Bounded/unbounded channel backpressure control
+   - Bounded delivery with consumer-visible loss and session invalidation
 
 4. **Enterprise-Grade Resilience**
-   - Rate limiting (120 req/s with burst of 20) via `governor`
+   - Rate limiting tuned to Schwab's 120 requests/minute limit (2 req/s, burst of 10) via `governor`
    - Exponential backoff retry logic with jitter
    - Circuit breaker for upstream failure protection
    - Comprehensive error handling and structured telemetry
@@ -206,7 +206,7 @@ edition = "2024" # Q1 2026 SOTA Standard
 - **zeroize** (1.8) - Guaranteed memory clearing
 
 #### Resilience
-- **governor** (0.7) - GCRA-based rate limiting
+- **governor** (0.10) - GCRA-based rate limiting
 - **tower** (0.5) - Service middleware and abstraction
 
 ---

@@ -66,8 +66,12 @@ tokio::spawn(async move {
 ## MCP Server Issues
 
 ### Tool responses missing account numbers or streamer credentials
-*   **Cause:** `schwab-mcp` redacts PII from every tool response by default — account numbers are masked to the last four digits and `schwabClientCustomerId` / `schwabClientCorrelId` fields are stripped.
-*   **Fix (local debugging only):** Set `SCHWAB_MCP_REDACT_PII=0` (or `false` / `no`) before starting the server. Leave it enabled anywhere LLM output may be logged.
+*   **Cause:** `schwab-mcp` redacts PII from every tool response by default — account numbers are masked to the last four digits and `schwabClientCustomerId` / `schwabClientCorrelId` / user-identity fields are stripped.
+*   **Fix (local debugging only):** Set `SCHWAB_MCP_REDACT_PII=0` (or `false` / `no`) before starting the server to reveal **full account numbers**. Streamer credentials and identity fields stay dropped regardless — that switch only controls account-number masking. Leave masking enabled anywhere LLM output may be logged.
+
+### `refusing to start the HTTP/WebSocket transport on non-loopback address`
+*   **Cause:** MCP requires bearer policy for network access and an additional explicit opt-in for non-loopback binding. Configure `SCHWAB_MCP_POLICY_FILE` and a TLS proxy; see `ENTERPRISE_REMEDIATION.md`.
+*   **Fix:** Keep `SCHWAB_MCP_BIND` on loopback (the default). If you genuinely need a remote bind, put an authenticating reverse proxy in front and set `SCHWAB_MCP_ALLOW_REMOTE=1` to acknowledge the risk.
 
 ### `SCHWAB_TOKEN_STORE=<value> not recognized`
 *   **Cause:** The env var was set to something other than `keychain`, `encrypted` (alias: `encryptedfile` / `encrypted_file`), or `file`. Previous versions silently downgraded unknown values to plaintext `File`; the current version errors loudly instead.

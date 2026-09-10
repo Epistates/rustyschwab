@@ -100,7 +100,7 @@ schwab-rs/
 │   │   ├─ RetryConfig: Exponential backoff settings
 │   │   ├─ RateLimitConfig: Rate limiting parameters
 │   │   ├─ ReconnectConfig: WebSocket reconnection strategy
-│   │   └─ ChannelKind: Bounded vs Unbounded channels for backpressure
+│   │   └─ ChannelKind: Bounded queues with explicit gap notifications
 │   │
 │   ├── error.rs (256 LOC)
 │   │   ├─ Error: Main error enum (HttpError, Auth, WebSocket, etc.)
@@ -155,7 +155,7 @@ schwab-rs/
 │   │   │   ├─ StreamClient: Main streaming entry point
 │   │   │   ├─ StreamClientBuilder: Fluent builder pattern
 │   │   │   ├─ ConnectionState: Tracks connection lifecycle
-│   │   │   ├─ MessageSender/MessageReceiver: Bounded/Unbounded channels
+│   │   │   ├─ MessageSender/MessageReceiver: Tracked bounded delivery and health state
 │   │   │   ├─ Ping/Pong heartbeat (20s interval, 30s timeout)
 │   │   │   ├─ Exponential backoff reconnection (2s-128s)
 │   │   │   ├─ 90-second crash detection
@@ -453,20 +453,17 @@ pub struct RetryPolicy {
 let quota = Quota::per_second(120).allow_burst(20);
 let rate_limiter = RateLimiter::direct(quota);
 ```
-**Default**: 120 req/s with 20-request burst (Schwab's limits)
+**Default**: 2 req/s with a 10-request burst; configure for application entitlement.
 **Pattern**: Async-aware using `rate_limiter.until_ready().await`
 
-### 7. **Bounded vs Unbounded Channels for Backpressure**
+### 7. Bounded streaming delivery
 
-```rust
-pub enum MessageReceiver {
-    Unbounded(mpsc::UnboundedReceiver<StreamMessage>),  // No backpressure
-    Bounded(mpsc::Receiver<StreamMessage>),             // Backpressure
-}
-```
-**Rationale**: 
-- **Unbounded**: Fast, compatible with slow consumers (memory at risk)
-- **Bounded**: Memory-bounded, slows producer when buffer full
+`StreamClient` uses a tracked bounded queue (4,096 messages by default).
+Consumers receive explicit health, generation and loss state. Overflow
+invalidates the session and requires reconciliation; it does not silently
+return an apparently healthy snapshot. The legacy `Unbounded` configuration
+is capped at 65,536 messages. See the enterprise remediation guide for
+freshness and activity-history semantics.
 
 ### 8. **Heartbeat + Ping/Pong for Connection Stability**
 
@@ -603,7 +600,8 @@ SCHWAB_TOKENS_FILE
 SCHWAB_TOKEN_STORE           // keychain | encrypted | file (unset = platform default)
 SCHWAB_PKCE_ENABLED          // defaults to false
 SCHWAB_METRICS_BIND          // schwab-mcp: opt-in Prometheus scrape endpoint
-SCHWAB_MCP_REDACT_PII        // schwab-mcp: defaults on
+SCHWAB_MCP_REDACT_PII        // schwab-mcp: account-number masking on by default (creds/identity always dropped)
+SCHWAB_MCP_ALLOW_REMOTE      // schwab-mcp: allow non-loopback http/ws bind (bearer policy and TLS proxy required)
 
 // 2. .env files (via dotenvy crate)
 // 3. Code configuration (SchwabConfig)
@@ -816,7 +814,7 @@ Send to WebSocket
 |----------|------|------|-----------|
 | **Arc<RwLock<T>> for client state** | Shareable, cloneable | RwLock overhead | Allows concurrent access without channels |
 | **Thin endpoint wrappers** | Clean API organization | Extra indirection | Easier to maintain, centralized logic |
-| **Unbounded channels by default** | Backward compatible, fast | Risk of memory growth | Can use Bounded(N) when needed |
+| **Bounded tracked channels** | Explicit loss and generation state | Slow consumers require reconciliation | Size queues and monitor loss |
 | **Keychain as default (macOS)** | Best security | Platform-specific | Leverages OS capabilities |
 | **EncryptedFile as default (Linux/Windows)** | Portable, encrypted | Key management complexity | Balances security and usability |
 | **ChaCha20 over AES** | Faster, memory-safe | Less adoption | NCC Group audited, immune to cache timing |
