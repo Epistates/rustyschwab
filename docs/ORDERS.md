@@ -169,6 +169,15 @@ constructor (`TRAILING_STOP_LIMIT`, `LIMIT_ON_CLOSE`, `priceLinkBasis`, …)
 can be set directly or deserialized from JSON. The paper engine and the MCP
 policy reject some of these fields; see their docs.
 
+`TRAILING_STOP_LIMIT` deliberately has no constructor. Schwab's request
+schema carries `priceLinkBasis` and `priceLinkType` but no `priceOffset`, and
+publishes no example of the type, so whether the limit is a fixed `price` or
+trails alongside the stop is unspecified. `validate()` takes the only reading
+the schema supports, a fixed `price` plus the trailing-stop trio
+(`stopPriceLinkBasis`, `stopPriceLinkType`, `stopPriceOffset`); start from
+`trailing_stop(...)`, set `order_type` and `price`, and confirm the shape with
+`preview_order` before relying on it.
+
 ## JSON specs and the MCP `build_order` tool
 
 `OrderSpec` is the same composition in JSON, keyed by `kind`. The MCP

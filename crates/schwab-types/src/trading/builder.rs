@@ -301,6 +301,13 @@ impl OrderRequest {
 
     /// A stop that trails `basis` by `offset`, expressed as `link` (a price
     /// difference, a percentage, or ticks).
+    ///
+    /// There is no `trailing_stop_limit` constructor on purpose: Schwab's
+    /// schema has no `priceOffset` and no published `TRAILING_STOP_LIMIT`
+    /// example, so how the limit should be linked is unspecified. To send one,
+    /// set `order_type` to [`OrderType::TrailingStopLimit`] and a fixed `price`
+    /// on the result (the reading `validate()` enforces) and confirm the shape
+    /// with a preview first.
     pub fn trailing_stop(
         leg: OrderRequestLeg,
         basis: PriceLinkBasis,

@@ -250,6 +250,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools` like any other tool.
 - `docs/ORDERS.md` is rewritten around the constructors; it previously
   showed the response type `Order` with fields that do not exist.
+- `TRAILING_STOP_LIMIT` deliberately keeps no constructor; `docs/ORDERS.md`
+  and the `trailing_stop` docs now say why (Schwab's schema has no
+  `priceOffset` and no published example, so the limit linkage is
+  unspecified) and how to send one with a fixed `price`.
 
 ### Changed — documentation truth pass
 - `docs/ARCHITECTURE_OVERVIEW.md` is rewritten to describe the current
