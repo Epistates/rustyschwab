@@ -7,7 +7,7 @@ use super::{
     PositionEffect, PriceLinkBasis, PriceLinkType, RequestedDestination, SpecialInstruction,
     StopType, TaxLotMethod,
 };
-use crate::common::PutCall;
+use crate::common::{AssetType, PutCall};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use std::{fmt, str::FromStr};
@@ -199,7 +199,7 @@ impl OrderRequestInstrument {
     pub fn equity(symbol: impl Into<String>) -> Self {
         Self {
             symbol: symbol.into(),
-            asset_type: "EQUITY".into(),
+            asset_type: AssetType::Equity,
         }
     }
 
@@ -208,7 +208,7 @@ impl OrderRequestInstrument {
     pub fn option(symbol: impl Into<String>) -> Self {
         Self {
             symbol: symbol.into(),
-            asset_type: "OPTION".into(),
+            asset_type: AssetType::Option,
         }
     }
 }

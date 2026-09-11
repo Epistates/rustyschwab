@@ -6,6 +6,7 @@
 //! - Position information
 //! - User preferences and streamer info
 
+use crate::common::AccountsInstrument;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
@@ -55,7 +56,7 @@ pub struct Position {
     pub long_quantity: Option<f64>,
     pub settled_long_quantity: Option<f64>,
     pub settled_short_quantity: Option<f64>,
-    pub instrument: Option<PositionInstrument>,
+    pub instrument: Option<AccountsInstrument>,
     pub market_value: Option<f64>,
     pub maintenance_requirement: Option<f64>,
     pub average_long_price: Option<f64>,
@@ -67,19 +68,6 @@ pub struct Position {
     pub previous_session_long_quantity: Option<f64>,
     pub previous_session_short_quantity: Option<f64>,
     pub current_cost: Option<f64>,
-}
-
-#[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct PositionInstrument {
-    pub asset_type: String,
-    pub cusip: Option<String>,
-    pub symbol: String,
-    pub description: Option<String>,
-    pub instrument_id: Option<i64>,
-    pub net_change: Option<f64>,
 }
 
 #[skip_serializing_none]

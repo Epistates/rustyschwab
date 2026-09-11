@@ -175,7 +175,7 @@ fn exposure(
             ));
         }
         for leg in &order.order_leg_collection {
-            use schwab_types::trading::OrderInstruction;
+            use schwab_types::{common::AssetType, trading::OrderInstruction};
             if matches!(
                 leg.instruction,
                 OrderInstruction::SellShort
@@ -186,9 +186,9 @@ fn exposure(
                     "Opening short exposure requires an external portfolio risk engine",
                 ));
             }
-            let multiplier = match leg.instrument.asset_type.as_str() {
-                "EQUITY" => rust_decimal::Decimal::ONE,
-                "OPTION" => *multipliers
+            let multiplier = match leg.instrument.asset_type {
+                AssetType::Equity => rust_decimal::Decimal::ONE,
+                AssetType::Option => *multipliers
                     .get(&leg.instrument.symbol)
                     .filter(|v| **v > rust_decimal::Decimal::ZERO)
                     .ok_or_else(|| {

@@ -472,4 +472,170 @@ fn order_enums_use_the_trader_api_spellings() {
         }))
         .is_err()
     );
+    // A misspelled asset type is rejected the same way.
+    assert!(
+        serde_json::from_value::<OrderRequest>(serde_json::json!({
+            "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
+            "orderLegCollection":[{"instruction":"BUY","quantity":"1",
+                "instrument":{"assetType":"STOCK","symbol":"AAPL"}}]
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn order_details_decode_the_documented_payload_fully_typed() {
+    use schwab_types::common::AssetType;
+    use schwab_types::trading::{
+        Order, OrderActivityType, OrderLegType, OrderStatus, PositionEffect, RequestedDestination,
+    };
+    // Schwab's documented `order_details` example, with the placeholder
+    // digits replaced by plausible values.
+    let json = r#"{
+        "session":"NORMAL",
+        "duration":"DAY",
+        "orderType":"LIMIT",
+        "complexOrderStrategyType":"NONE",
+        "quantity":1.0,
+        "filledQuantity":0.0,
+        "remainingQuantity":0.0,
+        "requestedDestination":"AUTO",
+        "destinationLinkName":"AutoRoute",
+        "price":10.0,
+        "orderLegCollection":[
+            {
+                "orderLegType":"EQUITY",
+                "legId":1,
+                "instrument":{
+                    "assetType":"EQUITY",
+                    "cusip":"458140100",
+                    "symbol":"INTC",
+                    "instrumentId":1234567
+                },
+                "instruction":"BUY",
+                "positionEffect":"OPENING",
+                "quantity":1.0
+            }
+        ],
+        "orderStrategyType":"SINGLE",
+        "orderId":1000000000001,
+        "cancelable":false,
+        "editable":false,
+        "status":"CANCELED",
+        "enteredTime":"2025-01-15T14:31:22+0000",
+        "closeTime":"2025-01-15T14:35:00+0000",
+        "tag":"API_TRADER",
+        "accountNumber":12345678,
+        "orderActivityCollection":[
+            {
+                "activityType":"EXECUTION",
+                "activityId":900000000001,
+                "executionType":"CANCELED",
+                "quantity":1.0,
+                "orderRemainingQuantity":0.0,
+                "executionLegs":[
+                    {
+                        "legId":1,
+                        "quantity":1.0,
+                        "mismarkedQuantity":0.0,
+                        "price":0.0,
+                        "time":"2025-01-15T14:35:00+0000",
+                        "instrumentId":1234567
+                    }
+                ]
+            }
+        ]
+    }"#;
+    let order: Order = serde_json::from_str(json).unwrap();
+    assert_eq!(order.order_id.as_deref(), Some("1000000000001"));
+    assert_eq!(order.account_number.as_deref(), Some("12345678"));
+    assert_eq!(
+        order.requested_destination,
+        Some(RequestedDestination::Auto)
+    );
+    assert_eq!(order.status, Some(OrderStatus::Canceled));
+    assert_eq!(order.tag.as_deref(), Some("API_TRADER"));
+    assert!(order.extra.is_empty(), "{:?}", order.extra);
+    let leg = &order.order_leg_collection[0];
+    assert_eq!(leg.order_leg_type, OrderLegType::Equity);
+    assert_eq!(leg.position_effect, Some(PositionEffect::Opening));
+    assert_eq!(leg.instrument.asset_type, AssetType::Equity);
+    assert_eq!(leg.instrument.instrument_id, Some(1234567));
+    assert!(
+        leg.instrument.extra.is_empty(),
+        "{:?}",
+        leg.instrument.extra
+    );
+    let activity = &order.order_activity_collection[0];
+    assert_eq!(activity.activity_type, Some(OrderActivityType::Execution));
+    assert_eq!(activity.execution_type.as_deref(), Some("CANCELED"));
+    // Beyond the spec, so it stays in `extra` rather than failing.
+    assert_eq!(activity.extra["activityId"], 900000000001_i64);
+    let fill = &activity.execution_legs[0];
+    assert_eq!(fill.leg_id, Some(1));
+    assert_eq!(fill.time.as_deref(), Some("2025-01-15T14:35:00+0000"));
+    // Serialized orders carry the same names Schwab uses.
+    let wire = serde_json::to_value(&order).unwrap();
+    assert_eq!(wire["requestedDestination"], "AUTO");
+    assert_eq!(
+        wire["orderActivityCollection"][0]["activityId"],
+        900000000001_i64
+    );
+    assert!(wire["orderLegCollection"][0].get("quantityType").is_none());
+}
+
+#[test]
+fn position_instruments_type_the_option_extension_and_tolerate_unknown() {
+    use schwab_types::accounts::SecuritiesAccount;
+    use schwab_types::common::{AssetType, PutCall};
+    let json = r#"{
+        "accountNumber": "12345678",
+        "type": "MARGIN",
+        "positions": [
+            {
+                "longQuantity": 2.0,
+                "instrument": {
+                    "assetType": "OPTION",
+                    "cusip": "0AAPL.EH50190000",
+                    "symbol": "AAPL  250815C00190000",
+                    "description": "APPLE INC 08/15/2025 $190 Call",
+                    "instrumentId": 98765432,
+                    "netChange": 0.35,
+                    "type": "VANILLA",
+                    "putCall": "CALL",
+                    "underlyingSymbol": "AAPL",
+                    "optionMultiplier": 100
+                }
+            },
+            {
+                "longQuantity": 100.0,
+                "instrument": {
+                    "assetType": "CASH_EQUIVALENT",
+                    "symbol": "SWVXX",
+                    "type": "MONEY_MARKET_FUND",
+                    "putCall": "UNKNOWN"
+                }
+            }
+        ]
+    }"#;
+    let account: SecuritiesAccount = serde_json::from_str(json).unwrap();
+    let call = account.positions.as_ref().unwrap()[0]
+        .instrument
+        .as_ref()
+        .unwrap();
+    assert_eq!(call.asset_type, AssetType::Option);
+    assert_eq!(call.put_call, Some(PutCall::Call));
+    assert_eq!(call.underlying_symbol.as_deref(), Some("AAPL"));
+    assert_eq!(call.option_multiplier, Some(100));
+    assert_eq!(call.type_.as_deref(), Some("VANILLA"));
+    assert!(call.extra.is_empty(), "{:?}", call.extra);
+    let sweep = account.positions.as_ref().unwrap()[1]
+        .instrument
+        .as_ref()
+        .unwrap();
+    assert_eq!(sweep.asset_type, AssetType::CashEquivalent);
+    // Schwab's spec lists `UNKNOWN` next to `PUT`/`CALL`; it reads as
+    // "no right" rather than failing the whole account.
+    assert_eq!(sweep.put_call, None);
+    assert_eq!(sweep.type_.as_deref(), Some("MONEY_MARKET_FUND"));
 }

@@ -41,6 +41,7 @@
 //! bracket.validate().unwrap();
 //! ```
 
+use crate::common::{AccountsInstrument, AssetType};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
@@ -50,6 +51,9 @@ mod spec;
 pub use builder::OptionSymbol;
 pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 
+/// An order as Schwab reports it. Tolerant: enums that only appear on
+/// responses carry an `Unknown` catch-all, and undocumented fields land in
+/// `extra`. Times are the broker's ISO-8601 strings, kept verbatim.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -67,7 +71,7 @@ pub struct Order {
     pub quantity: Option<f64>,
     pub filled_quantity: Option<f64>,
     pub remaining_quantity: Option<f64>,
-    pub requested_destination: Option<String>,
+    pub requested_destination: Option<RequestedDestination>,
     pub destination_link_name: Option<String>,
     pub price: Option<f64>,
     #[serde(default)]
@@ -76,42 +80,102 @@ pub struct Order {
     pub cancelable: Option<bool>,
     pub editable: Option<bool>,
     pub status: Option<OrderStatus>,
+    pub status_description: Option<String>,
     pub entered_time: Option<String>,
     pub close_time: Option<String>,
+    pub cancel_time: Option<String>,
+    pub release_time: Option<String>,
     pub stop_price: Option<f64>,
-    pub stop_price_link_basis: Option<String>,
-    pub stop_price_link_type: Option<String>,
+    pub stop_price_link_basis: Option<PriceLinkBasis>,
+    pub stop_price_link_type: Option<PriceLinkType>,
     pub stop_price_offset: Option<f64>,
+    pub stop_type: Option<StopType>,
+    pub price_link_basis: Option<PriceLinkBasis>,
+    pub price_link_type: Option<PriceLinkType>,
+    pub activation_price: Option<f64>,
+    pub tax_lot_method: Option<TaxLotMethod>,
+    pub special_instruction: Option<SpecialInstruction>,
+    pub tag: Option<String>,
     #[serde(default)]
     pub child_order_strategies: Vec<Order>,
     #[serde(default)]
-    pub order_activity_collection: Vec<serde_json::Value>,
+    pub replacing_order_collection: Vec<Order>,
+    #[serde(default)]
+    pub order_activity_collection: Vec<OrderActivity>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
     #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub account_number: Option<String>,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderLeg {
     pub order_leg_type: OrderLegType,
     pub leg_id: Option<i64>,
-    pub instrument: OrderInstrument,
+    pub instrument: AccountsInstrument,
     pub instruction: OrderInstruction,
     pub position_effect: Option<PositionEffect>,
     pub quantity: f64,
+    pub quantity_type: Option<QuantityType>,
 }
 
+/// One entry of `orderActivityCollection`: an execution (partial or full
+/// fill) or an order action. The real payload carries more than the spec
+/// documents (an `activityId`, `executionType: CANCELED`), so
+/// `execution_type` stays a string and the rest lands in `extra`.
+#[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
-pub struct OrderInstrument {
-    pub asset_type: String,
-    pub cusip: Option<String>,
-    pub symbol: String,
-    pub description: Option<String>,
+pub struct OrderActivity {
+    pub activity_type: Option<OrderActivityType>,
+    /// `FILL` is the only documented value; `CANCELED` has been observed.
+    pub execution_type: Option<String>,
+    pub quantity: Option<f64>,
+    pub order_remaining_quantity: Option<f64>,
+    #[serde(default)]
+    pub execution_legs: Vec<ExecutionLeg>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OrderActivityType {
+    Execution,
+    OrderAction,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Per-leg detail of an [`OrderActivity`] execution.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionLeg {
+    pub leg_id: Option<i64>,
+    pub price: Option<f64>,
+    pub quantity: Option<f64>,
+    pub mismarked_quantity: Option<f64>,
+    pub instrument_id: Option<i64>,
+    pub time: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// How an order leg's `quantity` is denominated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QuantityType {
+    AllShares,
+    Dollars,
+    Shares,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -482,7 +546,7 @@ pub struct OrderRequestLeg {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderRequestInstrument {
     pub symbol: String,
-    pub asset_type: String,
+    pub asset_type: AssetType,
 }
 
 impl OrderRequest {
@@ -558,7 +622,6 @@ impl OrderRequest {
             for leg in &self.order_leg_collection {
                 if leg.quantity <= rust_decimal::Decimal::ZERO
                     || leg.instrument.symbol.trim().is_empty()
-                    || leg.instrument.asset_type.trim().is_empty()
                 {
                     return Err(
                         "Leg quantity must be finite/positive and instrument must be specified"

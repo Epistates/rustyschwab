@@ -4,9 +4,12 @@ use crate::{
     coordination::{Lease, lease_held},
     execution::{OrderJournal, SubmissionOutcome, ensure_not_halted},
     storage::{audit, meta, sql},
-    types::trading::{
-        OrderDuration, OrderInstruction, OrderRequest, OrderSession, OrderStrategyType,
-        OrderSubmitResponse, OrderType,
+    types::{
+        common::AssetType,
+        trading::{
+            OrderDuration, OrderInstruction, OrderRequest, OrderSession, OrderStrategyType,
+            OrderSubmitResponse, OrderType,
+        },
     },
     utils::canonical_json,
 };
@@ -314,7 +317,7 @@ fn validate_order(order: &OrderRequest) -> Result<()> {
         ));
     }
     let leg = &order.order_leg_collection[0];
-    if leg.instrument.asset_type != "EQUITY"
+    if leg.instrument.asset_type != AssetType::Equity
         || !symbol_valid(&leg.instrument.symbol)
         || leg.position_effect.is_some()
         || !matches!(

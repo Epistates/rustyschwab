@@ -326,6 +326,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The order enums (`OrderSession`, `OrderDuration`, `OrderType`,
   `OrderInstruction`, `ComplexOrderStrategyType`, `OrderStatus`,
   `OrderLegType`, `PositionEffect`) are `Copy`, `Eq` and `Hash`.
+- Asset types are an enum on both sides of the wire.
+  `schwab_types::common::AssetType` carries the Trader API's full
+  `assetType` set (`EQUITY`, `OPTION`, `INDEX`, `MUTUAL_FUND`,
+  `CASH_EQUIVALENT`, `FIXED_INCOME`, `CURRENCY`, `COLLECTIVE_INVESTMENT`,
+  `FUTURE`, `FOREX`, `PRODUCT`) and replaces the `String` on
+  `OrderRequestInstrument`, order legs and positions; the previous
+  `common::AssetType` (Market Data's `assetMainType` values) is renamed
+  `AssetMainType`. Positions and order legs share one instrument type,
+  `common::AccountsInstrument` (Schwab's `AccountsInstrument`), which
+  replaces `accounts::PositionInstrument` and `trading::OrderInstrument`
+  and adds the option (`putCall`, `underlyingSymbol`, `optionMultiplier`)
+  and fixed-income (`maturityDate`, `factor`, `variableRate`) extensions
+  plus a tolerant `extra` map. `putCall` decodes through
+  `common::lenient`, which reads Schwab's documented `UNKNOWN` as `None`
+  instead of failing the account.
+- `Order` is fully typed against the spec: `requestedDestination`,
+  `stopPriceLinkBasis` and `stopPriceLinkType` are the same enums the
+  request side uses, and the documented fields that previously landed in
+  `extra` (`statusDescription`, `cancelTime`, `releaseTime`, `stopType`,
+  `priceLinkBasis`, `priceLinkType`, `activationPrice`, `taxLotMethod`,
+  `specialInstruction`, `tag`, `replacingOrderCollection`) have fields.
+  `orderActivityCollection` is `Vec<OrderActivity>` (activity type,
+  quantities, `ExecutionLeg`s with price/time/`legId`) instead of raw
+  JSON; `executionType` stays a string because Schwab sends `CANCELED`,
+  which the spec omits. `OrderLeg` gained `quantityType` and skips
+  absent fields when serialized, as `Order` already did.
 
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a

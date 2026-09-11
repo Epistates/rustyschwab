@@ -4,7 +4,10 @@ use crate::{
     error::{Error, Result},
     execution::ensure_not_halted,
     storage::{StateDatabase, sql},
-    types::trading::{OrderInstruction, OrderRequest, OrderStrategyType, OrderType},
+    types::{
+        common::AssetType,
+        trading::{OrderInstruction, OrderRequest, OrderStrategyType, OrderType},
+    },
 };
 use async_trait::async_trait;
 use rust_decimal::Decimal;
@@ -119,7 +122,7 @@ impl PortfolioRisk {
             ));
         }
         let leg = &order.order_leg_collection[0];
-        if leg.instrument.asset_type != "EQUITY"
+        if leg.instrument.asset_type != AssetType::Equity
             || !matches!(
                 leg.instruction,
                 OrderInstruction::Buy | OrderInstruction::Sell
