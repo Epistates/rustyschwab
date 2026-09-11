@@ -296,6 +296,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CHANGELOG: the paper-trading and enterprise follow-up notes that sat above
   the preamble, and the MCP dependency review that sat under 0.1.0, now
   live under Unreleased where the work is.
+- README links to `docs/*.md`, `CONTRIBUTING.md` and the issue tracker are
+  absolute GitHub URLs. The README is the `schwab-rs` crate front page on
+  docs.rs, where repository-relative links (`docs/ORDERS.md`,
+  `../../issues`) resolved to nothing.
+- The example packages (`auth_test`, `comprehensive`, `oauth-flow`,
+  `streaming-examples`, `enterprise-bench`) inherit `version`, `edition`
+  and `rust-version` from the workspace and are marked `publish = false`;
+  they were pinned at `0.1.0` / a literal edition and, apart from
+  `enterprise-bench`, publishable.
 
 ### Added — live conformance harness
 - `SchwabClient::get_json(path, query)` issues an authenticated `GET` to any
