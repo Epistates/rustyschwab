@@ -81,6 +81,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `crates/schwab-types/tests/response_shapes.rs` — fixture-based
   deserialization tests so wire-shape regressions fail in CI.
 
+### Fixed — request-side wire audit (query names and streamer field tables verified against Schwab docs + Schwabdev 3.0.5)
+- **Price history**: `periodType`/`frequencyType` were sent upper-case
+  (`DAY`, `MINUTE`); Schwab only accepts lower-case. `PriceHistoryParams`
+  and `OptionChainParams` moved to `schwab_types::market_data` and grew
+  `new(symbol)` plus `validate()`, which enforces Schwab's period /
+  frequency-type / frequency tables (and the defaulted frequency type)
+  before the request is sent. `Candle.volume` is now `i64`.
+- **Typed request enums** replace free-form strings: `QuoteField`
+  (`fields=quote,fundamental`), `MoverIndex` (`$DJI`, `NYSE`, …),
+  `MoverFrequency` (bare integer `0|1|5|10|30|60`), `Market`
+  (`equity|option|bond|future|forex`), `Entitlement` (`PN|NP|PP`) and
+  `OptionType` (`S|NS|ALL`). `get_quotes_with_options`, `get_movers`,
+  `get_markets`/`get_market` and the matching MCP tools take them; each
+  enum exposes `as_str()`/`Display` that is tested equal to its serde
+  wire value. The unused `common::MarketType` was removed.
+- **Account paths**: every `/trader/v1/accounts/{hash}` builder now
+  rejects empty or non-URL-safe segments and all-digit values (an
+  account *number* where the `hashValue` is required) before any
+  request is made.
+- **Streamer field tables**: `LEVELONE_OPTIONS` now covers fields
+  36 and 40–55 (exchange, 52-week range, indicative quotes, exercise
+  type); `LEVELONE_FUTURES_OPTIONS` stops at field 31, which is where
+  Schwab's guide ends and past which the streamer rejects the command.
+- Added `crates/schwab-types/tests/request_params.rs` and
+  `crates/schwab-rs/tests/market_data_wire.rs` (wiremock) so the query
+  strings and local guards are asserted in CI; the wiremock client
+  fixture now lives in `crates/schwab-rs/tests/common/`.
+
 ### Fixed — streaming protocol & reliability
 - Subscriptions now use the **`ADD`** command (additive) like the
   reference client. `SUBS` *replaces* a service's entire key list

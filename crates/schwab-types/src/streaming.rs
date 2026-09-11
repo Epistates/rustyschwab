@@ -235,7 +235,9 @@ impl StreamService {
             StreamService::LeveloneEquities => LevelOneEquityFields::default_fields(),
             StreamService::LeveloneOptions => LevelOneOptionFields::default_fields(),
             StreamService::LeveloneFutures => range_csv(40),
-            StreamService::LeveloneFuturesOptions => range_csv(35),
+            // Futures options stop at field 31 (Schwab's streamer guide);
+            // requesting beyond that is rejected with a bad-command error.
+            StreamService::LeveloneFuturesOptions => range_csv(31),
             StreamService::LeveloneForex => range_csv(29),
             // Book services carry symbol, snapshot time, bid levels, ask levels
             StreamService::NyseBook | StreamService::NasdaqBook | StreamService::OptionsBook => {
@@ -380,12 +382,29 @@ impl LevelOneOptionFields {
     pub const SECURITY_STATUS: u32 = 33;
     pub const THEORETICAL_VALUE: u32 = 34;
     pub const UNDERLYING_PRICE: u32 = 35;
+    pub const UV_EXPIRATION_TYPE: u32 = 36;
     pub const MARK: u32 = 37;
     pub const QUOTE_TIME_MILLIS: u32 = 38;
     pub const TRADE_TIME_MILLIS: u32 = 39;
+    pub const EXCHANGE: u32 = 40;
+    pub const EXCHANGE_NAME: u32 = 41;
+    pub const LAST_TRADING_DAY: u32 = 42;
+    pub const SETTLEMENT_TYPE: u32 = 43;
+    pub const NET_PERCENT_CHANGE: u32 = 44;
+    pub const MARK_NET_CHANGE: u32 = 45;
+    pub const MARK_PERCENT_CHANGE: u32 = 46;
+    pub const IMPLIED_YIELD: u32 = 47;
+    pub const IS_PENNY_PILOT: u32 = 48;
+    pub const OPTION_ROOT: u32 = 49;
+    pub const HIGH_52_WEEK: u32 = 50;
+    pub const LOW_52_WEEK: u32 = 51;
+    pub const INDICATIVE_ASK_PRICE: u32 = 52;
+    pub const INDICATIVE_BID_PRICE: u32 = 53;
+    pub const INDICATIVE_QUOTE_TIME: u32 = 54;
+    pub const EXERCISE_TYPE: u32 = 55;
 
     pub fn default_fields() -> String {
-        (0..=39)
+        (0..=Self::EXERCISE_TYPE)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
             .join(",")

@@ -11,9 +11,9 @@ use crate::retry::RetryPolicy;
 use crate::transport::HttpTransport;
 use crate::types::accounts::{Account, AccountNumberHash, UserPreferences};
 use crate::types::market_data::{
-    ContractType, ExpirationChainResponse, ExpirationMonth, FrequencyType, Instrument,
-    InstrumentsResponse, MarketsHoursResponse, MoverSort, MoversResponse, OptionChainResponse,
-    OptionStrategy, PeriodType, PriceHistoryResponse, Projection, QuoteItem, QuotesResponse, Range,
+    ExpirationChainResponse, Instrument, InstrumentsResponse, Market, MarketsHoursResponse,
+    MoverFrequency, MoverIndex, MoverSort, MoversResponse, OptionChainResponse,
+    PriceHistoryResponse, Projection, QuoteField, QuoteItem, QuotesResponse,
 };
 use crate::types::trading::{Order, OrderRequest, OrderSubmitResponse, Transaction};
 use chrono::NaiveDate;
@@ -23,6 +23,8 @@ use std::sync::Arc;
 use tracing::{debug, info};
 use url::Url;
 use urlencoding;
+
+pub use crate::types::market_data::{OptionChainParams, PriceHistoryParams};
 
 #[derive(Clone)]
 pub struct SchwabClient {
@@ -581,22 +583,30 @@ impl SchwabClient {
 
     /// Get quotes for multiple symbols
     pub async fn get_quotes(&self, symbols: &[&str]) -> Result<QuotesResponse> {
-        self.get_quotes_with_options(symbols, None, None).await
+        self.get_quotes_with_options(symbols, &[], None).await
     }
 
-    /// Get quotes for multiple symbols with advanced options
+    /// Get quotes for multiple symbols with advanced options.
+    ///
+    /// An empty `fields` slice leaves the parameter off, which Schwab
+    /// treats as [`QuoteField::All`].
     pub async fn get_quotes_with_options(
         &self,
         symbols: &[&str],
-        fields: Option<&str>,
+        fields: &[QuoteField],
         indicative: Option<bool>,
     ) -> Result<QuotesResponse> {
         if symbols.is_empty() {
             return Err(Error::InvalidParameter("No symbols provided".to_string()));
         }
+        if let Some(symbol) = symbols.iter().find(|s| s.trim().is_empty()) {
+            return Err(Error::InvalidParameter(format!(
+                "Blank symbol {symbol:?} in request"
+            )));
+        }
         let mut params = vec![("symbols", symbols.join(","))];
-        if let Some(f) = fields {
-            params.push(("fields", f.to_string()));
+        if let Some(fields) = quote_fields_csv(fields) {
+            params.push(("fields", fields));
         }
         if let Some(i) = indicative {
             params.push(("indicative", i.to_string()));
@@ -616,18 +626,24 @@ impl SchwabClient {
     /// by symbol — `{"AAPL": {...}}` — so we fetch the map and extract the
     /// requested entry.
     pub async fn get_quote(&self, symbol: &str) -> Result<QuoteItem> {
-        self.get_quote_with_options(symbol, None).await
+        self.get_quote_with_options(symbol, &[]).await
     }
 
-    /// Get quote for a single symbol with advanced options
+    /// Get quote for a single symbol with advanced options.
+    ///
+    /// An empty `fields` slice leaves the parameter off, which Schwab
+    /// treats as [`QuoteField::All`].
     pub async fn get_quote_with_options(
         &self,
         symbol: &str,
-        fields: Option<&str>,
+        fields: &[QuoteField],
     ) -> Result<QuoteItem> {
+        if symbol.trim().is_empty() {
+            return Err(Error::InvalidParameter("symbol is required".into()));
+        }
         let mut params = Vec::new();
-        if let Some(f) = fields {
-            params.push(("fields", f.to_string()));
+        if let Some(fields) = quote_fields_csv(fields) {
+            params.push(("fields", fields));
         }
         let encoded_symbol = urlencoding::encode(symbol);
         let response: QuotesResponse = self
@@ -652,11 +668,15 @@ impl SchwabClient {
             })
     }
 
-    /// Get price history for a symbol
+    /// Get price history for a symbol.
+    ///
+    /// Rejects period/frequency combinations Schwab does not accept before
+    /// the request is sent; see [`PriceHistoryParams::validate`].
     pub async fn get_price_history(
         &self,
         params: &PriceHistoryParams,
     ) -> Result<PriceHistoryResponse> {
+        params.validate().map_err(Error::InvalidParameter)?;
         self.request_with_query(
             "get_price_history",
             Method::GET,
@@ -666,11 +686,15 @@ impl SchwabClient {
         .await
     }
 
-    /// Get option chain for a symbol
+    /// Get option chain for a symbol.
+    ///
+    /// Rejects out-of-range parameters before the request is sent; see
+    /// [`OptionChainParams::validate`].
     pub async fn get_option_chain(
         &self,
         params: &OptionChainParams,
     ) -> Result<OptionChainResponse> {
+        params.validate().map_err(Error::InvalidParameter)?;
         self.request_with_query(
             "get_option_chain",
             Method::GET,
@@ -685,6 +709,9 @@ impl SchwabClient {
         &self,
         symbol: &str,
     ) -> Result<ExpirationChainResponse> {
+        if symbol.trim().is_empty() {
+            return Err(Error::InvalidParameter("symbol is required".into()));
+        }
         let params = [("symbol", symbol)];
         self.request_with_query(
             "get_option_expiration_chain",
@@ -695,25 +722,22 @@ impl SchwabClient {
         .await
     }
 
-    /// Get market movers for an index
+    /// Get market movers for an index or screener universe.
     pub async fn get_movers(
         &self,
-        index: &str,
+        index: MoverIndex,
         sort: Option<MoverSort>,
-        frequency: Option<i32>,
+        frequency: Option<MoverFrequency>,
     ) -> Result<MoversResponse> {
         let mut params = Vec::new();
-        if let Some(s) = sort {
-            params.push((
-                "sort",
-                serde_json::to_value(s)?.as_str().unwrap().to_owned(),
-            ));
+        if let Some(sort) = sort {
+            params.push(("sort", sort.as_str().to_owned()));
         }
-        if let Some(f) = frequency {
-            params.push(("frequency", f.to_string()));
+        if let Some(frequency) = frequency {
+            params.push(("frequency", frequency.as_minutes().to_string()));
         }
 
-        let encoded_index = urlencoding::encode(index);
+        let encoded_index = urlencoding::encode(index.as_str());
         self.request_with_query(
             "get_movers",
             Method::GET,
@@ -729,16 +753,10 @@ impl SchwabClient {
         symbol: &str,
         projection: Projection,
     ) -> Result<InstrumentsResponse> {
-        let params = [
-            ("symbol", symbol.to_string()),
-            (
-                "projection",
-                serde_json::to_value(projection)?
-                    .as_str()
-                    .unwrap()
-                    .to_owned(),
-            ),
-        ];
+        if symbol.trim().is_empty() {
+            return Err(Error::InvalidParameter("symbol is required".into()));
+        }
+        let params = [("symbol", symbol), ("projection", projection.as_str())];
         self.request_with_query(
             "search_instruments",
             Method::GET,
@@ -750,6 +768,9 @@ impl SchwabClient {
 
     /// Get instrument details by CUSIP
     pub async fn get_instrument(&self, cusip: &str) -> Result<Instrument> {
+        if cusip.trim().is_empty() {
+            return Err(Error::InvalidParameter("cusip is required".into()));
+        }
         let encoded_cusip = urlencoding::encode(cusip);
         let response: InstrumentsResponse = self
             .request(
@@ -774,12 +795,20 @@ impl SchwabClient {
     /// code to hours: `{"equity": {"EQ": {...}}}`.
     pub async fn get_markets(
         &self,
-        markets: &[&str],
-        date: Option<&str>,
+        markets: &[Market],
+        date: Option<NaiveDate>,
     ) -> Result<MarketsHoursResponse> {
-        let mut params = vec![("markets", markets.join(","))];
-        if let Some(d) = date {
-            params.push(("date", d.to_string()));
+        if markets.is_empty() {
+            return Err(Error::InvalidParameter("No markets provided".into()));
+        }
+        let markets = markets
+            .iter()
+            .map(|m| m.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![("markets", markets)];
+        if let Some(date) = date {
+            params.push(("date", date.to_string()));
         }
         self.request_with_query(
             "get_markets",
@@ -797,17 +826,17 @@ impl SchwabClient {
     /// just the requested market populated.
     pub async fn get_market(
         &self,
-        market_id: &str,
-        date: Option<&str>,
+        market: Market,
+        date: Option<NaiveDate>,
     ) -> Result<MarketsHoursResponse> {
         let mut params = Vec::new();
-        if let Some(d) = date {
-            params.push(("date", d.to_string()));
+        if let Some(date) = date {
+            params.push(("date", date.to_string()));
         }
         self.request_with_query(
             "get_market",
             Method::GET,
-            &format!("/marketdata/v1/markets/{}", market_id),
+            &format!("/marketdata/v1/markets/{}", market.as_str()),
             &params,
         )
         .await
@@ -850,7 +879,7 @@ impl SchwabClient {
         self.request_with_query(
             "get_account",
             Method::GET,
-            &format!("/trader/v1/accounts/{}", account_hash),
+            &account_path(account_hash, "")?,
             &params,
         )
         .await
@@ -882,7 +911,7 @@ impl SchwabClient {
         self.request_with_query(
             "get_account_orders",
             Method::GET,
-            &format!("/trader/v1/accounts/{}/orders", account_hash),
+            &account_path(account_hash, "/orders")?,
             &params,
         )
         .await
@@ -900,7 +929,7 @@ impl SchwabClient {
         self.submit_order_request(
             "place_order",
             Method::POST,
-            &format!("/trader/v1/accounts/{}/orders", account_hash),
+            &account_path(account_hash, "/orders")?,
             order,
             None,
         )
@@ -917,7 +946,7 @@ impl SchwabClient {
         self.submit_order_request(
             "place_order",
             Method::POST,
-            &format!("/trader/v1/accounts/{account}/orders"),
+            &account_path(account, "/orders")?,
             order,
             Some(lease),
         )
@@ -933,7 +962,7 @@ impl SchwabClient {
         self.submit_order_request(
             "replace_order",
             Method::PUT,
-            &format!("/trader/v1/accounts/{account}/orders/{id}"),
+            &order_path(account, id)?,
             order,
             Some(lease),
         )
@@ -945,7 +974,7 @@ impl SchwabClient {
         self.request(
             "get_order",
             Method::GET,
-            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
+            &order_path(account_hash, order_id)?,
         )
         .await
     }
@@ -955,7 +984,7 @@ impl SchwabClient {
         self.request(
             "cancel_order",
             Method::DELETE,
-            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
+            &order_path(account_hash, order_id)?,
         )
         .await
     }
@@ -974,7 +1003,7 @@ impl SchwabClient {
         self.submit_order_request(
             "replace_order",
             Method::PUT,
-            &format!("/trader/v1/accounts/{}/orders/{}", account_hash, order_id),
+            &order_path(account_hash, order_id)?,
             order,
             None,
         )
@@ -995,7 +1024,7 @@ impl SchwabClient {
         self.request_with_body(
             "preview_order",
             Method::POST,
-            &format!("/trader/v1/accounts/{}/previewOrder", account_hash),
+            &account_path(account_hash, "/previewOrder")?,
             order,
         )
         .await
@@ -1052,7 +1081,7 @@ impl SchwabClient {
         self.request_with_query(
             "get_transactions",
             Method::GET,
-            &format!("/trader/v1/accounts/{}/transactions", account_hash),
+            &account_path(account_hash, "/transactions")?,
             &params,
         )
         .await
@@ -1064,13 +1093,11 @@ impl SchwabClient {
         account_hash: &str,
         transaction_id: &str,
     ) -> Result<Transaction> {
+        path_segment("transaction_id", transaction_id)?;
         self.request(
             "get_transaction",
             Method::GET,
-            &format!(
-                "/trader/v1/accounts/{}/transactions/{}",
-                account_hash, transaction_id
-            ),
+            &account_path(account_hash, &format!("/transactions/{transaction_id}"))?,
         )
         .await
     }
@@ -1084,6 +1111,62 @@ impl SchwabClient {
         )
         .await
     }
+}
+
+/// Comma-separated `fields` value, or `None` when the caller wants Schwab's
+/// default (every section).
+fn quote_fields_csv(fields: &[QuoteField]) -> Option<String> {
+    if fields.is_empty() {
+        return None;
+    }
+    Some(
+        fields
+            .iter()
+            .map(|f| f.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Reject values that cannot be a Schwab identifier before they reach a
+/// URL path. Schwab identifiers are URL-safe (`[A-Za-z0-9_-]`), so anything
+/// else is a caller bug that would otherwise surface as an opaque 4xx or,
+/// for an embedded `/`, as a request for a different resource.
+pub(crate) fn path_segment(name: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::InvalidParameter(format!("{name} must not be empty")));
+    }
+    if !value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(Error::InvalidParameter(format!(
+            "{name} contains characters that are not valid in a Schwab identifier"
+        )));
+    }
+    Ok(())
+}
+
+/// Build a `/trader/v1/accounts/{account_hash}{suffix}` path.
+///
+/// Besides the [`path_segment`] rules, an all-digit value is refused: that
+/// is an account *number*, and Schwab expects the opaque `hashValue` from
+/// `get_account_numbers` here.
+pub(crate) fn account_path(account_hash: &str, suffix: &str) -> Result<String> {
+    path_segment("account_hash", account_hash)?;
+    if account_hash.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(Error::InvalidParameter(
+            "account_hash looks like an account number; use the hashValue from get_account_numbers"
+                .into(),
+        ));
+    }
+    Ok(format!("/trader/v1/accounts/{account_hash}{suffix}"))
+}
+
+/// Build a `/trader/v1/accounts/{account_hash}/orders/{order_id}` path.
+pub(crate) fn order_path(account_hash: &str, order_id: &str) -> Result<String> {
+    path_segment("order_id", order_id)?;
+    account_path(account_hash, &format!("/orders/{order_id}"))
 }
 
 /// Extract the order ID from a `Location` header value — the last
@@ -1142,72 +1225,51 @@ impl Default for SchwabClientBuilder {
     }
 }
 
-// Parameter structs for complex queries
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct PriceHistoryParams {
-    pub symbol: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period_type: Option<PeriodType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub period: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency_type: Option<FrequencyType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frequency: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub start_date: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub end_date: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub need_extended_hours_data: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub need_previous_close: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub struct OptionChainParams {
-    pub symbol: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub contract_type: Option<ContractType>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strike_count: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_underlying_quote: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strategy: Option<OptionStrategy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interval: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub strike: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub range: Option<Range>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub from_date: Option<NaiveDate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub to_date: Option<NaiveDate>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub volatility: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub underlying_price: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interest_rate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub days_to_expiration: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exp_month: Option<ExpirationMonth>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub option_type: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entitlement: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn account_path_accepts_hashes_and_rejects_numbers_and_separators() {
+        assert_eq!(
+            account_path("A1B2-c3_D4", "/orders").unwrap(),
+            "/trader/v1/accounts/A1B2-c3_D4/orders"
+        );
+        for bad in ["", "12345678", "abc/def", "abc?x=1", "a b", "héllo"] {
+            let err = account_path(bad, "").unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidParameter(_)),
+                "{bad:?} produced {err:?}"
+            );
+        }
+        assert!(
+            account_path("12345678", "")
+                .unwrap_err()
+                .to_string()
+                .contains("account number")
+        );
+    }
+
+    #[test]
+    fn order_path_validates_both_segments() {
+        assert_eq!(
+            order_path("hash", "123456").unwrap(),
+            "/trader/v1/accounts/hash/orders/123456"
+        );
+        assert!(order_path("hash", "").is_err());
+        assert!(order_path("hash", "1/2").is_err());
+        assert!(order_path("", "1").is_err());
+    }
+
+    #[test]
+    fn quote_fields_csv_omits_empty_and_joins_wire_names() {
+        assert_eq!(quote_fields_csv(&[]), None);
+        assert_eq!(
+            quote_fields_csv(&[QuoteField::Quote, QuoteField::Fundamental]).as_deref(),
+            Some("quote,fundamental")
+        );
+    }
+
     #[test]
     fn order_id_from_location_parses_last_segment() {
         assert_eq!(

@@ -4,7 +4,6 @@
 //! the Schwab API, including:
 //!
 //! - Asset types (Equity, Option, Future, etc.)
-//! - Market types
 //! - Response headers
 //! - Pagination info
 
@@ -54,17 +53,6 @@ pub enum AssetSubType {
     Rgt,
     Uit,
     War,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum MarketType {
-    Equity,
-    Option,
-    Future,
-    Bond,
-    Forex,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

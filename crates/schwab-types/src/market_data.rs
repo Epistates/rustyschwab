@@ -222,7 +222,8 @@ pub struct Candle {
     pub high: f64,
     pub low: f64,
     pub close: f64,
-    pub volume: i32,
+    /// Daily volume on large-cap names exceeds `i32::MAX`; keep this wide.
+    pub volume: i64,
     pub datetime: i64,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -455,10 +456,49 @@ pub struct InstrumentFundamental {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Period type for price history requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Quote sections selectable via the `fields` query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "lowercase")]
+pub enum QuoteField {
+    /// Every section (Schwab's default when `fields` is omitted)
+    All,
+    /// Bid/ask, last, volume — [`QuoteItem::quote`]
+    Quote,
+    /// Ratios, dividends, margins — [`QuoteItem::fundamental`]
+    Fundamental,
+    /// Pre/post-market prints — [`QuoteItem::extended`]
+    Extended,
+    /// Symbol description and exchange — [`QuoteItem::reference`]
+    Reference,
+    /// Regular-session last/net change — [`QuoteItem::regular`]
+    Regular,
+}
+
+impl QuoteField {
+    /// Wire name used in the `fields` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Quote => "quote",
+            Self::Fundamental => "fundamental",
+            Self::Extended => "extended",
+            Self::Reference => "reference",
+            Self::Regular => "regular",
+        }
+    }
+}
+
+impl std::fmt::Display for QuoteField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Period type for price history requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
 pub enum PeriodType {
     /// Daily period
     Day,
@@ -470,10 +510,62 @@ pub enum PeriodType {
     Ytd,
 }
 
+impl PeriodType {
+    /// Wire name used in the `periodType` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Month => "month",
+            Self::Year => "year",
+            Self::Ytd => "ytd",
+        }
+    }
+
+    /// `period` values Schwab accepts for this period type.
+    pub const fn valid_periods(self) -> &'static [i32] {
+        match self {
+            Self::Day => &[1, 2, 3, 4, 5, 10],
+            Self::Month => &[1, 2, 3, 6],
+            Self::Year => &[1, 2, 3, 5, 10, 15, 20],
+            Self::Ytd => &[1],
+        }
+    }
+
+    /// `frequencyType` values Schwab accepts for this period type.
+    pub const fn valid_frequency_types(self) -> &'static [FrequencyType] {
+        match self {
+            Self::Day => &[FrequencyType::Minute],
+            Self::Month => &[FrequencyType::Daily, FrequencyType::Weekly],
+            Self::Year => &[
+                FrequencyType::Daily,
+                FrequencyType::Weekly,
+                FrequencyType::Monthly,
+            ],
+            Self::Ytd => &[FrequencyType::Daily, FrequencyType::Weekly],
+        }
+    }
+
+    /// The `frequencyType` Schwab assumes when the request omits it.
+    pub const fn default_frequency_type(self) -> FrequencyType {
+        match self {
+            Self::Day => FrequencyType::Minute,
+            Self::Month => FrequencyType::Weekly,
+            Self::Year => FrequencyType::Monthly,
+            Self::Ytd => FrequencyType::Weekly,
+        }
+    }
+}
+
+impl std::fmt::Display for PeriodType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Frequency type for price history candles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "lowercase")]
 pub enum FrequencyType {
     /// Minute bars
     Minute,
@@ -485,8 +577,34 @@ pub enum FrequencyType {
     Monthly,
 }
 
+impl FrequencyType {
+    /// Wire name used in the `frequencyType` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Minute => "minute",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+
+    /// `frequency` values Schwab accepts for this frequency type.
+    pub const fn valid_frequencies(self) -> &'static [i32] {
+        match self {
+            Self::Minute => &[1, 5, 10, 15, 30],
+            Self::Daily | Self::Weekly | Self::Monthly => &[1],
+        }
+    }
+}
+
+impl std::fmt::Display for FrequencyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Option contract type filter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContractType {
@@ -499,7 +617,7 @@ pub enum ContractType {
 }
 
 /// Option strategy type for chain requests.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OptionStrategy {
@@ -530,7 +648,7 @@ pub enum OptionStrategy {
 }
 
 /// Option moneyness range filter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Range {
@@ -551,7 +669,7 @@ pub enum Range {
 }
 
 /// Expiration month filter for options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExpirationMonth {
@@ -584,7 +702,7 @@ pub enum ExpirationMonth {
 }
 
 /// Sort criteria for market movers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MoverSort {
@@ -598,8 +716,133 @@ pub enum MoverSort {
     PercentChangeDown,
 }
 
+impl MoverSort {
+    /// Wire name used in the `sort` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Volume => "VOLUME",
+            Self::Trades => "TRADES",
+            Self::PercentChangeUp => "PERCENT_CHANGE_UP",
+            Self::PercentChangeDown => "PERCENT_CHANGE_DOWN",
+        }
+    }
+}
+
+impl std::fmt::Display for MoverSort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Index or screener universe for `GET /movers/{index}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MoverIndex {
+    /// Dow Jones Industrial Average
+    #[serde(rename = "$DJI")]
+    Dji,
+    /// NASDAQ Composite
+    #[serde(rename = "$COMPX")]
+    Compx,
+    /// S&P 500
+    #[serde(rename = "$SPX")]
+    Spx,
+    /// NYSE-listed equities
+    Nyse,
+    /// NASDAQ-listed equities
+    Nasdaq,
+    /// OTC bulletin board
+    Otcbb,
+    /// Every index
+    IndexAll,
+    /// Every equity
+    EquityAll,
+    /// Every option
+    OptionAll,
+    /// Put options
+    OptionPut,
+    /// Call options
+    OptionCall,
+}
+
+impl MoverIndex {
+    /// Wire name used as the `{index}` path segment.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dji => "$DJI",
+            Self::Compx => "$COMPX",
+            Self::Spx => "$SPX",
+            Self::Nyse => "NYSE",
+            Self::Nasdaq => "NASDAQ",
+            Self::Otcbb => "OTCBB",
+            Self::IndexAll => "INDEX_ALL",
+            Self::EquityAll => "EQUITY_ALL",
+            Self::OptionAll => "OPTION_ALL",
+            Self::OptionPut => "OPTION_PUT",
+            Self::OptionCall => "OPTION_CALL",
+        }
+    }
+}
+
+impl std::fmt::Display for MoverIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Look-back window, in minutes, for `GET /movers/{index}`.
+///
+/// Serializes as the bare integer Schwab expects (`frequency=5`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema_repr))]
+#[serde(into = "u8", try_from = "u8")]
+#[repr(u8)]
+pub enum MoverFrequency {
+    /// Schwab's default window
+    All = 0,
+    OneMinute = 1,
+    FiveMinutes = 5,
+    TenMinutes = 10,
+    ThirtyMinutes = 30,
+    SixtyMinutes = 60,
+}
+
+impl MoverFrequency {
+    /// The window length in minutes as sent on the wire.
+    pub const fn as_minutes(self) -> u8 {
+        self as u8
+    }
+}
+
+impl From<MoverFrequency> for u8 {
+    fn from(frequency: MoverFrequency) -> Self {
+        frequency.as_minutes()
+    }
+}
+
+impl TryFrom<u8> for MoverFrequency {
+    type Error = String;
+
+    fn try_from(minutes: u8) -> Result<Self, Self::Error> {
+        Ok(match minutes {
+            0 => Self::All,
+            1 => Self::OneMinute,
+            5 => Self::FiveMinutes,
+            10 => Self::TenMinutes,
+            30 => Self::ThirtyMinutes,
+            60 => Self::SixtyMinutes,
+            other => {
+                return Err(format!(
+                    "frequency {other} is not valid; expected one of 0, 1, 5, 10, 30, 60"
+                ));
+            }
+        })
+    }
+}
+
 /// Projection type for instrument searches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Projection {
@@ -615,6 +858,242 @@ pub enum Projection {
     Search,
     /// Include fundamental data
     Fundamental,
+}
+
+impl Projection {
+    /// Wire name used in the `projection` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SymbolSearch => "symbol-search",
+            Self::SymbolRegex => "symbol-regex",
+            Self::DescSearch => "desc-search",
+            Self::DescRegex => "desc-regex",
+            Self::Search => "search",
+            Self::Fundamental => "fundamental",
+        }
+    }
+}
+
+impl std::fmt::Display for Projection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Market whose trading hours are requested via `GET /markets`.
+///
+/// Also the top-level key of [`MarketsHoursResponse`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum Market {
+    Equity,
+    Option,
+    Bond,
+    Future,
+    Forex,
+}
+
+impl Market {
+    /// Wire name used in the `markets` query parameter and `{marketId}` path.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Equity => "equity",
+            Self::Option => "option",
+            Self::Bond => "bond",
+            Self::Future => "future",
+            Self::Forex => "forex",
+        }
+    }
+}
+
+impl std::fmt::Display for Market {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Market-data entitlement of the requesting user, for option chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum Entitlement {
+    /// Non-paying professional
+    #[serde(rename = "PN")]
+    NonPayingPro,
+    /// Non-professional
+    #[serde(rename = "NP")]
+    NonPro,
+    /// Paying professional
+    #[serde(rename = "PP")]
+    PayingPro,
+}
+
+/// Contract standardization filter for option chains.
+///
+/// Schwab only honours this for retail tokens with the
+/// [`Entitlement::PayingPro`] entitlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+pub enum OptionType {
+    /// Standard contracts only
+    #[serde(rename = "S")]
+    Standard,
+    /// Non-standard (adjusted) contracts only
+    #[serde(rename = "NS")]
+    NonStandard,
+    /// Both
+    #[serde(rename = "ALL")]
+    All,
+}
+
+/// Query parameters for `GET /pricehistory`.
+///
+/// `period`, `frequencyType`, and `frequency` are only valid in specific
+/// combinations; [`validate`](Self::validate) checks them against Schwab's
+/// documented tables before the request leaves the process.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PriceHistoryParams {
+    pub symbol: String,
+    pub period_type: Option<PeriodType>,
+    /// Number of `period_type` units; see [`PeriodType::valid_periods`].
+    pub period: Option<i32>,
+    /// Candle granularity; see [`PeriodType::valid_frequency_types`].
+    pub frequency_type: Option<FrequencyType>,
+    /// Candles per `frequency_type` unit; see [`FrequencyType::valid_frequencies`].
+    pub frequency: Option<i32>,
+    /// Inclusive start, milliseconds since the Unix epoch.
+    pub start_date: Option<i64>,
+    /// Inclusive end, milliseconds since the Unix epoch.
+    pub end_date: Option<i64>,
+    pub need_extended_hours_data: Option<bool>,
+    pub need_previous_close: Option<bool>,
+}
+
+impl PriceHistoryParams {
+    /// Request with Schwab's defaults for everything but the symbol.
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Check the request against Schwab's period/frequency tables.
+    ///
+    /// Only combinations Schwab documents are cross-checked: `period`
+    /// against `period_type`, `frequency_type` against `period_type`, and
+    /// `frequency` against the explicit or defaulted `frequency_type`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() {
+            return Err("symbol is required".into());
+        }
+        if let (Some(period_type), Some(period)) = (self.period_type, self.period)
+            && !period_type.valid_periods().contains(&period)
+        {
+            return Err(format!(
+                "period {period} is not valid for periodType {period_type}; expected one of {:?}",
+                period_type.valid_periods()
+            ));
+        }
+        if let (Some(period_type), Some(frequency_type)) = (self.period_type, self.frequency_type)
+            && !period_type
+                .valid_frequency_types()
+                .contains(&frequency_type)
+        {
+            return Err(format!(
+                "frequencyType {frequency_type} is not valid for periodType {period_type}; expected one of {}",
+                join_names(period_type.valid_frequency_types())
+            ));
+        }
+        let frequency_type = self
+            .frequency_type
+            .or_else(|| self.period_type.map(PeriodType::default_frequency_type));
+        if let (Some(frequency_type), Some(frequency)) = (frequency_type, self.frequency)
+            && !frequency_type.valid_frequencies().contains(&frequency)
+        {
+            return Err(format!(
+                "frequency {frequency} is not valid for frequencyType {frequency_type}; expected one of {:?}",
+                frequency_type.valid_frequencies()
+            ));
+        }
+        if let (Some(start), Some(end)) = (self.start_date, self.end_date)
+            && start > end
+        {
+            return Err("startDate must not be after endDate".into());
+        }
+        Ok(())
+    }
+}
+
+fn join_names(types: &[FrequencyType]) -> String {
+    types
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Query parameters for `GET /chains`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct OptionChainParams {
+    pub symbol: String,
+    pub contract_type: Option<ContractType>,
+    /// Number of strikes above and below the at-the-money price (≥ 1).
+    pub strike_count: Option<i32>,
+    pub include_underlying_quote: Option<bool>,
+    pub strategy: Option<OptionStrategy>,
+    /// Strike interval for spread strategy chains.
+    pub interval: Option<f64>,
+    pub strike: Option<f64>,
+    pub range: Option<Range>,
+    pub from_date: Option<NaiveDate>,
+    pub to_date: Option<NaiveDate>,
+    /// Volatility used in `ANALYTICAL` calculations.
+    pub volatility: Option<f64>,
+    /// Underlying price used in `ANALYTICAL` calculations.
+    pub underlying_price: Option<f64>,
+    /// Interest rate used in `ANALYTICAL` calculations.
+    pub interest_rate: Option<f64>,
+    /// Days to expiration used in `ANALYTICAL` calculations (≥ 0).
+    pub days_to_expiration: Option<i32>,
+    pub exp_month: Option<ExpirationMonth>,
+    pub option_type: Option<OptionType>,
+    pub entitlement: Option<Entitlement>,
+}
+
+impl OptionChainParams {
+    /// Request with Schwab's defaults for everything but the symbol.
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Check the request against Schwab's documented bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.symbol.trim().is_empty() {
+            return Err("symbol is required".into());
+        }
+        if self.strike_count.is_some_and(|count| count < 1) {
+            return Err("strikeCount must be at least 1".into());
+        }
+        if self.days_to_expiration.is_some_and(|days| days < 0) {
+            return Err("daysToExpiration must not be negative".into());
+        }
+        if let (Some(from), Some(to)) = (self.from_date, self.to_date)
+            && from > to
+        {
+            return Err("fromDate must not be after toDate".into());
+        }
+        Ok(())
+    }
 }
 
 /// API error response item.

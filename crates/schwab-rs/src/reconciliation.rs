@@ -270,7 +270,7 @@ impl SchwabClient {
                     .request_with_query(
                         "reconcile_orders",
                         reqwest::Method::GET,
-                        &format!("/trader/v1/accounts/{account}/orders"),
+                        &crate::client::account_path(account, "/orders")?,
                         &[
                             ("fromEnteredTime", from.to_rfc3339()),
                             ("toEnteredTime", to.to_rfc3339()),
@@ -309,7 +309,7 @@ impl SchwabClient {
                     .request(
                         "reconcile_order",
                         reqwest::Method::GET,
-                        &format!("/trader/v1/accounts/{account}/orders/{id}"),
+                        &crate::client::order_path(account, &id)?,
                     )
                     .await?;
                 if broker_id(order.get("orderId")).as_deref() != Some(&id) {
@@ -323,7 +323,7 @@ impl SchwabClient {
                 .request_with_query(
                     "reconcile_account",
                     reqwest::Method::GET,
-                    &format!("/trader/v1/accounts/{account}"),
+                    &crate::client::account_path(account, "")?,
                     &[("fields", "positions")],
                 )
                 .await?;

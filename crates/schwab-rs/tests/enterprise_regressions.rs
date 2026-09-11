@@ -1,6 +1,8 @@
 //! Regression tests for the enterprise audit: assert safe observable behavior.
-use chrono::{Duration as CDuration, Utc};
-use schwab_rs::auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind};
+mod common;
+
+use common::mock_client as client;
+use schwab_rs::auth::{FileTokenStore, TokenStore, TokenStoreKind};
 use schwab_rs::circuit_breaker::{CircuitBreaker, CircuitState};
 use schwab_rs::config::CircuitBreakerConfig;
 use schwab_rs::types::{
@@ -11,42 +13,6 @@ use schwab_rs::{Error, SchwabClient, SchwabConfig};
 use std::time::Duration;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-fn client(server: &MockServer, expired: bool) -> (SchwabClient, tempfile::TempDir, TokenSet) {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = SchwabConfig::default();
-    config.oauth.app_key = "12345678901234567890123456789012".into();
-    config.oauth.app_secret = "1234567890123456".into();
-    config.oauth.token_store_kind = TokenStoreKind::File;
-    config.oauth.tokens_file = dir.path().join("tokens.json");
-    config.oauth.auto_refresh = false;
-    config.oauth.capture_callback = false;
-    config.oauth.token_url = format!("{}/oauth/token", server.uri());
-    config.client.base_url = server.uri();
-    config.client.rate_limit.enabled = false;
-    config.client.retry.initial_backoff = Duration::from_millis(1);
-    config.client.retry.max_backoff = Duration::from_millis(2);
-    config.streaming = None;
-    let issued = Utc::now() - CDuration::days(2);
-    let mut tokens = TokenSet::new(
-        "old_access".into(),
-        "same_refresh".into(),
-        "".into(),
-        "Bearer".into(),
-        1800,
-        "".into(),
-        issued,
-    );
-    tokens.expires_at = if expired {
-        Utc::now() - CDuration::minutes(1)
-    } else {
-        Utc::now() + CDuration::minutes(20)
-    };
-    FileTokenStore::new(config.oauth.tokens_file.clone())
-        .save(&tokens)
-        .unwrap();
-    (SchwabClient::new(config).unwrap(), dir, tokens)
-}
 
 #[tokio::test]
 async fn ambiguous_order_submission_is_never_replayed_and_blocks_until_reconciled() {
@@ -173,7 +139,7 @@ fn account_type_is_retained() {
 
 #[tokio::test]
 async fn search_and_movers_use_broker_wire_values() {
-    use schwab_rs::types::market_data::{MoverSort, Projection};
+    use schwab_rs::types::market_data::{MoverIndex, MoverSort, Projection};
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(400))
@@ -184,7 +150,7 @@ async fn search_and_movers_use_broker_wire_values() {
         .search_instruments("AAPL", Projection::SymbolSearch)
         .await;
     let _ = client
-        .get_movers("$DJI", Some(MoverSort::PercentChangeUp), None)
+        .get_movers(MoverIndex::Dji, Some(MoverSort::PercentChangeUp), None)
         .await;
     let requests = server.received_requests().await.unwrap();
     assert!(

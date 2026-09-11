@@ -324,18 +324,32 @@ println!("Open this URL in a browser: {}", auth_url);
 ### 3. Use the API
 
 ```rust,ignore
+use schwab_rs::types::market_data::{
+    FrequencyType, OptionChainParams, PeriodType, PriceHistoryParams, QuoteField,
+};
+
 // Get quotes
 let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
 
-// Advanced quotes: only request specific fields and enable indicative pricing
+// Advanced quotes: only request specific sections and enable indicative pricing
 let adv_quotes = client.get_quotes_with_options(
     &["AAPL"],
-    Some("quote,reference"),
+    &[QuoteField::Quote, QuoteField::Reference],
     Some(true)
 ).await?;
 
+// Price history — period/frequency combinations are validated against
+// Schwab's tables before the request is sent
+let history = client.get_price_history(&PriceHistoryParams {
+    period_type: Some(PeriodType::Day),
+    period: Some(10),
+    frequency_type: Some(FrequencyType::Minute),
+    frequency: Some(5),
+    ..PriceHistoryParams::new("AAPL")
+}).await?;
+
 // Get option chain
-let chain = client.get_option_chain("SPY").await?;
+let chain = client.get_option_chain(&OptionChainParams::new("SPY")).await?;
 
 // Preview an order (validate without executing)
 let preview = client.preview_order("account_hash", &order).await?;

@@ -4,7 +4,7 @@
 use super::{PaperBroker, PaperClockMode, PaperEventKind, PaperEventSource};
 use crate::{
     Error, Result, SchwabClient,
-    types::market_data::{MarketHours, QuoteItem},
+    types::market_data::{Market, MarketHours, QuoteItem},
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -148,12 +148,13 @@ impl SchwabPaperFeed {
         // dropped future and otherwise commit after the disconnect event.
         let hours = tokio::time::timeout(
             Duration::from_secs(10),
-            self.market_data.get_market("equity", Some(&date)),
+            self.market_data
+                .get_market(Market::Equity, Some(now.date_naive())),
         )
         .await
         .map_err(|_| Error::InvalidParameter("Paper calendar deadline exceeded".into()))??;
         let hours = hours
-            .get("equity")
+            .get(Market::Equity.as_str())
             .and_then(|v| v.get("EQ"))
             .ok_or_else(|| Error::InvalidParameter("Equity calendar absent".into()))?;
         let open = regular_session_open(hours, &date, Utc::now().timestamp_millis())?;

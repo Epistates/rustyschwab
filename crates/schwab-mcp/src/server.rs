@@ -12,7 +12,9 @@ use schwab_rs::SchwabClient;
 use schwab_rs::client::{OptionChainParams, PriceHistoryParams};
 use schwab_rs::config::StreamConfig;
 use schwab_rs::streaming::{StreamClient, StreamerIdentity};
-use schwab_types::market_data::{MoverSort, Projection};
+use schwab_types::market_data::{
+    Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
+};
 use schwab_types::streaming::StreamService;
 use schwab_types::trading::OrderRequest;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -128,7 +130,8 @@ impl SchwabMcp {
     // ============================================================
 
     /// Get quotes for one or more symbols (equities, options, etc.).
-    /// Optional `fields` is a comma-separated subset like "quote,fundamental".
+    /// Optional `fields` restricts the returned sections (e.g. `["quote","fundamental"]`);
+    /// omit it for every section.
     /// Set `indicative=true` to include pre/post-market indicative quotes.
     #[tool(
         read_only = true,
@@ -139,14 +142,14 @@ impl SchwabMcp {
     async fn get_quotes(
         &self,
         symbols: Vec<String>,
-        fields: Option<String>,
+        fields: Option<Vec<QuoteField>>,
         indicative: Option<bool>,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_quotes", async {
             let refs: Vec<&str> = symbols.iter().map(String::as_str).collect();
             let resp = self
                 .client
-                .get_quotes_with_options(&refs, fields.as_deref(), indicative)
+                .get_quotes_with_options(&refs, fields.as_deref().unwrap_or(&[]), indicative)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
@@ -164,12 +167,12 @@ impl SchwabMcp {
     async fn get_quote(
         &self,
         symbol: String,
-        fields: Option<String>,
+        fields: Option<Vec<QuoteField>>,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_quote", async {
             let resp = self
                 .client
-                .get_quote_with_options(&symbol, fields.as_deref())
+                .get_quote_with_options(&symbol, fields.as_deref().unwrap_or(&[]))
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
@@ -244,8 +247,9 @@ impl SchwabMcp {
         .await
     }
 
-    /// Get top market movers for an index (e.g. `$SPX`, `$COMPX`, `$DJI`).
-    /// `frequency` filters to movers over the last N minutes (1, 5, 10, 30, 60).
+    /// Get top market movers for an index (`$SPX`, `$COMPX`, `$DJI`) or a
+    /// screener universe (`NYSE`, `NASDAQ`, `OPTION_ALL`, ...).
+    /// `frequency` is the look-back window in minutes (0, 1, 5, 10, 30, 60).
     #[tool(
         read_only = true,
         destructive = false,
@@ -254,14 +258,14 @@ impl SchwabMcp {
     )]
     async fn get_movers(
         &self,
-        index: String,
+        index: MoverIndex,
         sort: Option<MoverSort>,
-        frequency: Option<i32>,
+        frequency: Option<MoverFrequency>,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_movers", async {
             let resp = self
                 .client
-                .get_movers(&index, sort, frequency)
+                .get_movers(index, sort, frequency)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
@@ -307,8 +311,8 @@ impl SchwabMcp {
         .await
     }
 
-    /// Get market hours for multiple markets (`equity,option,future,bond,forex`).
-    /// `date` is `YYYY-MM-DD`; omit for today.
+    /// Get market hours for one or more markets (`equity`, `option`, `future`,
+    /// `bond`, `forex`). `date` is `YYYY-MM-DD`; omit for today.
     #[tool(
         read_only = true,
         destructive = false,
@@ -317,14 +321,13 @@ impl SchwabMcp {
     )]
     async fn get_markets(
         &self,
-        markets: Vec<String>,
-        date: Option<String>,
+        markets: Vec<Market>,
+        date: Option<chrono::NaiveDate>,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_markets", async {
-            let refs: Vec<&str> = markets.iter().map(String::as_str).collect();
             let resp = self
                 .client
-                .get_markets(&refs, date.as_deref())
+                .get_markets(&markets, date)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
@@ -332,7 +335,7 @@ impl SchwabMcp {
         .await
     }
 
-    /// Get market hours for a single market.
+    /// Get market hours for a single market. `date` is `YYYY-MM-DD`; omit for today.
     #[tool(
         read_only = true,
         destructive = false,
@@ -341,13 +344,13 @@ impl SchwabMcp {
     )]
     async fn get_market(
         &self,
-        market_id: String,
-        date: Option<String>,
+        market: Market,
+        date: Option<chrono::NaiveDate>,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_market", async {
             let resp = self
                 .client
-                .get_market(&market_id, date.as_deref())
+                .get_market(market, date)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
