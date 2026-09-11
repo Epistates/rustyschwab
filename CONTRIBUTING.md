@@ -90,6 +90,11 @@ Then:
   journal `begin_once`/`finish` pairing.
 - Public items carry doc comments; doc examples must compile and pass
   `cargo test --doc`.
+- Doc-comment markdown tables (the metric catalogs in `metrics.rs`) and
+  SQL migration literals (`storage.rs`) run past 100 columns on purpose:
+  a table row cannot wrap and stay a row, and rustfmt leaves comments and
+  string literals alone (`wrap_comments` / `format_strings` stay off, and
+  `error_on_line_overflow` is not enabled). Do not reflow them.
 
 ## Commit messages
 
