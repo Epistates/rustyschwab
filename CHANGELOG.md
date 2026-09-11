@@ -200,6 +200,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   net change; they are the regular-market trade flag and last price. It now
   subscribes by `LevelOneEquityFields` constants and prints a
   `LevelOneEquity`.
+- `AccountActivity::message()` returns `messageData` parsed as the JSON
+  object an order event carries (`None` for plain-text errors). The MCP
+  `ACCT_ACTIVITY` event log stores that parsed object under `messageData`
+  instead of the JSON-in-a-string the wire sends, so consumers no longer
+  parse twice; plain-text messages stay strings.
+
+### Fixed — `stream_snapshot` freshness
+- `fresh` was effectively never true after the first delta: it required
+  *every* field to have been updated within 2s, but level-one deltas carry
+  only the fields that changed, so baseline-filled statics such as
+  `description` aged out immediately. It also compared the broker
+  timestamp against the wall clock, so a quiet symbol on a healthy stream
+  reported late delivery. Freshness is now judged per key: the stream is
+  ready on the entry's generation, the REST baseline has landed when one
+  is required, and the last delta both arrived within 2s of the broker
+  stamping it (`lagMs`) and within 2s of now (`ageMs`). `staleReason`
+  names the first failed condition (`"stream not ready"`, `"REST baseline
+  not applied yet"`, `"no update within the freshness window"`, …) so a
+  consumer can tell reconnecting from quiet. `fieldUpdatedAt` is receipt
+  time for baseline-filled fields too, matching delta-filled ones.
 
 ### Added — order constructors
 - `OrderRequest` builds the way Schwab's order examples are written:

@@ -3,6 +3,16 @@
 //! Content is stored by field name (`bidPrice`, not `"1"`), decoded through
 //! the service's field table, so snapshots read like REST quotes and REST
 //! baselines merge in by name.
+//!
+//! A snapshot is `fresh` when the cache is authoritative for the key *and*
+//! recent: the stream is ready on the generation that produced the entry,
+//! the REST baseline has landed when one is required, and the last delta
+//! both reached the cache within [`FRESH_WINDOW_MS`] of the broker stamping
+//! it and arrived within [`FRESH_WINDOW_MS`] of now. Level-one deltas carry
+//! only changed fields, so freshness is judged per key, never per field;
+//! `fieldUpdatedAt` reports the per-field times for callers that care.
+//! `staleReason` names the first failed condition so a consumer can tell
+//! "reconnecting" from "quiet symbol".
 use crate::redact;
 use parking_lot::RwLock;
 use schwab_rs::{
@@ -14,6 +24,10 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
 };
+
+/// Bound on both the delivery lag of the last delta (`received - broker`)
+/// and its age (`now - received`) for a snapshot to be `fresh`.
+pub const FRESH_WINDOW_MS: i64 = 2000;
 
 #[derive(Default)]
 struct CacheState {
@@ -27,10 +41,33 @@ struct CacheState {
 }
 struct Entry {
     value: Value,
+    /// Receipt time of each field's current value, whether it came from a
+    /// stream delta or the REST baseline.
     field_times: HashMap<String, i64>,
     received: i64,
     broker: i64,
     generation: u64,
+}
+impl CacheState {
+    /// The first freshness condition an entry fails, or `None` when fresh.
+    /// Ordered from "the stream is unusable" to "the key is merely quiet".
+    fn stale_reason(&self, entry: &Entry, has_baseline: bool, now: i64) -> Option<&'static str> {
+        if !self.status.ready {
+            Some("stream not ready")
+        } else if entry.generation != self.status.generation {
+            Some("stream restarted since this update")
+        } else if self.baseline_required && !has_baseline {
+            Some("REST baseline not applied yet")
+        } else if entry.broker <= 0 {
+            Some("no broker timestamp")
+        } else if entry.received.saturating_sub(entry.broker) > FRESH_WINDOW_MS {
+            Some("delivered late relative to the broker timestamp")
+        } else if now.saturating_sub(entry.received) > FRESH_WINDOW_MS {
+            Some("no update within the freshness window")
+        } else {
+            None
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub struct StreamCache {
@@ -117,28 +154,16 @@ impl StreamCache {
             .map(|((_, key), entry)| {
                 let age = now.saturating_sub(entry.received).max(0);
                 let baseline = cache.baselines.get(&(service.to_owned(), key.clone()));
-                // A snapshot is fresh only when every field was updated
-                // within the window on the current generation.
-                let broker_recent = entry.broker > 0
-                    && entry.broker <= now
-                    && now.saturating_sub(entry.broker) <= 2000;
-                let fields_recent = entry
-                    .field_times
-                    .values()
-                    .all(|at| now.saturating_sub(*at) <= 2000);
-                let fresh = cache.status.ready
-                    && (!cache.baseline_required || baseline.is_some())
-                    && age <= 2000
-                    && broker_recent
-                    && entry.generation == cache.status.generation
-                    && fields_recent;
+                let stale_reason = cache.stale_reason(entry, baseline.is_some(), now);
                 let snapshot = json!({
                     "content": entry.value,
                     "receivedAt": entry.received,
                     "brokerTimestamp": entry.broker,
                     "generation": entry.generation,
                     "ageMs": age,
-                    "fresh": fresh,
+                    "lagMs": entry.received.saturating_sub(entry.broker),
+                    "fresh": stale_reason.is_none(),
+                    "staleReason": stale_reason,
                     "fieldUpdatedAt": entry.field_times,
                     "restBaseline": baseline,
                 });
@@ -185,7 +210,7 @@ impl StreamCache {
         }
         let now = chrono::Utc::now().timestamp_millis();
         let broker = prices.get("quoteTime").and_then(Value::as_i64).unwrap_or(0);
-        if broker <= 0 || now < broker || now - broker > 2000 {
+        if broker <= 0 || now < broker || now - broker > FRESH_WINDOW_MS {
             return false;
         }
         // `extended` is left out: it reuses `quoteTime`/`totalVolume` for the
@@ -216,7 +241,7 @@ impl StreamCache {
         for (field, value) in content.as_object().unwrap() {
             if entry.value.get(field).is_none() {
                 entry.value[field] = value.clone();
-                entry.field_times.insert(field.clone(), broker);
+                entry.field_times.insert(field.clone(), now);
             }
         }
         cache.baselines.insert((service.into(), key.into()), quote);
@@ -425,16 +450,98 @@ mod tests {
             json!({"bidPrice":10,"askPrice":11}),
             now - 3000,
         );
+        let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+        assert_eq!(snapshot["AAPL"]["fresh"], false);
         assert_eq!(
-            cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["fresh"],
-            false
+            snapshot["AAPL"]["staleReason"],
+            "delivered late relative to the broker timestamp"
         );
+        assert!(snapshot["AAPL"]["lagMs"].as_i64().unwrap() >= 3000);
         assert!(!cache.apply_baseline(
             1,
             "LEVELONE_EQUITIES",
             "AAPL",
             json!({"quote":{"bidPrice":null,"askPrice":11,"quoteTime":now}})
         ));
+    }
+    /// Level-one deltas only carry the fields that changed, so a field that
+    /// has not ticked for a while must not make an actively updating key
+    /// stale; only the entry's own age does.
+    #[test]
+    fn freshness_is_judged_per_key_not_per_field() {
+        let cache = StreamCache::new();
+        cache.update_status(StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        cache.put(
+            "LEVELONE_EQUITIES".into(),
+            "AAPL".into(),
+            json!({"bidPrice":10,"askPrice":11,"description":"Apple Inc"}),
+            now,
+        );
+        {
+            let mut state = cache.inner.write();
+            let entry = state
+                .snapshots
+                .get_mut(&("LEVELONE_EQUITIES".into(), "AAPL".into()))
+                .unwrap();
+            entry.field_times.insert("description".into(), now - 60_000);
+            entry.field_times.insert("askPrice".into(), now - 5_000);
+        }
+        let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+        assert_eq!(snapshot["AAPL"]["fresh"], true, "{snapshot:?}");
+        assert_eq!(snapshot["AAPL"]["staleReason"], Value::Null);
+        assert_eq!(
+            snapshot["AAPL"]["fieldUpdatedAt"]["description"],
+            now - 60_000
+        );
+
+        // A quiet key is stale for the recency reason, not a lag reason.
+        cache
+            .inner
+            .write()
+            .snapshots
+            .get_mut(&("LEVELONE_EQUITIES".into(), "AAPL".into()))
+            .unwrap()
+            .received = now - 3_000;
+        let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+        assert_eq!(snapshot["AAPL"]["fresh"], false);
+        assert_eq!(
+            snapshot["AAPL"]["staleReason"],
+            "no update within the freshness window"
+        );
+        assert!(snapshot["AAPL"]["ageMs"].as_i64().unwrap() >= 3_000);
+    }
+    /// Reasons are reported from the most to the least severe condition.
+    #[test]
+    fn stale_reasons_name_the_first_failed_condition() {
+        let cache = StreamCache::new();
+        cache.require_baseline();
+        cache.update_status(StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        cache.put(
+            "LEVELONE_EQUITIES".into(),
+            "AAPL".into(),
+            json!({"bidPrice":10}),
+            now,
+        );
+        let reason = |cache: &StreamCache| {
+            cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["staleReason"].clone()
+        };
+        assert_eq!(reason(&cache), "REST baseline not applied yet");
+        cache.inner.write().status.generation = 2;
+        assert_eq!(reason(&cache), "stream restarted since this update");
+        // `update_status` would drop the entries; poke the flag directly to
+        // see the reason a not-ready stream reports.
+        cache.inner.write().status.ready = false;
+        assert_eq!(reason(&cache), "stream not ready");
     }
     #[test]
     fn recovery_rejects_stale_generations_and_old_broker_quotes() {

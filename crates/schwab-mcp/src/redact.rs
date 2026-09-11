@@ -145,7 +145,10 @@ fn redact_object(map: &mut Map<String, Value>, mask_accounts: bool) {
 ///
 /// The name-keyed walk covers `ACCT_ACTIVITY`'s `accountNumber`; the
 /// activity payload in `messageData` is JSON serialized *into a string*,
-/// which the walk can't see into, so it is parsed and redacted here.
+/// which the walk can't see into, so it is parsed and redacted here and
+/// then kept as the parsed object, so the event log never hands a consumer
+/// JSON it has to parse again. Plain-text `messageData` (errors) stays a
+/// string.
 pub fn apply_stream_content(service: &str, value: &mut Value) {
     redact_stream_content_with(service, value, account_masking_enabled());
 }
@@ -160,15 +163,16 @@ fn redact_stream_content_with(service: &str, value: &mut Value, mask_accounts: b
     if service != "ACCT_ACTIVITY" {
         return;
     }
-    if let Some(Value::String(s)) = value.get_mut("messageData") {
-        // JSON for order events, NULL or plain text for errors — only
-        // rewrite what parses as JSON. Always recurse so any embedded
-        // credentials are dropped even when account masking is disabled
-        // for debugging.
-        if let Ok(mut inner) = serde_json::from_str::<Value>(s) {
-            redact_with(&mut inner, mask_accounts);
-            *s = inner.to_string();
-        }
+    // JSON objects for order events, NULL or plain text for errors — only
+    // rewrite what parses as an object. Always recurse so any embedded
+    // credentials are dropped even when account masking is disabled for
+    // debugging.
+    if let Some(slot) = value.get_mut("messageData")
+        && let Value::String(s) = &*slot
+        && let Ok(mut inner @ Value::Object(_)) = serde_json::from_str::<Value>(s)
+    {
+        redact_with(&mut inner, mask_accounts);
+        *slot = inner;
     }
 }
 
@@ -312,7 +316,8 @@ mod tests {
         redact_stream_content_with("ACCT_ACTIVITY", &mut v, false);
         // Account number not masked (debugging), but identity still dropped.
         assert_eq!(v["accountNumber"], "987654321");
-        let inner: Value = serde_json::from_str(v["messageData"].as_str().unwrap()).unwrap();
+        let inner = &v["messageData"];
+        assert!(inner.is_object(), "{inner}");
         assert_eq!(inner["AccountNumber"], "987654321");
         assert!(inner.get("login").is_none());
     }
@@ -330,24 +335,28 @@ mod tests {
         redact_stream_content("ACCT_ACTIVITY", &mut v);
         assert_eq!(v["accountNumber"], "***4321");
         assert_eq!(v["messageType"], "OrderFillCompleted");
-        let inner: Value = serde_json::from_str(v["messageData"].as_str().unwrap()).unwrap();
+        // Stored as the parsed object, not re-serialized into a string.
+        let inner = &v["messageData"];
         assert_eq!(inner["AccountNumber"], "***4321");
         assert_eq!(inner["SchwabOrderID"], "1003811730601");
+        assert_eq!(inner["BaseEvent"]["EventType"], "OrderFillCompletedEvent");
         // Subscription echo key is not an account number — untouched.
         assert_eq!(v["key"], "Account Activity");
     }
 
     #[test]
-    fn acct_activity_leaves_non_json_message_data_alone() {
-        let mut v = json!({
-            "key": "Account Activity",
-            "accountNumber": "987654321",
-            "messageType": "ERROR",
-            "messageData": "Subscription rejected: bad key"
-        });
-        redact_stream_content("ACCT_ACTIVITY", &mut v);
-        assert_eq!(v["accountNumber"], "***4321");
-        assert_eq!(v["messageData"], "Subscription rejected: bad key");
+    fn acct_activity_leaves_non_object_message_data_alone() {
+        for text in ["Subscription rejected: bad key", "NULL", "123", "[1]"] {
+            let mut v = json!({
+                "key": "Account Activity",
+                "accountNumber": "987654321",
+                "messageType": "ERROR",
+                "messageData": text
+            });
+            redact_stream_content("ACCT_ACTIVITY", &mut v);
+            assert_eq!(v["accountNumber"], "***4321");
+            assert_eq!(v["messageData"], text);
+        }
     }
 
     #[test]

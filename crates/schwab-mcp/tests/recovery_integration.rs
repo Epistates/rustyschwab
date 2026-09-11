@@ -194,7 +194,9 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
     let event = &events["events"][0]["content"];
     assert_eq!(event["messageType"], "OrderCreated");
     assert_eq!(event["accountNumber"], "***6789");
-    let message: Value = serde_json::from_str(event["messageData"].as_str().unwrap()).unwrap();
+    // `messageData` arrives as JSON-in-a-string; the log stores it parsed.
+    let message = &event["messageData"];
+    assert!(message.is_object(), "{message}");
     assert_eq!(message["BaseEvent"]["AccountNumber"], "***6789");
     assert!(
         client

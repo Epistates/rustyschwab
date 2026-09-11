@@ -669,7 +669,8 @@ field_table! {
 
 field_table! {
     /// An `ACCT_ACTIVITY` order event. `message_data` is JSON serialized
-    /// into a string for order events and plain text for errors.
+    /// into a string for order events and plain text for errors; see
+    /// [`AccountActivity::message`] for the parsed form.
     AcctActivityFields => AccountActivity {
         key = KEY;
         envelope = { seq: i64 };
@@ -677,6 +678,34 @@ field_table! {
         /// `OrderCreated`, `OrderAccepted`, `OrderFillCompleted`, …
         2 MESSAGE_TYPE message_type "messageType": String,
         3 MESSAGE_DATA message_data "messageData": String,
+    }
+}
+
+impl AccountActivity {
+    /// `message_data` parsed as the JSON object an order event carries, or
+    /// `None` when it is absent or plain text (subscription errors).
+    ///
+    /// ```
+    /// use schwab_types::streaming::AccountActivity;
+    ///
+    /// let event = AccountActivity {
+    ///     message_type: Some("OrderCreated".into()),
+    ///     message_data: Some(r#"{"SchwabOrderID":"1003811730601"}"#.into()),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(event.message().unwrap()["SchwabOrderID"], "1003811730601");
+    ///
+    /// let rejected = AccountActivity {
+    ///     message_data: Some("Subscription rejected: bad key".into()),
+    ///     ..Default::default()
+    /// };
+    /// assert!(rejected.message().is_none());
+    /// ```
+    pub fn message(&self) -> Option<Map<String, Value>> {
+        match serde_json::from_str(self.message_data.as_deref()?) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        }
     }
 }
 

@@ -954,7 +954,13 @@ impl SchwabMcp {
     /// to the listed keys. Returns an object keyed by `key`; each entry's
     /// `content` uses the same field names as REST quotes (`bidPrice`,
     /// `lastPrice`, `totalVolume`, …), never the wire's field numbers.
-    /// `ACCT_ACTIVITY` returns the bounded event log instead.
+    /// `fresh` is true when the stream is healthy for this key and its last
+    /// delta arrived promptly and recently (within 2s); otherwise
+    /// `staleReason` says why, and `ageMs`/`lagMs` give the numbers. A quiet
+    /// symbol on a healthy stream reports `fresh: false` with
+    /// `"no update within the freshness window"`; treat that as "unchanged",
+    /// not as an outage. `ACCT_ACTIVITY` returns the bounded event log
+    /// instead.
     #[tool(
         read_only = true,
         destructive = false,
