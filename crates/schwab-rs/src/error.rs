@@ -86,7 +86,8 @@ pub enum Error {
 
     /// Authentication-related error (OAuth flow, token refresh, credentials)
     ///
-    /// **Recovery**: Initiate a new OAuth2 authentication flow by calling `AuthManager::authorize()`
+    /// **Recovery**: Initiate a new OAuth2 authentication flow by calling
+    /// `AuthManager::authorize()`
     #[error("Authentication error: {0}")]
     Auth(#[from] AuthError),
 
@@ -130,7 +131,8 @@ pub enum Error {
 
     /// API-specific error returned by Schwab servers
     ///
-    /// **Recovery**: Check the error code and message for specific guidance from Schwab API documentation
+    /// **Recovery**: Check the error code and message for specific guidance from the
+    /// Schwab API documentation
     #[error("API error [{code}]: {message}")]
     Api {
         /// Schwab API error code

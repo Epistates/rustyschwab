@@ -34,7 +34,8 @@ fn remote_bind_allowed() -> bool {
 fn guard_network_bind(transport: &str, addr: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
     if !addr.ip().is_loopback() && !allow_remote {
         anyhow::bail!(
-            "Remote {transport} bind {addr} requires SCHWAB_MCP_ALLOW_REMOTE=1 and a TLS-terminating proxy"
+            "Remote {transport} bind {addr} requires SCHWAB_MCP_ALLOW_REMOTE=1 \
+             and a TLS-terminating proxy"
         );
     }
     Ok(())
@@ -68,12 +69,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(%addr, "metrics: Prometheus scrape endpoint live at http://<bind>/metrics");
     } else {
         tracing::debug!(
-            "metrics: disabled (set SCHWAB_METRICS_BIND=127.0.0.1:9090 to expose Prometheus scrape endpoint)"
+            "metrics: disabled (set SCHWAB_METRICS_BIND=127.0.0.1:9090 \
+             to expose Prometheus scrape endpoint)"
         );
     }
 
-    let config = SchwabConfig::from_env()
-        .context("failed to load SchwabConfig from environment (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.)")?;
+    let config = SchwabConfig::from_env().context(
+        "failed to load SchwabConfig from environment \
+         (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.)",
+    )?;
 
     let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
     match std::env::var("SCHWAB_RISK_POLICY_FILE") {
@@ -225,7 +229,8 @@ async fn main() -> anyhow::Result<()> {
     }
     anyhow::ensure!(
         stream_owners <= 1,
-        "Only one principal may own streaming for a Schwab login; share market data through a separate service"
+        "Only one principal may own streaming for a Schwab login; \
+         share market data through a separate service"
     );
     if transport == "stdio" {
         let principal = std::env::var("SCHWAB_MCP_PRINCIPAL")
@@ -253,12 +258,13 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => None,
         };
         if identity.is_none() {
+            let short_lived = servers.iter().all(|s| {
+                s.principal.token_expires_at.is_some() && !s.principal.token_sha256.is_empty()
+            });
             anyhow::ensure!(
-                servers
-                    .iter()
-                    .all(|s| s.principal.token_expires_at.is_some()
-                        && !s.principal.token_sha256.is_empty()),
-                "Static network credentials require token_expires_at; configure short-lived issuer tokens with SCHWAB_MCP_IDENTITY_FILE"
+                short_lived,
+                "Static network credentials require token_expires_at; \
+                 configure short-lived issuer tokens with SCHWAB_MCP_IDENTITY_FILE"
             );
         }
         let app = schwab_mcp::network::router_reloadable(
@@ -284,7 +290,10 @@ async fn main() -> anyhow::Result<()> {
                 client.begin_drain();
                 let _ = stop.send(());
                 // Long-lived transports must not prevent bounded process exit.
-                if let Ok(result) = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serving).await { result?; }
+                let grace = std::time::Duration::from_secs(30);
+                if let Ok(result) = tokio::time::timeout(grace, &mut serving).await {
+                    result?;
+                }
             }
         }
     }

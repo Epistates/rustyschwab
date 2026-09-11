@@ -51,9 +51,14 @@ async fn main() -> anyhow::Result<()> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                _=tokio::signal::ctrl_c()=>{broker.begin_drain();break;}
-                _=interval.tick()=>{
-                    if let Err(error)=feed.tick().await {eprintln!("paper feed suspended: {error}");}
+                _ = tokio::signal::ctrl_c() => {
+                    broker.begin_drain();
+                    break;
+                }
+                _ = interval.tick() => {
+                    if let Err(error) = feed.tick().await {
+                        eprintln!("paper feed suspended: {error}");
+                    }
                 }
             }
         }

@@ -255,8 +255,23 @@ impl McpHandler for AuthorizedServer {
             } else {
                 self.principal.name.clone()
             };
-            Some(self.audit.begin_once(&audit_scope, name, serde_json::json!({"principal":self.principal.name,"intentDigest":digest,"requestId":ctx.request_id(),"arguments":args}), dedup).await
-                .map_err(|_| McpError::internal("Audit persistence failed, approval already consumed, or an earlier operation requires reconciliation"))?)
+            let request = serde_json::json!({
+                "principal": self.principal.name,
+                "intentDigest": digest,
+                "requestId": ctx.request_id(),
+                "arguments": args,
+            });
+            let id = self
+                .audit
+                .begin_once(&audit_scope, name, request, dedup)
+                .await
+                .map_err(|_| {
+                    McpError::internal(
+                        "Audit persistence failed, approval already consumed, \
+                         or an earlier operation requires reconciliation",
+                    )
+                })?;
+            Some(id)
         } else {
             None
         };

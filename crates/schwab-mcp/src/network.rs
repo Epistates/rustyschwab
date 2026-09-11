@@ -216,10 +216,11 @@ async fn authenticate(
         return unauthorized(&state);
     }
     request.extensions_mut().insert(validity.clone());
+    let deadline = std::time::Duration::from_secs((expires_at - now).clamp(1, 120) as u64);
     tokio::select! {
-        response=router.oneshot(request)=>response.unwrap_or_else(|never|match never{}),
-        _=validity.revoked.changed()=>unauthorized(&state),
-        _=tokio::time::sleep(std::time::Duration::from_secs((expires_at-now).clamp(1,120) as u64))=>StatusCode::GATEWAY_TIMEOUT.into_response(),
+        response = router.oneshot(request) => response.unwrap_or_else(|never| match never {}),
+        _ = validity.revoked.changed() => unauthorized(&state),
+        _ = tokio::time::sleep(deadline) => StatusCode::GATEWAY_TIMEOUT.into_response(),
     }
 }
 fn unauthorized(state: &NetworkState) -> Response {
@@ -267,46 +268,97 @@ async fn session(
     let mut pending = HashMap::<String, tokio::task::AbortHandle>::new();
     loop {
         tokio::select! {
-            _=validity.revoked.changed()=>break,
-            _=&mut expiry=>break,
+            _ = validity.revoked.changed() => break,
+            _ = &mut expiry => break,
             completed = jobs.join_next(), if !jobs.is_empty() => {
                 if let Some(Ok((id, response))) = completed {
                     pending.remove(&id);
-                    if !send(&mut socket, response).await { break; }
+                    if !send(&mut socket, response).await {
+                        break;
+                    }
                 }
             }
             next = socket.recv() => {
                 let text = match next {
                     Some(Ok(Message::Text(text))) => text,
-                    Some(Ok(Message::Ping(data))) => { if socket.send(Message::Pong(data)).await.is_err() { break; } continue; },
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     Some(Ok(Message::Pong(_))) => continue,
                     _ => break,
                 };
                 let request = match rpc::parse_request(&text) {
                     Ok(request) => request,
-                    Err(_) => { if !send(&mut socket, rpc::JsonRpcOutgoing::error(Some(serde_json::Value::Null), McpError::parse_error("Invalid JSON-RPC request"))).await { break; } continue; }
+                    Err(_) => {
+                        let response = rpc::JsonRpcOutgoing::error(
+                            Some(serde_json::Value::Null),
+                            McpError::parse_error("Invalid JSON-RPC request"),
+                        );
+                        if !send(&mut socket, response).await {
+                            break;
+                        }
+                        continue;
+                    }
                 };
                 if request.method == "notifications/cancelled" {
                     if let Some(id) = request.params.as_ref().and_then(|p| p.get("requestId"))
-                        && let Some(handle) = pending.remove(&id.to_string()) { handle.abort(); }
+                        && let Some(handle) = pending.remove(&id.to_string())
+                    {
+                        handle.abort();
+                    }
                     continue;
                 }
-                if request.method == "notifications/initialized" { initialized = version.is_some(); continue; }
-                if request.is_notification() { continue; }
+                if request.method == "notifications/initialized" {
+                    initialized = version.is_some();
+                    continue;
+                }
+                if request.is_notification() {
+                    continue;
+                }
                 if request.method == "initialize" {
-                    let response = if version.is_some() { rpc::JsonRpcOutgoing::error(request.id, McpError::invalid_request("Already initialized")) }
-                    else { rpc::route_request(&server, request, &RequestContext::websocket()).await };
-                    if let Some(v) = response.result.as_ref().and_then(|r| r.get("protocolVersion")).and_then(|v| v.as_str()) { version = Some(v.into()); }
-                    if !send(&mut socket, response).await { break; }
+                    let response = if version.is_some() {
+                        rpc::JsonRpcOutgoing::error(
+                            request.id,
+                            McpError::invalid_request("Already initialized"),
+                        )
+                    } else {
+                        rpc::route_request(&server, request, &RequestContext::websocket()).await
+                    };
+                    let negotiated = response
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.get("protocolVersion"))
+                        .and_then(|v| v.as_str());
+                    if let Some(v) = negotiated {
+                        version = Some(v.into());
+                    }
+                    if !send(&mut socket, response).await {
+                        break;
+                    }
                     continue;
                 }
                 if !initialized || pending.len() >= 32 {
-                    if !send(&mut socket, rpc::JsonRpcOutgoing::error(request.id, McpError::invalid_request("Session not ready or concurrency limit reached"))).await { break; }
+                    let response = rpc::JsonRpcOutgoing::error(
+                        request.id,
+                        McpError::invalid_request("Session not ready or concurrency limit reached"),
+                    );
+                    if !send(&mut socket, response).await {
+                        break;
+                    }
                     continue;
                 }
                 let id = request.id.as_ref().unwrap().to_string();
                 if pending.contains_key(&id) {
-                    if !send(&mut socket, rpc::JsonRpcOutgoing::error(request.id, McpError::invalid_request("Request ID is already active"))).await { break; }
+                    let response = rpc::JsonRpcOutgoing::error(
+                        request.id,
+                        McpError::invalid_request("Request ID is already active"),
+                    );
+                    if !send(&mut socket, response).await {
+                        break;
+                    }
                     continue;
                 }
                 let handler = server.clone();
@@ -315,8 +367,17 @@ async fn session(
                 let handle = jobs.spawn(async move {
                     let ctx = RequestContext::websocket().with_request_id(key.clone());
                     let request_id = request.id.clone();
-                    let response = tokio::time::timeout(std::time::Duration::from_secs(120), rpc::route_request_versioned(&handler, request, &ctx, &version)).await
-                        .unwrap_or_else(|_| rpc::JsonRpcOutgoing::error(request_id, McpError::internal("Operation deadline exceeded; reconcile any pending execution")));
+                    let routed = rpc::route_request_versioned(&handler, request, &ctx, &version);
+                    let response = tokio::time::timeout(std::time::Duration::from_secs(120), routed)
+                        .await
+                        .unwrap_or_else(|_| {
+                            rpc::JsonRpcOutgoing::error(
+                                request_id,
+                                McpError::internal(
+                                    "Operation deadline exceeded; reconcile any pending execution",
+                                ),
+                            )
+                        });
                     (key, response)
                 });
                 pending.insert(id, handle);

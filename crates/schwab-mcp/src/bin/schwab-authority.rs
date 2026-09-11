@@ -100,8 +100,14 @@ async fn main() -> anyhow::Result<()> {
     let serving = std::future::IntoFuture::into_future(serve);
     tokio::pin!(serving);
     tokio::select! {
-        result=&mut serving=>result?,
-        _=shutdown()=>{client.begin_drain();let _=stop.send(());if let Ok(result)=tokio::time::timeout(Duration::from_secs(30),&mut serving).await{result?;}}
+        result = &mut serving => result?,
+        _ = shutdown() => {
+            client.begin_drain();
+            let _ = stop.send(());
+            if let Ok(result) = tokio::time::timeout(Duration::from_secs(30), &mut serving).await {
+                result?;
+            }
+        }
     }
     Ok(())
 }

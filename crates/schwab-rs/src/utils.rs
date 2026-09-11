@@ -81,7 +81,8 @@ pub fn format_time(dt: Option<DateTime<Utc>>, format: TimeFormat) -> Option<Stri
                 .next()
                 .unwrap_or(&iso); // Fallback to original if split fails
 
-            // Remove microseconds (keep only milliseconds): "2024-10-26T15:30:00.123456" → "2024-10-26T15:30:00.123"
+            // Remove microseconds (keep only milliseconds):
+            // "2024-10-26T15:30:00.123456" → "2024-10-26T15:30:00.123"
             if let Some(dot_pos) = timestamp.rfind('.') {
                 let (base, micros) = timestamp.split_at(dot_pos);
                 format!("{}{:.3}Z", base, &micros[..4.min(micros.len())])

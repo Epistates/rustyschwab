@@ -108,8 +108,14 @@ fn market_hours_are_nested_two_levels() {
                 "product": "EQ",
                 "isOpen": true,
                 "sessionHours": {
-                    "preMarket": [{"start": "2025-01-15T07:00:00-05:00", "end": "2025-01-15T09:30:00-05:00"}],
-                    "regularMarket": [{"start": "2025-01-15T09:30:00-05:00", "end": "2025-01-15T16:00:00-05:00"}]
+                    "preMarket": [{
+                        "start": "2025-01-15T07:00:00-05:00",
+                        "end": "2025-01-15T09:30:00-05:00"
+                    }],
+                    "regularMarket": [{
+                        "start": "2025-01-15T09:30:00-05:00",
+                        "end": "2025-01-15T16:00:00-05:00"
+                    }]
                 }
             }
         },

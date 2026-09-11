@@ -22,6 +22,42 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+
+const PAPER_SCHEMA: &str = "\
+    CREATE TABLE paper_accounts(account TEXT PRIMARY KEY,payload TEXT NOT NULL);\
+    CREATE TABLE paper_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,account TEXT NOT NULL,\
+      active INTEGER NOT NULL,payload TEXT NOT NULL);\
+    CREATE INDEX paper_active ON paper_orders(active,id);\
+    CREATE INDEX paper_account_orders ON paper_orders(account,id);\
+    CREATE TABLE paper_quotes(symbol TEXT PRIMARY KEY,payload TEXT NOT NULL);\
+    CREATE TABLE paper_quote_watermarks(symbol TEXT PRIMARY KEY,source_at INTEGER NOT NULL);\
+    CREATE TABLE paper_events(sequence INTEGER PRIMARY KEY,payload TEXT NOT NULL,\
+      result TEXT NOT NULL);";
+const COUNT_PAPER_TABLES: &str = "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+     AND name IN ('paper_accounts','paper_orders','paper_quotes','paper_quote_watermarks',\
+     'paper_events')";
+/// Live execution rows that would make a database unsafe to reuse for paper.
+const COUNT_LIVE_STATE_ROWS: &str = "SELECT (SELECT COUNT(*) FROM submissions)\
+     +(SELECT COUNT(*) FROM accounts)+(SELECT COUNT(*) FROM audit)";
+const COUNT_CAPTURE_METADATA: &str =
+    "SELECT COUNT(*) FROM meta WHERE key IN ('paper_capture_version','paper_capture_count')";
+/// Whether this database ever claimed complete command capture.
+const SELECT_CAPTURE_EXPECTED: &str = "SELECT \
+     EXISTS(SELECT 1 FROM meta WHERE key='paper_capture_version') \
+     OR EXISTS(SELECT 1 FROM audit WHERE kind='paper_command')";
+const SELECT_LEASE_HELD: &str = "SELECT EXISTS(SELECT 1 FROM leases \
+     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)";
+const SELECT_ORDER_PAGE: &str =
+    "SELECT payload FROM paper_orders WHERE account=?1 AND id>?2 ORDER BY id LIMIT ?3";
+const UPSERT_QUOTE_WATERMARK: &str = "INSERT INTO paper_quote_watermarks VALUES(?1,?2) \
+     ON CONFLICT(symbol) DO UPDATE SET source_at=excluded.source_at";
+const UPSERT_QUOTE: &str = "INSERT INTO paper_quotes VALUES(?1,?2) \
+     ON CONFLICT(symbol) DO UPDATE SET payload=excluded.payload";
+const SELECT_EVENT_PAGE: &str = "SELECT sequence, payload FROM paper_events \
+     WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 1000";
+const SELECT_EVENT_PAYLOAD: &str = "SELECT payload FROM paper_events WHERE sequence=?1";
+const REPLACE_EVENT_PAYLOAD: &str = "UPDATE paper_events SET payload=?2 WHERE sequence=?1";
+
 /// Independent execution engine. Durable configuration is immutable for a run.
 #[derive(Clone, Debug)]
 pub struct PaperBroker {
@@ -247,7 +283,8 @@ fn validate_order(order: &OrderRequest) -> Result<()> {
         || order.stop_price_link_basis.is_some()
     {
         return Err(invalid(
-            "Paper v2 supports single-leg NORMAL DAY/GTC equity MARKET/LIMIT/STOP/STOP_LIMIT orders only",
+            "Paper v2 supports single-leg NORMAL DAY/GTC equity \
+             MARKET/LIMIT/STOP/STOP_LIMIT orders only",
         ));
     }
     let leg = &order.order_leg_collection[0];
@@ -349,7 +386,15 @@ fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Res
         return Err(invalid("Operator halt is active"));
     }
     if let Some(fence) = fence {
-        let valid: bool=c.query_row("SELECT EXISTS(SELECT 1 FROM leases WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)",params![fence.resource,fence.owner,i64::try_from(fence.epoch).map_err(|_|invalid("Invalid lease epoch"))?,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(sql)?;
+        let epoch = i64::try_from(fence.epoch).map_err(|_| invalid("Invalid lease epoch"))?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let valid: bool = c
+            .query_row(
+                SELECT_LEASE_HELD,
+                params![fence.resource, fence.owner, epoch, now],
+                |r| r.get(0),
+            )
+            .map_err(sql)?;
         if !valid {
             return Err(invalid("Paper execution lease is no longer valid"));
         }
@@ -794,12 +839,20 @@ impl PaperBroker {
             return Err(invalid("Invalid paper history cursor/limit"));
         }
         let account = account.to_owned();
-        self.journal.database().run(move |c|{
-            ledger(c,&account)?;
-            let mut statement=c.prepare("SELECT payload FROM paper_orders WHERE account=?1 AND id>?2 ORDER BY id LIMIT ?3").map_err(sql)?;
-            statement.query_map(params![account,after_id as i64,limit],|r|r.get::<_,String>(0)).map_err(sql)?.map(|v|Ok(serde_json::from_str(&v.map_err(sql)?)?)).collect()
-        }
-).await
+        self.journal
+            .database()
+            .run(move |c| {
+                ledger(c, &account)?;
+                let mut statement = c.prepare(SELECT_ORDER_PAGE).map_err(sql)?;
+                statement
+                    .query_map(params![account, after_id as i64, limit], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map_err(sql)?
+                    .map(|v| Ok(serde_json::from_str(&v.map_err(sql)?)?))
+                    .collect()
+            })
+            .await
     }
     pub async fn snapshot(&self, account: &str) -> Result<PaperSnapshot> {
         let account = account.to_owned();
@@ -953,10 +1006,9 @@ fn capture(c: &Connection, command: PaperCommand, outcome: PaperCapturedOutcome)
         .map_err(sql)?;
     // Historical databases remain usable, but cannot claim complete capture.
     let Some(count) = count else {
-        let expected: bool = c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='paper_capture_version') OR EXISTS(SELECT 1 FROM audit WHERE kind='paper_command')",
-            [], |row| row.get(0),
-        ).map_err(sql)?;
+        let expected: bool = c
+            .query_row(SELECT_CAPTURE_EXPECTED, [], |row| row.get(0))
+            .map_err(sql)?;
         if expected {
             return Err(Error::Storage("Command capture metadata is missing".into()));
         }
@@ -1106,13 +1158,15 @@ fn apply_event(
                     "Quote source time must advance; do not reuse snapshot liquidity",
                 ));
             }
-            tx.execute("INSERT INTO paper_quote_watermarks VALUES(?1,?2) ON CONFLICT(symbol) DO UPDATE SET source_at=excluded.source_at",params![symbol,source_at_ms]).map_err(sql)?;
+            tx.execute(UPSERT_QUOTE_WATERMARK, params![symbol, source_at_ms])
+                .map_err(sql)?;
             let quote = Quote {
                 source_at_ms: *source_at_ms,
                 bid: *bid,
                 ask: *ask,
             };
-            tx.execute("INSERT INTO paper_quotes VALUES(?1,?2) ON CONFLICT(symbol) DO UPDATE SET payload=excluded.payload",params![symbol,encode(&quote)?]).map_err(sql)?;
+            tx.execute(UPSERT_QUOTE, params![symbol, encode(&quote)?])
+                .map_err(sql)?;
             quotes = Some((symbol.clone(), quote, *bid_size, *ask_size));
         }
     }
@@ -1309,16 +1363,17 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
         {
             return Err(invalid("Paper configuration differs from durable run"));
         }
-        let tables: i64 = tx.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('paper_accounts','paper_orders','paper_quotes','paper_quote_watermarks','paper_events')", [], |r|r.get(0)).map_err(sql)?;
+        let tables: i64 = tx
+            .query_row(COUNT_PAPER_TABLES, [], |r| r.get(0))
+            .map_err(sql)?;
         if tables != 5 {
             return Err(Error::Storage(
                 "Paper database is missing required tables; restore a complete backup".into(),
             ));
         }
-        let capture_metadata: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM meta WHERE key IN ('paper_capture_version','paper_capture_count')",
-            [], |row| row.get(0),
-        ).map_err(sql)?;
+        let capture_metadata: i64 = tx
+            .query_row(COUNT_CAPTURE_METADATA, [], |row| row.get(0))
+            .map_err(sql)?;
         let captured: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM audit WHERE kind='paper_command'",
@@ -1371,17 +1426,13 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
                 |r| r.get(0),
             )
             .map_err(sql)?;
-        let count: i64 = tx.query_row("SELECT (SELECT COUNT(*) FROM submissions)+(SELECT COUNT(*) FROM accounts)+(SELECT COUNT(*) FROM audit)", [], |r|r.get(0)).map_err(sql)?;
+        let count: i64 = tx
+            .query_row(COUNT_LIVE_STATE_ROWS, [], |r| r.get(0))
+            .map_err(sql)?;
         if mode.is_some() || paper_tables != 0 || count != 0 {
             return Err(invalid("Paper mode requires a new dedicated database"));
         }
-        tx.execute_batch("CREATE TABLE paper_accounts(account TEXT PRIMARY KEY,payload TEXT NOT NULL);
-            CREATE TABLE paper_orders(id INTEGER PRIMARY KEY AUTOINCREMENT,account TEXT NOT NULL,active INTEGER NOT NULL,payload TEXT NOT NULL);
-            CREATE INDEX paper_active ON paper_orders(active,id);
-            CREATE INDEX paper_account_orders ON paper_orders(account,id);
-            CREATE TABLE paper_quotes(symbol TEXT PRIMARY KEY,payload TEXT NOT NULL);
-            CREATE TABLE paper_quote_watermarks(symbol TEXT PRIMARY KEY,source_at INTEGER NOT NULL);
-            CREATE TABLE paper_events(sequence INTEGER PRIMARY KEY,payload TEXT NOT NULL,result TEXT NOT NULL);").map_err(sql)?;
+        tx.execute_batch(PAPER_SCHEMA).map_err(sql)?;
         for (name, account) in &config.accounts {
             let state = PaperAccount {
                 cash: account.initial_cash,
@@ -1759,61 +1810,90 @@ impl PaperBroker {
             return Err(invalid("Invalid archive sequence"));
         }
         self.journal.database().backup(destination.clone()).await?;
-        self.journal.database().run(move |connection| {
-            use std::io::Read;
-            let archive = rusqlite::Connection::open_with_flags(
-                &destination, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ).map_err(sql)?;
-            let saved: Clock = get(&archive, "paper_clock")?;
-            if through_sequence > saved.sequence {
-                return Err(invalid("Archive does not cover requested frontier"));
-            }
-            let mut file = std::fs::File::open(&destination)?;
-            let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-            let mut buffer = [0_u8; 65536];
-            loop {
-                let bytes = file.read(&mut buffer)?;
-                if bytes == 0 { break; }
-                digest.update(&buffer[..bytes]);
-            }
-            let hash = digest.finish().as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(sql)?;
-            let mut cursor = 0_i64;
-            let mut compacted = 0;
-            loop {
-                let batch = {
-                    let mut statement = tx.prepare(
-                        "SELECT sequence, payload FROM paper_events WHERE sequence>?1 AND sequence<=?2 ORDER BY sequence LIMIT 1000",
-                    ).map_err(sql)?;
-                    statement.query_map(params![cursor, through_sequence as i64], |row| {
-                        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-                    }).map_err(sql)?.collect::<std::result::Result<Vec<_>, _>>().map_err(sql)?
-                };
-                if batch.is_empty() { break; }
-                for (sequence, payload) in batch {
-                    cursor = sequence;
-                    if payload.starts_with("sha256:") { continue; }
-                    let saved: String = archive.query_row(
-                        "SELECT payload FROM paper_events WHERE sequence=?1", [sequence], |row| row.get(0),
-                    ).map_err(sql)?;
-                    if payload != saved {
-                        return Err(Error::Storage("Archived event payload mismatch".into()));
-                    }
-                    tx.execute(
-                        "UPDATE paper_events SET payload=?2 WHERE sequence=?1",
-                        params![sequence, payload_receipt(&payload)],
-                    ).map_err(sql)?;
-                    compacted += 1;
+        self.journal
+            .database()
+            .run(move |connection| {
+                use std::io::Read;
+                let archive = rusqlite::Connection::open_with_flags(
+                    &destination,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(sql)?;
+                let saved: Clock = get(&archive, "paper_clock")?;
+                if through_sequence > saved.sequence {
+                    return Err(invalid("Archive does not cover requested frontier"));
                 }
-            }
-            let report = PaperArchiveReport {
-                through_sequence, compacted, archive_path: destination, sha256: hash,
-            };
-            put(&tx, &format!("paper_archive:{through_sequence}"), &report)?;
-            audit(&tx, "paper_events_archived", &through_sequence.to_string(), &serde_json::to_value(&report)?)?;
-            tx.commit().map_err(sql)?;
-            Ok(report)
-        }).await
+                let mut file = std::fs::File::open(&destination)?;
+                let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+                let mut buffer = [0_u8; 65536];
+                loop {
+                    let bytes = file.read(&mut buffer)?;
+                    if bytes == 0 {
+                        break;
+                    }
+                    digest.update(&buffer[..bytes]);
+                }
+                let hash = digest
+                    .finish()
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                let tx = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let mut cursor = 0_i64;
+                let mut compacted = 0;
+                loop {
+                    let batch = {
+                        let mut statement = tx.prepare(SELECT_EVENT_PAGE).map_err(sql)?;
+                        statement
+                            .query_map(params![cursor, through_sequence as i64], |row| {
+                                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                            })
+                            .map_err(sql)?
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                            .map_err(sql)?
+                    };
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for (sequence, payload) in batch {
+                        cursor = sequence;
+                        if payload.starts_with("sha256:") {
+                            continue;
+                        }
+                        let saved: String = archive
+                            .query_row(SELECT_EVENT_PAYLOAD, [sequence], |row| row.get(0))
+                            .map_err(sql)?;
+                        if payload != saved {
+                            return Err(Error::Storage("Archived event payload mismatch".into()));
+                        }
+                        tx.execute(
+                            REPLACE_EVENT_PAYLOAD,
+                            params![sequence, payload_receipt(&payload)],
+                        )
+                        .map_err(sql)?;
+                        compacted += 1;
+                    }
+                }
+                let report = PaperArchiveReport {
+                    through_sequence,
+                    compacted,
+                    archive_path: destination,
+                    sha256: hash,
+                };
+                put(&tx, &format!("paper_archive:{through_sequence}"), &report)?;
+                audit(
+                    &tx,
+                    "paper_events_archived",
+                    &through_sequence.to_string(),
+                    &serde_json::to_value(&report)?,
+                )?;
+                tx.commit().map_err(sql)?;
+                Ok(report)
+            })
+            .await
     }
 }
 

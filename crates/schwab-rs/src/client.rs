@@ -574,8 +574,19 @@ impl SchwabClient {
                 .map(|s| crate::metrics::status_class(s.as_u16()))
                 .unwrap_or("error"),
         };
-        metrics::counter!(crate::metrics::HTTP_REQUESTS_TOTAL, "op" => op, "method" => method_label, "status" => status).increment(1);
-        metrics::histogram!(crate::metrics::HTTP_REQUEST_DURATION, "op" => op, "method" => method_label).record(start.elapsed().as_secs_f64());
+        metrics::counter!(
+            crate::metrics::HTTP_REQUESTS_TOTAL,
+            "op" => op,
+            "method" => method_label,
+            "status" => status
+        )
+        .increment(1);
+        metrics::histogram!(
+            crate::metrics::HTTP_REQUEST_DURATION,
+            "op" => op,
+            "method" => method_label
+        )
+        .record(start.elapsed().as_secs_f64());
         result
     }
 

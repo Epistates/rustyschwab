@@ -8,6 +8,34 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const INVALIDATE_ACCOUNT: &str = "INSERT INTO accounts VALUES(?1,?2,0,0,'{}') \
+     ON CONFLICT(account) DO UPDATE SET valid=0,generation=MAX(generation,excluded.generation)";
+const SELECT_ACCOUNT_STATE: &str =
+    "SELECT generation,observed_at,valid,snapshot FROM accounts WHERE account=?1";
+const SELECT_ACCOUNT_GENERATION: &str =
+    "SELECT generation,observed_at FROM accounts WHERE account=?1";
+const UPSERT_ACCOUNT_SNAPSHOT: &str = "INSERT INTO accounts VALUES(?1,?2,?3,?4,?5) \
+     ON CONFLICT(account) DO UPDATE SET generation=excluded.generation,\
+     observed_at=excluded.observed_at,valid=excluded.valid,snapshot=excluded.snapshot";
+const UPSERT_ORDER: &str = "INSERT INTO orders VALUES(?1,?2,?3,?4) \
+     ON CONFLICT(account,order_id) DO UPDATE SET observed_at=excluded.observed_at,\
+     payload=excluded.payload";
+const UPDATE_ORDER_PAYLOAD: &str =
+    "UPDATE orders SET payload=?1,observed_at=?2 WHERE account=?3 AND order_id=?4";
+const INSERT_EXECUTION_IF_NEW: &str = "INSERT OR IGNORE INTO executions VALUES(?1,?2,?3)";
+/// Submissions with no outcome yet, or accepted without a broker order ID.
+const SELECT_PENDING_SUBMISSIONS: &str = "SELECT id,request FROM submissions \
+     WHERE account=?1 AND (outcome IS NULL OR json_extract(outcome,'$.order_id') IS NULL \
+     AND json_extract(outcome,'$.status')='accepted')";
+const RESOLVE_SUBMISSION_OUTCOME: &str = "UPDATE submissions SET outcome=?1 WHERE id=?2";
+/// Submissions whose linked broker order has reached a terminal status.
+const SELECT_TERMINAL_SUBMISSIONS: &str = "SELECT s.id FROM submissions s \
+     JOIN orders o ON o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') \
+     WHERE s.account=?1 AND json_extract(o.payload,'$.status') \
+     IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')";
+const RELEASE_HELD_RESERVATION: &str =
+    "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
     pub account: String,
@@ -31,19 +59,19 @@ impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
         let account = account.to_owned();
         self.run(move |c| {
-            c.execute("INSERT INTO accounts VALUES(?1,?2,0,0,'{}') ON CONFLICT(account) DO UPDATE SET valid=0,generation=MAX(generation,excluded.generation)",params![account,generation as i64]).map_err(sql)?;
+            c.execute(INVALIDATE_ACCOUNT, params![account, generation as i64])
+                .map_err(sql)?;
             Ok(())
-        }).await
+        })
+        .await
     }
     pub async fn account_state(&self, account: &str) -> Result<Option<AccountState>> {
         let account = account.to_owned();
         self.run(move |c| {
             let row: Option<(i64, i64, bool, String)> = c
-                .query_row(
-                    "SELECT generation,observed_at,valid,snapshot FROM accounts WHERE account=?1",
-                    [&account],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
+                .query_row(SELECT_ACCOUNT_STATE, [&account], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
                 .optional()
                 .map_err(sql)?;
             row.map(|(generation, observed_at, reconciled, snapshot)| {
@@ -70,45 +98,130 @@ impl StateDatabase {
     ) -> Result<ReconciliationReport> {
         let account = account.to_owned();
         self.run(move |c| {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
-            let current: Option<(i64,i64)> = tx.query_row("SELECT generation,observed_at FROM accounts WHERE account=?1",[&account],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(sql)?;
-            if current.is_some_and(|(g,at)| g != generation as i64 || at > started_at) { return Err(Error::Storage("Reconciliation superseded by a newer account generation".into())); }
-            let mut report = ReconciliationReport { account:account.clone(),generation,orders_observed:orders.len(),newly_observed_activities:0,resolved_attempts:vec![],unresolved_attempts:vec![],reconciled:false,terminal_attempts:vec![] };
-            for order in &orders { persist_order(&tx,&account,order,started_at,&mut report.newly_observed_activities)?; }
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let current: Option<(i64, i64)> = tx
+                .query_row(SELECT_ACCOUNT_GENERATION, [&account], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()
+                .map_err(sql)?;
+            if current.is_some_and(|(g, at)| g != generation as i64 || at > started_at) {
+                return Err(Error::Storage(
+                    "Reconciliation superseded by a newer account generation".into(),
+                ));
+            }
+            let mut report = ReconciliationReport {
+                account: account.clone(),
+                generation,
+                orders_observed: orders.len(),
+                newly_observed_activities: 0,
+                resolved_attempts: vec![],
+                unresolved_attempts: vec![],
+                reconciled: false,
+                terminal_attempts: vec![],
+            };
+            for order in &orders {
+                persist_order(
+                    &tx,
+                    &account,
+                    order,
+                    started_at,
+                    &mut report.newly_observed_activities,
+                )?;
+            }
             // Direct/top-level results take precedence over the potentially
             // older child copies embedded in a parent response.
             for order in &orders {
-                if let Some(id)=broker_id(order.get("orderId")) {
-                    tx.execute("UPDATE orders SET payload=?1,observed_at=?2 WHERE account=?3 AND order_id=?4",params![serde_json::to_string(order)?,started_at,account,id]).map_err(sql)?;
+                if let Some(id) = broker_id(order.get("orderId")) {
+                    tx.execute(
+                        UPDATE_ORDER_PAYLOAD,
+                        params![serde_json::to_string(order)?, started_at, account, id],
+                    )
+                    .map_err(sql)?;
                 }
             }
             let pending = {
-                let mut stmt = tx.prepare("SELECT id,request FROM submissions WHERE account=?1 AND (outcome IS NULL OR json_extract(outcome,'$.order_id') IS NULL AND json_extract(outcome,'$.status')='accepted')").map_err(sql)?;
-                stmt.query_map([&account],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).map_err(sql)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql)?
+                let mut stmt = tx.prepare(SELECT_PENDING_SUBMISSIONS).map_err(sql)?;
+                stmt.query_map([&account], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })
+                .map_err(sql)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sql)?
             };
-            for (id,request) in pending {
+            for (id, request) in pending {
                 let request: Value = serde_json::from_str(&request)?;
                 let tag = request.get("tag").and_then(Value::as_str);
-                let candidates:Vec<_> = orders.iter().filter(|o|tag.is_some_and(|tag|o.get("tag").and_then(Value::as_str)==Some(tag)) && matches_request(&request,o)).collect();
-                if candidates.len()==1 && let Some(order_id)=broker_id(candidates[0].get("orderId")) {
-                    let outcome = crate::execution::SubmissionOutcome::Accepted { order_id:Some(order_id) };
-                    tx.execute("UPDATE submissions SET outcome=?1 WHERE id=?2",params![serde_json::to_string(&outcome)?,id]).map_err(sql)?;
-                    audit(&tx,"broker_reconciled",&id,&serde_json::to_value(&outcome)?)?;
+                let candidates: Vec<_> = orders
+                    .iter()
+                    .filter(|o| {
+                        let same_tag = tag
+                            .is_some_and(|tag| o.get("tag").and_then(Value::as_str) == Some(tag));
+                        same_tag && matches_request(&request, o)
+                    })
+                    .collect();
+                if candidates.len() == 1
+                    && let Some(order_id) = broker_id(candidates[0].get("orderId"))
+                {
+                    let outcome = crate::execution::SubmissionOutcome::Accepted {
+                        order_id: Some(order_id),
+                    };
+                    tx.execute(
+                        RESOLVE_SUBMISSION_OUTCOME,
+                        params![serde_json::to_string(&outcome)?, id],
+                    )
+                    .map_err(sql)?;
+                    audit(
+                        &tx,
+                        "broker_reconciled",
+                        &id,
+                        &serde_json::to_value(&outcome)?,
+                    )?;
                     report.resolved_attempts.push(id);
-                } else { report.unresolved_attempts.push(id); }
+                } else {
+                    report.unresolved_attempts.push(id);
+                }
             }
-            report.terminal_attempts={
-                let mut stmt=tx.prepare("SELECT s.id FROM submissions s JOIN orders o ON o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') WHERE s.account=?1 AND json_extract(o.payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')").map_err(sql)?;
-                stmt.query_map([&account],|r|r.get::<_,String>(0)).map_err(sql)?.collect::<std::result::Result<Vec<_>,_>>().map_err(sql)?
+            report.terminal_attempts = {
+                let mut stmt = tx.prepare(SELECT_TERMINAL_SUBMISSIONS).map_err(sql)?;
+                stmt.query_map([&account], |r| r.get::<_, String>(0))
+                    .map_err(sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql)?
             };
-            for id in &report.terminal_attempts {tx.execute("UPDATE reservations SET state='released' WHERE id=?1 AND state='held'",[id]).map_err(sql)?;}
-            report.reconciled=report.unresolved_attempts.is_empty();
-            tx.execute("INSERT INTO accounts VALUES(?1,?2,?3,?4,?5) ON CONFLICT(account) DO UPDATE SET generation=excluded.generation,observed_at=excluded.observed_at,valid=excluded.valid,snapshot=excluded.snapshot",params![account,generation as i64,started_at,report.reconciled,serde_json::to_string(&snapshot)?]).map_err(sql)?;
-            audit(&tx,"account_reconciled",&account,&serde_json::to_value(&report)?)?;
+            for id in &report.terminal_attempts {
+                tx.execute(RELEASE_HELD_RESERVATION, [id]).map_err(sql)?;
+            }
+            report.reconciled = report.unresolved_attempts.is_empty();
+            tx.execute(
+                UPSERT_ACCOUNT_SNAPSHOT,
+                params![
+                    account,
+                    generation as i64,
+                    started_at,
+                    report.reconciled,
+                    serde_json::to_string(&snapshot)?
+                ],
+            )
+            .map_err(sql)?;
+            audit(
+                &tx,
+                "account_reconciled",
+                &account,
+                &serde_json::to_value(&report)?,
+            )?;
             tx.commit().map_err(sql)?;
-            metrics::counter!("schwab_reconciliation_total", "outcome"=>if report.reconciled {"ready"}else{"unresolved"}).increment(1);
+            let outcome = if report.reconciled {
+                "ready"
+            } else {
+                "unresolved"
+            };
+            metrics::counter!("schwab_reconciliation_total", "outcome" => outcome).increment(1);
             Ok(report)
-        }).await
+        })
+        .await
     }
 }
 fn broker_id(value: Option<&Value>) -> Option<String> {
@@ -148,7 +261,11 @@ fn persist_order(
     activities: &mut usize,
 ) -> Result<()> {
     if let Some(id) = broker_id(order.get("orderId")) {
-        c.execute("INSERT INTO orders VALUES(?1,?2,?3,?4) ON CONFLICT(account,order_id) DO UPDATE SET observed_at=excluded.observed_at,payload=excluded.payload",params![account,id,at,serde_json::to_string(order)?]).map_err(sql)?;
+        c.execute(
+            UPSERT_ORDER,
+            params![account, id, at, serde_json::to_string(order)?],
+        )
+        .map_err(sql)?;
         if let Some(items) = order
             .get("orderActivityCollection")
             .and_then(Value::as_array)
@@ -165,10 +282,7 @@ fn persist_order(
                 );
                 // Deduplicated observations, not synthetic broker execution IDs.
                 *activities += c
-                    .execute(
-                        "INSERT OR IGNORE INTO executions VALUES(?1,?2,?3)",
-                        params![account, key, body],
-                    )
+                    .execute(INSERT_EXECUTION_IF_NEW, params![account, key, body])
                     .map_err(sql)?;
             }
         }

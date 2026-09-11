@@ -329,7 +329,8 @@ mod tests {
             "key": "Account Activity",
             "1": "987654321",
             "2": "OrderFillCompleted",
-            "3": "{\"SchwabOrderID\":\"1003811730601\",\"AccountNumber\":\"987654321\",\"BaseEvent\":{\"EventType\":\"OrderFillCompletedEvent\"}}"
+            "3": "{\"SchwabOrderID\":\"1003811730601\",\"AccountNumber\":\"987654321\",\
+                  \"BaseEvent\":{\"EventType\":\"OrderFillCompletedEvent\"}}"
         });
         redact_stream_content("ACCT_ACTIVITY", &mut v);
         assert_eq!(v["1"], "***4321");

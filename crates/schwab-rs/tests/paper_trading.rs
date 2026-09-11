@@ -7,12 +7,43 @@ fn d(v: &str) -> Decimal {
 }
 fn config() -> PaperConfig {
     serde_json::from_value(json!({
-    "model_version":MODEL_VERSION,"accounts":{"paper-test":{"initial_cash":"1000","limits":{"max_open_quantity":"100","max_open_notional":"10000","max_position_quantity":"100","max_snapshot_age_ms":5000}}},
-    "execution_latency_ms":10,"cancel_latency_ms":100,"quote_max_age_ms":5000,"slippage_bps":"0","market_collar_bps":"500","fee_per_share":"0.01","max_working_orders":100
-})).unwrap()
+        "model_version": MODEL_VERSION,
+        "accounts": {
+            "paper-test": {
+                "initial_cash": "1000",
+                "limits": {
+                    "max_open_quantity": "100",
+                    "max_open_notional": "10000",
+                    "max_position_quantity": "100",
+                    "max_snapshot_age_ms": 5000,
+                },
+            },
+        },
+        "execution_latency_ms": 10,
+        "cancel_latency_ms": 100,
+        "quote_max_age_ms": 5000,
+        "slippage_bps": "0",
+        "market_collar_bps": "500",
+        "fee_per_share": "0.01",
+        "max_working_orders": 100,
+    }))
+    .unwrap()
 }
 fn order(tag: &str, side: &str, q: &str, price: &str) -> OrderRequest {
-    serde_json::from_value(json!({"tag":tag,"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":price,"orderLegCollection":[{"quantity":q,"instruction":side,"instrument":{"symbol":"ABC","assetType":"EQUITY"}}]})).unwrap()
+    serde_json::from_value(json!({
+        "tag": tag,
+        "orderStrategyType": "SINGLE",
+        "orderType": "LIMIT",
+        "session": "NORMAL",
+        "duration": "DAY",
+        "price": price,
+        "orderLegCollection": [{
+            "quantity": q,
+            "instruction": side,
+            "instrument": {"symbol": "ABC", "assetType": "EQUITY"},
+        }],
+    }))
+    .unwrap()
 }
 fn quote(sequence: u64, at: i64, bid: &str, ask: &str, size: &str) -> PaperEvent {
     PaperEvent {
@@ -49,6 +80,20 @@ async fn setup() -> (tempfile::TempDir, PaperBroker) {
         .await
         .unwrap();
     (dir, broker)
+}
+/// Inject a storage fault: a trigger that aborts the next statement matching `when`.
+async fn install_fault(broker: &PaperBroker, name: &str, when: &str, message: &str) {
+    let ddl = format!("CREATE TRIGGER {name} {when} BEGIN SELECT RAISE(ABORT,'{message}'); END;");
+    broker
+        .order_journal()
+        .database()
+        .run(move |c| {
+            c.execute_batch(&ddl)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
 }
 #[tokio::test]
 async fn partial_fills_reservations_cost_basis_and_realized_pnl_survive_restart() {
@@ -451,9 +496,13 @@ async fn failed_event_rolls_back_all_fills_and_remains_replayable() {
     b.place_order("paper-test", &order("atomic-two", "BUY", "1", "11"))
         .await
         .unwrap();
-    b.order_journal().database().run(|c| {
-        c.execute_batch("CREATE TRIGGER fail_second_fill BEFORE UPDATE ON paper_accounts WHEN json_extract(NEW.payload,'$.cash')='979.96' BEGIN SELECT RAISE(ABORT,'injected storage fault'); END;").map_err(|e|Error::Storage(e.to_string()))?;Ok(())
-    }).await.unwrap();
+    install_fault(
+        &b,
+        "fail_second_fill",
+        "BEFORE UPDATE ON paper_accounts WHEN json_extract(NEW.payload,'$.cash')='979.96'",
+        "injected storage fault",
+    )
+    .await;
     let event = quote(3, 200, "10", "10.01", "2");
     assert!(b.apply(event.clone()).await.is_err());
     let state = b.snapshot("paper-test").await.unwrap();
@@ -534,9 +583,13 @@ async fn disconnect_does_not_reset_consumed_quote_watermark() {
 #[tokio::test]
 async fn storage_failures_are_not_reported_as_conclusive_submission_rejections() {
     let (_dir, b) = setup().await;
-    b.order_journal().database().run(|c| {
-        c.execute_batch("CREATE TRIGGER fail_accept BEFORE INSERT ON paper_orders BEGIN SELECT RAISE(ABORT,'injected acceptance fault'); END;").map_err(|e|Error::Storage(e.to_string()))?;Ok(())
-    }).await.unwrap();
+    install_fault(
+        &b,
+        "fail_accept",
+        "BEFORE INSERT ON paper_orders",
+        "injected acceptance fault",
+    )
+    .await;
     assert!(matches!(
         b.place_order("paper-test", &order("storage", "BUY", "1", "11"))
             .await,
@@ -1042,11 +1095,13 @@ async fn event_attribution_commits_once_and_invalid_subjects_do_not_advance_stat
 async fn command_capture_failure_rolls_back_order_and_tag_acceptance() {
     let (_dir, broker) = setup().await;
     assert_eq!(broker.captured_command_count().await.unwrap(), 2);
-    broker.order_journal().database().run(|c| {
-        c.execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON audit WHEN NEW.kind='paper_command' BEGIN SELECT RAISE(ABORT,'capture unavailable'); END;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
-    }).await.unwrap();
+    install_fault(
+        &broker,
+        "fail_capture",
+        "BEFORE INSERT ON audit WHEN NEW.kind='paper_command'",
+        "capture unavailable",
+    )
+    .await;
     let request = order("capture-atomic", "BUY", "1", "11");
     assert!(broker.place_order("paper-test", &request).await.is_err());
     assert_eq!(broker.verify_integrity().await.unwrap().orders, 0);

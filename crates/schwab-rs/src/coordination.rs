@@ -8,6 +8,18 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+const SELECT_LEASE: &str = "SELECT owner,epoch,expires_at FROM leases WHERE resource=?1";
+const UPSERT_LEASE: &str = "INSERT INTO leases VALUES(?1,?2,?3,?4) \
+     ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,epoch=excluded.epoch,\
+     expires_at=excluded.expires_at";
+/// Extends a lease only while the caller still holds the current epoch.
+const RENEW_LEASE: &str = "UPDATE leases SET expires_at=?1 \
+     WHERE resource=?2 AND owner=?3 AND epoch=?4 AND expires_at>?5";
+const RELEASE_LEASE: &str =
+    "UPDATE leases SET expires_at=0 WHERE resource=?1 AND owner=?2 AND epoch=?3";
+const SELECT_LEASE_HELD: &str = "SELECT EXISTS(SELECT 1 FROM leases \
+     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
     pub resource: String,
@@ -108,29 +120,64 @@ impl Coordinator for StateDatabase {
     async fn acquire(&self, resource: &str, owner: &str, ttl: Duration) -> Result<Lease> {
         let resource = resource.to_owned();
         let owner = owner.to_owned();
-        self.run(move|c|{
-            let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
-            let now=chrono::Utc::now().timestamp_millis();let expires_at=expiry(now,ttl)?;
-            let old:Option<(String,i64,i64)>=tx.query_row("SELECT owner,epoch,expires_at FROM leases WHERE resource=?1",[&resource],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(sql)?;
-            if old.as_ref().is_some_and(|(_,_,until)|*until>now){return Err(Error::Storage("Resource already has a live owner".into()));}
-            let epoch=old.map_or(1,|(_,epoch,_)|epoch+1);
-            tx.execute("INSERT INTO leases VALUES(?1,?2,?3,?4) ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,epoch=excluded.epoch,expires_at=excluded.expires_at",params![resource,owner,{ epoch },expires_at]).map_err(sql)?;
-            tx.commit().map_err(sql)?;Ok(Lease{resource,owner,epoch:epoch as u64,expires_at})
-        }).await
+        self.run(move |c| {
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let now = chrono::Utc::now().timestamp_millis();
+            let expires_at = expiry(now, ttl)?;
+            let old: Option<(String, i64, i64)> = tx
+                .query_row(SELECT_LEASE, [&resource], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .optional()
+                .map_err(sql)?;
+            if old.as_ref().is_some_and(|(_, _, until)| *until > now) {
+                return Err(Error::Storage("Resource already has a live owner".into()));
+            }
+            let epoch = old.map_or(1, |(_, epoch, _)| epoch + 1);
+            tx.execute(UPSERT_LEASE, params![resource, owner, epoch, expires_at])
+                .map_err(sql)?;
+            tx.commit().map_err(sql)?;
+            Ok(Lease {
+                resource,
+                owner,
+                epoch: epoch as u64,
+                expires_at,
+            })
+        })
+        .await
     }
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease> {
         let mut lease = lease.clone();
-        self.run(move|c|{
-            let now=chrono::Utc::now().timestamp_millis();let expires_at=expiry(now,ttl)?;
-            if c.execute("UPDATE leases SET expires_at=?1 WHERE resource=?2 AND owner=?3 AND epoch=?4 AND expires_at>?5",params![expires_at,lease.resource,lease.owner,lease.epoch as i64,now]).map_err(sql)?!=1{return Err(Error::Storage("Lease expired or fenced".into()));}
-            lease.expires_at=expires_at;Ok(lease)
-        }).await
+        self.run(move |c| {
+            let now = chrono::Utc::now().timestamp_millis();
+            let expires_at = expiry(now, ttl)?;
+            let renewed = c
+                .execute(
+                    RENEW_LEASE,
+                    params![
+                        expires_at,
+                        lease.resource,
+                        lease.owner,
+                        lease.epoch as i64,
+                        now
+                    ],
+                )
+                .map_err(sql)?;
+            if renewed != 1 {
+                return Err(Error::Storage("Lease expired or fenced".into()));
+            }
+            lease.expires_at = expires_at;
+            Ok(lease)
+        })
+        .await
     }
     async fn release(&self, lease: &Lease) -> Result<()> {
         let lease = lease.clone();
         self.run(move |c| {
             c.execute(
-                "UPDATE leases SET expires_at=0 WHERE resource=?1 AND owner=?2 AND epoch=?3",
+                RELEASE_LEASE,
                 params![lease.resource, lease.owner, lease.epoch as i64],
             )
             .map_err(sql)?;
@@ -140,7 +187,16 @@ impl Coordinator for StateDatabase {
     }
     async fn valid(&self, lease: &Lease) -> Result<bool> {
         let lease = lease.clone();
-        self.run(move|c|c.query_row("SELECT EXISTS(SELECT 1 FROM leases WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)",params![lease.resource,lease.owner,lease.epoch as i64,chrono::Utc::now().timestamp_millis()],|r|r.get(0)).map_err(sql)).await
+        self.run(move |c| {
+            let now = chrono::Utc::now().timestamp_millis();
+            c.query_row(
+                SELECT_LEASE_HELD,
+                params![lease.resource, lease.owner, lease.epoch as i64, now],
+                |r| r.get(0),
+            )
+            .map_err(sql)
+        })
+        .await
     }
 }
 
@@ -165,10 +221,15 @@ impl LeaseSession {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _=&mut stopped => break,
-                    _=tokio::time::sleep(Duration::from_secs(5)) => {
-                        let renewal=tokio::time::timeout(Duration::from_secs(5),backend.renew(&held,ttl)).await;
-                        if !matches!(renewal,Ok(Ok(_))) { let _=lost_tx.send(true); break; }
+                    _ = &mut stopped => break,
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                        let renewal =
+                            tokio::time::timeout(Duration::from_secs(5), backend.renew(&held, ttl))
+                                .await;
+                        if !matches!(renewal, Ok(Ok(_))) {
+                            let _ = lost_tx.send(true);
+                            break;
+                        }
                     }
                 }
             }
@@ -192,7 +253,10 @@ impl LeaseSession {
         if *self.lost.borrow() {
             return Err(Error::OwnershipLost);
         }
-        let result = tokio::select! { result=future=>result, _=self.lost.changed()=>Err(Error::OwnershipLost) };
+        let result = tokio::select! {
+            result = future => result,
+            _ = self.lost.changed() => Err(Error::OwnershipLost),
+        };
         self.stop.take();
         if let Some(closed) = self.closed.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), closed).await;

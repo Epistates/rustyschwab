@@ -6,6 +6,11 @@ use std::{
     time::Duration,
 };
 
+/// Every table the schema creates; a restore refuses a backup missing any of them.
+const COUNT_STATE_TABLES: &str = "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
+     AND name IN ('meta','submissions','audit','consumed_approvals','used_order_tags',\
+     'accounts','orders','executions','leases','quota','quota_config','approvals','reservations')";
+
 #[derive(Clone, Debug)]
 pub struct StateDatabase {
     path: PathBuf,
@@ -157,10 +162,14 @@ impl StateDatabase {
             if schema != "1" {
                 return Err(Error::Storage("Unsupported backup schema version".into()));
             }
-            let tables: i64 = source.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('meta','submissions','audit','consumed_approvals','used_order_tags','accounts','orders','executions','leases','quota','quota_config','approvals','reservations')", [], |r| r.get(0)
-            ).map_err(sql)?;
-            if tables != 13 { return Err(Error::Storage("Backup is missing required state tables".into())); }
+            let tables: i64 = source
+                .query_row(COUNT_STATE_TABLES, [], |r| r.get(0))
+                .map_err(sql)?;
+            if tables != 13 {
+                return Err(Error::Storage(
+                    "Backup is missing required state tables".into(),
+                ));
+            }
             if target_path.exists() {
                 return Err(Error::InvalidParameter(
                     "Restore destination already exists".into(),

@@ -51,9 +51,21 @@ impl Drop for Setup {
 }
 fn grants() -> Value {
     json!([
-        {"subject":"backend","role":"backend"},
-        {"subject":"operator","role":"operator"},
-        {"subject":"trader","role":"trader","policy":{"name":"desk","identity_subject":"trader","tools":["place_order","replace_order","cancel_order"],"accounts":["A"],"max_quantity":"2","max_notional":"100","require_approval":true}}
+        {"subject": "backend", "role": "backend"},
+        {"subject": "operator", "role": "operator"},
+        {
+            "subject": "trader",
+            "role": "trader",
+            "policy": {
+                "name": "desk",
+                "identity_subject": "trader",
+                "tools": ["place_order", "replace_order", "cancel_order"],
+                "accounts": ["A"],
+                "max_quantity": "2",
+                "max_notional": "100",
+                "require_approval": true,
+            },
+        }
     ])
 }
 async fn setup() -> Setup {

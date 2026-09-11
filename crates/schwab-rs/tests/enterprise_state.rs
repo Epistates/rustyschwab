@@ -301,7 +301,11 @@ async fn restore_rejects_missing_corrupt_and_foreign_backups_without_creating_st
     schwab_rs::security::secure_file_write(&source, &[]).unwrap();
     rusqlite::Connection::open(&source)
         .unwrap()
-        .execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO meta VALUES('schema','1'); CREATE TABLE unrelated(value TEXT);")
+        .execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); \
+             INSERT INTO meta VALUES('schema','1'); \
+             CREATE TABLE unrelated(value TEXT);",
+        )
         .unwrap();
     assert!(
         StateDatabase::restore(source, destination.clone())
@@ -320,17 +324,35 @@ async fn sqlite_full_rolls_back_outcome_and_preserves_pending_intent() {
         .await
         .unwrap();
     let attempt = id.clone();
-    journal.database().run(move |connection| {
-        let pages: i64 = connection.query_row("PRAGMA page_count", [], |r| r.get(0)).unwrap();
-        connection.pragma_update(None, "max_page_count", pages).unwrap();
-        let tx = connection.transaction().unwrap();
-        tx.execute("UPDATE submissions SET outcome='\"Rejected\"' WHERE id=?1", [attempt]).unwrap();
-        let error = tx.execute("INSERT INTO meta VALUES('fill',zeroblob(1048576))", []).unwrap_err();
-        assert!(matches!(error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull));
-        // SQLITE_FULL may roll back the transaction itself; Drop is also safe.
-        drop(tx);
-        Ok(())
-    }).await.unwrap();
+    journal
+        .database()
+        .run(move |connection| {
+            let pages: i64 = connection
+                .query_row("PRAGMA page_count", [], |r| r.get(0))
+                .unwrap();
+            connection
+                .pragma_update(None, "max_page_count", pages)
+                .unwrap();
+            let tx = connection.transaction().unwrap();
+            tx.execute(
+                "UPDATE submissions SET outcome='\"Rejected\"' WHERE id=?1",
+                [attempt],
+            )
+            .unwrap();
+            let error = tx
+                .execute("INSERT INTO meta VALUES('fill',zeroblob(1048576))", [])
+                .unwrap_err();
+            let disk_full = matches!(
+                error,
+                rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull
+            );
+            assert!(disk_full, "expected SQLITE_FULL, got {error}");
+            // SQLITE_FULL may roll back the transaction itself; Drop is also safe.
+            drop(tx);
+            Ok(())
+        })
+        .await
+        .unwrap();
     let reopened = OrderJournal::new(journal.path().to_owned());
     assert!(
         reopened

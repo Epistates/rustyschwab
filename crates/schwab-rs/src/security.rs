@@ -315,8 +315,8 @@ pub fn verify_file_permissions(path: &Path) -> Result<()> {
             "token file has insecure permissions (expected 0600)"
         );
         return Err(Error::Auth(AuthError::TokenFileInsecure(format!(
-            "token file has insecure permissions {:o} (expected 0600); see server logs for the path",
-            perms
+            "token file has insecure permissions {perms:o} (expected 0600); \
+             see server logs for the path"
         ))));
     }
 

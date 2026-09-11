@@ -59,7 +59,11 @@ impl JwtVerifier {
         }))
     }
     pub fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({"resource":self.config.audience,"authorization_servers":[self.config.issuer],"bearer_methods_supported":["header"]})
+        serde_json::json!({
+            "resource": self.config.audience,
+            "authorization_servers": [self.config.issuer],
+            "bearer_methods_supported": ["header"],
+        })
     }
     pub fn challenge(&self) -> String {
         let mut resource =

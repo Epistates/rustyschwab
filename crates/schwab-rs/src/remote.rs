@@ -274,7 +274,11 @@ pub fn secure_endpoint(endpoint: &str) -> Result<reqwest::Url> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(Error::Config("Service endpoint requires HTTPS, no userinfo/query/fragment; HTTP loopback is allowed for tests".into()));
+        return Err(Error::Config(
+            "Service endpoint requires HTTPS, no userinfo/query/fragment; \
+             HTTP loopback is allowed for tests"
+                .into(),
+        ));
     }
     Ok(url)
 }

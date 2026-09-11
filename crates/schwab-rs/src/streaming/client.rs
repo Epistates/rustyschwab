@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep};
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -98,10 +99,10 @@ impl MessageReceiver {
                         return None;
                     }
                     let current = state.borrow_and_update().clone();
-                    if pending
-                        .as_ref()
-                        .is_some_and(|(generation, _)| !current.ready || *generation != current.generation)
-                    {
+                    let stale = pending.as_ref().is_some_and(|(generation, _)| {
+                        !current.ready || *generation != current.generation
+                    });
+                    if stale {
                         *pending = None;
                     }
                     if pending.is_none() {
@@ -1340,10 +1341,7 @@ impl StreamClientInner {
                 Ok(tokio_tungstenite::tungstenite::Message::Close(frame)) => {
                     let is_normal_closure = frame
                         .as_ref()
-                        .map(|f| {
-                            f.code
-                                == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Normal
-                        })
+                        .map(|f| f.code == CloseCode::Normal)
                         .unwrap_or(false);
                     info!("WebSocket close frame received: {:?}", frame);
                     return if is_normal_closure {
@@ -1380,8 +1378,8 @@ impl StreamClientInner {
                 let elapsed = last_pong.read().elapsed();
                 if elapsed > timeout_duration {
                     error!(
-                        "WebSocket ping timeout ({:?} since last pong, limit: {:?}), connection will reconnect",
-                        elapsed, timeout_duration
+                        "WebSocket ping timeout ({elapsed:?} since last pong, \
+                         limit: {timeout_duration:?}), connection will reconnect"
                     );
                     // Connection will be closed when this task is aborted in connect_and_run
                     break;

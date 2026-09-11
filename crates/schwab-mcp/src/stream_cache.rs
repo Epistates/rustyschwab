@@ -54,7 +54,12 @@ impl StreamCache {
                 cache.events.pop_front();
                 cache.events_evicted += 1;
             }
-            cache.events.push_back(json!({"receivedAt":now,"brokerTimestamp":broker,"generation":generation,"content":value}));
+            cache.events.push_back(json!({
+                "receivedAt": now,
+                "brokerTimestamp": broker,
+                "generation": generation,
+                "content": value,
+            }));
             return;
         }
         if cache.snapshots.len() >= 10000
@@ -101,18 +106,51 @@ impl StreamCache {
     pub fn snapshot(&self, service: &str, keys: Option<&[String]>) -> HashMap<String, Value> {
         let cache = self.inner.read();
         let now = chrono::Utc::now().timestamp_millis();
-        cache.snapshots.iter().filter(|((svc,k),_)| svc == service && keys.is_none_or(|ks| ks.contains(k)))
-            .map(|((_,key),entry)| {
+        cache
+            .snapshots
+            .iter()
+            .filter(|((svc, k), _)| svc == service && keys.is_none_or(|ks| ks.contains(k)))
+            .map(|((_, key), entry)| {
                 let age = now.saturating_sub(entry.received).max(0);
-                (key.clone(), json!({"content":entry.value,"receivedAt":entry.received,"brokerTimestamp":entry.broker,
-                    "generation":entry.generation,"ageMs":age,"fresh":cache.status.ready && (!cache.baseline_required || cache.baselines.contains_key(&(service.to_owned(),key.clone()))) && age <= 2000 && entry.broker > 0 && entry.broker <= now && now.saturating_sub(entry.broker) <= 2000 && entry.generation == cache.status.generation && entry.field_times.iter().filter(|(key,_)| key.parse::<u32>().is_ok()).all(|(_,at)| now.saturating_sub(*at) <= 2000),
-                    "fieldUpdatedAt":entry.field_times,"restBaseline":cache.baselines.get(&(service.to_owned(),key.clone()))}))
-            }).collect()
+                let baseline = cache.baselines.get(&(service.to_owned(), key.clone()));
+                // A snapshot is fresh only when every numbered field was
+                // updated within the window on the current generation.
+                let broker_recent = entry.broker > 0
+                    && entry.broker <= now
+                    && now.saturating_sub(entry.broker) <= 2000;
+                let fields_recent = entry
+                    .field_times
+                    .iter()
+                    .filter(|(key, _)| key.parse::<u32>().is_ok())
+                    .all(|(_, at)| now.saturating_sub(*at) <= 2000);
+                let fresh = cache.status.ready
+                    && (!cache.baseline_required || baseline.is_some())
+                    && age <= 2000
+                    && broker_recent
+                    && entry.generation == cache.status.generation
+                    && fields_recent;
+                let snapshot = json!({
+                    "content": entry.value,
+                    "receivedAt": entry.received,
+                    "brokerTimestamp": entry.broker,
+                    "generation": entry.generation,
+                    "ageMs": age,
+                    "fresh": fresh,
+                    "fieldUpdatedAt": entry.field_times,
+                    "restBaseline": baseline,
+                });
+                (key.clone(), snapshot)
+            })
+            .collect()
     }
     pub fn events(&self) -> Value {
         let cache = self.inner.read();
-        json!({"events":cache.events,"evicted":cache.events_evicted,"lostMessages":cache.status.lost_messages,
-            "reconciliationRequired":cache.reconciled_generation != Some(cache.status.generation)})
+        json!({
+            "events": cache.events,
+            "evicted": cache.events_evicted,
+            "lostMessages": cache.status.lost_messages,
+            "reconciliationRequired": cache.reconciled_generation != Some(cache.status.generation),
+        })
     }
     pub fn require_baseline(&self) {
         self.inner.write().baseline_required = true;

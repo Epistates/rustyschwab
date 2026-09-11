@@ -3,9 +3,18 @@ use crate::{
     error::{Error, Result},
     execution::{AuditEvent, OrderJournal},
     remote::RemoteBackend,
+    storage::sql,
 };
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+
+const INSERT_AUDIT_STREAM_ID: &str = "INSERT OR IGNORE INTO meta VALUES('audit_stream_id',?1)";
+const SELECT_AUDIT_STREAM_ID: &str = "SELECT value FROM meta WHERE key='audit_stream_id'";
+const INSERT_META_IF_NEW: &str = "INSERT OR IGNORE INTO meta VALUES(?1,?2)";
+const SELECT_META: &str = "SELECT value FROM meta WHERE key=?1";
+const UPSERT_META: &str =
+    "INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditBatch {
     pub stream_id: String,
@@ -50,44 +59,32 @@ impl OrderJournal {
             .run(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(crate::storage::sql)?;
-                tx.execute(
-                    "INSERT OR IGNORE INTO meta VALUES('audit_stream_id',?1)",
-                    [uuid::Uuid::new_v4().to_string()],
-                )
-                .map_err(crate::storage::sql)?;
+                    .map_err(sql)?;
+                tx.execute(INSERT_AUDIT_STREAM_ID, [uuid::Uuid::new_v4().to_string()])
+                    .map_err(sql)?;
                 let stream: String = tx
-                    .query_row(
-                        "SELECT value FROM meta WHERE key='audit_stream_id'",
-                        [],
-                        |r| r.get(0),
-                    )
-                    .map_err(crate::storage::sql)?;
+                    .query_row(SELECT_AUDIT_STREAM_ID, [], |r| r.get(0))
+                    .map_err(sql)?;
                 let pin = format!("{get_key}:endpoint");
-                tx.execute(
-                    "INSERT OR IGNORE INTO meta VALUES(?1,?2)",
-                    rusqlite::params![pin, endpoint],
-                )
-                .map_err(crate::storage::sql)?;
+                tx.execute(INSERT_META_IF_NEW, rusqlite::params![pin, endpoint])
+                    .map_err(sql)?;
                 let pinned: String = tx
-                    .query_row("SELECT value FROM meta WHERE key=?1", [pin], |r| r.get(0))
-                    .map_err(crate::storage::sql)?;
+                    .query_row(SELECT_META, [pin], |r| r.get(0))
+                    .map_err(sql)?;
                 if pinned != endpoint {
                     return Err(Error::Config(
                         "Audit sink ID is pinned to another endpoint".into(),
                     ));
                 }
                 let cursor: Option<String> = tx
-                    .query_row("SELECT value FROM meta WHERE key=?1", [get_key], |r| {
-                        r.get(0)
-                    })
+                    .query_row(SELECT_META, [get_key], |r| r.get(0))
                     .optional()
-                    .map_err(crate::storage::sql)?;
+                    .map_err(sql)?;
                 let cursor: Cursor = cursor
                     .map(|v| serde_json::from_str(&v))
                     .transpose()?
                     .unwrap_or_default();
-                tx.commit().map_err(crate::storage::sql)?;
+                tx.commit().map_err(sql)?;
                 Ok((stream, cursor))
             })
             .await?;
@@ -119,14 +116,32 @@ impl OrderJournal {
             through: last,
             digest: batch.batch_sha256,
         };
-        self.database().run(move|c| {
-            let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(crate::storage::sql)?;
-            let current:Option<String>=tx.query_row("SELECT value FROM meta WHERE key=?1",[&key],|r|r.get(0)).optional().map_err(crate::storage::sql)?;
-            let current:Cursor=current.map(|v|serde_json::from_str(&v)).transpose()?.unwrap_or_default();
-            if current.through!=cursor.through || current.digest!=cursor.digest {return Err(Error::Storage("Audit cursor advanced concurrently; reload before retrying".into()));}
-            tx.execute("INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![key,serde_json::to_string(&new)?]).map_err(crate::storage::sql)?;
-            tx.commit().map_err(crate::storage::sql)
-        }).await?;
+        self.database()
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let current: Option<String> = tx
+                    .query_row(SELECT_META, [&key], |r| r.get(0))
+                    .optional()
+                    .map_err(sql)?;
+                let current: Cursor = current
+                    .map(|v| serde_json::from_str(&v))
+                    .transpose()?
+                    .unwrap_or_default();
+                if current.through != cursor.through || current.digest != cursor.digest {
+                    return Err(Error::Storage(
+                        "Audit cursor advanced concurrently; reload before retrying".into(),
+                    ));
+                }
+                tx.execute(
+                    UPSERT_META,
+                    rusqlite::params![key, serde_json::to_string(&new)?],
+                )
+                .map_err(sql)?;
+                tx.commit().map_err(sql)
+            })
+            .await?;
         Ok(Some(ack))
     }
 }

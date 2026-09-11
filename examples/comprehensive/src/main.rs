@@ -125,17 +125,24 @@ async fn main() -> Result<()> {
         Ok(accounts) => {
             info!("✅ Successfully retrieved {} accounts", accounts.len());
             if let Some(account) = accounts.first() {
-                let hash = &account.securities_account.account_number; // This is actually the hash in API
+                // The API returns the encrypted account hash in this field.
+                let hash = &account.securities_account.account_number;
                 info!("Using account hash: {}", hash);
 
                 // 3. Preview an order
-                let order: schwab_rs::types::trading::OrderRequest = serde_json::from_value(
-                    serde_json::json!({
-                        "session":"NORMAL", "duration":"DAY", "orderType":"LIMIT", "price":1.0,
-                        "orderStrategyType":"SINGLE", "orderLegCollection":[{"instruction":"BUY", "quantity":1,
-                        "instrument":{"assetType":"EQUITY", "symbol":"AAPL"}}]
-                    }),
-                )?;
+                let order: schwab_rs::types::trading::OrderRequest =
+                    serde_json::from_value(serde_json::json!({
+                        "session": "NORMAL",
+                        "duration": "DAY",
+                        "orderType": "LIMIT",
+                        "price": 1.0,
+                        "orderStrategyType": "SINGLE",
+                        "orderLegCollection": [{
+                            "instruction": "BUY",
+                            "quantity": 1,
+                            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"},
+                        }],
+                    }))?;
 
                 match client.preview_order(hash, &order).await {
                     Ok(resp) => info!("✅ Order preview success: {}", resp),

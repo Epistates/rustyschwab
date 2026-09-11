@@ -307,26 +307,89 @@ async fn operator(
     headers: HeaderMap,
     Json(request): Json<OperatorRequest>,
 ) -> Response {
-    response(async {
-        let _permit=state.capacity.clone().try_acquire_owned().map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?;
-        let (identity,grants)=state.authenticate(&headers,Role::Operator).await?;
-        let operation=async {
-            let journal=|name:&str|->Result<OrderJournal,StatusCode> {
-                if !grants.iter().any(|g|g.role==Role::Trader&&g.subject!=identity.subject&&g.policy.as_ref().is_some_and(|p|p.name==name)){return Err(StatusCode::FORBIDDEN);}
-                Ok(state.journal(name))
+    response(
+        async {
+            let _permit = state
+                .capacity
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            let (identity, grants) = state.authenticate(&headers, Role::Operator).await?;
+            let operation = async {
+                // Operators may only act on principals they do not trade as.
+                let journal = |name: &str| -> Result<OrderJournal, StatusCode> {
+                    let delegated = grants.iter().any(|g| {
+                        g.role == Role::Trader
+                            && g.subject != identity.subject
+                            && g.policy.as_ref().is_some_and(|p| p.name == name)
+                    });
+                    if !delegated {
+                        return Err(StatusCode::FORBIDDEN);
+                    }
+                    Ok(state.journal(name))
+                };
+                match request {
+                    OperatorRequest::Approve {
+                        principal,
+                        digest,
+                        expires_at,
+                    } => journal(&principal)?
+                        .approve(&principal, &digest, &identity.subject, expires_at)
+                        .await
+                        .map_err(|_| StatusCode::CONFLICT)?,
+                    OperatorRequest::Revoke { principal, digest } => journal(&principal)?
+                        .revoke_approval(&digest, &identity.subject)
+                        .await
+                        .map_err(|_| StatusCode::CONFLICT)?,
+                    OperatorRequest::Resolve {
+                        principal,
+                        attempt,
+                        evidence,
+                    } => {
+                        let outcome = SubmissionOutcome::Reconciled {
+                            evidence: format!("Verified operator {}: {evidence}", identity.subject),
+                        };
+                        journal(&principal)?
+                            .finish(&attempt, outcome)
+                            .await
+                            .map_err(|_| StatusCode::CONFLICT)?
+                    }
+                    OperatorRequest::Halt { reason } => state
+                        .client
+                        .halt_submissions(&reason, &identity.subject)
+                        .await
+                        .map_err(|_| StatusCode::CONFLICT)?,
+                    OperatorRequest::Resume => state
+                        .client
+                        .clear_operator_halt(&identity.subject)
+                        .await
+                        .map_err(|_| StatusCode::CONFLICT)?,
+                    OperatorRequest::Status => {
+                        let halted = state
+                            .client
+                            .operator_halt()
+                            .await
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                        let pending = state
+                            .client
+                            .execution_store()
+                            .pending_count()
+                            .await
+                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                        return Ok(json!({
+                            "operator_halt": halted,
+                            "pending_submissions": pending,
+                        }));
+                    }
+                }
+                Ok(json!({"ok":true}))
             };
-            match request {
-                OperatorRequest::Approve{principal,digest,expires_at}=>journal(&principal)?.approve(&principal,&digest,&identity.subject,expires_at).await.map_err(|_|StatusCode::CONFLICT)?,
-                OperatorRequest::Revoke{principal,digest}=>journal(&principal)?.revoke_approval(&digest,&identity.subject).await.map_err(|_|StatusCode::CONFLICT)?,
-                OperatorRequest::Resolve{principal,attempt,evidence}=>journal(&principal)?.finish(&attempt,SubmissionOutcome::Reconciled{evidence:format!("Verified operator {}: {evidence}",identity.subject)}).await.map_err(|_|StatusCode::CONFLICT)?,
-                OperatorRequest::Halt{reason}=>state.client.halt_submissions(&reason,&identity.subject).await.map_err(|_|StatusCode::CONFLICT)?,
-                OperatorRequest::Resume=>state.client.clear_operator_halt(&identity.subject).await.map_err(|_|StatusCode::CONFLICT)?,
-                OperatorRequest::Status=>return Ok(json!({"operator_halt":state.client.operator_halt().await.map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?,"pending_submissions":state.client.execution_store().pending_count().await.map_err(|_|StatusCode::SERVICE_UNAVAILABLE)?})),
-            }
-            Ok(json!({"ok":true}))
-        };
-        tokio::time::timeout(allowance(&identity),operation).await.map_err(|_|StatusCode::GATEWAY_TIMEOUT)?
-    }.await)
+            tokio::time::timeout(allowance(&identity), operation)
+                .await
+                .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
+        }
+        .await,
+    )
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]

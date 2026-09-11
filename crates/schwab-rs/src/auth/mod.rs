@@ -390,7 +390,8 @@ impl AuthManager {
                 }
                 TokenStoreKind::EncryptedFile => {
                     tracing::info!(
-                        "Using EncryptedFileTokenStore (ChaCha20Poly1305 encryption + 0600 permissions)"
+                        "Using EncryptedFileTokenStore \
+                         (ChaCha20Poly1305 encryption + 0600 permissions)"
                     );
                     Arc::new(EncryptedFileTokenStore::new(config.tokens_file.clone()))
                 }
@@ -531,7 +532,12 @@ impl AuthManager {
         );
         self.token_store.save(&new_tokens)?;
         *self.tokens.write() = Some(new_tokens);
-        metrics::counter!(crate::metrics::TOKEN_REFRESH_TOTAL, "outcome" => "success", "grant" => "refresh_token").increment(1);
+        metrics::counter!(
+            crate::metrics::TOKEN_REFRESH_TOTAL,
+            "outcome" => "success",
+            "grant" => "refresh_token"
+        )
+        .increment(1);
         Ok(())
     }
 
@@ -784,7 +790,12 @@ impl AuthManager {
                     warn!(
                         "Automatic token refresh failed; authentication may require intervention"
                     );
-                    metrics::counter!(crate::metrics::TOKEN_REFRESH_TOTAL, "outcome" => "failure", "grant" => "refresh_token").increment(1);
+                    metrics::counter!(
+                        crate::metrics::TOKEN_REFRESH_TOTAL,
+                        "outcome" => "failure",
+                        "grant" => "refresh_token"
+                    )
+                    .increment(1);
                 }
             }
         });
@@ -876,9 +887,10 @@ impl AuthManager {
         // Determine bind address based on security configuration
         let addr = if self.config.allow_external_callback {
             warn!(
-                "⚠️  SECURITY: OAuth callback server binding to 0.0.0.0:{} (all network interfaces). \
-                 This exposes the callback to your LAN/WAN — only enable when terminating TLS in \
-                 front of this process (ngrok / cloudflared / reverse proxy).",
+                "⚠️  SECURITY: OAuth callback server binding to 0.0.0.0:{} \
+                 (all network interfaces). This exposes the callback to your LAN/WAN — \
+                 only enable when terminating TLS in front of this process \
+                 (ngrok / cloudflared / reverse proxy).",
                 port
             );
             std::net::SocketAddr::from(([0, 0, 0, 0], port))
@@ -901,7 +913,9 @@ impl AuthManager {
 
             tokio::select! {
                 code = rx => {
-                    code.map_err(|_| AuthError::OAuthFlow("Failed to receive authorization code".to_string()))
+                    code.map_err(|_| {
+                        AuthError::OAuthFlow("Failed to receive authorization code".to_string())
+                    })
                 }
                 result = server => {
                     Err(AuthError::OAuthFlow(format!(
@@ -953,7 +967,9 @@ impl AuthManager {
 
             tokio::select! {
                 code = rx => {
-                    code.map_err(|_| AuthError::OAuthFlow("Failed to receive authorization code".to_string()))
+                    code.map_err(|_| {
+                        AuthError::OAuthFlow("Failed to receive authorization code".to_string())
+                    })
                 }
                 result = server => {
                     Err(AuthError::OAuthFlow(format!(
@@ -967,7 +983,9 @@ impl AuthManager {
     #[cfg(not(feature = "callback-server"))]
     async fn capture_callback_code(&self) -> AuthResult<String> {
         Err(AuthError::OAuthFlow(
-            "Callback server not enabled. Enable the 'callback-server' feature or manually copy the authorization code.".to_string()
+            "Callback server not enabled. Enable the 'callback-server' feature \
+             or manually copy the authorization code."
+                .to_string(),
         ))
     }
 

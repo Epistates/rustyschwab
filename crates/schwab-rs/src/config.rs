@@ -156,7 +156,8 @@ impl Default for StreamConfig {
             heartbeat_interval: Duration::from_secs(20), // WebSocket heartbeat interval
             ping_timeout: Duration::from_secs(30),       // WebSocket ping timeout
             max_subscriptions: 500,
-            channel_kind: ChannelKind::Bounded(4096), // Bounded with explicit loss/lifecycle notifications
+            // Bounded with explicit loss/lifecycle notifications
+            channel_kind: ChannelKind::Bounded(4096),
         }
     }
 }
@@ -245,8 +246,8 @@ impl SchwabConfig {
         if !is_localhost {
             if scheme != "https" && scheme != "wss" {
                 return Err(Error::Config(format!(
-                    "Insecure scheme '{}' used for external domain '{}' in {}. Must use 'https' or 'wss'.",
-                    scheme, host, field_name
+                    "Insecure scheme '{scheme}' used for external domain '{host}' in \
+                     {field_name}. Must use 'https' or 'wss'."
                 )));
             }
         } else {

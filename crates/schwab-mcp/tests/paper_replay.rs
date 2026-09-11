@@ -186,11 +186,20 @@ async fn backup_replay_rejects_capture_gaps_and_missing_capture_metadata() {
 async fn backup_replay_detects_ledger_changes_that_preserve_conservation() {
     let dir = tempfile::tempdir().unwrap();
     let broker = captured_run(dir.path()).await;
-    broker.order_journal().database().run(|c| {
-        c.execute("UPDATE paper_accounts SET payload=json_set(payload,'$.cash','99800.9700','$.realized_pnl','1')", [])
+    broker
+        .order_journal()
+        .database()
+        .run(|c| {
+            c.execute(
+                "UPDATE paper_accounts SET payload=\
+                 json_set(payload,'$.cash','99800.9700','$.realized_pnl','1')",
+                [],
+            )
             .map_err(|e| schwab_rs::Error::Storage(e.to_string()))?;
-        Ok(())
-    }).await.unwrap();
+            Ok(())
+        })
+        .await
+        .unwrap();
     broker.verify_integrity().await.unwrap();
     let backup = dir.path().join("backup/run.sqlite3");
     broker
@@ -210,10 +219,21 @@ async fn backup_replay_reproduces_committed_rejection_and_lost_acknowledgement()
     use schwab_rs::paper::*;
     let dir = tempfile::tempdir().unwrap();
     let broker = captured_run(dir.path()).await;
-    let mut order: schwab_rs::types::trading::OrderRequest = serde_json::from_value(serde_json::json!({
-        "tag":"rejected","orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"101",
-        "orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"ABC","assetType":"EQUITY"}}]
-    })).unwrap();
+    let mut order: schwab_rs::types::trading::OrderRequest =
+        serde_json::from_value(serde_json::json!({
+            "tag": "rejected",
+            "orderStrategyType": "SINGLE",
+            "orderType": "LIMIT",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "price": "101",
+            "orderLegCollection": [{
+                "quantity": "1",
+                "instruction": "BUY",
+                "instrument": {"symbol": "ABC", "assetType": "EQUITY"},
+            }],
+        }))
+        .unwrap();
     broker
         .apply(PaperEvent {
             sequence: 5,

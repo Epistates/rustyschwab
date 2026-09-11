@@ -1,8 +1,58 @@
 //! Durable submission intent/outcome journal. Pending intents survive task
 //! cancellation and process failure, and block new submissions for that account.
 use crate::error::{Error, Result};
+use crate::storage::{audit, sql};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+const SELECT_APPROVAL_CONSUMED: &str =
+    "SELECT EXISTS(SELECT 1 FROM consumed_approvals WHERE key=?1)";
+const SELECT_PENDING_SUBMISSION: &str =
+    "SELECT id FROM submissions WHERE account=?1 AND outcome IS NULL";
+const SELECT_APPROVAL_EXISTS: &str = "SELECT EXISTS(SELECT 1 FROM approvals WHERE digest=?1)";
+const SELECT_APPROVAL_LIVE: &str = "SELECT EXISTS(SELECT 1 FROM approvals \
+     WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0)";
+const CONSUME_APPROVAL: &str = "UPDATE approvals SET consumed=1 \
+     WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0";
+const INSERT_APPROVAL: &str =
+    "INSERT INTO approvals(digest,principal,expires_at,operator) VALUES(?1,?2,?3,?4)";
+const INSERT_CONSUMED_APPROVAL: &str = "INSERT INTO consumed_approvals VALUES(?1)";
+const INSERT_CONSUMED_APPROVAL_IF_NEW: &str = "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)";
+const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)";
+const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)";
+const RESOLVE_SUBMISSION: &str =
+    "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
+const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,dedup_key \
+     FROM submissions ORDER BY created_at,id";
+const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
+     WHERE sequence>?1 ORDER BY sequence LIMIT ?2";
+/// Resolved submissions older than `?1` whose audit trail is exported through
+/// `?2`, hold no reservation, and are rejected/reconciled or whose broker
+/// order reached a terminal status.
+const PRUNE_RESOLVED_SUBMISSIONS: &str = "DELETE FROM submissions \
+     WHERE outcome IS NOT NULL AND created_at<?1 \
+       AND NOT EXISTS(SELECT 1 FROM audit WHERE subject=submissions.id AND sequence>?2) \
+       AND NOT EXISTS(SELECT 1 FROM reservations r WHERE r.id=submissions.id AND r.state='held') \
+       AND (json_extract(outcome,'$.status') IN ('rejected','reconciled') \
+         OR EXISTS(SELECT 1 FROM orders o \
+           WHERE o.account=submissions.account \
+             AND o.order_id=json_extract(submissions.outcome,'$.order_id') \
+             AND json_extract(o.payload,'$.status') \
+               IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')))";
+/// Open broker orders plus accepted submissions whose order is not yet known
+/// to be terminal.
+const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
+     WHERE account=?1 AND COALESCE(json_extract(payload,'$.status'),'UNKNOWN') \
+       NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') \
+     UNION \
+     SELECT json_extract(s.outcome,'$.order_id') FROM submissions s \
+     WHERE s.account=?1 AND json_extract(s.outcome,'$.order_id') IS NOT NULL \
+       AND NOT EXISTS(SELECT 1 FROM orders o \
+         WHERE o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') \
+           AND json_extract(o.payload,'$.status') \
+             IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))";
+const UPSERT_OPERATOR_HALT: &str = "INSERT INTO meta VALUES('operator_halt',?1) \
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionRecord {
@@ -60,34 +110,93 @@ impl OrderJournal {
     ) -> Result<String> {
         let account = account.to_owned();
         let operation = operation.to_owned();
-        self.database.run(move |conn| {
-            use rusqlite::{OptionalExtension, params};
-            use crate::storage::{sql,audit};
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
-            if let Some(key) = &dedup_key {
-                let used: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM consumed_approvals WHERE key=?1)",[key],|r|r.get(0)).map_err(sql)?;
-                if used { return Err(Error::InvalidParameter("Execution intent already consumed".into())); }
-            }
-            let pending: Option<String> = tx.query_row("SELECT id FROM submissions WHERE account=?1 AND outcome IS NULL",[&account],|r|r.get(0)).optional().map_err(sql)?;
-            if let Some(attempt_id) = pending { return Err(Error::ReconciliationRequired { attempt_id }); }
-            if let Some(key)=&dedup_key {
-                let configured:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE digest=?1)",[key],|r|r.get(0)).map_err(sql)?;
-                if configured && tx.execute("UPDATE approvals SET consumed=1 WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0",params![key,account,chrono::Utc::now().timestamp()]).map_err(sql)?!=1 {
-                    return Err(Error::InvalidParameter("Approval expired, revoked or belongs to another principal".into()));
+        self.database
+            .run(move |conn| {
+                use rusqlite::{OptionalExtension, params};
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                if let Some(key) = &dedup_key {
+                    let used: bool = tx
+                        .query_row(SELECT_APPROVAL_CONSUMED, [key], |r| r.get(0))
+                        .map_err(sql)?;
+                    if used {
+                        return Err(Error::InvalidParameter(
+                            "Execution intent already consumed".into(),
+                        ));
+                    }
                 }
-            }
-            if let Some(tag)=request.get("tag").and_then(serde_json::Value::as_str) {
-                if tag.trim().is_empty(){return Err(Error::InvalidParameter("Order tag must not be empty".into()));}
-                if tx.execute("INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)",params![account,tag]).map_err(sql)?!=1{return Err(Error::InvalidParameter("Order tag was already used for this account".into()));}
-            }
-            let id = uuid::Uuid::new_v4().to_string();
-            let record = SubmissionRecord { attempt_id:id.clone(),account,operation,request,created_at:chrono::Utc::now().timestamp_millis(),outcome:None,dedup_key };
-            tx.execute("INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)",params![record.attempt_id,record.account,record.operation,record.created_at,serde_json::to_string(&record.request)?,record.dedup_key]).map_err(sql)?;
-            if let Some(key) = &record.dedup_key { tx.execute("INSERT INTO consumed_approvals VALUES(?1)",[key]).map_err(sql)?; }
-            audit(&tx,"intent",&id,&serde_json::to_value(&record)?)?;
-            tx.commit().map_err(sql)?;
-            Ok(id)
-        }).await
+                let pending: Option<String> = tx
+                    .query_row(SELECT_PENDING_SUBMISSION, [&account], |r| r.get(0))
+                    .optional()
+                    .map_err(sql)?;
+                if let Some(attempt_id) = pending {
+                    return Err(Error::ReconciliationRequired { attempt_id });
+                }
+                if let Some(key) = &dedup_key {
+                    let configured: bool = tx
+                        .query_row(SELECT_APPROVAL_EXISTS, [key], |r| r.get(0))
+                        .map_err(sql)?;
+                    if configured
+                        && tx
+                            .execute(
+                                CONSUME_APPROVAL,
+                                params![key, account, chrono::Utc::now().timestamp()],
+                            )
+                            .map_err(sql)?
+                            != 1
+                    {
+                        return Err(Error::InvalidParameter(
+                            "Approval expired, revoked or belongs to another principal".into(),
+                        ));
+                    }
+                }
+                if let Some(tag) = request.get("tag").and_then(serde_json::Value::as_str) {
+                    if tag.trim().is_empty() {
+                        return Err(Error::InvalidParameter(
+                            "Order tag must not be empty".into(),
+                        ));
+                    }
+                    if tx
+                        .execute(INSERT_USED_ORDER_TAG, params![account, tag])
+                        .map_err(sql)?
+                        != 1
+                    {
+                        return Err(Error::InvalidParameter(
+                            "Order tag was already used for this account".into(),
+                        ));
+                    }
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let record = SubmissionRecord {
+                    attempt_id: id.clone(),
+                    account,
+                    operation,
+                    request,
+                    created_at: chrono::Utc::now().timestamp_millis(),
+                    outcome: None,
+                    dedup_key,
+                };
+                tx.execute(
+                    INSERT_SUBMISSION,
+                    params![
+                        record.attempt_id,
+                        record.account,
+                        record.operation,
+                        record.created_at,
+                        serde_json::to_string(&record.request)?,
+                        record.dedup_key
+                    ],
+                )
+                .map_err(sql)?;
+                if let Some(key) = &record.dedup_key {
+                    tx.execute(INSERT_CONSUMED_APPROVAL, [key]).map_err(sql)?;
+                }
+                audit(&tx, "intent", &id, &serde_json::to_value(&record)?)?;
+                tx.commit().map_err(sql)?;
+                Ok(id)
+            })
+            .await
     }
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
@@ -100,13 +209,12 @@ impl OrderJournal {
         let id = id.to_owned();
         self.database
             .run(move |conn| {
-                use crate::storage::{audit, sql};
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
                 let changed = tx
                     .execute(
-                        "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL",
+                        RESOLVE_SUBMISSION,
                         rusqlite::params![serde_json::to_string(&outcome)?, id],
                     )
                     .map_err(sql)?;
@@ -122,26 +230,81 @@ impl OrderJournal {
             .await
     }
     pub async fn records(&self) -> Result<Vec<SubmissionRecord>> {
-        self.database.run(|conn| {
-            let mut query = conn.prepare("SELECT id,account,operation,created_at,request,outcome,dedup_key FROM submissions ORDER BY created_at,id").map_err(crate::storage::sql)?;
-            let rows = query.query_map([],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?,r.get::<_,Option<String>>(6)?))).map_err(crate::storage::sql)?;
-            rows.map(|row| { let (attempt_id,account,operation,created_at,request,outcome,dedup_key) = row.map_err(crate::storage::sql)?; Ok(SubmissionRecord { attempt_id,account,operation,created_at,request:serde_json::from_str(&request)?,outcome:outcome.map(|s|serde_json::from_str(&s)).transpose()?,dedup_key }) }).collect()
-        }).await
+        self.database
+            .run(|conn| {
+                let mut query = conn.prepare(SELECT_SUBMISSIONS).map_err(sql)?;
+                let rows = query
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    })
+                    .map_err(sql)?;
+                rows.map(|row| {
+                    let (attempt_id, account, operation, created_at, request, outcome, dedup_key) =
+                        row.map_err(sql)?;
+                    Ok(SubmissionRecord {
+                        attempt_id,
+                        account,
+                        operation,
+                        created_at,
+                        request: serde_json::from_str(&request)?,
+                        outcome: outcome.map(|s| serde_json::from_str(&s)).transpose()?,
+                        dedup_key,
+                    })
+                })
+                .collect()
+            })
+            .await
     }
     /// Ordered, bounded pages for an external immutable audit sink.
     pub async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
-        self.database.run(move |conn| {
-            let mut stmt = conn.prepare("SELECT sequence,at,kind,subject,payload FROM audit WHERE sequence>?1 ORDER BY sequence LIMIT ?2").map_err(crate::storage::sql)?;
-            let rows = stmt.query_map(rusqlite::params![after,limit.clamp(1,10000)],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get::<_,String>(4)?))).map_err(crate::storage::sql)?;
-            rows.map(|row|{let(sequence,at,kind,subject,payload)=row.map_err(crate::storage::sql)?; Ok(AuditEvent{sequence,at,kind,subject,payload:serde_json::from_str(&payload)?})}).collect()
-        }).await
+        self.database
+            .run(move |conn| {
+                let mut stmt = conn.prepare(SELECT_AUDIT_PAGE).map_err(sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![after, limit.clamp(1, 10000)], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(sql)?;
+                rows.map(|row| {
+                    let (sequence, at, kind, subject, payload) = row.map_err(sql)?;
+                    Ok(AuditEvent {
+                        sequence,
+                        at,
+                        kind,
+                        subject,
+                        payload: serde_json::from_str(&payload)?,
+                    })
+                })
+                .collect()
+            })
+            .await
     }
     /// Explicit retention after durable export acknowledgement. Pending records,
     /// consumed approval tombstones and all audit events remain intact.
     pub async fn prune_resolved(&self, before: i64, exported_through: i64) -> Result<usize> {
-        self.database.run(move |conn| {
-            conn.execute("DELETE FROM submissions WHERE outcome IS NOT NULL AND created_at<?1 AND NOT EXISTS(SELECT 1 FROM audit WHERE subject=submissions.id AND sequence>?2) AND NOT EXISTS(SELECT 1 FROM reservations r WHERE r.id=submissions.id AND r.state='held') AND (json_extract(outcome,'$.status') IN ('rejected','reconciled') OR EXISTS(SELECT 1 FROM orders o WHERE o.account=submissions.account AND o.order_id=json_extract(submissions.outcome,'$.order_id') AND json_extract(o.payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')))",rusqlite::params![before,exported_through]).map_err(crate::storage::sql)
-        }).await
+        self.database
+            .run(move |conn| {
+                conn.execute(
+                    PRUNE_RESOLVED_SUBMISSIONS,
+                    rusqlite::params![before, exported_through],
+                )
+                .map_err(sql)
+            })
+            .await
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,12 +342,30 @@ impl OrderJournal {
         let principal = principal.to_owned();
         let digest = digest.to_owned();
         let operator = operator.to_owned();
-        self.database.run(move|c|{
-            let tx=c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(crate::storage::sql)?;
-            tx.execute("INSERT INTO approvals(digest,principal,expires_at,operator) VALUES(?1,?2,?3,?4)",rusqlite::params![digest,principal,expires_at,operator]).map_err(crate::storage::sql)?;
-            crate::storage::audit(&tx,"approval_granted",&digest,&serde_json::json!({"principal":principal,"operator":operator,"expires_at":expires_at}))?;
-            tx.commit().map_err(crate::storage::sql)?;Ok(())
-        }).await
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                tx.execute(
+                    INSERT_APPROVAL,
+                    rusqlite::params![digest, principal, expires_at, operator],
+                )
+                .map_err(sql)?;
+                audit(
+                    &tx,
+                    "approval_granted",
+                    &digest,
+                    &serde_json::json!({
+                        "principal": principal,
+                        "operator": operator,
+                        "expires_at": expires_at
+                    }),
+                )?;
+                tx.commit().map_err(sql)?;
+                Ok(())
+            })
+            .await
     }
     pub async fn approval_operator(&self, digest: &str) -> Result<Option<String>> {
         let digest = digest.to_owned();
@@ -197,14 +378,23 @@ impl OrderJournal {
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(crate::storage::sql)
+                .map_err(sql)
             })
             .await
     }
     pub async fn is_approved(&self, principal: &str, digest: &str) -> Result<bool> {
         let principal = principal.to_owned();
         let digest = digest.to_owned();
-        self.database.run(move|c|c.query_row("SELECT EXISTS(SELECT 1 FROM approvals WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0)",rusqlite::params![digest,principal,chrono::Utc::now().timestamp()],|r|r.get(0)).map_err(crate::storage::sql)).await
+        self.database
+            .run(move |c| {
+                c.query_row(
+                    SELECT_APPROVAL_LIVE,
+                    rusqlite::params![digest, principal, chrono::Utc::now().timestamp()],
+                    |r| r.get(0),
+                )
+                .map_err(sql)
+            })
+            .await
     }
     pub async fn revoke_approval(&self, digest: &str, operator: &str) -> Result<()> {
         let digest = digest.to_owned();
@@ -213,22 +403,19 @@ impl OrderJournal {
             .run(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(crate::storage::sql)?;
+                    .map_err(sql)?;
                 tx.execute("UPDATE approvals SET consumed=1 WHERE digest=?1", [&digest])
-                    .map_err(crate::storage::sql)?;
+                    .map_err(sql)?;
                 // Tombstone also revokes an approval originally supplied in policy.
-                tx.execute(
-                    "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)",
-                    [&digest],
-                )
-                .map_err(crate::storage::sql)?;
-                crate::storage::audit(
+                tx.execute(INSERT_CONSUMED_APPROVAL_IF_NEW, [&digest])
+                    .map_err(sql)?;
+                audit(
                     &tx,
                     "approval_revoked",
                     &digest,
                     &serde_json::json!({"operator":operator}),
                 )?;
-                tx.commit().map_err(crate::storage::sql)?;
+                tx.commit().map_err(sql)?;
                 Ok(())
             })
             .await
@@ -274,10 +461,15 @@ pub trait ExecutionStore: Send + Sync {
 impl ExecutionStore for OrderJournal {
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>> {
         let account = account.to_owned();
-        self.database.run(move |c| {
-            let mut stmt = c.prepare("SELECT order_id FROM orders WHERE account=?1 AND COALESCE(json_extract(payload,'$.status'),'UNKNOWN') NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') UNION SELECT json_extract(s.outcome,'$.order_id') FROM submissions s WHERE s.account=?1 AND json_extract(s.outcome,'$.order_id') IS NOT NULL AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') AND json_extract(o.payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))").map_err(crate::storage::sql)?;
-            stmt.query_map([account],|r|r.get(0)).map_err(crate::storage::sql)?.collect::<std::result::Result<Vec<_>,_>>().map_err(crate::storage::sql)
-        }).await
+        self.database
+            .run(move |c| {
+                let mut stmt = c.prepare(SELECT_RECONCILIATION_TARGETS).map_err(sql)?;
+                stmt.query_map([account], |r| r.get(0))
+                    .map_err(sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql)
+            })
+            .await
     }
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()> {
         if order_id.is_empty() || !order_id.bytes().all(|b| b.is_ascii_digit()) {
@@ -297,7 +489,7 @@ impl ExecutionStore for OrderJournal {
                         serde_json::json!({"orderId":id,"status":"UNKNOWN"}).to_string()
                     ],
                 )
-                .map_err(crate::storage::sql)?;
+                .map_err(sql)?;
                 Ok(())
             })
             .await
@@ -312,7 +504,7 @@ impl ExecutionStore for OrderJournal {
                     |r| r.get(0),
                 )
                 .optional()
-                .map_err(crate::storage::sql)
+                .map_err(sql)
             })
             .await
     }
@@ -323,14 +515,26 @@ impl ExecutionStore for OrderJournal {
             ));
         }
         let operator = operator.to_owned();
-        self.database.run(move |c| {
-            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(crate::storage::sql)?;
-            if let Some(reason) = &reason {
-                tx.execute("INSERT INTO meta VALUES('operator_halt',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[reason]).map_err(crate::storage::sql)?;
-            } else {tx.execute("DELETE FROM meta WHERE key='operator_halt'",[]).map_err(crate::storage::sql)?;}
-            crate::storage::audit(&tx,"operator_halt_changed",&operator,&serde_json::json!({"reason":reason}))?;
-            tx.commit().map_err(crate::storage::sql)
-        }).await
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                if let Some(reason) = &reason {
+                    tx.execute(UPSERT_OPERATOR_HALT, [reason]).map_err(sql)?;
+                } else {
+                    tx.execute("DELETE FROM meta WHERE key='operator_halt'", [])
+                        .map_err(sql)?;
+                }
+                audit(
+                    &tx,
+                    "operator_halt_changed",
+                    &operator,
+                    &serde_json::json!({"reason":reason}),
+                )?;
+                tx.commit().map_err(sql)
+            })
+            .await
     }
     async fn begin_once(
         &self,
@@ -380,7 +584,7 @@ impl ExecutionStore for OrderJournal {
                     |r| r.get::<_, i64>(0),
                 )
                 .map(|n| n as usize)
-                .map_err(crate::storage::sql)
+                .map_err(sql)
             })
             .await
     }
@@ -389,8 +593,8 @@ impl ExecutionStore for OrderJournal {
             .run(|c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                    .map_err(crate::storage::sql)?;
-                tx.commit().map_err(crate::storage::sql)
+                    .map_err(sql)?;
+                tx.commit().map_err(sql)
             })
             .await
     }

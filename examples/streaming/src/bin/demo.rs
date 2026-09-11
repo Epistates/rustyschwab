@@ -116,7 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // SERVICE 1: Level One Equities
     // ═══════════════════════════════════════════════════════
     println!("📊 [1/13] Subscribing to Level One Equities: AMD, INTC");
-    // Custom fields: 0=Symbol, 1=Bid, 2=Ask, 3=Last, 4=BidSize, 5=AskSize, 6=BidID, 7=AskID, 8=Volume
+    // Custom fields: 0=Symbol, 1=Bid, 2=Ask, 3=Last, 4=BidSize, 5=AskSize,
+    // 6=BidID, 7=AskID, 8=Volume
     stream_client.set_service_fields(
         StreamService::LeveloneEquities,
         "0,1,2,3,4,5,6,7,8".to_string(),

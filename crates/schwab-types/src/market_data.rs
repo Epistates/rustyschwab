@@ -1004,7 +1004,8 @@ impl PriceHistoryParams {
                 .contains(&frequency_type)
         {
             return Err(format!(
-                "frequencyType {frequency_type} is not valid for periodType {period_type}; expected one of {}",
+                "frequencyType {frequency_type} is not valid for periodType {period_type}; \
+                 expected one of {}",
                 join_names(period_type.valid_frequency_types())
             ));
         }
@@ -1015,7 +1016,8 @@ impl PriceHistoryParams {
             && !frequency_type.valid_frequencies().contains(&frequency)
         {
             return Err(format!(
-                "frequency {frequency} is not valid for frequencyType {frequency_type}; expected one of {:?}",
+                "frequency {frequency} is not valid for frequencyType {frequency_type}; \
+                 expected one of {:?}",
                 frequency_type.valid_frequencies()
             ));
         }
