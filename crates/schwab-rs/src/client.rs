@@ -303,6 +303,30 @@ impl SchwabClient {
         .await
     }
 
+    /// `GET` any Schwab REST path and return the raw JSON body.
+    ///
+    /// Escape hatch for endpoints without typed bindings and for shape
+    /// conformance checks. The request goes through the same auth, request
+    /// budget, circuit breaker and retry pipeline as the typed methods.
+    /// Deliberately `GET`-only: writes must use the order methods so they
+    /// are journaled and never replayed.
+    ///
+    /// `path` is relative to the configured base URL (for example
+    /// `/marketdata/v1/quotes`); `query` pairs are URL-encoded for you.
+    pub async fn get_json(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value> {
+        if !path.starts_with('/') {
+            return Err(Error::InvalidParameter("path must start with '/'".into()));
+        }
+        self.request_with_options::<serde_json::Value, [(&str, &str)]>(
+            "get_json",
+            Method::GET,
+            path,
+            (!query.is_empty()).then_some(query),
+            None::<&()>,
+        )
+        .await
+    }
+
     /// Submit an order (`POST`/`PUT`) whose success payload is the
     /// `Location` response header — Schwab returns 201 with an empty body
     /// for order placement/replacement, carrying the new order's URL in

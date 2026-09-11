@@ -309,6 +309,21 @@ HTTP mocking uses `wiremock`. Evidence from local qualification runs is
 written to `docs/audit/`, which is git-ignored; the hosted workflows upload
 the same files as artifacts.
 
+Everything above runs against mocks. The one gate that talks to Schwab is
+the **live conformance harness**, `crates/schwab-rs/tests/live_conformance.rs`:
+with `SCHWAB_LIVE_CONFORMANCE=1` and real credentials it `GET`s every
+read-only endpoint through `SchwabClient::get_json`, proves the typed
+binding still decodes the body, and diffs the body's *shape* (key sets and
+scalar types, never values) against `tests/fixtures/conformance/*.shape.json`.
+A decode error or a scalar changing type fails; keys appearing or vanishing
+warn, because Schwab omits absent fields and a sample is data-dependent.
+`SCHWAB_LIVE_CONFORMANCE=record` merges the live shapes into the fixtures.
+`qualification.yml` runs it weekly when the repository has
+`SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET` and `SCHWAB_TOKENS_JSON` secrets and
+uploads `live-conformance.json`; without them the job is skipped, and the
+harness's own request → decode → diff → record cycle is still covered by a
+`wiremock` test in the same file.
+
 ## Where to look
 
 | Task | Start at |

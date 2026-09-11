@@ -56,3 +56,60 @@ jobs:
         with:
           name: qualification-stream-${{ matrix.delay }}
           path: qualification-soak.json
+  # Read-only sweep of the real Schwab API (crates/schwab-rs/tests/live_conformance.rs).
+  # `secrets` is not readable from a job-level `if`, so a preflight job turns
+  # their presence into an output and the sweep is skipped, not failed, on
+  # forks and repositories without credentials. SCHWAB_TOKENS_JSON is the
+  # contents of a `schwab_tokens.json` produced by `cargo run -p oauth-flow`;
+  # Schwab refresh tokens expire after seven days, so rotate it at least weekly.
+  live-preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    env:
+      SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKENS_JSON: ${{ secrets.SCHWAB_TOKENS_JSON }}
+    steps:
+      - id: check
+        run: |
+          if [ -n "$SCHWAB_APP_KEY" ] && [ -n "$SCHWAB_APP_SECRET" ] && [ -n "$SCHWAB_TOKENS_JSON" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::SCHWAB_APP_KEY, SCHWAB_APP_SECRET or SCHWAB_TOKENS_JSON not configured; live conformance skipped"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+  live-conformance:
+    needs: live-preflight
+    if: needs.live-preflight.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN_STORE: file
+      SCHWAB_TOKENS_FILE: ${{ runner.temp }}/schwab_tokens.json
+      SCHWAB_LIVE_CONFORMANCE: '1'
+      SCHWAB_LIVE_CONFORMANCE_REPORT: ${{ github.workspace }}/live-conformance.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Materialize the token file (0600, outside the workspace)
+        env:
+          SCHWAB_TOKENS_JSON: ${{ secrets.SCHWAB_TOKENS_JSON }}
+        run: |
+          umask 077
+          printf '%s' "$SCHWAB_TOKENS_JSON" > "$SCHWAB_TOKENS_FILE"
+      - name: Live read-only conformance sweep
+        run: cargo test -p schwab-rs --test live_conformance --all-features --locked -- --nocapture live_shapes_match_fixtures
+      - name: Remove the token file
+        if: always()
+        run: rm -f "$SCHWAB_TOKENS_FILE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qualification-live-conformance
+          path: live-conformance.json
+          if-no-files-found: ignore

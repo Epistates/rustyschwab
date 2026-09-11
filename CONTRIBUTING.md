@@ -58,7 +58,16 @@ Then:
 1. Add or update tests. Wire-shape changes need a fixture or `wiremock`
    test; decoding changes should keep
    `crates/schwab-types/tests/properties.rs` (no panic on arbitrary input)
-   passing.
+   passing. If you have Schwab credentials, also run the read-only live
+   sweep so the typed bindings are checked against the real API:
+
+   ```bash
+   SCHWAB_LIVE_CONFORMANCE=1 cargo test -p schwab-rs --test live_conformance -- --nocapture
+   ```
+
+   It only issues `GET`s. `SCHWAB_LIVE_CONFORMANCE=record` refreshes
+   `crates/schwab-rs/tests/fixtures/conformance/`; commit the fixture diff
+   with the change that explains it.
 2. Add a line under `## [Unreleased]` in `CHANGELOG.md`
    (Keep a Changelog format).
 3. Update `.env.example` and the README "Environment Variables" section if

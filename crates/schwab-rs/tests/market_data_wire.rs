@@ -311,3 +311,42 @@ async fn account_paths_reject_account_numbers_and_separators_before_the_wire() {
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn get_json_is_a_bearer_get_with_encoded_query_and_raw_body() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .and(query_param("symbols", "AAPL,$SPX"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "AAPL": {"quote": {"lastPrice": 1.5}},
+            "unknownTopLevelKey": true
+        })))
+        .mount(&server)
+        .await;
+
+    let body = client
+        .get_json("/marketdata/v1/quotes", &[("symbols", "AAPL,$SPX")])
+        .await
+        .unwrap();
+    assert_eq!(body["AAPL"]["quote"]["lastPrice"], json!(1.5));
+    assert_eq!(body["unknownTopLevelKey"], json!(true));
+
+    let request = only_request(&server).await;
+    assert_eq!(
+        request.headers.get("authorization").unwrap(),
+        "Bearer old_access"
+    );
+    assert_eq!(
+        request.url.query(),
+        Some("symbols=AAPL%2C%24SPX"),
+        "reqwest form-encodes the pairs"
+    );
+
+    assert!(matches!(
+        client.get_json("marketdata/v1/quotes", &[]).await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}

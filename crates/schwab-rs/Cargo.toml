@@ -81,6 +81,8 @@ governor = { workspace = true }
 [dev-dependencies]
 wiremock = { workspace = true }
 tempfile = { workspace = true }
+# Live conformance harness loads `.env` like the binaries do.
+dotenvy = { workspace = true }
 
 [features]
 default = ["rustls"]

@@ -262,6 +262,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the preamble, and the MCP dependency review that sat under 0.1.0, now
   live under Unreleased where the work is.
 
+### Added — live conformance harness
+- `SchwabClient::get_json(path, query)` issues an authenticated `GET` to any
+  REST path and returns the raw `serde_json::Value`, through the same
+  budget, circuit-breaker, retry and refresh pipeline as the typed methods.
+  It is deliberately `GET`-only so writes stay on the journaled order
+  methods.
+- `crates/schwab-rs/tests/live_conformance.rs` is a read-only sweep of the
+  real API, skipped unless `SCHWAB_LIVE_CONFORMANCE` is set. It fetches the
+  market-data, account, order, transaction and preference endpoints, proves
+  each typed binding still decodes the live body, and diffs the body's
+  shape (key sets and scalar types, never values) against
+  `tests/fixtures/conformance/*.shape.json`. A decode error or a scalar
+  changing type fails the run; keys appearing or vanishing are warnings,
+  because Schwab omits absent fields. `SCHWAB_LIVE_CONFORMANCE=record`
+  merges the live shapes into the fixtures; the JSON report goes to
+  `SCHWAB_LIVE_CONFORMANCE_REPORT` (default `target/live-conformance.json`).
+  The request → decode → diff → record cycle is also exercised offline
+  against `wiremock`, so the harness itself is tested in every CI run.
+- `qualification.yml` runs the sweep weekly when `SCHWAB_APP_KEY`,
+  `SCHWAB_APP_SECRET` and `SCHWAB_TOKENS_JSON` secrets exist (a preflight
+  job turns their presence into an output, so forks skip rather than fail)
+  and uploads `live-conformance.json`. The token file is written with
+  `umask 077` outside the workspace and removed afterwards.
+
 ### Fixed — order enums aligned with the Trader API (breaking)
 - Spellings Schwab does not use are gone: `OrderType::CabinetOrder` is
   `Cabinet` (`CABINET`), `ComplexOrderStrategyType::DoubleCalendar` /
