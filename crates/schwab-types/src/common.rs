@@ -55,6 +55,15 @@ pub enum AssetSubType {
     War,
 }
 
+/// Option contract right, as Schwab spells it in `putCall` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PutCall {
+    Put,
+    Call,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]

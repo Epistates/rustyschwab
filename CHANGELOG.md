@@ -200,6 +200,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscribes by `LevelOneEquityFields` constants and prints a
   `LevelOneEquity`.
 
+### Fixed — order enums aligned with the Trader API (breaking)
+- Spellings Schwab does not use are gone: `OrderType::CabinetOrder` is
+  `Cabinet` (`CABINET`), `ComplexOrderStrategyType::DoubleCalendar` /
+  `UnbalancedButterflySpread` / `UnbalancedCondorSpread` are
+  `DoubleDiagonal` / `UnbalancedButterfly` / `UnbalancedCondor`, and the
+  phantom `OrderStatus::Awaiting` is replaced by the real
+  `AwaitingParentOrder` and `AwaitingStopCondition`.
+- `OrderStrategyType` carries every value Schwab reports (`CANCEL`,
+  `RECALL`, `PAIR`, `FLATTEN`, `TWO_DAY_SWAP`, `BLAST_ALL`) so order
+  history no longer fails to deserialize; `OrderRequest::validate()`
+  rejects them, since only `SINGLE`, `OCO` and `TRIGGER` can be submitted.
+  `OrderLegType` gained `COLLECTIVE_INVESTMENT`.
+- The string-typed request fields are enums: `PriceLinkBasis`
+  (`stopPriceLinkBasis` / `priceLinkBasis`), `PriceLinkType`, `StopType`,
+  `TaxLotMethod`, `SpecialInstruction` and `RequestedDestination`, all
+  with Schwab's value sets, so a typo is a compile error rather than a
+  400. `schwab_types::common::PutCall` names an option right.
+- The order enums (`OrderSession`, `OrderDuration`, `OrderType`,
+  `OrderInstruction`, `ComplexOrderStrategyType`, `OrderStatus`,
+  `OrderLegType`, `PositionEffect`) are `Copy`, `Eq` and `Hash`.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

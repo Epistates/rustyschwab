@@ -81,7 +81,7 @@ pub struct OrderInstrument {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderSession {
@@ -92,7 +92,7 @@ pub enum OrderSession {
     Seamless,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderDuration {
@@ -107,7 +107,7 @@ pub enum OrderDuration {
     NextEndOfMonth,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderType {
@@ -117,7 +117,7 @@ pub enum OrderType {
     Stop,
     StopLimit,
     TrailingStop,
-    CabinetOrder,
+    Cabinet,
     NonMarketable,
     MarketOnClose,
     Exercise,
@@ -128,7 +128,7 @@ pub enum OrderType {
     LimitOnClose,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ComplexOrderStrategyType {
@@ -146,32 +146,41 @@ pub enum ComplexOrderStrategyType {
     IronCondor,
     VerticalRoll,
     CollarWithStock,
-    DoubleCalendar,
-    UnbalancedButterflySpread,
-    UnbalancedCondorSpread,
+    DoubleDiagonal,
+    UnbalancedButterfly,
+    UnbalancedCondor,
     UnbalancedIronCondor,
     UnbalancedVerticalRoll,
     MutualFundSwap,
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Only [`Single`](Self::Single), [`Oco`](Self::Oco), and
+/// [`Trigger`](Self::Trigger) can be submitted; the rest appear on orders
+/// Schwab reports back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[derive(Default)]
 pub enum OrderStrategyType {
     #[default]
     Single,
+    Cancel,
+    Recall,
+    Pair,
+    Flatten,
+    TwoDaySwap,
+    BlastAll,
     Oco,
     Trigger,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderStatus {
-    Awaiting,
+    AwaitingParentOrder,
     AwaitingCondition,
+    AwaitingStopCondition,
     AwaitingManualReview,
     Accepted,
     AwaitingUrOut,
@@ -193,7 +202,7 @@ pub enum OrderStatus {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderLegType {
@@ -205,9 +214,10 @@ pub enum OrderLegType {
     CashEquivalent,
     FixedIncome,
     Currency,
+    CollectiveInvestment,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderInstruction {
@@ -224,7 +234,7 @@ pub enum OrderInstruction {
     SellShortExempt,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum PositionEffect {
@@ -232,6 +242,87 @@ pub enum PositionEffect {
     Closing,
     #[default]
     Automatic,
+}
+
+/// What a linked (trailing) price follows: `priceLinkBasis` and
+/// `stopPriceLinkBasis`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PriceLinkBasis {
+    Manual,
+    Base,
+    Trigger,
+    Last,
+    Bid,
+    Ask,
+    AskBid,
+    Mark,
+    Average,
+}
+
+/// How a linked price's offset is expressed: `priceLinkType` and
+/// `stopPriceLinkType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PriceLinkType {
+    Value,
+    Percent,
+    Tick,
+}
+
+/// Which price a stop order triggers on (`stopType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum StopType {
+    Standard,
+    Bid,
+    Ask,
+    Last,
+    Mark,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TaxLotMethod {
+    Fifo,
+    Lifo,
+    HighCost,
+    LowCost,
+    AverageCost,
+    SpecificLot,
+    LossHarvester,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SpecialInstruction {
+    AllOrNone,
+    DoNotReduce,
+    AllOrNoneDoNotReduce,
+}
+
+/// Routing venue for `requestedDestination`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RequestedDestination {
+    Inet,
+    EcnArca,
+    Cboe,
+    Amex,
+    Phlx,
+    Ise,
+    Box,
+    Nyse,
+    Nasdaq,
+    Bats,
+    C2,
+    Auto,
 }
 
 /// Result of submitting an order via `POST .../orders` or `PUT .../orders/{id}`.
@@ -324,17 +415,17 @@ pub struct OrderRequest {
     pub price: Option<rust_decimal::Decimal>,
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub stop_price: Option<rust_decimal::Decimal>,
-    pub stop_price_link_basis: Option<String>,
-    pub stop_price_link_type: Option<String>,
+    pub stop_price_link_basis: Option<PriceLinkBasis>,
+    pub stop_price_link_type: Option<PriceLinkType>,
     #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
     pub stop_price_offset: Option<rust_decimal::Decimal>,
-    pub stop_type: Option<String>,
-    pub price_link_basis: Option<String>,
-    pub price_link_type: Option<String>,
-    pub tax_lot_method: Option<String>,
+    pub stop_type: Option<StopType>,
+    pub price_link_basis: Option<PriceLinkBasis>,
+    pub price_link_type: Option<PriceLinkType>,
+    pub tax_lot_method: Option<TaxLotMethod>,
     pub tag: Option<String>,
-    pub special_instruction: Option<String>,
-    pub requested_destination: Option<String>,
+    pub special_instruction: Option<SpecialInstruction>,
+    pub requested_destination: Option<RequestedDestination>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order_leg_collection: Vec<OrderRequestLeg>,
     pub order_strategy_type: OrderStrategyType,
@@ -393,16 +484,22 @@ impl OrderRequest {
                 );
             }
         } else {
-            if self.order_leg_collection.is_empty()
-                || self.session.is_none()
-                || self.duration.is_none()
-                || self.order_type.is_none()
-            {
+            if !matches!(
+                self.order_strategy_type,
+                OrderStrategyType::Single | OrderStrategyType::Trigger
+            ) {
+                return Err("Only SINGLE, OCO, and TRIGGER strategies can be submitted".into());
+            }
+            let (Some(kind), Some(_), Some(_), false) = (
+                self.order_type,
+                self.session,
+                self.duration,
+                self.order_leg_collection.is_empty(),
+            ) else {
                 return Err(
                     "Executable orders require legs, session, duration, and orderType".into(),
                 );
-            }
-            let kind = self.order_type.as_ref().unwrap();
+            };
             if matches!(
                 kind,
                 OrderType::Limit

@@ -289,3 +289,61 @@ fn triggered_trailing_stop_and_partial_fill_activity_are_preserved() {
         activity
     );
 }
+
+#[test]
+fn order_enums_use_the_trader_api_spellings() {
+    use schwab_types::trading::{
+        ComplexOrderStrategyType, Order, OrderRequest, OrderStatus, OrderStrategyType, OrderType,
+        PriceLinkBasis, RequestedDestination, SpecialInstruction,
+    };
+    fn wire<T: serde::Serialize>(value: T) -> serde_json::Value {
+        serde_json::to_value(value).unwrap()
+    }
+    assert_eq!(wire(OrderType::Cabinet), "CABINET");
+    assert_eq!(
+        wire(ComplexOrderStrategyType::DoubleDiagonal),
+        "DOUBLE_DIAGONAL"
+    );
+    assert_eq!(
+        wire(ComplexOrderStrategyType::UnbalancedButterfly),
+        "UNBALANCED_BUTTERFLY"
+    );
+    assert_eq!(
+        wire(ComplexOrderStrategyType::UnbalancedCondor),
+        "UNBALANCED_CONDOR"
+    );
+    assert_eq!(wire(PriceLinkBasis::AskBid), "ASK_BID");
+    assert_eq!(wire(RequestedDestination::C2), "C2");
+    assert_eq!(wire(RequestedDestination::EcnArca), "ECN_ARCA");
+    assert_eq!(
+        wire(SpecialInstruction::AllOrNoneDoNotReduce),
+        "ALL_OR_NONE_DO_NOT_REDUCE"
+    );
+    assert_eq!(
+        wire(OrderStatus::AwaitingStopCondition),
+        "AWAITING_STOP_CONDITION"
+    );
+    // Schwab reports strategy types that cannot be submitted.
+    let reported: Order = serde_json::from_value(
+        serde_json::json!({"orderId":1,"orderStrategyType":"PAIR","status":"AWAITING_PARENT_ORDER"}),
+    )
+    .unwrap();
+    assert_eq!(reported.order_strategy_type, Some(OrderStrategyType::Pair));
+    assert_eq!(reported.status, Some(OrderStatus::AwaitingParentOrder));
+    let request: OrderRequest = serde_json::from_value(serde_json::json!({
+        "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"PAIR",
+        "orderLegCollection":[{"instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]
+    }))
+    .unwrap();
+    assert!(request.validate().is_err());
+    // Request-only fields are typed; a misspelled destination is rejected
+    // before it reaches the broker.
+    assert!(
+        serde_json::from_value::<OrderRequest>(serde_json::json!({
+            "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
+            "requestedDestination":"NYSE_ARCA",
+            "orderLegCollection":[{"instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]
+        }))
+        .is_err()
+    );
+}

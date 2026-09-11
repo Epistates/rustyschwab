@@ -428,7 +428,7 @@ async fn day_expiry_market_collar_and_unsupported_features_are_explicit() {
         PaperOrderStatus::Expired
     );
     let mut unsupported = order("unsupported", "BUY", "1", "11");
-    unsupported.tax_lot_method = Some("FIFO".into());
+    unsupported.tax_lot_method = Some(schwab_rs::types::trading::TaxLotMethod::Fifo);
     assert!(b.place_order("paper-test", &unsupported).await.is_err());
     assert!(
         b.place_order("paper-test", &order("short", "SELL", "1", "11"))
