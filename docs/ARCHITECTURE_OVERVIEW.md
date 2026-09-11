@@ -299,6 +299,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`,
 `cargo doc --workspace --no-deps --locked`,
 `cargo build --workspace --all-targets --locked`,
 `cargo test --workspace --all-targets --all-features --locked`,
+`cargo test --workspace --doc --all-features --locked`,
 `cargo check -p schwab-rs --no-default-features --locked`, `cargo audit`, an
 MSRV (1.89) build, `cargo-semver-checks`, and the stream soak harness
 (`examples/enterprise_bench` + `tools/soak.py`). `qualification.yml` runs the

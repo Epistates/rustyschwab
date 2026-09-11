@@ -28,6 +28,7 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --all-targets --all-features --locked 2>&1 | tee qualification-tests.txt
+          cargo test --workspace --doc --all-features --locked 2>&1 | tee -a qualification-tests.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:

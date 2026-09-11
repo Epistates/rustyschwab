@@ -43,11 +43,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo doc --workspace --no-deps --locked
 cargo build --workspace --all-targets --locked
 cargo test --workspace --all-targets --all-features --locked
+cargo test --workspace --doc --all-features --locked
 cargo check -p schwab-rs --no-default-features --locked
 ```
 
-`--all-targets` skips doctests, so also run
-`cargo test --workspace --doc --all-features` when you touch doc comments.
+The two `cargo test` lines are both needed: `--all-targets` skips doctests.
 CI additionally tests on the MSRV, runs `cargo audit`, compares the public
 API against the base branch with `cargo-semver-checks`, and runs the stream
 soak harness. Intentional public-API breaks need a CHANGELOG entry with
