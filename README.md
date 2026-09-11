@@ -4,21 +4,21 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 
 > [!WARNING]
 > **RISK WARNING**: This SDK is for advanced users and is provided "as is" without warranty of any kind. Automated trading involves significant risk of financial loss.
-> **Test your logic in isolated simulation before using real capital.** The [paper trading mode](docs/PAPER_TRADING.md) runs locally; it does not connect to thinkorswim paperMoney.
+> **Test your logic in isolated simulation before using real capital.** The [paper trading mode](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md) runs locally; it does not connect to thinkorswim paperMoney.
 > Use of this SDK is entirely at your own risk.
 
 ## Documentation
 
-- **[Full Documentation Index](docs/INDEX.md)**: Main entry point for all guides.
-- **[Setup Guide](docs/SETUP_GUIDE.md)**: Detailed instructions for getting started.
-- **[Placing Orders](docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
-- **[Real-time Streaming](docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)**: Common issues and solutions.
-- **[Architecture Overview](docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](CONTRIBUTING.md)**: For contributors.
+- **[Full Documentation Index](https://github.com/epistates/rustyschwab/blob/main/docs/INDEX.md)**: Main entry point for all guides.
+- **[Setup Guide](https://github.com/epistates/rustyschwab/blob/main/docs/SETUP_GUIDE.md)**: Detailed instructions for getting started.
+- **[Placing Orders](https://github.com/epistates/rustyschwab/blob/main/docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
+- **[Real-time Streaming](https://github.com/epistates/rustyschwab/blob/main/docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
+- **[Troubleshooting](https://github.com/epistates/rustyschwab/blob/main/docs/TROUBLESHOOTING.md)**: Common issues and solutions.
+- **[Architecture Overview](https://github.com/epistates/rustyschwab/blob/main/docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md)**: For contributors.
 
 ## Features
 
-- **[Paper trading and deterministic replay](docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency and authenticated gateway support. Start with `ops/paper/replay.jsonl`.
+- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency and authenticated gateway support. Start with `ops/paper/replay.jsonl`.
 
 - **OAuth2 Authentication**
   - Authorization code flow with built-in callback server
@@ -543,7 +543,7 @@ Network transports require `SCHWAB_MCP_POLICY_FILE` and a bearer token on
 every request. Principals have explicit account/tool permissions and isolated
 sessions. Remote access also requires a TLS proxy and
 `SCHWAB_MCP_ALLOW_REMOTE=1` for non-loopback binding. See the
-[policy configuration and migration guide](docs/ENTERPRISE_REMEDIATION.md).
+[policy configuration and migration guide](https://github.com/epistates/rustyschwab/blob/main/docs/ENTERPRISE_REMEDIATION.md).
 
 
 ### Guardrail for real trades
@@ -848,7 +848,7 @@ cargo run -p streaming-examples --bin streaming_quotes
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md) for guidelines.
 
 ## License
 
@@ -861,7 +861,7 @@ This SDK is not affiliated with, endorsed by, or officially connected with Charl
 ## Support
 
 For issues and questions:
-- GitHub Issues: [Project Issues](../../issues)
+- GitHub Issues: [Project Issues](https://github.com/epistates/rustyschwab/issues)
 - Documentation: [docs.rs/schwab-rs](https://docs.rs/schwab-rs)
 
 ## Development
@@ -901,16 +901,16 @@ cargo run -p streaming-examples --bin streaming_quotes
 cargo run -p streaming-examples --bin streaming_processing
 ```
 
-See [enterprise remediation and migration notes](docs/ENTERPRISE_REMEDIATION.md)
+See [enterprise remediation and migration notes](https://github.com/epistates/rustyschwab/blob/main/docs/ENTERPRISE_REMEDIATION.md)
 for execution reconciliation, decimal order requests, principal authorization,
 stream freshness, compiler support, and release validation requirements.
 
 
 The 0.2.0 candidate adds transactional state, reconciliation, shared local
 coordination, short-lived identity, portfolio risk integration and operator
-commands. See [enterprise operations](docs/OPERATIONS.md) for migration,
+commands. See [enterprise operations](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md) for migration,
 configuration and external release gates. This candidate has not been published.
 
-For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](docs/SHARED_AUTHORITY.md).
+For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](https://github.com/epistates/rustyschwab/blob/main/docs/SHARED_AUTHORITY.md).
 
-See the [MCP and LLM integration review](docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper-mode gaps, and the TurboMCP v4 migration criteria.
+See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper-mode gaps, and the TurboMCP v4 migration criteria.
