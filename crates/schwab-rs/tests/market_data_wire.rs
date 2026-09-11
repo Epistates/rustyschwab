@@ -247,6 +247,47 @@ async fn movers_encode_the_index_in_the_path_and_frequency_as_minutes() {
     assert_eq!(movers.screeners[0].symbol, "AAPL");
 }
 
+/// `/instruments/{cusip}` answers with the same `{"instruments":[…]}` envelope
+/// as the search endpoint; `get_instrument` unwraps the first entry and turns
+/// an empty list into an API error instead of a decode error.
+#[tokio::test]
+async fn instrument_by_cusip_unwraps_the_instruments_envelope() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/instruments/037833100"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "instruments": [{
+                "cusip": "037833100", "symbol": "AAPL", "description": "APPLE INC",
+                "exchange": "NASDAQ", "assetType": "EQUITY"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/instruments/000000000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"instruments": []})))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let instrument = client.get_instrument("037833100").await.unwrap();
+    assert_eq!(instrument.symbol, "AAPL");
+    assert_eq!(instrument.cusip.as_deref(), Some("037833100"));
+
+    let err = client.get_instrument("000000000").await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Api { code, .. } if code == "NOT_FOUND"),
+        "{err}"
+    );
+    assert!(matches!(
+        client.get_instrument("  ").await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn market_hours_use_lowercase_markets_and_iso_dates() {
     let server = MockServer::start().await;

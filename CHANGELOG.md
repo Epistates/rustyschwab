@@ -322,7 +322,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *failure on successful submissions*). `preview_order` returns the raw
   JSON validation payload (`serde_json::Value`) since its shape varies.
 - **Instruments**: `InstrumentsResponse` now matches the
-  `{"instruments": [...]}` wrapper.
+  `{"instruments": [...]}` wrapper. `GET /instruments/{cusip}` uses the
+  same envelope; `get_instrument` unwraps its first entry and answers an
+  empty list with `Error::Api { code: "NOT_FOUND" }`, pinned by a
+  `wiremock` test and decoded that way by the live conformance harness.
+- **Fundamentals** (breaking): `QuoteFundamental` and
+  `InstrumentFundamental` are retyped to the payloads Schwab sends.
+  Share-count volumes arrive as JSON floats (`"avg10DaysVolume":
+  37498265.0`) and `dividendDate` as a string, so the previous `i64`
+  fields failed to decode any quote requested with `fields=fundamental`
+  and any `projection=fundamental` search. `QuoteFundamental` now carries
+  exactly the documented quote section (`avg1YearVolume`, `divExDate`,
+  `divFreq`, `lastEarningsDate`, `nextDivExDate`, …; the ratio fields it
+  never received are gone) and `InstrumentFundamental` the full
+  fundamental projection, with explicit renames for the `TTM`/`MRQ`
+  suffixes that a `camelCase` rename would emit as `Ttm`/`Mrq`.
 - **Market hours**: `get_markets`/`get_market` return the doubly nested
   `{market_type: {product: hours}}` map Schwab actually sends.
 - **Transactions**: parameter renamed `type` → `types` (the name Schwab

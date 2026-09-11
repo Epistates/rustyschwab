@@ -98,6 +98,129 @@ fn instruments_response_is_wrapped_in_instruments_key() {
     assert_eq!(parsed.instruments[0].symbol, "AAPL");
 }
 
+/// Quote fundamentals as Schwab sends them: share counts as JSON floats and
+/// dates as ISO-8601 strings. An integer-typed volume field rejects
+/// `37498265.0` outright, which is what this pins against.
+#[test]
+fn quote_fundamentals_decode_float_volumes_and_string_dates() {
+    let json = r#"{
+        "AAPL": {
+            "symbol": "AAPL",
+            "fundamental": {
+                "avg10DaysVolume": 37498265.0,
+                "avg1YearVolume": 58820585.0,
+                "declarationDate": "2024-08-01T04:00:00Z",
+                "divAmount": 1.0,
+                "divExDate": "2024-08-12T04:00:00Z",
+                "divFreq": 4,
+                "divPayAmount": 0.25,
+                "divPayDate": "2024-08-15T04:00:00Z",
+                "divYield": 0.43144,
+                "eps": 6.13,
+                "fundLeverageFactor": 0.0,
+                "lastEarningsDate": "2024-08-01T04:00:00Z",
+                "nextDivExDate": "2024-11-12T05:00:00Z",
+                "nextDivPayDate": "2024-11-15T05:00:00Z",
+                "peRatio": 35.35277
+            }
+        }
+    }"#;
+
+    let parsed: QuotesResponse = serde_json::from_str(json).unwrap();
+    let fundamental = parsed.quotes["AAPL"].fundamental.as_ref().unwrap();
+    assert_eq!(fundamental.avg10_days_volume, Some(37_498_265.0));
+    assert_eq!(fundamental.div_freq, Some(4));
+    assert_eq!(
+        fundamental.next_div_pay_date.as_deref(),
+        Some("2024-11-15T05:00:00Z")
+    );
+    assert!(fundamental.extra.is_empty(), "{:?}", fundamental.extra);
+}
+
+/// `projection=fundamental` uses Schwab's other date format and upper-case
+/// `TTM`/`MRQ` suffixes that a plain `camelCase` rename would miss.
+#[test]
+fn instrument_fundamentals_decode_the_documented_projection() {
+    let json = r#"{
+        "instruments": [{
+            "fundamental": {
+                "symbol": "AAPL",
+                "high52": 237.49,
+                "low52": 164.075,
+                "dividendAmount": 1.0,
+                "dividendYield": 0.43144,
+                "dividendDate": "2024-08-12 00:00:00.0",
+                "peRatio": 35.35277,
+                "pegRatio": 116.555,
+                "pbRatio": 48.06189,
+                "prRatio": 8.43929,
+                "pcfRatio": 23.01545,
+                "grossMarginTTM": 45.962,
+                "grossMarginMRQ": 46.2571,
+                "netProfitMarginTTM": 26.4406,
+                "netProfitMarginMRQ": 25.0043,
+                "operatingMarginTTM": 26.4406,
+                "operatingMarginMRQ": 25.0043,
+                "returnOnEquity": 160.5833,
+                "returnOnAssets": 22.6119,
+                "returnOnInvestment": 50.98106,
+                "quickRatio": 0.79752,
+                "currentRatio": 0.95298,
+                "interestCoverage": 0.0,
+                "totalDebtToCapital": 51.3034,
+                "ltDebtToEquity": 151.8618,
+                "totalDebtToEquity": 129.2138,
+                "epsTTM": 6.56667,
+                "epsChangePercentTTM": 10.3155,
+                "epsChangeYear": 0.0,
+                "epsChange": 0.0,
+                "revChangeYear": -2.8005,
+                "revChangeTTM": 0.4349,
+                "revChangeIn": 0.0,
+                "sharesOutstanding": 15204137000.0,
+                "marketCapFloat": 0.0,
+                "marketCap": 3524014873860.0,
+                "bookValuePerShare": 4.38227,
+                "shortIntToFloat": 0.0,
+                "shortIntDayToCover": 0.0,
+                "divGrowthRate3Year": 0.0,
+                "dividendPayAmount": 0.25,
+                "dividendPayDate": "2024-08-15 00:00:00.0",
+                "beta": 1.23919,
+                "vol1DayAvg": 0.0,
+                "vol10DayAvg": 0.0,
+                "vol3MonthAvg": 0.0,
+                "avg10DaysVolume": 37498265,
+                "avg1DayVolume": 58820585,
+                "avg3MonthVolume": 51544618,
+                "declarationDate": "2024-08-01 00:00:00.0",
+                "dividendFreq": 4,
+                "eps": 6.13,
+                "dtnVolume": 34065076,
+                "nextDividendPayDate": "2024-11-15 00:00:00.0",
+                "nextDividendDate": "2024-11-12 00:00:00.0",
+                "fundLeverageFactor": 0.0
+            },
+            "cusip": "037833100",
+            "symbol": "AAPL",
+            "description": "APPLE INC",
+            "exchange": "NASDAQ",
+            "assetType": "EQUITY"
+        }]
+    }"#;
+
+    let parsed: InstrumentsResponse = serde_json::from_str(json).unwrap();
+    let fundamental = parsed.instruments[0].fundamental.as_ref().unwrap();
+    assert_eq!(fundamental.gross_margin_ttm, Some(45.962));
+    assert_eq!(fundamental.eps_ttm, Some(6.56667));
+    assert_eq!(fundamental.avg10_days_volume, Some(37_498_265.0));
+    assert_eq!(
+        fundamental.dividend_date.as_deref(),
+        Some("2024-08-12 00:00:00.0")
+    );
+    assert!(fundamental.extra.is_empty(), "{:?}", fundamental.extra);
+}
+
 #[test]
 fn market_hours_are_nested_two_levels() {
     let json = r#"{

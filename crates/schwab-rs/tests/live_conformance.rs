@@ -24,7 +24,7 @@ mod common;
 use chrono::{Duration, Utc};
 use schwab_rs::types::accounts::{Account, AccountNumberHash, UserPreferences};
 use schwab_rs::types::market_data::{
-    ExpirationChainResponse, Instrument, InstrumentsResponse, MarketsHoursResponse, MoversResponse,
+    ExpirationChainResponse, InstrumentsResponse, MarketsHoursResponse, MoversResponse,
     OptionChainResponse, PriceHistoryResponse, QuoteItem, QuotesResponse,
 };
 use schwab_rs::types::trading::{Order, Transaction};
@@ -363,12 +363,14 @@ fn market_data_endpoints() -> Vec<Endpoint> {
             &[],
             decode_as::<InstrumentsResponse>,
         ),
+        // Same `{"instruments":[…]}` envelope as the search endpoint;
+        // `get_instrument` unwraps the first entry.
         endpoint(
             "instrument_by_cusip",
             "/marketdata/v1/instruments/037833100",
             &[],
             &[],
-            decode_as::<Instrument>,
+            decode_as::<InstrumentsResponse>,
         ),
         endpoint(
             "markets",

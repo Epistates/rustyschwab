@@ -111,44 +111,36 @@ pub struct QuoteQuote {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Fundamental data including ratios, dividends, and financial metrics.
+/// Dividend, earnings and volume fundamentals attached to a quote.
+///
+/// This is the `fundamental` section of `GET /quotes`; the richer ratio set
+/// (margins, leverage, 52-week range) lives on
+/// [`InstrumentFundamental`] via `GET /instruments?projection=fundamental`.
+/// Volumes arrive as JSON floats (`37498265.0`), so they are `f64` even
+/// though they count shares. Dates are ISO-8601 strings
+/// (`"2024-08-15T04:00:00Z"`).
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct QuoteFundamental {
-    pub avg10_days_volume: Option<i64>,
-    pub avg30_days_volume: Option<i64>,
-    pub avg90_days_volume: Option<i64>,
+    pub avg10_days_volume: Option<f64>,
+    pub avg1_year_volume: Option<f64>,
+    pub declaration_date: Option<String>,
     pub div_amount: Option<f64>,
-    pub div_yield: Option<f64>,
+    pub div_ex_date: Option<String>,
+    /// Dividends per year (`4` for quarterly, `0` when none).
+    pub div_freq: Option<i64>,
     pub div_pay_amount: Option<f64>,
     pub div_pay_date: Option<String>,
+    pub div_yield: Option<f64>,
+    pub eps: Option<f64>,
+    pub fund_leverage_factor: Option<f64>,
+    pub fund_strategy: Option<String>,
+    pub last_earnings_date: Option<String>,
+    pub next_div_ex_date: Option<String>,
+    pub next_div_pay_date: Option<String>,
     pub pe_ratio: Option<f64>,
-    pub peg_ratio: Option<f64>,
-    pub pb_ratio: Option<f64>,
-    pub pr_ratio: Option<f64>,
-    pub pcf_ratio: Option<f64>,
-    pub gross_margin_ttm: Option<f64>,
-    pub gross_margin_mrq: Option<f64>,
-    pub net_profit_margin_ttm: Option<f64>,
-    pub net_profit_margin_mrq: Option<f64>,
-    pub operating_margin_ttm: Option<f64>,
-    pub operating_margin_mrq: Option<f64>,
-    pub return_on_equity: Option<f64>,
-    pub return_on_assets: Option<f64>,
-    pub return_on_investment: Option<f64>,
-    pub beta: Option<f64>,
-    pub market_cap: Option<f64>,
-    pub shares_outstanding: Option<f64>,
-    pub eps_ttm: Option<f64>,
-    pub eps_change_percent_ttm: Option<f64>,
-    pub eps_change_year: Option<f64>,
-    pub eps_change: Option<f64>,
-    pub book_value_per_share: Option<f64>,
-    pub high52: Option<f64>,
-    pub low52: Option<f64>,
-    pub fundamental_currency_code: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -432,7 +424,11 @@ pub struct Instrument {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-/// Fundamental data for an instrument.
+/// Fundamental data returned by `GET /instruments?projection=fundamental`.
+///
+/// Dates are Schwab's `"2024-08-12 00:00:00.0"` strings, not epoch millis.
+/// Volumes are `f64` because Schwab is inconsistent about sending them as
+/// integers or floats between endpoints; `f64` decodes both.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -443,15 +439,67 @@ pub struct InstrumentFundamental {
     pub low52: Option<f64>,
     pub dividend_amount: Option<f64>,
     pub dividend_yield: Option<f64>,
-    pub dividend_date: Option<i64>,
+    pub dividend_date: Option<String>,
     pub pe_ratio: Option<f64>,
     pub peg_ratio: Option<f64>,
     pub pb_ratio: Option<f64>,
     pub pr_ratio: Option<f64>,
-    pub pct_change: Option<f64>,
+    pub pcf_ratio: Option<f64>,
+    #[serde(rename = "grossMarginTTM")]
+    pub gross_margin_ttm: Option<f64>,
+    #[serde(rename = "grossMarginMRQ")]
+    pub gross_margin_mrq: Option<f64>,
+    #[serde(rename = "netProfitMarginTTM")]
+    pub net_profit_margin_ttm: Option<f64>,
+    #[serde(rename = "netProfitMarginMRQ")]
+    pub net_profit_margin_mrq: Option<f64>,
+    #[serde(rename = "operatingMarginTTM")]
+    pub operating_margin_ttm: Option<f64>,
+    #[serde(rename = "operatingMarginMRQ")]
+    pub operating_margin_mrq: Option<f64>,
+    pub return_on_equity: Option<f64>,
+    pub return_on_assets: Option<f64>,
+    pub return_on_investment: Option<f64>,
+    pub quick_ratio: Option<f64>,
+    pub current_ratio: Option<f64>,
+    pub interest_coverage: Option<f64>,
+    pub total_debt_to_capital: Option<f64>,
+    pub lt_debt_to_equity: Option<f64>,
+    pub total_debt_to_equity: Option<f64>,
+    #[serde(rename = "epsTTM")]
+    pub eps_ttm: Option<f64>,
+    #[serde(rename = "epsChangePercentTTM")]
+    pub eps_change_percent_ttm: Option<f64>,
+    pub eps_change_year: Option<f64>,
+    pub eps_change: Option<f64>,
+    pub rev_change_year: Option<f64>,
+    #[serde(rename = "revChangeTTM")]
+    pub rev_change_ttm: Option<f64>,
+    pub rev_change_in: Option<f64>,
+    pub shares_outstanding: Option<f64>,
+    pub market_cap_float: Option<f64>,
     pub market_cap: Option<f64>,
-    pub trade_time_in_long: Option<i64>,
-    pub exchange: Option<String>,
+    pub book_value_per_share: Option<f64>,
+    pub short_int_to_float: Option<f64>,
+    pub short_int_day_to_cover: Option<f64>,
+    pub div_growth_rate3_year: Option<f64>,
+    pub dividend_pay_amount: Option<f64>,
+    pub dividend_pay_date: Option<String>,
+    pub beta: Option<f64>,
+    pub vol1_day_avg: Option<f64>,
+    pub vol10_day_avg: Option<f64>,
+    pub vol3_month_avg: Option<f64>,
+    pub avg10_days_volume: Option<f64>,
+    pub avg1_day_volume: Option<f64>,
+    pub avg3_month_volume: Option<f64>,
+    pub declaration_date: Option<String>,
+    /// Dividends per year (`4` for quarterly, `0` when none).
+    pub dividend_freq: Option<i64>,
+    pub eps: Option<f64>,
+    pub dtn_volume: Option<f64>,
+    pub next_dividend_pay_date: Option<String>,
+    pub next_dividend_date: Option<String>,
+    pub fund_leverage_factor: Option<f64>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
