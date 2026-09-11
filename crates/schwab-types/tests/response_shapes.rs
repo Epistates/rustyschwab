@@ -330,9 +330,12 @@ fn order_enums_use_the_trader_api_spellings() {
     .unwrap();
     assert_eq!(reported.order_strategy_type, Some(OrderStrategyType::Pair));
     assert_eq!(reported.status, Some(OrderStatus::AwaitingParentOrder));
+    let leg = serde_json::json!({
+        "instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}
+    });
     let request: OrderRequest = serde_json::from_value(serde_json::json!({
         "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"PAIR",
-        "orderLegCollection":[{"instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]
+        "orderLegCollection":[leg]
     }))
     .unwrap();
     assert!(request.validate().is_err());
@@ -342,7 +345,7 @@ fn order_enums_use_the_trader_api_spellings() {
         serde_json::from_value::<OrderRequest>(serde_json::json!({
             "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
             "requestedDestination":"NYSE_ARCA",
-            "orderLegCollection":[{"instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]
+            "orderLegCollection":[leg]
         }))
         .is_err()
     );

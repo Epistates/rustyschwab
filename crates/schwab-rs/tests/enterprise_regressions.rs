@@ -6,8 +6,9 @@ use schwab_rs::auth::{FileTokenStore, TokenStore, TokenStoreKind};
 use schwab_rs::circuit_breaker::{CircuitBreaker, CircuitState};
 use schwab_rs::config::CircuitBreakerConfig;
 use schwab_rs::types::{
+    Decimal,
     accounts::Account,
-    trading::{Order, OrderDuration, OrderRequest},
+    trading::{Order, OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg},
 };
 use schwab_rs::{Error, SchwabClient, SchwabConfig};
 use std::time::Duration;
@@ -202,7 +203,10 @@ fn structured_errors_preserve_http_status() {
 }
 
 fn limit_order() -> OrderRequest {
-    serde_json::from_value(serde_json::json!({"session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":10.0,"orderStrategyType":"SINGLE","orderLegCollection":[{"instruction":"BUY","quantity":1,"instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]})).unwrap()
+    OrderRequest::limit(
+        OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 1),
+        Decimal::from(10),
+    )
 }
 
 #[tokio::test]

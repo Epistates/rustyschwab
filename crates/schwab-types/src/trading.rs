@@ -7,15 +7,46 @@
 //! - Transaction history
 //! - Execution reports
 //!
-//! # Order Types
+//! # Building orders
 //!
-//! - Market, Limit, Stop, StopLimit
-//! - TrailingStop, TrailingStopLimit
-//! - Various complex strategies (spreads, straddles, etc.)
+//! [`OrderRequest`](crate::trading::OrderRequest) is the strict outbound
+//! shape. Its constructors assemble it the way Schwab's order examples are
+//! written, so callers never hand-nest `childOrderStrategies`: single orders
+//! start from a leg
+//! ([`OrderRequestLeg::equity`](crate::trading::OrderRequestLeg::equity),
+//! [`OrderRequestLeg::option`](crate::trading::OrderRequestLeg::option)) and
+//! an order type ([`OrderRequest::market`](crate::trading::OrderRequest::market),
+//! [`OrderRequest::limit`](crate::trading::OrderRequest::limit), …), default
+//! to the `NORMAL` session and `DAY` duration, and take `with_*` setters;
+//! [`OrderRequest::one_cancels_other`](crate::trading::OrderRequest::one_cancels_other),
+//! [`OrderRequest::triggers`](crate::trading::OrderRequest::triggers) and
+//! [`OrderRequest::bracket`](crate::trading::OrderRequest::bracket) compose
+//! them. [`OptionSymbol`](crate::trading::OptionSymbol) formats and parses
+//! OSI option symbols.
+//! [`OrderRequest::validate`](crate::trading::OrderRequest::validate) checks
+//! structure before submission.
+//!
+//! ```
+//! use schwab_types::Decimal;
+//! use schwab_types::trading::{OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg};
+//!
+//! let entry = OrderRequest::limit(
+//!     OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 10),
+//!     Decimal::new(15025, 2),
+//! )
+//! .with_duration(OrderDuration::Gtc)
+//! .with_tag("swing-1");
+//! // Buy at 150.25; once filled, sell at 160 or stop out at 145.
+//! let bracket = entry.bracket(Decimal::from(160), Decimal::from(145)).unwrap();
+//! bracket.validate().unwrap();
+//! ```
 
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
+
+mod builder;
+pub use builder::OptionSymbol;
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

@@ -20,12 +20,21 @@
 //! ## Example
 //!
 //! Outbound orders use the strict [`trading::OrderRequest`] shape: unknown
-//! fields are rejected and prices/quantities are exact decimals.
+//! fields are rejected and prices/quantities are exact decimals. Build one
+//! with the constructors or deserialize the JSON Schwab documents.
 //!
 //! ```
-//! use schwab_types::trading::{OrderRequest, OrderType};
+//! use schwab_types::Decimal;
+//! use schwab_types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg, OrderType};
 //!
-//! let order: OrderRequest = serde_json::from_value(serde_json::json!({
+//! let order = OrderRequest::limit(
+//!     OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 10),
+//!     Decimal::new(15025, 2),
+//! );
+//! assert_eq!(order.order_type, Some(OrderType::Limit));
+//! order.validate().unwrap();
+//!
+//! let same: OrderRequest = serde_json::from_value(serde_json::json!({
 //!     "orderStrategyType": "SINGLE",
 //!     "orderType": "LIMIT",
 //!     "session": "NORMAL",
@@ -38,9 +47,7 @@
 //!     }]
 //! }))
 //! .unwrap();
-//!
-//! assert_eq!(order.order_type, Some(OrderType::Limit));
-//! order.validate().unwrap();
+//! assert_eq!(serde_json::to_value(&same).unwrap(), serde_json::to_value(&order).unwrap());
 //! ```
 
 /// Market data types including quotes, price history, and market hours.
@@ -57,3 +64,7 @@ pub mod trading;
 
 /// Common types shared across multiple modules.
 pub mod common;
+
+/// The exact-decimal type prices and quantities use, so callers do not need
+/// their own `rust_decimal` dependency to build orders.
+pub use rust_decimal::Decimal;

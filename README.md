@@ -324,9 +324,11 @@ println!("Open this URL in a browser: {}", auth_url);
 ### 3. Use the API
 
 ```rust,ignore
+use schwab_rs::types::Decimal;
 use schwab_rs::types::market_data::{
     FrequencyType, OptionChainParams, PeriodType, PriceHistoryParams, QuoteField,
 };
+use schwab_rs::types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
 
 // Get quotes
 let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
@@ -350,6 +352,14 @@ let history = client.get_price_history(&PriceHistoryParams {
 
 // Get option chain
 let chain = client.get_option_chain(&OptionChainParams::new("SPY")).await?;
+
+// Build an order — buy 10 AAPL at 150.25, then take profit at 160 or
+// stop out at 145 (a TRIGGER → OCO tree; see docs/ORDERS.md)
+let order = OrderRequest::limit(
+    OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 10),
+    "150.25".parse()?,
+)
+.bracket(Decimal::from(160), Decimal::from(145))?;
 
 // Preview an order (validate without executing)
 let preview = client.preview_order("account_hash", &order).await?;

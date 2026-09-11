@@ -200,6 +200,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subscribes by `LevelOneEquityFields` constants and prints a
   `LevelOneEquity`.
 
+### Added — order constructors
+- `OrderRequest` builds the way Schwab's order examples are written:
+  `market`, `limit`, `stop`, `stop_limit`, `trailing_stop`, `net_debit`,
+  `net_credit` and `net_zero` take legs from `OrderRequestLeg::equity` /
+  `OrderRequestLeg::option` (plus `with_position_effect`) and default to
+  `NORMAL` / `DAY`; `with_session`, `with_duration`, `with_tag`,
+  `with_complex_strategy`, `with_special_instruction`,
+  `with_destination`, `with_tax_lot_method` and `with_stop_type` set the
+  rest. `one_cancels_other`, `triggers` and `bracket` nest
+  `childOrderStrategies`; `bracket` derives the GTC take-profit / stop-loss
+  OCO pair from the entry leg via `OrderInstruction::closing()` and
+  rejects inverted exit prices. Unit tests pin the JSON against Schwab's
+  documented examples.
+- `trading::OptionSymbol` formats and parses the 21-character OSI form
+  (`AAPL  240517P00190000`), validating the root, right and strike.
+  `schwab_types::Decimal` re-exports `rust_decimal::Decimal` so callers
+  can write prices without their own dependency.
+- `docs/ORDERS.md` is rewritten around the constructors; it previously
+  showed the response type `Order` with fields that do not exist.
+
 ### Fixed — order enums aligned with the Trader API (breaking)
 - Spellings Schwab does not use are gone: `OrderType::CabinetOrder` is
   `Cabinet` (`CABINET`), `ComplexOrderStrategyType::DoubleCalendar` /
