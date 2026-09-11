@@ -5,7 +5,7 @@
 //! the pool; a second handle on the same path is a separate opener, so
 //! cross-process safety comes from SQLite's WAL locking, not from this type.
 use crate::error::{Error, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -185,14 +185,8 @@ impl StateDatabase {
                 Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(sql)?;
             integrity_check(&source)?;
-            let schema: String = source
-                .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
-                    r.get(0)
-                })
-                .map_err(sql)?;
-            if !schema
-                .parse::<u32>()
-                .is_ok_and(|version| (1..=SCHEMA_VERSION).contains(&version))
+            if !schema_version(&source)?
+                .is_some_and(|version| (1..=SCHEMA_VERSION).contains(&version))
             {
                 return Err(Error::Storage("Unsupported backup schema version".into()));
             }
@@ -358,13 +352,7 @@ fn validate_existing(connection: &Connection) -> Result<()> {
     }
 }
 fn schema_version(connection: &Connection) -> Result<Option<u32>> {
-    let version: Option<String> = connection
-        .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
-            r.get(0)
-        })
-        .optional()
-        .map_err(sql)?;
-    version
+    meta::get(connection, "schema")?
         .map(|v| {
             v.parse()
                 .map_err(|_| Error::Storage("Unsupported state schema version".into()))
@@ -395,11 +383,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             ],
         )
         .map_err(sql)?;
-        tx.execute(
-            "INSERT OR REPLACE INTO meta VALUES('schema',?1)",
-            [migration.version.to_string()],
-        )
-        .map_err(sql)?;
+        meta::put(&tx, "schema", &migration.version.to_string())?;
         tx.commit().map_err(sql)?;
     }
     Ok(())
@@ -407,14 +391,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 /// One-time import of the pre-SQLite JSON journal, recorded in `meta` so a
 /// retained legacy file is never replayed.
 fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
-    let imported: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_imported')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(sql)?;
-    if imported {
+    if meta::exists(connection, "legacy_imported")? {
         return Ok(());
     }
     crate::security::verify_file_permissions(legacy)?;
@@ -457,11 +434,63 @@ fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
                 .map_err(sql)?;
         }
     }
-    tx.execute("INSERT INTO meta VALUES('legacy_imported','1')", [])
-        .map_err(sql)?;
+    meta::put(&tx, "legacy_imported", "1")?;
     tx.commit().map_err(sql)?;
     Ok(())
 }
+/// The `meta` key/value table: schema version, execution mode, operator halt,
+/// paper run state and delivery cursors all live here. Values are opaque
+/// strings; the `_json` variants encode with serde for structured values.
+pub(crate) mod meta {
+    use super::sql;
+    use crate::error::Result;
+    use rusqlite::{Connection, OptionalExtension};
+    use serde::{Serialize, de::DeserializeOwned};
+
+    pub(crate) fn get(c: &Connection, key: &str) -> Result<Option<String>> {
+        c.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(sql)
+    }
+    pub(crate) fn exists(c: &Connection, key: &str) -> Result<bool> {
+        c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
+            [key],
+            |r| r.get(0),
+        )
+        .map_err(sql)
+    }
+    /// Insert or overwrite.
+    pub(crate) fn put(c: &Connection, key: &str, value: &str) -> Result<()> {
+        c.execute(
+            "INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [key, value],
+        )
+        .map_err(sql)?;
+        Ok(())
+    }
+    /// Insert only when the key is absent; an existing value is kept.
+    pub(crate) fn insert_if_new(c: &Connection, key: &str, value: &str) -> Result<()> {
+        c.execute("INSERT OR IGNORE INTO meta VALUES(?1,?2)", [key, value])
+            .map_err(sql)?;
+        Ok(())
+    }
+    pub(crate) fn delete(c: &Connection, key: &str) -> Result<()> {
+        c.execute("DELETE FROM meta WHERE key=?1", [key])
+            .map_err(sql)?;
+        Ok(())
+    }
+    pub(crate) fn get_json<T: DeserializeOwned>(c: &Connection, key: &str) -> Result<Option<T>> {
+        get(c, key)?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(Into::into)
+    }
+    pub(crate) fn put_json(c: &Connection, key: &str, value: &impl Serialize) -> Result<()> {
+        put(c, key, &serde_json::to_string(value)?)
+    }
+}
+
 pub(crate) fn audit(
     conn: &Connection,
     kind: &str,

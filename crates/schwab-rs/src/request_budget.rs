@@ -1,6 +1,7 @@
 //! Process-wide quota by credential and API origin, including every wire attempt.
 use crate::{
     config::RateLimitConfig,
+    coordination::Coordinator,
     error::{Error, Result},
 };
 use governor::{Quota, RateLimiter};
@@ -19,6 +20,7 @@ type Limiter = RateLimiter<
     governor::clock::DefaultClock,
 >;
 pub(crate) struct RequestBudget {
+    key: String,
     limiter: Limiter,
     recent: Mutex<VecDeque<Instant>>,
     per_minute: usize,
@@ -43,6 +45,7 @@ impl RequestBudget {
         let burst = NonZeroU32::new(config.burst_size)
             .ok_or_else(|| Error::Config("burst_size must be positive".into()))?;
         let budget = Arc::new(Self {
+            key: key.clone(),
             limiter: RateLimiter::direct(Quota::per_second(rps).allow_burst(burst)),
             recent: Mutex::new(VecDeque::new()),
             per_minute: rps.get().saturating_mul(60) as usize,
@@ -51,7 +54,21 @@ impl RequestBudget {
         budgets.insert(key, Arc::downgrade(&budget));
         Ok(budget)
     }
-    pub async fn acquire(&self) {
+    /// Wait for the in-process budget, then for the durable quota the
+    /// coordinator shares with every other process on this credential. Both
+    /// count the attempt only once it is admitted.
+    pub async fn admit(&self, coordinator: &dyn Coordinator) -> Result<()> {
+        self.acquire().await;
+        let (rps, burst) = self.configuration;
+        loop {
+            let wait = coordinator.quota(&self.key, rps, burst).await?;
+            if wait.is_zero() {
+                return Ok(());
+            }
+            tokio::time::sleep(wait).await;
+        }
+    }
+    async fn acquire(&self) {
         self.limiter.until_ready().await;
         loop {
             let wake = {

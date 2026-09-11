@@ -1,6 +1,8 @@
 //! Pluggable pre-trade risk with durable reservations for outstanding orders.
 use crate::{
+    coordination::{Lease, lease_held},
     error::{Error, Result},
+    execution::ensure_not_halted,
     storage::{StateDatabase, sql},
     types::trading::{OrderInstruction, OrderRequest, OrderStrategyType, OrderType},
 };
@@ -11,9 +13,6 @@ use std::collections::HashMap;
 
 const SELECT_ACCOUNT_BASELINE: &str =
     "SELECT observed_at,valid,snapshot FROM accounts WHERE account=?1";
-const SELECT_OPERATOR_HALTED: &str = "SELECT EXISTS(SELECT 1 FROM meta WHERE key='operator_halt')";
-const SELECT_LEASE_HELD: &str = "SELECT EXISTS(SELECT 1 FROM leases \
-     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)";
 const SELECT_HELD_RESERVATION: &str =
     "SELECT quantity,notional FROM reservations WHERE id=?1 AND account=?2 AND state='held'";
 /// Every held reservation for the account except (when revalidating) our own.
@@ -50,7 +49,7 @@ pub trait RiskProvider: Send + Sync {
         _account: &str,
         _attempt_id: &str,
         _order: &OrderRequest,
-        _lease: &crate::coordination::Lease,
+        _lease: &Lease,
     ) -> Result<()> {
         Err(Error::Config(
             "Risk provider must implement atomic fenced revalidation".into(),
@@ -91,7 +90,7 @@ impl PortfolioRisk {
         attempt_id: &str,
         order: &OrderRequest,
         revalidate: bool,
-        fence: Option<crate::coordination::Lease>,
+        fence: Option<Lease>,
     ) -> Result<()> {
         order.validate().map_err(Error::InvalidParameter)?;
         let limits = self
@@ -163,28 +162,11 @@ impl PortfolioRisk {
                     state.ok_or_else(|| stale("Account requires reconciliation before trading"))?;
                 let now = chrono::Utc::now().timestamp_millis();
                 if revalidate {
-                    let halted: bool = tx
-                        .query_row(SELECT_OPERATOR_HALTED, [], |r| r.get(0))
-                        .map_err(sql)?;
-                    if halted {
-                        return Err(Error::Halted("Operator trading halt is active".into()));
-                    }
-                    if let Some(lease) = fence {
-                        let valid: bool = tx
-                            .query_row(
-                                SELECT_LEASE_HELD,
-                                rusqlite::params![
-                                    lease.resource,
-                                    lease.owner,
-                                    lease.epoch as i64,
-                                    now
-                                ],
-                                |r| r.get(0),
-                            )
-                            .map_err(sql)?;
-                        if !valid {
-                            return Err(Error::OwnershipLost);
-                        }
+                    ensure_not_halted(&tx)?;
+                    if let Some(lease) = &fence
+                        && !lease_held(&tx, lease)?
+                    {
+                        return Err(Error::OwnershipLost);
                     }
                 }
 
@@ -330,7 +312,7 @@ impl RiskProvider for PortfolioRisk {
         account: &str,
         attempt_id: &str,
         order: &OrderRequest,
-        lease: &crate::coordination::Lease,
+        lease: &Lease,
     ) -> Result<()> {
         self.validate_and_reserve(account, attempt_id, order, true, Some(lease.clone()))
             .await

@@ -56,15 +56,11 @@ impl SchwabClient {
             config.oauth.tokens_file.with_extension("orders.json"),
         );
         let origin = Url::parse(&config.client.base_url)
-            .map_err(|_| Error::Config("Invalid base URL".into()))?
+            .map_err(|e| Error::Config(format!("Invalid base URL: {e}")))?
             .origin()
             .ascii_serialization();
         let budget_key = format!("{}:{origin}", config.oauth.app_key);
         let auth_manager = AuthManager::new(config.oauth).map_err(Error::Auth)?;
-
-        // Build transport with validated base URL and timeout
-        let _ = Url::parse(&config.client.base_url)
-            .map_err(|e| Error::Config(format!("Invalid base URL: {}", e)))?;
         let transport = HttpTransport::new(
             config.client.base_url.clone(),
             config.client.timeout,
@@ -196,36 +192,19 @@ impl SchwabClient {
                     .journal
                     .database()
                     .run(|c| {
-                        use rusqlite::OptionalExtension;
+                        use crate::storage::{meta, sql};
                         let tx = c
                             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                            .map_err(crate::storage::sql)?;
-                        let paper: bool = tx
-                            .query_row(
-                                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='paper_config')",
-                                [],
-                                |r| r.get(0),
-                            )
-                            .map_err(crate::storage::sql)?;
-                        let mode: Option<String> = tx
-                            .query_row(
-                                "SELECT value FROM meta WHERE key='execution_mode'",
-                                [],
-                                |r| r.get(0),
-                            )
-                            .optional()
-                            .map_err(crate::storage::sql)?;
+                            .map_err(sql)?;
+                        let paper = meta::exists(&tx, "paper_config")?;
+                        let mode = meta::get(&tx, "execution_mode")?;
                         if paper || mode.as_deref().is_some_and(|m| m != "live") {
                             return Err(Error::Config(
                                 "Live client cannot use paper execution state".into(),
                             ));
                         }
-                        tx.execute(
-                            "INSERT OR IGNORE INTO meta VALUES('execution_mode','live')",
-                            [],
-                        )
-                        .map_err(crate::storage::sql)?;
-                        tx.commit().map_err(crate::storage::sql)
+                        meta::insert_if_new(&tx, "execution_mode", "live")?;
+                        tx.commit().map_err(sql)
                     })
                     .await
             })
@@ -457,24 +436,7 @@ impl SchwabClient {
                     .map_err(Error::Auth)?;
                 let attempt = || async {
                     if let Some(budget) = &self.inner.rate_limiter {
-                        budget.acquire().await;
-                    }
-                    if self.inner.config.rate_limit.enabled {
-                        loop {
-                            let wait = self
-                                .inner
-                                .coordinator
-                                .quota(
-                                    &self.inner.quota_key,
-                                    self.inner.config.rate_limit.requests_per_second,
-                                    self.inner.config.rate_limit.burst_size,
-                                )
-                                .await?;
-                            if wait.is_zero() {
-                                break;
-                            }
-                            tokio::time::sleep(wait).await;
-                        }
+                        budget.admit(self.inner.coordinator.as_ref()).await?;
                     }
                     if submission && self.inner.execution.operator_halt().await?.is_some() {
                         return Err(Error::Halted("Operator trading halt is active".into()));

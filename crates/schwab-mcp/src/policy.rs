@@ -1,6 +1,7 @@
 //! Immutable per-principal authorization. Network authentication selects a
 //! principal-specific handler and session store before MCP dispatch.
 use crate::SchwabMcp;
+use schwab_rs::{SchwabClient, broker::TradingBackend, execution::OrderJournal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, sync::Arc};
@@ -58,6 +59,9 @@ impl PrincipalPolicy {
         }
         Ok(())
     }
+    fn owns_streaming(&self) -> bool {
+        self.tools.iter().any(|t| t.starts_with("stream_"))
+    }
     pub fn authorize(&self, name: &str, args: &Value) -> McpResult<()> {
         if !self.tools.contains(name) {
             return Err(McpError::invalid_params("Operation not authorized"));
@@ -101,6 +105,45 @@ impl PrincipalPolicy {
         }
         Ok(())
     }
+}
+/// Validate a principal set as a whole, at startup and on every reload: each
+/// policy is valid on its own, names, static token digests and identity
+/// subjects are unique, and at most one principal owns streaming for the
+/// Schwab login. With `static_credentials` (network transport and no token
+/// issuer) every principal must also carry a short-lived static token.
+pub fn validate_policies(
+    policies: &[PrincipalPolicy],
+    static_credentials: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!policies.is_empty(), "At least one principal is required");
+    let mut names = HashSet::new();
+    let mut digests = HashSet::new();
+    let mut subjects = HashSet::new();
+    for policy in policies {
+        policy.validate()?;
+        anyhow::ensure!(
+            names.insert(policy.name.as_str())
+                && (policy.token_sha256.is_empty()
+                    || digests.insert(policy.token_sha256.to_ascii_lowercase()))
+                && policy
+                    .identity_subject
+                    .as_deref()
+                    .is_none_or(|subject| subjects.insert(subject)),
+            "Principal names, identity subjects and token digests must be unique"
+        );
+        anyhow::ensure!(
+            !static_credentials
+                || (policy.token_expires_at.is_some() && !policy.token_sha256.is_empty()),
+            "Static network credentials require token_expires_at; \
+             configure short-lived issuer tokens with SCHWAB_MCP_IDENTITY_FILE"
+        );
+    }
+    anyhow::ensure!(
+        policies.iter().filter(|p| p.owns_streaming()).count() <= 1,
+        "Only one principal may own streaming for a Schwab login; \
+         share market data through a separate service"
+    );
+    Ok(())
 }
 // Conservative gross exposure sums all legs and child strategies, including
 // mutually exclusive children. Network writes require bounded-price orders;
@@ -206,7 +249,20 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
 pub struct AuthorizedServer {
     pub inner: SchwabMcp,
     pub principal: Arc<PrincipalPolicy>,
-    pub audit: schwab_rs::execution::OrderJournal,
+    pub audit: OrderJournal,
+}
+impl AuthorizedServer {
+    /// Bind a principal to its own approval and dispatch journal, kept beside
+    /// the client's token file under the principal's name digest.
+    pub fn new(client: Arc<SchwabClient>, policy: PrincipalPolicy) -> Self {
+        let audit =
+            OrderJournal::new(client.principal_journal_path(&digest(policy.name.as_bytes())));
+        Self {
+            inner: SchwabMcp::new(client),
+            principal: Arc::new(policy),
+            audit,
+        }
+    }
 }
 impl McpHandler for AuthorizedServer {
     fn server_info(&self) -> turbomcp::ServerInfo {

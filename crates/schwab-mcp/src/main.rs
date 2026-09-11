@@ -191,47 +191,15 @@ async fn main() -> anyhow::Result<()> {
             }
             Err(_) => anyhow::bail!("Network access and trading require SCHWAB_MCP_POLICY_FILE"),
         };
-    anyhow::ensure!(!policies.is_empty(), "At least one principal is required");
-    let mut names = std::collections::HashSet::new();
-    let mut digests = std::collections::HashSet::new();
-    let mut subjects = std::collections::HashSet::new();
-    let mut stream_owners = 0;
-    let mut servers = Vec::new();
-    for policy in policies {
-        policy.validate()?;
-        anyhow::ensure!(
-            names.insert(policy.name.clone())
-                && (policy.token_sha256.is_empty()
-                    || digests.insert(policy.token_sha256.to_ascii_lowercase()))
-                && policy
-                    .identity_subject
-                    .as_ref()
-                    .is_none_or(|subject| subjects.insert(subject.clone())),
-            "Principal names, identity subjects and token digests must be unique"
-        );
-        if policy.tools.iter().any(|t| t.starts_with("stream_")) {
-            stream_owners += 1;
-        }
-        let audit_path = client
-            .auth_manager()
-            .config()
-            .tokens_file
-            .with_extension("orders.json")
-            .with_extension(format!(
-                "{}.audit.json",
-                schwab_mcp::policy::digest(policy.name.as_bytes())
-            ));
-        servers.push(schwab_mcp::policy::AuthorizedServer {
-            inner: SchwabMcp::new(client.clone()),
-            principal: Arc::new(policy),
-            audit: schwab_rs::execution::OrderJournal::new(audit_path),
-        });
-    }
-    anyhow::ensure!(
-        stream_owners <= 1,
-        "Only one principal may own streaming for a Schwab login; \
-         share market data through a separate service"
-    );
+    let identity_file = std::env::var_os("SCHWAB_MCP_IDENTITY_FILE");
+    schwab_mcp::policy::validate_policies(
+        &policies,
+        transport != "stdio" && identity_file.is_none(),
+    )?;
+    let servers: Vec<_> = policies
+        .into_iter()
+        .map(|policy| schwab_mcp::policy::AuthorizedServer::new(client.clone(), policy))
+        .collect();
     if transport == "stdio" {
         let principal = std::env::var("SCHWAB_MCP_PRINCIPAL")
             .context("Set SCHWAB_MCP_PRINCIPAL for policy-controlled stdio")?;
@@ -248,25 +216,15 @@ async fn main() -> anyhow::Result<()> {
         let bind = std::env::var("SCHWAB_MCP_BIND").unwrap_or_else(|_| "127.0.0.1:8765".into());
         let addr: SocketAddr = bind.parse()?;
         guard_network_bind(&transport, addr, remote_bind_allowed())?;
-        let identity = match std::env::var("SCHWAB_MCP_IDENTITY_FILE") {
-            Ok(path) => Some(
+        let identity = match identity_file {
+            Some(path) => Some(
                 schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(&std::fs::read(
                     path,
                 )?)?)
                 .await?,
             ),
-            Err(_) => None,
+            None => None,
         };
-        if identity.is_none() {
-            let short_lived = servers.iter().all(|s| {
-                s.principal.token_expires_at.is_some() && !s.principal.token_sha256.is_empty()
-            });
-            anyhow::ensure!(
-                short_lived,
-                "Static network credentials require token_expires_at; \
-                 configure short-lived issuer tokens with SCHWAB_MCP_IDENTITY_FILE"
-            );
-        }
         let app = schwab_mcp::network::router_reloadable(
             servers,
             transport != "http",

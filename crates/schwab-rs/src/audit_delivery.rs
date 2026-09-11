@@ -3,17 +3,11 @@ use crate::{
     error::{Error, Result},
     execution::{AuditEvent, OrderJournal},
     remote::RemoteBackend,
-    storage::sql,
+    storage::{meta, sql},
 };
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-const INSERT_AUDIT_STREAM_ID: &str = "INSERT OR IGNORE INTO meta VALUES('audit_stream_id',?1)";
-const SELECT_AUDIT_STREAM_ID: &str = "SELECT value FROM meta WHERE key='audit_stream_id'";
-const INSERT_META_IF_NEW: &str = "INSERT OR IGNORE INTO meta VALUES(?1,?2)";
-const SELECT_META: &str = "SELECT value FROM meta WHERE key=?1";
-const UPSERT_META: &str =
-    "INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+const AUDIT_STREAM_ID_KEY: &str = "audit_stream_id";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AuditBatch {
@@ -60,30 +54,17 @@ impl OrderJournal {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                tx.execute(INSERT_AUDIT_STREAM_ID, [uuid::Uuid::new_v4().to_string()])
-                    .map_err(sql)?;
-                let stream: String = tx
-                    .query_row(SELECT_AUDIT_STREAM_ID, [], |r| r.get(0))
-                    .map_err(sql)?;
+                let missing = || Error::Storage("Audit delivery metadata is missing".into());
+                meta::insert_if_new(&tx, AUDIT_STREAM_ID_KEY, &uuid::Uuid::new_v4().to_string())?;
+                let stream = meta::get(&tx, AUDIT_STREAM_ID_KEY)?.ok_or_else(missing)?;
                 let pin = format!("{get_key}:endpoint");
-                tx.execute(INSERT_META_IF_NEW, rusqlite::params![pin, endpoint])
-                    .map_err(sql)?;
-                let pinned: String = tx
-                    .query_row(SELECT_META, [pin], |r| r.get(0))
-                    .map_err(sql)?;
-                if pinned != endpoint {
+                meta::insert_if_new(&tx, &pin, &endpoint)?;
+                if meta::get(&tx, &pin)?.ok_or_else(missing)? != endpoint {
                     return Err(Error::Config(
                         "Audit sink ID is pinned to another endpoint".into(),
                     ));
                 }
-                let cursor: Option<String> = tx
-                    .query_row(SELECT_META, [get_key], |r| r.get(0))
-                    .optional()
-                    .map_err(sql)?;
-                let cursor: Cursor = cursor
-                    .map(|v| serde_json::from_str(&v))
-                    .transpose()?
-                    .unwrap_or_default();
+                let cursor: Cursor = meta::get_json(&tx, &get_key)?.unwrap_or_default();
                 tx.commit().map_err(sql)?;
                 Ok((stream, cursor))
             })
@@ -121,24 +102,13 @@ impl OrderJournal {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                let current: Option<String> = tx
-                    .query_row(SELECT_META, [&key], |r| r.get(0))
-                    .optional()
-                    .map_err(sql)?;
-                let current: Cursor = current
-                    .map(|v| serde_json::from_str(&v))
-                    .transpose()?
-                    .unwrap_or_default();
+                let current: Cursor = meta::get_json(&tx, &key)?.unwrap_or_default();
                 if current.through != cursor.through || current.digest != cursor.digest {
                     return Err(Error::Storage(
                         "Audit cursor advanced concurrently; reload before retrying".into(),
                     ));
                 }
-                tx.execute(
-                    UPSERT_META,
-                    rusqlite::params![key, serde_json::to_string(&new)?],
-                )
-                .map_err(sql)?;
+                meta::put_json(&tx, &key, &new)?;
                 tx.commit().map_err(sql)
             })
             .await?;

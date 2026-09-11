@@ -1,5 +1,5 @@
 //! Authenticate before selecting a principal-isolated MCP router/session store.
-use crate::policy::{AuthorizedServer, digest};
+use crate::policy::{AuthorizedServer, PrincipalPolicy, digest, validate_policies};
 use axum::{
     Router,
     body::Body,
@@ -90,68 +90,23 @@ pub fn router_reloadable(
                 if current == previous {
                     continue;
                 }
-                let policies = current.as_deref().and_then(|bytes| {
-                    serde_json::from_slice::<Vec<crate::policy::PrincipalPolicy>>(bytes).ok()
-                });
-                let mut rebuilt = Vec::new();
-                let mut digests = std::collections::HashSet::new();
-                let mut valid = true;
-                let mut names = std::collections::HashSet::new();
-                let mut subjects = std::collections::HashSet::new();
-                let mut stream_owners = 0;
-                if let Some(policies) = policies {
-                    for policy in policies {
-                        if policy.validate().is_err()
-                            || !names.insert(policy.name.clone())
-                            || (!policy.token_sha256.is_empty()
-                                && !digests.insert(policy.token_sha256.to_ascii_lowercase()))
-                        {
-                            valid = false;
-                            break;
-                        }
-                        if let Some(subject) = &policy.identity_subject
-                            && !subjects.insert(subject.clone())
-                        {
-                            valid = false;
-                            break;
-                        }
-                        if policy.tools.iter().any(|t| t.starts_with("stream_")) {
-                            stream_owners += 1;
-                        }
-                        if state.identity.is_none()
-                            && (policy.token_expires_at.is_none() || policy.token_sha256.is_empty())
-                        {
-                            valid = false;
-                            break;
-                        }
-                        let audit = schwab_rs::execution::OrderJournal::new(
-                            client
-                                .auth_manager()
-                                .config()
-                                .tokens_file
-                                .with_extension("orders.json")
-                                .with_extension(format!(
-                                    "{}.audit.json",
-                                    digest(policy.name.as_bytes())
-                                )),
-                        );
-                        rebuilt.push(AuthorizedServer {
-                            inner: crate::SchwabMcp::new(client.clone()),
-                            principal: Arc::new(policy),
-                            audit,
-                        });
-                    }
-                } else {
-                    valid = false;
-                }
-                if stream_owners > 1 {
-                    valid = false;
-                }
-                *state.entries.write() = if valid {
-                    entries(rebuilt, websocket)
-                } else {
-                    Vec::new()
-                };
+                // An unreadable or invalid file revokes every principal until
+                // the operator fixes it, matching the startup rules.
+                let policies = current
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice::<Vec<PrincipalPolicy>>(bytes).ok())
+                    .filter(|policies| {
+                        validate_policies(policies, state.identity.is_none()).is_ok()
+                    });
+                let valid = policies.is_some();
+                *state.entries.write() = entries(
+                    policies
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|policy| AuthorizedServer::new(client.clone(), policy))
+                        .collect(),
+                    websocket,
+                );
                 state.revoked.send_modify(|version| *version += 1);
                 tracing::info!(valid, "MCP policy reloaded; existing sessions revoked");
                 previous = current;
@@ -434,7 +389,6 @@ mod rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SchwabMcp, policy::PrincipalPolicy};
     fn server(name: &str, token: &str, tools: &[&str]) -> AuthorizedServer {
         let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
             oauth: schwab_rs::OAuthConfig {
@@ -452,13 +406,7 @@ mod tests {
             serde_json::json!({"name":name,"token_sha256":digest(token.as_bytes()),"token_expires_at":chrono::Utc::now().timestamp()+3600,"tools":tools}),
         )
         .unwrap();
-        AuthorizedServer {
-            inner: SchwabMcp::new(Arc::new(client)),
-            principal: Arc::new(policy),
-            audit: schwab_rs::execution::OrderJournal::new(
-                std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4())),
-            ),
-        }
+        AuthorizedServer::new(Arc::new(client), policy)
     }
     #[tokio::test]
     async fn every_network_request_requires_a_valid_bearer_token() {

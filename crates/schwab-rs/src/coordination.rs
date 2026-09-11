@@ -27,6 +27,23 @@ pub struct Lease {
     pub epoch: u64,
     pub expires_at: i64,
 }
+/// Whether `lease` is still the live owner of its resource in this state file.
+/// Dispatch fences call this inside the same transaction as the write they
+/// guard so ownership cannot lapse between the check and the commit.
+pub(crate) fn lease_held(c: &rusqlite::Connection, lease: &Lease) -> Result<bool> {
+    // Epochs are allocated from an SQLite integer, so one that does not fit
+    // was never issued by this store.
+    let Ok(epoch) = i64::try_from(lease.epoch) else {
+        return Ok(false);
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    c.query_row(
+        SELECT_LEASE_HELD,
+        params![lease.resource, lease.owner, epoch, now],
+        |r| r.get(0),
+    )
+    .map_err(sql)
+}
 #[async_trait]
 pub trait Coordinator: std::fmt::Debug + Send + Sync {
     /// Atomically reserve quota or return the minimum wait before retrying.
@@ -187,16 +204,7 @@ impl Coordinator for StateDatabase {
     }
     async fn valid(&self, lease: &Lease) -> Result<bool> {
         let lease = lease.clone();
-        self.run(move |c| {
-            let now = chrono::Utc::now().timestamp_millis();
-            c.query_row(
-                SELECT_LEASE_HELD,
-                params![lease.resource, lease.owner, lease.epoch as i64, now],
-                |r| r.get(0),
-            )
-            .map_err(sql)
-        })
-        .await
+        self.run(move |c| lease_held(c, &lease)).await
     }
 }
 

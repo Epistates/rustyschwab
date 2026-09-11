@@ -113,6 +113,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A tampered file is now detected on the next open, not the next call:
   reopen with a new `StateDatabase` (or process) to re-validate.
 
+### Changed — one owner per durable-state concept
+- The `meta` key/value table has a single crate-private accessor
+  (`storage::meta::{get, exists, put, insert_if_new, delete, get_json,
+  put_json}`); the audit-delivery cursor, execution mode, operator halt,
+  paper run state and schema version all go through it instead of each
+  module carrying its own SQL.
+- One `execution::ensure_not_halted` admission check and one
+  `coordination::lease_held` fence check replace the copies in the risk
+  provider, the paper engine and the coordinator. A paper submission under
+  an operator halt now reports the same `Halted("Operator trading halt is
+  active")` as live dispatch, and a fence whose epoch cannot exist in the
+  store is treated as lost ownership rather than an invalid parameter.
+- In-process and durable rate-limit admission collapse into one
+  `RequestBudget::admit` call; `SchwabClient` no longer parses the base URL
+  twice.
+- `schwab-mcp`: `policy::validate_policies` is the one place the principal
+  set is checked (per-policy validity, unique names/digests/subjects, a
+  single streaming owner, short-lived static credentials without an
+  issuer), shared by startup and hot reload, and
+  `AuthorizedServer::new(client, policy)` derives the principal's journal
+  path from `TradingBackend::principal_journal_path` instead of two hand
+  copies of the extension dance. A reload that contains no principals now
+  revokes every session the same way an invalid file does.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

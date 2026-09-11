@@ -1,9 +1,9 @@
 use super::model::*;
 use crate::{
     Error, Result,
-    coordination::Lease,
-    execution::{OrderJournal, SubmissionOutcome},
-    storage::{audit, sql},
+    coordination::{Lease, lease_held},
+    execution::{OrderJournal, SubmissionOutcome, ensure_not_halted},
+    storage::{audit, meta, sql},
     types::trading::{
         OrderDuration, OrderInstruction, OrderRequest, OrderSession, OrderStrategyType,
         OrderSubmitResponse, OrderType,
@@ -45,8 +45,6 @@ const COUNT_CAPTURE_METADATA: &str =
 const SELECT_CAPTURE_EXPECTED: &str = "SELECT \
      EXISTS(SELECT 1 FROM meta WHERE key='paper_capture_version') \
      OR EXISTS(SELECT 1 FROM audit WHERE kind='paper_command')";
-const SELECT_LEASE_HELD: &str = "SELECT EXISTS(SELECT 1 FROM leases \
-     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)";
 const SELECT_ORDER_PAGE: &str =
     "SELECT payload FROM paper_orders WHERE account=?1 AND id>?2 ORDER BY id LIMIT ?3";
 const UPSERT_QUOTE_WATERMARK: &str = "INSERT INTO paper_quote_watermarks VALUES(?1,?2) \
@@ -124,19 +122,12 @@ pub(super) fn div(a: Decimal, b: Decimal) -> Result<Decimal> {
 fn encode(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
+/// Paper run state that `initialize` wrote; a missing key is corruption.
 fn get<T: DeserializeOwned>(c: &Connection, key: &str) -> Result<T> {
-    let value: String = c
-        .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
-        .map_err(sql)?;
-    Ok(serde_json::from_str(&value)?)
+    meta::get_json(c, key)?.ok_or_else(|| corrupt("Paper run metadata is missing"))
 }
 fn put(c: &Connection, key: &str, value: &impl Serialize) -> Result<()> {
-    c.execute(
-        "INSERT INTO meta VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![key, encode(value)?],
-    )
-    .map_err(sql)?;
-    Ok(())
+    meta::put_json(c, key, value)
 }
 fn ledger(c: &Connection, account: &str) -> Result<PaperAccount> {
     let value: Option<String> = c
@@ -410,29 +401,11 @@ fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Res
     if draining {
         return Err(Error::Halted("Paper broker is draining".into()));
     }
-    let halt: bool = c
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='operator_halt')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(sql)?;
-    if halt {
-        return Err(Error::Halted("Operator halt is active".into()));
-    }
-    if let Some(fence) = fence {
-        let epoch = i64::try_from(fence.epoch).map_err(|_| invalid("Invalid lease epoch"))?;
-        let now = chrono::Utc::now().timestamp_millis();
-        let valid: bool = c
-            .query_row(
-                SELECT_LEASE_HELD,
-                params![fence.resource, fence.owner, epoch, now],
-                |r| r.get(0),
-            )
-            .map_err(sql)?;
-        if !valid {
-            return Err(Error::OwnershipLost);
-        }
+    ensure_not_halted(c)?;
+    if let Some(fence) = fence
+        && !lease_held(c, fence)?
+    {
+        return Err(Error::OwnershipLost);
     }
     Ok(())
 }
@@ -1033,14 +1006,7 @@ impl PaperBroker {
 }
 
 fn capture(c: &Connection, command: PaperCommand, outcome: PaperCapturedOutcome) -> Result<()> {
-    let count: Option<String> = c
-        .query_row(
-            "SELECT value FROM meta WHERE key='paper_capture_count'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql)?;
+    let count: Option<u64> = meta::get_json(c, "paper_capture_count")?;
     // Historical databases remain usable, but cannot claim complete capture.
     let Some(count) = count else {
         let expected: bool = c
@@ -1051,7 +1017,7 @@ fn capture(c: &Connection, command: PaperCommand, outcome: PaperCapturedOutcome)
         }
         return Ok(());
     };
-    let index = serde_json::from_str::<u64>(&count)?
+    let index = count
         .checked_add(1)
         .ok_or_else(|| corrupt("Capture sequence exhausted"))?;
     let record = PaperCapturedCommand {
@@ -1379,29 +1345,15 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql)?;
-    let mode: Option<String> = tx
-        .query_row(
-            "SELECT value FROM meta WHERE key='execution_mode'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(sql)?;
+    let mode = meta::get(&tx, "execution_mode")?;
     if mode.as_deref().is_some_and(|m| m != "paper") {
         return Err(Error::Config(
             "Paper mode cannot use live execution state".into(),
         ));
     }
-    let prior: Option<String> = tx
-        .query_row("SELECT value FROM meta WHERE key='paper_config'", [], |r| {
-            r.get(0)
-        })
-        .optional()
-        .map_err(sql)?;
+    let prior: Option<serde_json::Value> = meta::get_json(&tx, "paper_config")?;
     if let Some(prior) = prior {
-        if canonical_json(&serde_json::from_str(&prior)?)
-            != canonical_json(&serde_json::to_value(config)?)
-        {
+        if canonical_json(&prior) != canonical_json(&serde_json::to_value(config)?) {
             return Err(Error::Config(
                 "Paper configuration differs from durable run".into(),
             ));
@@ -1492,8 +1444,7 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
             )
             .map_err(sql)?;
         }
-        tx.execute("INSERT INTO meta VALUES('execution_mode','paper')", [])
-            .map_err(sql)?;
+        meta::put(&tx, "execution_mode", "paper")?;
         put(&tx, "paper_config", config)?;
         put(&tx, "paper_clock", &Clock::default())?;
         put(&tx, "paper_capture_version", &1_u32)?;
@@ -1600,14 +1551,7 @@ fn corporate_action(
         return Err(invalid("Invalid corporate action identity/time"));
     }
     let key = format!("paper_action:{id}");
-    let used: bool = c
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)",
-            [&key],
-            |r| r.get(0),
-        )
-        .map_err(sql)?;
-    if used {
+    if meta::exists(c, &key)? {
         return Err(Error::Duplicate(
             "Corporate action already applied; retry the original event sequence".into(),
         ));
@@ -1951,17 +1895,8 @@ impl PaperBroker {
         self.journal
             .database()
             .run(|connection| {
-                let count: Option<String> = connection
-                    .query_row(
-                        "SELECT value FROM meta WHERE key='paper_capture_count'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(sql)?;
-                let count = count
-                    .ok_or_else(|| Error::Storage("Run lacks complete command capture".into()))?;
-                Ok(serde_json::from_str(&count)?)
+                meta::get_json(connection, "paper_capture_count")?
+                    .ok_or_else(|| Error::Storage("Run lacks complete command capture".into()))
             })
             .await
     }

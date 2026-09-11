@@ -1,7 +1,7 @@
 //! Durable submission intent/outcome journal. Pending intents survive task
 //! cancellation and process failure, and block new submissions for that account.
 use crate::error::{Error, Result};
-use crate::storage::{audit, sql};
+use crate::storage::{audit, meta, sql};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -53,8 +53,16 @@ const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
          WHERE o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') \
            AND json_extract(o.payload,'$.status') \
              IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))";
-const UPSERT_OPERATOR_HALT: &str = "INSERT INTO meta VALUES('operator_halt',?1) \
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+const OPERATOR_HALT_KEY: &str = "operator_halt";
+
+/// Admission check shared by every dispatch path, live and paper: fail closed
+/// while an operator halt is recorded in the same state file.
+pub(crate) fn ensure_not_halted(c: &rusqlite::Connection) -> Result<()> {
+    if meta::exists(c, OPERATOR_HALT_KEY)? {
+        return Err(Error::Halted("Operator trading halt is active".into()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionRecord {
@@ -500,18 +508,7 @@ impl ExecutionStore for OrderJournal {
             .await
     }
     async fn operator_halt(&self) -> Result<Option<String>> {
-        self.database
-            .run(|c| {
-                use rusqlite::OptionalExtension;
-                c.query_row(
-                    "SELECT value FROM meta WHERE key='operator_halt'",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()
-                .map_err(sql)
-            })
-            .await
+        self.database.run(|c| meta::get(c, OPERATOR_HALT_KEY)).await
     }
     async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()> {
         if operator.trim().is_empty() || reason.as_ref().is_some_and(|r| r.trim().is_empty()) {
@@ -525,11 +522,9 @@ impl ExecutionStore for OrderJournal {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                if let Some(reason) = &reason {
-                    tx.execute(UPSERT_OPERATOR_HALT, [reason]).map_err(sql)?;
-                } else {
-                    tx.execute("DELETE FROM meta WHERE key='operator_halt'", [])
-                        .map_err(sql)?;
+                match &reason {
+                    Some(reason) => meta::put(&tx, OPERATOR_HALT_KEY, reason)?,
+                    None => meta::delete(&tx, OPERATOR_HALT_KEY)?,
                 }
                 audit(
                     &tx,
