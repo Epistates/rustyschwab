@@ -48,8 +48,15 @@ One module per Schwab API area: `market_data`, `trading`, `accounts`,
 - **Strict out, tolerant in.** Types the SDK sends (`trading::OrderRequest`,
   `OrderRequestLeg`, `OrderRequestInstrument`) use `deny_unknown_fields`
   and exact `Decimal` prices/quantities. Types Schwab returns (`Order`,
-  `Account`, quotes, …) accept unknown fields and use `f64` where Schwab
-  emits numbers.
+  `Account`, quotes, stream payloads, …) accept unknown fields and use `f64`
+  where Schwab emits numbers. That is deliberate, not a shortcut: Schwab
+  sends JSON numbers, `serde_json` parses them to `f64` before any `Decimal`
+  deserializer runs, and `rust_decimal` then re-parses the shortest
+  round-trip string, so a `Decimal` response field would carry exactly the
+  same value. Turning on `serde_json`'s `arbitrary_precision` to change that
+  would replace numbers inside `serde_json::Value` with private maps and
+  break `canonical_json` intent digests. Prices become `Decimal` where they
+  enter exact accounting (`paper::feed` converts via `to_string().parse()`).
 - **`Decimal` is re-exported** (`schwab_types::Decimal`, also reachable as
   `schwab_rs::types::Decimal`) so callers do not depend on `rust_decimal`
   directly. Decimal fields deserialize from strings or numbers and serialize

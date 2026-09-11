@@ -10,7 +10,14 @@
 //! Names follow the REST types for the same concept
 //! ([`QuoteQuote`](crate::market_data::QuoteQuote),
 //! [`Candle`](crate::market_data::Candle)) so a stream delta and a REST
-//! quote merge by name; prices are `f64` for the same reason.
+//! quote merge by name; prices are `f64` for the same reason, and because
+//! nothing is lost by it: Schwab emits JSON numbers, `serde_json` parses
+//! those to `f64` before any `Decimal` impl sees them, and `Decimal`'s own
+//! `visit_f64` re-parses the shortest round-trip string. Convert at the
+//! point a price enters exact accounting (`value.to_string().parse()`, as
+//! the paper feed does) rather than in the wire type. Requests go the other
+//! way: [`OrderRequest`](crate::trading::OrderRequest) prices are `Decimal`
+//! serialized as strings so the broker never sees a float.
 //!
 //! ```
 //! use schwab_types::streaming::{DataContent, LevelOneEquity, LevelOneEquityFields};
