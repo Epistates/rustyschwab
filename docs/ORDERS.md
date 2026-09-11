@@ -151,7 +151,11 @@ let bracket = OrderRequest::limit(
 `bracket` requires a single-leg `SINGLE` entry whose instruction opens a
 position (`BUY`, `SELL_SHORT`, `BUY_TO_OPEN`, `SELL_TO_OPEN`) and rejects
 exit prices on the wrong side for the direction: long entries need
-`take_profit > stop_loss`, short entries the reverse.
+`take_profit > stop_loss`, short entries the reverse. The MCP risk policy
+sums entry, take-profit and stop-loss as gross exposure and prices the
+stop-loss at the entry's limit (a child that only flattens what its bounded
+parent opens cannot fill for more), so size `max_quantity` / `max_notional`
+for three legs; short brackets are refused like any other opening short.
 
 ## Other request fields
 

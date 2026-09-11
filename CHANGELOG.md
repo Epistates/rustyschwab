@@ -250,6 +250,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools` like any other tool.
 - `docs/ORDERS.md` is rewritten around the constructors; it previously
   showed the response type `Order` with fields that do not exist.
+- `PrincipalPolicy` accepts the bracket it builds: a triggered child that
+  only flattens the long position its bounded parent opens (the paired
+  closing instruction, the same instrument, no more than the entry's
+  quantity) is priced at the parent's limit, so `bracket(...)` / the
+  `bracket` spec clears the risk check with entry + take-profit + stop-loss
+  summed as gross exposure. Previously the stop-loss child was refused as
+  "requires an order with a bounded limit price", which rejected every
+  bracket over the network. Every other unbounded order (market, trailing,
+  naked stop, a stop that sells more than the entry or another symbol, a
+  stop under a market entry) is still refused. `OrderInstruction::opens_long`
+  is now public.
 - `TRAILING_STOP_LIMIT` deliberately keeps no constructor; `docs/ORDERS.md`
   and the `trailing_stop` docs now say why (Schwab's schema has no
   `priceOffset` and no published example, so the limit linkage is

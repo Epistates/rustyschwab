@@ -148,15 +148,65 @@ pub fn validate_policies(
 // Conservative gross exposure sums all legs and child strategies, including
 // mutually exclusive children. Network writes require bounded-price orders;
 // market, trailing-market, and naked stop orders have no finite execution cap.
+// The one exception is a bracket exit: a child that only closes the long
+// position its bounded parent opens (same instrument, no more than the
+// parent's quantity) cannot fill for more than the parent paid, so an
+// unbounded stop there is priced at the parent's limit.
 fn exposure(
     order: &schwab_types::trading::OrderRequest,
     multipliers: &std::collections::HashMap<String, rust_decimal::Decimal>,
 ) -> McpResult<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+    exposure_under(order, multipliers, None)
+}
+
+/// `entry` is the bounded long entry this order hangs under as a triggered
+/// child, if any. OCO wrappers carry no legs and pass it through.
+fn exposure_under(
+    order: &schwab_types::trading::OrderRequest,
+    multipliers: &std::collections::HashMap<String, rust_decimal::Decimal>,
+    entry: Option<(
+        &schwab_types::trading::OrderRequestLeg,
+        rust_decimal::Decimal,
+    )>,
+) -> McpResult<(rust_decimal::Decimal, rust_decimal::Decimal)> {
     use schwab_types::trading::{OrderStrategyType, OrderType};
     let mut quantity = rust_decimal::Decimal::ZERO;
     let mut notional = rust_decimal::Decimal::ZERO;
+    let mut child_entry = entry;
     if order.order_strategy_type != OrderStrategyType::Oco {
-        if !matches!(
+        use schwab_types::{common::AssetType, trading::OrderInstruction};
+        let [leg] = order.order_leg_collection.as_slice() else {
+            return Err(McpError::invalid_params(
+                "Multi-leg exposure requires an external portfolio risk engine",
+            ));
+        };
+        if matches!(
+            leg.instruction,
+            OrderInstruction::SellShort
+                | OrderInstruction::SellShortExempt
+                | OrderInstruction::SellToOpen
+        ) {
+            return Err(McpError::invalid_params(
+                "Opening short exposure requires an external portfolio risk engine",
+            ));
+        }
+        let multiplier = match leg.instrument.asset_type {
+            AssetType::Equity => rust_decimal::Decimal::ONE,
+            AssetType::Option => *multipliers
+                .get(&leg.instrument.symbol)
+                .filter(|v| **v > rust_decimal::Decimal::ZERO)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Option contract requires an operator-verified multiplier",
+                    )
+                })?,
+            _ => {
+                return Err(McpError::invalid_params(
+                    "Risk policy supports standard equity and option contracts only",
+                ));
+            }
+        };
+        let bounded = matches!(
             order.order_type,
             Some(
                 OrderType::Limit
@@ -164,62 +214,32 @@ fn exposure(
                     | OrderType::NetDebit
                     | OrderType::NetCredit
             )
-        ) {
-            return Err(McpError::invalid_params(
-                "Policy requires an order with a bounded limit price",
-            ));
-        }
-        if order.order_leg_collection.len() != 1 {
-            return Err(McpError::invalid_params(
-                "Multi-leg exposure requires an external portfolio risk engine",
-            ));
-        }
-        for leg in &order.order_leg_collection {
-            use schwab_types::{common::AssetType, trading::OrderInstruction};
-            if matches!(
-                leg.instruction,
-                OrderInstruction::SellShort
-                    | OrderInstruction::SellShortExempt
-                    | OrderInstruction::SellToOpen
-            ) {
-                return Err(McpError::invalid_params(
-                    "Opening short exposure requires an external portfolio risk engine",
-                ));
-            }
-            let multiplier = match leg.instrument.asset_type {
-                AssetType::Equity => rust_decimal::Decimal::ONE,
-                AssetType::Option => *multipliers
-                    .get(&leg.instrument.symbol)
-                    .filter(|v| **v > rust_decimal::Decimal::ZERO)
-                    .ok_or_else(|| {
-                        McpError::invalid_params(
-                            "Option contract requires an operator-verified multiplier",
-                        )
-                    })?,
-                _ => {
-                    return Err(McpError::invalid_params(
-                        "Risk policy supports standard equity and option contracts only",
-                    ));
-                }
-            };
-            quantity = quantity
-                .checked_add(leg.quantity)
-                .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
-            let price = order.price.ok_or_else(|| {
-                McpError::invalid_params("Policy requires an order with a bounded limit price")
-            })?;
-            let exposure = leg
-                .quantity
-                .checked_mul(multiplier)
-                .and_then(|v| v.checked_mul(price))
-                .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
-            notional = notional
-                .checked_add(exposure)
-                .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
-        }
+        );
+        let price = match (bounded, order.price) {
+            (true, Some(price)) => price,
+            _ => entry
+                .filter(|(opened, _)| closes(leg, opened))
+                .map(|(_, price)| price)
+                .ok_or_else(|| {
+                    McpError::invalid_params("Policy requires an order with a bounded limit price")
+                })?,
+        };
+        quantity = quantity
+            .checked_add(leg.quantity)
+            .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
+        let exposure = leg
+            .quantity
+            .checked_mul(multiplier)
+            .and_then(|v| v.checked_mul(price))
+            .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
+        notional = notional
+            .checked_add(exposure)
+            .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
+        child_entry =
+            (bounded && leg.instruction.opens_long() == Some(true)).then_some((leg, price));
     }
     for child in &order.child_order_strategies {
-        let (q, n) = exposure(child, multipliers)?;
+        let (q, n) = exposure_under(child, multipliers, child_entry)?;
         quantity = quantity
             .checked_add(q)
             .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
@@ -229,6 +249,18 @@ fn exposure(
     }
 
     Ok((quantity, notional))
+}
+
+/// Whether `leg` can only flatten what `entry` opened: the paired closing
+/// instruction, the same instrument, and no more than the entry's quantity.
+fn closes(
+    leg: &schwab_types::trading::OrderRequestLeg,
+    entry: &schwab_types::trading::OrderRequestLeg,
+) -> bool {
+    entry.instruction.closing() == Some(leg.instruction)
+        && leg.instrument.symbol == entry.instrument.symbol
+        && leg.instrument.asset_type == entry.instrument.asset_type
+        && leg.quantity <= entry.quantity
 }
 pub fn digest(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -437,5 +469,47 @@ mod tests {
         p.approved_intents
             .insert(intent_digest("place_order", &args));
         assert!(p.authorize("place_order", &args).is_err());
+    }
+    #[test]
+    fn bracket_exits_are_priced_at_the_entry_and_everything_else_stays_bounded() {
+        use rust_decimal::Decimal;
+        use schwab_types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let none = Default::default();
+        let entry = || OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 2);
+        // Entry 2 @ 50 + take profit 2 @ 60 + stop 2 priced at the entry's 50.
+        let bracket = OrderRequest::limit(entry(), d("50"))
+            .bracket(d("60"), d("45"))
+            .unwrap();
+        assert_eq!(exposure(&bracket, &none).unwrap(), (d("6"), d("320")));
+
+        // A naked stop with nothing to cover it, or a market entry, is refused.
+        let stop = || {
+            OrderRequest::stop(
+                OrderRequestLeg::equity(OrderInstruction::Sell, "AAPL", 2),
+                d("45"),
+            )
+        };
+        assert!(exposure(&stop(), &none).is_err());
+        assert!(exposure(&OrderRequest::market(entry()), &none).is_err());
+
+        // Only a child that flattens what the entry opened is covered: not a
+        // larger quantity, another symbol, another buy, or a market entry.
+        let under = |child: OrderRequest| OrderRequest::limit(entry(), d("50")).triggers(child);
+        assert!(exposure(&under(stop()), &none).is_ok());
+        for uncovered in [
+            OrderRequest::stop(
+                OrderRequestLeg::equity(OrderInstruction::Sell, "AAPL", 3),
+                d("45"),
+            ),
+            OrderRequest::stop(
+                OrderRequestLeg::equity(OrderInstruction::Sell, "MSFT", 2),
+                d("45"),
+            ),
+            OrderRequest::stop(entry(), d("55")),
+        ] {
+            assert!(exposure(&under(uncovered), &none).is_err());
+        }
+        assert!(exposure(&OrderRequest::market(entry()).triggers(stop()), &none).is_err());
     }
 }

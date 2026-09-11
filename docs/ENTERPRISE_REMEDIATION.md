@@ -64,7 +64,7 @@ Operator approval is the SHA-256 returned by `schwab_mcp::policy::intent_digest(
 
 Restricted principals cannot call aggregate linked-account endpoints or access account activity. Only one configured principal may use streaming tools for a shared broker stream identity. Separate broker credentials/deployments are required for independently owned stream sessions.
 
-The built-in risk policy is deliberately narrow: bounded-price, single-leg equity/option orders with positive quantity and gross notional caps; opening short positions and multi-leg exposure require an external portfolio risk engine. Options require an operator-verified multiplier per exact symbol. Quantity/notional caps do not implement portfolio margin, position limits or regulatory suitability. The SDK retains broader order expressiveness for applications implementing those checks.
+The built-in risk policy is deliberately narrow: bounded-price, single-leg equity/option orders with positive quantity and gross notional caps; opening short positions and multi-leg exposure require an external portfolio risk engine. Options require an operator-verified multiplier per exact symbol. Child strategies are summed into the same gross figures, so a bracket counts entry + take-profit + stop-loss; the stop-loss is the one unbounded order the policy accepts, because a child that only flattens the long position its bounded parent opens cannot fill for more than the parent paid and is priced at the parent's limit. Quantity/notional caps do not implement portfolio margin, position limits or regulatory suitability. The SDK retains broader order expressiveness for applications implementing those checks.
 
 ## Remaining release validation
 

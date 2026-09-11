@@ -185,8 +185,9 @@ impl OrderInstruction {
     }
 
     /// Whether filling this instruction leaves the account long the
-    /// instrument (`BUY`, `BUY_TO_OPEN`) rather than short.
-    fn opens_long(self) -> Option<bool> {
+    /// instrument (`BUY`, `BUY_TO_OPEN`) rather than short; `None` for
+    /// instructions that close or exchange.
+    pub fn opens_long(self) -> Option<bool> {
         match self {
             Self::Buy | Self::BuyToOpen => Some(true),
             Self::SellShort | Self::SellToOpen => Some(false),
