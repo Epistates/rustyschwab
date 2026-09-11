@@ -16,7 +16,7 @@ use schwab_types::market_data::{
     Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
 };
 use schwab_types::streaming::StreamService;
-use schwab_types::trading::OrderRequest;
+use schwab_types::trading::{OrderRequest, OrderSpec};
 use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
@@ -623,8 +623,31 @@ impl SchwabMcp {
     }
 
     // ============================================================
-    // Orders (write) — always available: preview
+    // Orders (write) — always available: build, preview
     // ============================================================
+
+    /// Expand a compact order spec (`kind`: `market`, `limit`, `stop`,
+    /// `stop_limit`, `trailing_stop`, `net_debit`, `net_credit`, `net_zero`,
+    /// `oco`, `trigger`, `bracket`) into the exact `order` JSON that
+    /// `preview_order`, `place_order` and `replace_order` accept. Option legs
+    /// take an OSI `symbol` or the contract by parts; `bracket` derives the
+    /// good-till-cancel take-profit/stop-loss pair from the entry leg. Runs
+    /// locally, never contacts Schwab, and validates the result.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = false
+    )]
+    async fn build_order(&self, spec: OrderSpec) -> McpResult<Json<serde_json::Value>> {
+        timed("build_order", async {
+            let order = spec.build().map_err(McpError::invalid_params)?;
+            let json =
+                serde_json::to_value(order).map_err(|e| McpError::internal(e.to_string()))?;
+            Ok(Json(json))
+        })
+        .await
+    }
 
     /// Dry-run an order to see fees, buying-power impact, and validation
     /// errors *without* submitting it. Always available — does not touch

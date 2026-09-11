@@ -543,8 +543,11 @@ require an explicit tool permission.
 - **Accounts** — `get_account_numbers`, `get_accounts`, `get_account`,
   `get_user_preferences`
 - **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`
-- **Orders (write)** — `preview_order`, `place_order`, `cancel_order`,
-  `replace_order` *(last three gated)*
+- **Orders (write)** — `build_order(spec)` expands a compact spec
+  (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
+  contract parts) into the exact `order` JSON the next three accept, locally
+  and without contacting Schwab; `preview_order`, `place_order`,
+  `cancel_order`, `replace_order` *(last three gated)*
 - **Transactions** — `get_transactions`, `get_transaction`
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,

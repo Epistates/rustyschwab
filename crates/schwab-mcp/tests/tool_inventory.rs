@@ -30,6 +30,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_account_orders",
     "get_all_orders",
     // Orders (write)
+    "build_order",
     "preview_order",
     "place_order",
     "cancel_order",
@@ -98,7 +99,7 @@ fn every_expected_tool_is_registered() {
             annotations.open_world_hint,
             Some(!matches!(
                 tool.name.as_str(),
-                "stream_status" | "stream_snapshot"
+                "build_order" | "stream_status" | "stream_snapshot"
             ))
         );
         let schema = serde_json::to_value(tool).unwrap();
@@ -118,4 +119,65 @@ fn every_expected_tool_is_registered() {
         EXPECTED_TOOLS.len(),
         "registered tools count mismatch — registered: {names:?}",
     );
+}
+
+/// `build_order` runs locally: its output is the strict `OrderRequest`
+/// JSON the write tools accept, and its input schema exposes the `kind`
+/// discriminator so clients can compose specs from the schema alone.
+#[tokio::test]
+async fn build_order_expands_specs_into_order_requests() {
+    let server = server();
+    let schema = serde_json::to_value(
+        server
+            .list_tools()
+            .into_iter()
+            .find(|t| t.name == "build_order")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        schema["inputSchema"].to_string().contains("\"kind\""),
+        "{}",
+        schema["inputSchema"]
+    );
+    let result = server
+        .call_tool(
+            "build_order",
+            serde_json::json!({"spec": {
+                "kind": "bracket",
+                "entry": {"kind": "limit", "price": "150.25",
+                    "leg": {"instruction": "BUY", "quantity": "10",
+                        "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
+                "take_profit": "160",
+                "stop_loss": "145"
+            }}),
+            &turbomcp::RequestContext::stdio(),
+        )
+        .await
+        .unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    let order = match &result["structuredContent"] {
+        serde_json::Value::Null => {
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+        structured => structured.clone(),
+    };
+    let request: schwab_rs::types::trading::OrderRequest =
+        serde_json::from_value(order.clone()).unwrap();
+    request.validate().unwrap();
+    assert_eq!(order["orderStrategyType"], "TRIGGER");
+    assert_eq!(order["childOrderStrategies"][0]["orderStrategyType"], "OCO");
+
+    let rejected = server
+        .call_tool(
+            "build_order",
+            serde_json::json!({"spec": {"kind": "iceberg"}}),
+            &turbomcp::RequestContext::stdio(),
+        )
+        .await;
+    let rejected = match rejected {
+        Ok(result) => serde_json::to_value(result).unwrap()["isError"] == true,
+        Err(_) => true,
+    };
+    assert!(rejected, "unknown kinds must be rejected");
 }

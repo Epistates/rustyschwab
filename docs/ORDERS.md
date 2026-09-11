@@ -169,6 +169,44 @@ constructor (`TRAILING_STOP_LIMIT`, `LIMIT_ON_CLOSE`, `priceLinkBasis`, …)
 can be set directly or deserialized from JSON. The paper engine and the MCP
 policy reject some of these fields; see their docs.
 
+## JSON specs and the MCP `build_order` tool
+
+`OrderSpec` is the same composition in JSON, keyed by `kind`. The MCP
+server's `build_order` tool takes one and returns the expanded, validated
+`OrderRequest` JSON to pass to `preview_order` / `place_order`, so the
+operator-approved intent and the request Schwab receives stay one shape.
+`OrderSpec::build()` (or `OrderRequest::try_from(spec)`) does the same in
+Rust for config-driven callers.
+
+```json
+{
+  "kind": "bracket",
+  "entry": {
+    "kind": "limit",
+    "leg": {
+      "instruction": "BUY_TO_OPEN", "quantity": "1",
+      "instrument": {"asset_type": "OPTION", "underlying": "AAPL",
+                     "expiration": "2024-05-17", "right": "PUT", "strike": "190"},
+      "position_effect": "OPENING"
+    },
+    "price": "2.50",
+    "settings": {"duration": "GOOD_TILL_CANCEL", "tag": "hedge-1"}
+  },
+  "take_profit": "4.00",
+  "stop_loss": "1.50"
+}
+```
+
+Single kinds (`market`, `limit`, `stop`, `stop_limit`, `trailing_stop`)
+take `leg`; the net-priced kinds (`net_debit`, `net_credit`, `net_zero`)
+take `legs`; all accept `settings` with `session`, `duration`, `tag`,
+`complex_strategy`, `special_instruction`, `destination`,
+`tax_lot_method` and `stop_type`. `oco` takes `first` / `second`,
+`trigger` takes `entry` / `children`, `bracket` takes `entry` /
+`take_profit` / `stop_loss`. Option instruments give either an OSI
+`symbol` or all of `underlying`, `expiration`, `right`, `strike`. Unknown
+keys are errors.
+
 ## Tips
 
 - Symbols: equities `AAPL`; indexes `$SPX`; options via `OptionSymbol`.

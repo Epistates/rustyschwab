@@ -46,7 +46,9 @@ use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 mod builder;
+mod spec;
 pub use builder::OptionSymbol;
+pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]

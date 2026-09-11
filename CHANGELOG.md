@@ -217,6 +217,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`AAPL  240517P00190000`), validating the root, right and strike.
   `schwab_types::Decimal` re-exports `rust_decimal::Decimal` so callers
   can write prices without their own dependency.
+- `trading::OrderSpec` is the same composition as JSON, keyed by `kind`
+  (`market` … `net_zero`, `oco`, `trigger`, `bracket`) with `LegSpec` /
+  `InstrumentSpec` (OSI symbol or contract parts) and `OrderSettings`;
+  `OrderSpec::build()` / `OrderRequest::try_from` expand and validate it.
+  Unknown keys are rejected at every level.
+- `schwab-mcp` gains the read-only, local `build_order(spec)` tool that
+  returns the expanded `OrderRequest` JSON for `preview_order` /
+  `place_order` / `replace_order`, so policy digests and operator
+  approvals keep seeing the single wire shape. Principals must list it in
+  `tools` like any other tool.
 - `docs/ORDERS.md` is rewritten around the constructors; it previously
   showed the response type `Order` with fields that do not exist.
 
