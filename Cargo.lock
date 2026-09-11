@@ -210,7 +210,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "auth_test"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "comprehensive"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "enterprise-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures-util",
@@ -2482,7 +2482,7 @@ dependencies = [
 
 [[package]]
 name = "oauth-flow"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dotenvy",
@@ -3953,7 +3953,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "streaming-examples"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "schwab-rs",
