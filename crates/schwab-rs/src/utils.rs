@@ -11,9 +11,10 @@ use chrono::{DateTime, Utc};
 /// provides standardized conversion from DateTime to the required format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeFormat {
-    /// ISO 8601 format: "2024-10-26T15:30:00Z"
+    /// Schwab's ISO 8601 spelling: "2024-10-26T15:30:00.000Z"
     ///
-    /// Used by most trading endpoints (orders, transactions)
+    /// Used by the order and transaction listings; see
+    /// [`schwab_timestamp`](schwab_types::common::schwab_timestamp).
     Iso8601,
 
     /// Unix epoch timestamp in seconds: 1698340200
@@ -67,29 +68,7 @@ pub enum TimeFormat {
 /// ```
 pub fn format_time(dt: Option<DateTime<Utc>>, format: TimeFormat) -> Option<String> {
     dt.map(|d| match format {
-        TimeFormat::Iso8601 => {
-            // Python: f"{dt.isoformat().split('+')[0][:-3]}Z"
-            // Strips microseconds (keeps only milliseconds) and adds 'Z'
-            let iso = d.to_rfc3339();
-
-            // Split at '+' (timezone marker) to get timestamp part
-            let timestamp = iso
-                .split('+')
-                .next()
-                .unwrap_or(&iso) // Always safe: split() yields at least one element
-                .split('Z')
-                .next()
-                .unwrap_or(&iso); // Fallback to original if split fails
-
-            // Remove microseconds (keep only milliseconds):
-            // "2024-10-26T15:30:00.123456" → "2024-10-26T15:30:00.123"
-            if let Some(dot_pos) = timestamp.rfind('.') {
-                let (base, micros) = timestamp.split_at(dot_pos);
-                format!("{}{:.3}Z", base, &micros[..4.min(micros.len())])
-            } else {
-                format!("{}Z", timestamp)
-            }
-        }
+        TimeFormat::Iso8601 => schwab_types::common::schwab_timestamp(d),
         TimeFormat::Epoch => {
             // Unix epoch in seconds
             d.timestamp().to_string()
@@ -183,16 +162,16 @@ mod tests {
             .with_nanosecond(123456789)
             .unwrap();
 
-        let result = format_time(Some(dt), TimeFormat::Iso8601);
-        assert!(result.is_some());
-        let formatted = result.unwrap();
-
-        // Should start with date
-        assert!(formatted.starts_with("2024-10-26T"));
-        // Should end with Z
-        assert!(formatted.ends_with('Z'));
-        // Should contain time
-        assert!(formatted.contains("15:30:00"));
+        // Exactly three fractional digits, as Schwab documents.
+        assert_eq!(
+            format_time(Some(dt), TimeFormat::Iso8601).as_deref(),
+            Some("2024-10-26T15:30:00.123Z")
+        );
+        let whole = Utc.with_ymd_and_hms(2024, 10, 26, 15, 30, 0).unwrap();
+        assert_eq!(
+            format_time(Some(whole), TimeFormat::Iso8601).as_deref(),
+            Some("2024-10-26T15:30:00.000Z")
+        );
     }
 
     #[test]

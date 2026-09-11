@@ -23,6 +23,7 @@ mod common;
 
 use chrono::{Duration, Utc};
 use schwab_rs::types::accounts::{Account, AccountNumberHash, UserPreferences};
+use schwab_rs::types::common::schwab_timestamp as iso;
 use schwab_rs::types::market_data::{
     ExpirationChainResponse, InstrumentsResponse, MarketsHoursResponse, MoversResponse,
     OptionChainResponse, PriceHistoryResponse, QuoteItem, QuotesResponse,
@@ -281,10 +282,6 @@ fn endpoint(
         map_paths,
         decode,
     }
-}
-
-fn iso(ts: chrono::DateTime<Utc>) -> String {
-    ts.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
 /// Endpoints that need no account context.

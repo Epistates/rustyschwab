@@ -3,6 +3,7 @@ use crate::{
     SchwabClient,
     error::{Error, Result},
     storage::{StateDatabase, audit, sql},
+    types::trading::OrdersParams,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -386,11 +387,10 @@ impl SchwabClient {
                         "reconcile_orders",
                         reqwest::Method::GET,
                         &crate::client::account_path(account, "/orders")?,
-                        &[
-                            ("fromEnteredTime", from.to_rfc3339()),
-                            ("toEnteredTime", to.to_rfc3339()),
-                            ("maxResults", "3000".into()),
-                        ],
+                        &OrdersParams {
+                            max_results: Some(3000),
+                            ..OrdersParams::new(from, to)
+                        },
                     )
                     .await?;
                 if page.len() >= 3000 {

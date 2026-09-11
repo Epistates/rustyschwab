@@ -16,7 +16,7 @@ use schwab_types::market_data::{
     Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
 };
 use schwab_types::streaming::StreamService;
-use schwab_types::trading::{OrderRequest, OrderSpec};
+use schwab_types::trading::{OrderRequest, OrderSpec, OrdersParams, TransactionsParams};
 use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
@@ -493,9 +493,10 @@ impl SchwabMcp {
     }
 
     /// List orders for a specific account.
-    /// `from_entered_time`/`to_entered_time` are **required** by Schwab —
-    /// ISO-8601 (`2025-01-15T00:00:00.000Z`), max range one year.
-    /// `status` values: `AWAITING_PARENT_ORDER`, `WORKING`, `FILLED`, `CANCELED`, etc.
+    /// `params.fromEnteredTime`/`params.toEnteredTime` are **required** by
+    /// Schwab (RFC 3339, e.g. `2025-01-15T00:00:00Z`; max range one year).
+    /// `params.status` values: `AWAITING_PARENT_ORDER`, `WORKING`,
+    /// `FILLED`, `CANCELED`, etc.
     #[tool(
         read_only = true,
         destructive = false,
@@ -505,21 +506,12 @@ impl SchwabMcp {
     async fn get_account_orders(
         &self,
         account_hash: String,
-        from_entered_time: String,
-        to_entered_time: String,
-        max_results: Option<i32>,
-        status: Option<String>,
+        params: OrdersParams,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_account_orders", async {
             let resp = self
                 .client
-                .get_account_orders(
-                    &account_hash,
-                    &from_entered_time,
-                    &to_entered_time,
-                    max_results,
-                    status.as_deref(),
-                )
+                .get_account_orders(&account_hash, &params)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))
@@ -528,32 +520,17 @@ impl SchwabMcp {
     }
 
     /// List orders across all linked accounts in a time window.
-    /// `from_entered_time`/`to_entered_time` are **required** by Schwab —
-    /// ISO-8601 (`2025-01-15T00:00:00.000Z`), max range one year.
+    /// `params.fromEnteredTime`/`params.toEnteredTime` are **required** by
+    /// Schwab (RFC 3339, e.g. `2025-01-15T00:00:00Z`; max range one year).
     #[tool(
         read_only = true,
         destructive = false,
         idempotent = true,
         open_world = true
     )]
-    async fn get_all_orders(
-        &self,
-        from_entered_time: String,
-        to_entered_time: String,
-        max_results: Option<i32>,
-        status: Option<String>,
-    ) -> McpResult<Json<serde_json::Value>> {
+    async fn get_all_orders(&self, params: OrdersParams) -> McpResult<Json<serde_json::Value>> {
         timed("get_all_orders", async {
-            let resp = self
-                .client
-                .get_all_orders(
-                    &from_entered_time,
-                    &to_entered_time,
-                    max_results,
-                    status.as_deref(),
-                )
-                .await
-                .map_err(map_err)?;
+            let resp = self.client.get_all_orders(&params).await.map_err(map_err)?;
             Ok(redact::json_response(resp))
         })
         .await
@@ -564,10 +541,10 @@ impl SchwabMcp {
     // ============================================================
 
     /// List transactions for an account.
-    /// `start_date`/`end_date` are **required** — ISO-8601
-    /// (`2025-01-15T00:00:00.000Z`), max range one year. `types` is
-    /// **required**: `TRADE`, `DIVIDEND_OR_INTEREST`, `CASH_RECEIPT`,
-    /// `ELECTRONIC_FUND`, etc.
+    /// `params.startDate`/`params.endDate` are **required** (RFC 3339, e.g.
+    /// `2025-01-15T00:00:00Z`; max range one year), as is at least one
+    /// entry in `params.types`: `TRADE`, `DIVIDEND_OR_INTEREST`,
+    /// `CASH_RECEIPT`, `ELECTRONIC_FUND`, etc.
     #[tool(
         read_only = true,
         destructive = false,
@@ -577,21 +554,12 @@ impl SchwabMcp {
     async fn get_transactions(
         &self,
         account_hash: String,
-        start_date: String,
-        end_date: String,
-        types: String,
-        symbol: Option<String>,
+        params: TransactionsParams,
     ) -> McpResult<Json<serde_json::Value>> {
         timed("get_transactions", async {
             let resp = self
                 .client
-                .get_transactions(
-                    &account_hash,
-                    &start_date,
-                    &end_date,
-                    &types,
-                    symbol.as_deref(),
-                )
+                .get_transactions(&account_hash, &params)
                 .await
                 .map_err(map_err)?;
             Ok(redact::json_response(resp))

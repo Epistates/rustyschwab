@@ -325,11 +325,15 @@ println!("Open this URL in a browser: {}", auth_url);
 ### 3. Use the API
 
 ```rust,ignore
+use chrono::{Duration, Utc};
 use schwab_rs::types::Decimal;
 use schwab_rs::types::market_data::{
     FrequencyType, OptionChainParams, PeriodType, PriceHistoryParams, QuoteField,
 };
-use schwab_rs::types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
+use schwab_rs::types::trading::{
+    OrderInstruction, OrderRequest, OrderRequestLeg, OrderStatus, OrdersParams,
+    TransactionType, TransactionsParams,
+};
 
 // Get quotes
 let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
@@ -369,6 +373,20 @@ let preview = client.preview_order("account_hash", &order).await?;
 // `Location` header (no JSON body)
 let response = client.place_order("account_hash", &order).await?;
 println!("order id: {:?}", response.order_id);
+
+// List what filled this month, and the trades and dividends behind it.
+// Windows are `DateTime<Utc>`; the client emits Schwab's exact timestamp
+// spelling and rejects an inverted window before sending anything.
+let month_start = Utc::now() - Duration::days(30);
+let filled = client.get_account_orders("account_hash", &OrdersParams {
+    status: Some(OrderStatus::Filled),
+    ..OrdersParams::new(month_start, Utc::now())
+}).await?;
+let activity = client.get_transactions("account_hash", &TransactionsParams::new(
+    month_start,
+    Utc::now(),
+    [TransactionType::Trade, TransactionType::DividendOrInterest],
+)).await?;
 ```
 
 ### 4. Stream Market Data

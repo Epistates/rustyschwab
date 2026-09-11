@@ -15,7 +15,9 @@ use crate::types::market_data::{
     MoverFrequency, MoverIndex, MoverSort, MoversResponse, OptionChainResponse,
     PriceHistoryResponse, Projection, QuoteField, QuoteItem, QuotesResponse,
 };
-use crate::types::trading::{Order, OrderRequest, OrderSubmitResponse, Transaction};
+use crate::types::trading::{
+    Order, OrderRequest, OrderSubmitResponse, OrdersParams, Transaction, TransactionsParams,
+};
 use chrono::NaiveDate;
 use reqwest::{Method, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
@@ -882,32 +884,19 @@ impl SchwabClient {
 
     /// Get orders for an account.
     ///
-    /// `from_entered_time` / `to_entered_time` are **required** by Schwab
-    /// (ISO-8601, e.g. `2025-01-15T00:00:00.000Z`; max range one year).
+    /// Rejects an inverted window or a zero page size before the request is
+    /// sent; see [`OrdersParams::validate`].
     pub async fn get_account_orders(
         &self,
         account_hash: &str,
-        from_entered_time: &str,
-        to_entered_time: &str,
-        max_results: Option<i32>,
-        status: Option<&str>,
+        params: &OrdersParams,
     ) -> Result<Vec<Order>> {
-        let mut params = vec![
-            ("fromEnteredTime", from_entered_time.to_string()),
-            ("toEnteredTime", to_entered_time.to_string()),
-        ];
-        if let Some(max) = max_results {
-            params.push(("maxResults", max.to_string()));
-        }
-        if let Some(s) = status {
-            params.push(("status", s.to_string()));
-        }
-
+        params.validate().map_err(Error::InvalidParameter)?;
         self.request_with_query(
             "get_account_orders",
             Method::GET,
             &account_path(account_hash, "/orders")?,
-            &params,
+            params,
         )
         .await
     }
@@ -1027,57 +1016,29 @@ impl SchwabClient {
 
     /// Get all orders across all accounts.
     ///
-    /// `from_entered_time` / `to_entered_time` are **required** by Schwab
-    /// (ISO-8601, e.g. `2025-01-15T00:00:00.000Z`; max range one year).
-    pub async fn get_all_orders(
-        &self,
-        from_entered_time: &str,
-        to_entered_time: &str,
-        max_results: Option<i32>,
-        status: Option<&str>,
-    ) -> Result<Vec<Order>> {
-        let mut params = vec![
-            ("fromEnteredTime", from_entered_time.to_string()),
-            ("toEnteredTime", to_entered_time.to_string()),
-        ];
-        if let Some(max) = max_results {
-            params.push(("maxResults", max.to_string()));
-        }
-        if let Some(s) = status {
-            params.push(("status", s.to_string()));
-        }
-
-        self.request_with_query("get_all_orders", Method::GET, "/trader/v1/orders", &params)
+    /// Rejects an inverted window or a zero page size before the request is
+    /// sent; see [`OrdersParams::validate`].
+    pub async fn get_all_orders(&self, params: &OrdersParams) -> Result<Vec<Order>> {
+        params.validate().map_err(Error::InvalidParameter)?;
+        self.request_with_query("get_all_orders", Method::GET, "/trader/v1/orders", params)
             .await
     }
 
     /// Get account transactions.
     ///
-    /// `start_date`, `end_date` (ISO-8601, max range one year) and `types`
-    /// (e.g. `TRADE`, `DIVIDEND_OR_INTEREST`, `CASH_RECEIPT`) are
-    /// **required** by Schwab.
+    /// Rejects an inverted window or an empty type list before the request
+    /// is sent; see [`TransactionsParams::validate`].
     pub async fn get_transactions(
         &self,
         account_hash: &str,
-        start_date: &str,
-        end_date: &str,
-        types: &str,
-        symbol: Option<&str>,
+        params: &TransactionsParams,
     ) -> Result<Vec<Transaction>> {
-        let mut params = vec![
-            ("startDate", start_date.to_string()),
-            ("endDate", end_date.to_string()),
-            ("types", types.to_string()),
-        ];
-        if let Some(s) = symbol {
-            params.push(("symbol", s.to_string()));
-        }
-
+        params.validate().map_err(Error::InvalidParameter)?;
         self.request_with_query(
             "get_transactions",
             Method::GET,
             &account_path(account_hash, "/transactions")?,
-            &params,
+            params,
         )
         .await
     }

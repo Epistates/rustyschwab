@@ -6,6 +6,9 @@
 //! - Order status and responses
 //! - Transaction history
 //! - Execution reports
+//! - Query parameters for the order and transaction listings
+//!   ([`OrdersParams`](crate::trading::OrdersParams),
+//!   [`TransactionsParams`](crate::trading::TransactionsParams))
 //!
 //! # Building orders
 //!
@@ -42,6 +45,7 @@
 //! ```
 
 use crate::common::{AccountsInstrument, AssetType, PutCall};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
@@ -438,6 +442,52 @@ pub struct OrderSubmitResponse {
     pub location: Option<String>,
 }
 
+/// Query parameters for `GET .../orders` (one account) and `GET /orders`
+/// (every linked account).
+///
+/// Both bounds are required by Schwab, which formats them as
+/// [`schwab_timestamp`](crate::common::schwab_timestamp) on the wire and
+/// caps the window at one year.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct OrdersParams {
+    /// No orders entered before this instant are returned.
+    #[serde(serialize_with = "crate::common::serialize_timestamp")]
+    pub from_entered_time: DateTime<Utc>,
+    /// No orders entered after this instant are returned.
+    #[serde(serialize_with = "crate::common::serialize_timestamp")]
+    pub to_entered_time: DateTime<Utc>,
+    /// Page size (≥ 1); Schwab's default is 3000.
+    pub max_results: Option<u32>,
+    /// Only orders in this status.
+    pub status: Option<OrderStatus>,
+}
+
+impl OrdersParams {
+    /// Every order entered in the window, in Schwab's default page size.
+    pub fn new(from_entered_time: DateTime<Utc>, to_entered_time: DateTime<Utc>) -> Self {
+        Self {
+            from_entered_time,
+            to_entered_time,
+            max_results: None,
+            status: None,
+        }
+    }
+
+    /// Check the request against Schwab's documented bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.from_entered_time > self.to_entered_time {
+            return Err("fromEnteredTime must not be after toEnteredTime".into());
+        }
+        if self.max_results == Some(0) {
+            return Err("maxResults must be at least 1".into());
+        }
+        Ok(())
+    }
+}
+
 /// A transaction as Schwab reports it: header fields plus one
 /// [`TransferItem`] per instrument moved and per fee charged. There is no
 /// top-level instrument or fee map; a trade's security leg and each of its
@@ -494,6 +544,35 @@ pub enum TransactionType {
     MarginCall,
     MoneyMarket,
     SmaAdjustment,
+}
+
+impl TransactionType {
+    /// Wire name used in the `types` query parameter.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Trade => "TRADE",
+            Self::ReceiveAndDeliver => "RECEIVE_AND_DELIVER",
+            Self::DividendOrInterest => "DIVIDEND_OR_INTEREST",
+            Self::AchReceipt => "ACH_RECEIPT",
+            Self::AchDisbursement => "ACH_DISBURSEMENT",
+            Self::CashReceipt => "CASH_RECEIPT",
+            Self::CashDisbursement => "CASH_DISBURSEMENT",
+            Self::ElectronicFund => "ELECTRONIC_FUND",
+            Self::WireOut => "WIRE_OUT",
+            Self::WireIn => "WIRE_IN",
+            Self::Journal => "JOURNAL",
+            Self::Memorandum => "MEMORANDUM",
+            Self::MarginCall => "MARGIN_CALL",
+            Self::MoneyMarket => "MONEY_MARKET",
+            Self::SmaAdjustment => "SMA_ADJUSTMENT",
+        }
+    }
+}
+
+impl std::fmt::Display for TransactionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -646,6 +725,99 @@ pub struct TransactionInstrument {
     pub multiplier: Option<f64>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Query parameters for `GET .../transactions`.
+///
+/// Both bounds and at least one type are required by Schwab, which formats
+/// the bounds as [`schwab_timestamp`](crate::common::schwab_timestamp) on
+/// the wire, joins the types with commas, and caps the window at one year.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionsParams {
+    /// No transactions before this instant are returned.
+    #[serde(serialize_with = "crate::common::serialize_timestamp")]
+    pub start_date: DateTime<Utc>,
+    /// No transactions after this instant are returned.
+    #[serde(serialize_with = "crate::common::serialize_timestamp")]
+    pub end_date: DateTime<Utc>,
+    /// Transaction categories to include (at least one). Serializes as the
+    /// comma-joined list the query string takes; deserializes from that or
+    /// from a JSON array.
+    #[serde(
+        serialize_with = "serialize_transaction_types",
+        deserialize_with = "deserialize_transaction_types"
+    )]
+    pub types: Vec<TransactionType>,
+    /// Only activity in this symbol.
+    pub symbol: Option<String>,
+}
+
+impl TransactionsParams {
+    /// Every transaction of the given types in the window.
+    pub fn new(
+        start_date: DateTime<Utc>,
+        end_date: DateTime<Utc>,
+        types: impl IntoIterator<Item = TransactionType>,
+    ) -> Self {
+        Self {
+            start_date,
+            end_date,
+            types: types.into_iter().collect(),
+            symbol: None,
+        }
+    }
+
+    /// Check the request against Schwab's documented bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.start_date > self.end_date {
+            return Err("startDate must not be after endDate".into());
+        }
+        if self.types.is_empty() {
+            return Err("types must name at least one transaction type".into());
+        }
+        if self.symbol.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            return Err("symbol must not be blank".into());
+        }
+        Ok(())
+    }
+}
+
+/// Comma-joined wire names, the only list encoding the query string takes.
+fn serialize_transaction_types<S: serde::Serializer>(
+    types: &[TransactionType],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let csv = types
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    serializer.serialize_str(&csv)
+}
+
+/// Accept the comma-joined wire form back, so serialized params round-trip.
+fn deserialize_transaction_types<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<TransactionType>, D::Error> {
+    use serde::de::IntoDeserializer;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Types {
+        List(Vec<TransactionType>),
+        Csv(String),
+    }
+
+    match Types::deserialize(deserializer)? {
+        Types::List(types) => Ok(types),
+        Types::Csv(csv) => csv
+            .split(',')
+            .map(|name| TransactionType::deserialize(name.trim().into_deserializer()))
+            .collect(),
+    }
 }
 
 /// Outgoing orders have a strict schema, separate from tolerant broker responses.

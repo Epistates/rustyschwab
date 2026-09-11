@@ -427,6 +427,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `get_markets`/`get_market` and the matching MCP tools take them; each
   enum exposes `as_str()`/`Display` that is tested equal to its serde
   wire value. The unused `common::MarketType` was removed.
+- **Order and transaction listings** (breaking): `get_account_orders`,
+  `get_all_orders` and `get_transactions` take `OrdersParams` /
+  `TransactionsParams` (`schwab_types::trading`) instead of five
+  positional strings. Windows are `DateTime<Utc>` and leave the process
+  as `common::schwab_timestamp`, the `yyyy-MM-dd'T'HH:mm:ss.SSSZ`
+  spelling Schwab documents (three fractional digits, always). `status`
+  is `OrderStatus`, `types` is a non-empty `Vec<TransactionType>` joined
+  with commas on the wire (and read back from either a list or that
+  string), and `validate()` rejects an inverted window, a zero
+  `maxResults`, an empty type list or a blank symbol before any bytes
+  are sent. Reconciliation's order scan and the live-conformance harness
+  use the same formatter; previously reconciliation sent
+  `to_rfc3339()` (nanosecond fractions, `+00:00`), which is not the
+  documented form. The MCP `get_account_orders`, `get_all_orders` and
+  `get_transactions` tools take `params` with the same shape.
 - **Account paths**: every `/trader/v1/accounts/{hash}` builder now
   rejects empty or non-URL-safe segments and all-digit values (an
   account *number* where the `hashValue` is required) before any

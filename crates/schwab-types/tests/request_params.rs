@@ -2,12 +2,14 @@
 //! puts on the query string, and the param validators must enforce Schwab's
 //! documented combination tables before a request leaves the process.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, TimeZone, Utc};
+use schwab_types::common::schwab_timestamp;
 use schwab_types::market_data::{
     Candle, Entitlement, FrequencyType, Market, MoverFrequency, MoverIndex, MoverSort,
     OptionChainParams, OptionType, PeriodType, PriceHistoryParams, Projection, QuoteField,
 };
 use schwab_types::streaming::{LevelOneOptionFields, StreamService};
+use schwab_types::trading::{OrderStatus, OrdersParams, TransactionType, TransactionsParams};
 use serde::Serialize;
 
 /// The serde representation of `value` as a bare JSON string.
@@ -332,6 +334,155 @@ fn option_chain_validate() {
     assert_eq!(value["optionType"], "S");
     assert_eq!(value["fromDate"], "2025-01-15");
     assert!(value.get("toDate").is_none(), "None fields must be omitted");
+}
+
+#[test]
+fn schwab_timestamps_always_carry_three_fractional_digits() {
+    let whole = Utc.with_ymd_and_hms(2025, 1, 15, 9, 30, 0).unwrap();
+    assert_eq!(schwab_timestamp(whole), "2025-01-15T09:30:00.000Z");
+    let nanos = whole + chrono::Duration::nanoseconds(123_456_789);
+    assert_eq!(schwab_timestamp(nanos), "2025-01-15T09:30:00.123Z");
+}
+
+#[test]
+fn transaction_type_wire_names() {
+    assert_as_str_matches_serde(
+        &[
+            TransactionType::Trade,
+            TransactionType::ReceiveAndDeliver,
+            TransactionType::DividendOrInterest,
+            TransactionType::AchReceipt,
+            TransactionType::AchDisbursement,
+            TransactionType::CashReceipt,
+            TransactionType::CashDisbursement,
+            TransactionType::ElectronicFund,
+            TransactionType::WireOut,
+            TransactionType::WireIn,
+            TransactionType::Journal,
+            TransactionType::Memorandum,
+            TransactionType::MarginCall,
+            TransactionType::MoneyMarket,
+            TransactionType::SmaAdjustment,
+        ],
+        TransactionType::as_str,
+    );
+}
+
+#[test]
+fn orders_params_serialize_with_schwab_query_names() {
+    let from = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let to =
+        Utc.with_ymd_and_hms(2025, 1, 15, 16, 0, 0).unwrap() + chrono::Duration::milliseconds(250);
+    let params = OrdersParams {
+        max_results: Some(50),
+        status: Some(OrderStatus::Filled),
+        ..OrdersParams::new(from, to)
+    };
+    assert_eq!(params.validate(), Ok(()));
+    assert_eq!(
+        serde_json::to_value(&params).unwrap(),
+        serde_json::json!({
+            "fromEnteredTime": "2025-01-01T00:00:00.000Z",
+            "toEnteredTime": "2025-01-15T16:00:00.250Z",
+            "maxResults": 50,
+            "status": "FILLED",
+        })
+    );
+    let bare = serde_json::to_value(OrdersParams::new(from, to)).unwrap();
+    assert!(
+        bare.get("maxResults").is_none(),
+        "None fields must be omitted"
+    );
+    assert!(bare.get("status").is_none(), "None fields must be omitted");
+
+    // The wire form is RFC 3339, so it reads back as the same instant.
+    let back: OrdersParams =
+        serde_json::from_value(serde_json::to_value(&params).unwrap()).unwrap();
+    assert_eq!(back, params);
+}
+
+#[test]
+fn orders_params_validate() {
+    let from = Utc.with_ymd_and_hms(2025, 1, 15, 0, 0, 0).unwrap();
+    let to = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    assert!(
+        OrdersParams::new(from, to)
+            .validate()
+            .unwrap_err()
+            .contains("fromEnteredTime")
+    );
+    assert_eq!(OrdersParams::new(from, from).validate(), Ok(()));
+    let params = OrdersParams {
+        max_results: Some(0),
+        ..OrdersParams::new(to, from)
+    };
+    assert!(params.validate().unwrap_err().contains("maxResults"));
+}
+
+#[test]
+fn transactions_params_join_types_and_read_either_form_back() {
+    let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2025, 1, 31, 23, 59, 59).unwrap();
+    let params = TransactionsParams {
+        symbol: Some("AAPL".into()),
+        ..TransactionsParams::new(
+            start,
+            end,
+            [TransactionType::Trade, TransactionType::DividendOrInterest],
+        )
+    };
+    assert_eq!(params.validate(), Ok(()));
+    let value = serde_json::to_value(&params).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "startDate": "2025-01-01T00:00:00.000Z",
+            "endDate": "2025-01-31T23:59:59.000Z",
+            "types": "TRADE,DIVIDEND_OR_INTEREST",
+            "symbol": "AAPL",
+        })
+    );
+
+    let from_csv: TransactionsParams = serde_json::from_value(value).unwrap();
+    assert_eq!(from_csv, params);
+    let from_list: TransactionsParams = serde_json::from_value(serde_json::json!({
+        "startDate": "2025-01-01T00:00:00Z",
+        "endDate": "2025-01-31T23:59:59Z",
+        "types": ["TRADE", "DIVIDEND_OR_INTEREST"],
+        "symbol": "AAPL",
+    }))
+    .unwrap();
+    assert_eq!(from_list, params);
+
+    let bad = serde_json::from_value::<TransactionsParams>(serde_json::json!({
+        "startDate": "2025-01-01T00:00:00Z",
+        "endDate": "2025-01-31T23:59:59Z",
+        "types": "TRADE,BOGUS",
+    }));
+    assert!(bad.is_err(), "unknown transaction types must not be sent");
+}
+
+#[test]
+fn transactions_params_validate() {
+    let start = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+    let end = Utc.with_ymd_and_hms(2025, 1, 31, 0, 0, 0).unwrap();
+    assert!(
+        TransactionsParams::new(end, start, [TransactionType::Trade])
+            .validate()
+            .unwrap_err()
+            .contains("startDate")
+    );
+    assert!(
+        TransactionsParams::new(start, end, [])
+            .validate()
+            .unwrap_err()
+            .contains("types")
+    );
+    let params = TransactionsParams {
+        symbol: Some("  ".into()),
+        ..TransactionsParams::new(start, end, [TransactionType::Trade])
+    };
+    assert!(params.validate().unwrap_err().contains("symbol"));
 }
 
 #[test]

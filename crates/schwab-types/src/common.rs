@@ -8,9 +8,12 @@
 //!   [`AssetMainType`](crate::common::AssetMainType) on Market Data
 //! - [`AccountsInstrument`](crate::common::AccountsInstrument), the
 //!   instrument shape positions and order legs share
+//! - [`schwab_timestamp`](crate::common::schwab_timestamp), the one
+//!   timestamp spelling the Trader API's time-window query parameters accept
 //! - Response headers
 //! - Pagination info
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
@@ -169,4 +172,31 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(de)?;
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Format a timestamp for the Trader API's time-window query parameters
+/// (`fromEnteredTime`, `toEnteredTime`, `startDate`, `endDate`).
+///
+/// Schwab documents exactly one shape, `yyyy-MM-dd'T'HH:mm:ss.SSSZ`: UTC,
+/// a literal `Z`, and exactly three fractional digits. RFC 3339 spellings
+/// that omit the fraction or carry more digits are not the documented form,
+/// so the crate never emits them.
+///
+/// ```
+/// use chrono::{TimeZone, Utc};
+/// use schwab_types::common::schwab_timestamp;
+///
+/// let at = Utc.with_ymd_and_hms(2025, 1, 15, 9, 30, 0).unwrap();
+/// assert_eq!(schwab_timestamp(at), "2025-01-15T09:30:00.000Z");
+/// ```
+pub fn schwab_timestamp(at: DateTime<Utc>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// `serialize_with` adapter for [`schwab_timestamp`].
+pub(crate) fn serialize_timestamp<S: serde::Serializer>(
+    at: &DateTime<Utc>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&schwab_timestamp(*at))
 }
