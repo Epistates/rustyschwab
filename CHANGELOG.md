@@ -1,23 +1,26 @@
 # Changelog
 
-## Paper trading candidate
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased — 0.2.0 candidate]
+
+### Added — paper trading
 
 - Capture execution mutations atomically for new paper runs, including committed injected rejection and lost acknowledgement.
 - Verify captured execution history from a backup with `schwab-paper-verify --backup`; compare final accounts and complete order history and reject incomplete capture.
-
 - Add `schwab-paper-verify` for isolated bounded transcript verification with final account coverage and integrity checks.
 - Require dedicated paper ingestion roles; operator grants no longer imply quote, calendar, corporate-action or fault injection. Record accepted-event provenance atomically.
-
 - Version the paper model as `equity-bbo-v2`; older runs require their original binary/configuration.
 - Add explicit settlement calendars, durable pending cash, dividend entitlements, split cash-in-lieu and persistent stop triggers.
 - Add opt-in read-only REST quotes/calendar polling, logical integrity checks and backup-backed event payload compaction.
-
 - Add isolated durable long-equity paper execution, replay and wall-clock modes, finite-liquidity partial fills, exact-decimal accounting and injected faults.
 - Share verified gateway approval/lease controls through `TradingBackend`; add paper market ingestion and scoped account reports.
 - Add `schwab-paper` offline replay CLI, example commands, mode-isolation checks and release artifact inclusion.
 
-
-### Enterprise follow-up (0.2 candidate)
+### Changed — enterprise follow-up
 
 - Revalidate risk after admission waits; persist operator halts independently of recovery.
 - Split full order-history windows, follow known old orders by ID, and include external open-order exposure.
@@ -26,13 +29,11 @@
 - Bound REST recovery and synthetic delivery gaps; cover shared state, approval replay/revocation and recovery end to end.
 - Existing risk plugins must implement dispatch revalidation; use durable halt APIs for operator control. Review outstanding approvals after canonical digest migration.
 
+### Changed — MCP dependency and integration review
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased — 0.2.0 candidate]
+- Upgrade stable TurboMCP to 3.3 and refresh compatible locked dependencies.
+- Add behavior hints to all MCP tools and live-execution guidance to discovery.
+- Remove unused dependencies, configure weekly dependency checks, and document LLM integration gaps and v4 migration criteria.
 
 ### Enterprise utility operations
 
@@ -229,6 +230,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tools` like any other tool.
 - `docs/ORDERS.md` is rewritten around the constructors; it previously
   showed the response type `Order` with fields that do not exist.
+
+### Changed — documentation truth pass
+- `docs/ARCHITECTURE_OVERVIEW.md` is rewritten to describe the current
+  workspace: the three crates and five MCP binaries, the REST resilience
+  pipeline in the order it actually runs, the submission journal and SQLite
+  state layout, streaming generation/loss semantics, the MCP authorization
+  boundary and the authority gateway, plus a "where to look" table. It no
+  longer quotes line counts, test counts, dependency versions or grades.
+- `CONTRIBUTING.md` lists the exact CI commands and the `-p` form for the
+  example packages; `docs/INDEX.md` indexes every document that exists.
+- `docs/DEVELOPER_DOCUMENTATION.md`, `docs/QUICK_START.md` and
+  `docs/QUICK_REFERENCE.md` are removed. They were generated snapshots of an
+  older tree (wrong module layout, `cargo run --example`, "PKCE on by
+  default", test-count tables), and the last one documented the Python
+  Schwabdev API rather than this SDK.
+- README and the security section state what the code does instead of
+  grading it ("OWASP compliant", "world-class", "best-in-class",
+  "100% improvement" are gone); the nonexistent "90-second crash detection"
+  bullet and the `.rs` example file names are corrected.
+- Links to `docs/audit/` are converted to plain paths with a note that the
+  directory is git-ignored local evidence (it is uploaded as workflow
+  artifacts, never committed), so the docs no longer link to files that a
+  clone does not contain. `.gitignore` also covers the derived state files
+  next to the token file (`*.orders.json`, `*.orders.store/`, `*.sqlite3*`,
+  lock files).
+- `.env.example` documents `SCHWAB_CAPTURE_CALLBACK`; `docs/SETUP_GUIDE.md`
+  names the real key-file path (`schwab_tokens.key`) and the `-p oauth-flow`
+  command; `docs/MCP_LLM_INTEGRATION.md` counts 31 tools.
+- CHANGELOG: the paper-trading and enterprise follow-up notes that sat above
+  the preamble, and the MCP dependency review that sat under 0.1.0, now
+  live under Unreleased where the work is.
 
 ### Fixed — order enums aligned with the Trader API (breaking)
 - Spellings Schwab does not use are gone: `OrderType::CabinetOrder` is
@@ -527,9 +559,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `chacha20poly1305` (0.10)
 - `keyring` (3.6)
 - `secrecy` (0.10)
-
-### MCP dependency and integration review
-
-- Upgrade stable TurboMCP to 3.3 and refresh compatible locked dependencies.
-- Add behavior hints to all MCP tools and live-execution guidance to discovery.
-- Remove unused dependencies, configure weekly dependency checks, and document LLM integration gaps and v4 migration criteria.

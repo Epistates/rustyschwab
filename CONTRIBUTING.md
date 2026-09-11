@@ -1,211 +1,99 @@
-# Contributing to Schwab Rust SDK
+# Contributing
 
-Thank you for your interest in contributing to the Schwab Rust SDK! This document provides guidelines and instructions for contributing to the project.
+Thanks for helping. This file covers the mechanics; read
+[docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md) before
+changing anything non-trivial, and its "Where to look" table to find the
+right module.
 
-## Code of Conduct
+## Reporting issues
 
-Please be respectful and constructive in all interactions. We aim to maintain a welcoming and inclusive environment for all contributors.
+Search existing issues first. Include what you ran, what you expected,
+what happened, the crate version or commit, and your OS and Rust version.
+Redact account hashes, tokens and app keys from logs. Report security
+problems privately rather than in a public issue.
 
-## How to Contribute
+## Development setup
 
-### Reporting Issues
-
-1. Check existing issues to avoid duplicates
-2. Use the issue template when available
-3. Provide clear descriptions and steps to reproduce
-4. Include relevant error messages and logs
-5. Specify your environment (OS, Rust version, etc.)
-
-### Submitting Pull Requests
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes
-4. Add tests for new functionality
-5. Ensure all tests pass (`cargo test --all-features`)
-6. Run clippy (`cargo clippy -- -D warnings`)
-7. Format your code (`cargo fmt`)
-8. Commit with clear messages
-9. Push to your fork
-10. Open a Pull Request
-
-### Development Setup
+Rust 1.89 or newer (edition 2024). No other toolchain is needed; SQLite is
+bundled.
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd rustyschwab
-
-# Install Rust (if needed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build the project
-cargo build --all-features
-
-# Run tests
-cargo test --all-features
-
-# Run examples (requires credentials)
-SCHWAB_APP_KEY=your_key SCHWAB_APP_SECRET=your_secret cargo run --example comprehensive
+cargo build --workspace --all-targets --all-features
+cargo test --workspace --all-targets --all-features
 ```
 
-## Code Style
+Examples are workspace packages, so run them with `-p`:
 
-### Rust Guidelines
-
-- Follow standard Rust naming conventions
-- Use `rustfmt` for formatting
-- Use `clippy` for linting
-- Prefer explicit error handling over `unwrap()`
-- Document public APIs with doc comments
-- Add unit tests for new functions
-- Keep functions focused and small
-
-### Documentation
-
-- Add doc comments for all public items
-- Include examples in doc comments where helpful
-- Update README.md for significant changes
-- Update CHANGELOG.md following Keep a Changelog format
-
-### Testing
-
-- Write unit tests for new functionality
-- Add integration tests for API endpoints
-- Test error cases, not just happy paths
-- Mock external dependencies in tests
-- Ensure tests are deterministic
-
-## Project Structure
-
-```
-rustyschwab/
-├── crates/
-│   ├── schwab-rs/          # Main SDK library
-│   │   ├── src/
-│   │   │   ├── auth.rs     # OAuth implementation
-│   │   │   ├── client.rs   # API client
-│   │   │   ├── streaming/  # WebSocket streaming
-│   │   │   ├── error.rs    # Error types
-│   │   │   └── lib.rs      # Library root
-│   │   └── Cargo.toml
-│   └── schwab-types/       # Shared type definitions
-│       ├── src/
-│       │   ├── market_data.rs
-│       │   ├── streaming.rs
-│       │   ├── accounts.rs
-│       │   └── trading.rs
-│       └── Cargo.toml
-├── examples/               # Usage examples
-├── tests/                  # Integration tests
-└── Cargo.toml             # Workspace configuration
+```bash
+cp .env.example .env   # then fill in SCHWAB_APP_KEY / SCHWAB_APP_SECRET
+cargo run -p oauth-flow
+cargo run -p comprehensive
+cargo run -p streaming-examples --bin streaming_quotes
 ```
 
-## Commit Messages
+## Before opening a pull request
 
-Follow conventional commit format:
+Run what CI runs (`.github/workflows/ci.yml`):
 
-```
-type(scope): description
-
-[optional body]
-
-[optional footer]
-```
-
-Types:
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation changes
-- `style`: Code style changes
-- `refactor`: Code refactoring
-- `test`: Test additions or changes
-- `chore`: Maintenance tasks
-
-Example:
-```
-feat(auth): add token expiry notifications
-
-Implement callback system for token lifecycle events including
-access token expiry warnings and refresh token expiration.
-
-Closes #123
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo doc --workspace --no-deps --locked
+cargo build --workspace --all-targets --locked
+cargo test --workspace --all-targets --all-features --locked
+cargo check -p schwab-rs --no-default-features --locked
 ```
 
-## API Design Principles
+`--all-targets` skips doctests, so also run
+`cargo test --workspace --doc --all-features` when you touch doc comments.
+CI additionally tests on the MSRV, runs `cargo audit`, compares the public
+API against the base branch with `cargo-semver-checks`, and runs the stream
+soak harness. Intentional public-API breaks need a CHANGELOG entry with
+migration notes.
 
-1. **Type Safety**: Use strong types over primitive types
-2. **Error Handling**: Return `Result` types with descriptive errors
-3. **Async First**: All I/O operations should be async
-4. **Builder Pattern**: Use builders for complex configurations
-5. **Zero-Cost Abstractions**: Avoid runtime overhead where possible
+Then:
 
-## Security
+1. Add or update tests. Wire-shape changes need a fixture or `wiremock`
+   test; decoding changes should keep
+   `crates/schwab-types/tests/properties.rs` (no panic on arbitrary input)
+   passing.
+2. Add a line under `## [Unreleased]` in `CHANGELOG.md`
+   (Keep a Changelog format).
+3. Update `.env.example` and the README "Environment Variables" section if
+   you add or rename a `SCHWAB_*` variable, and
+   `crates/schwab-mcp/tests/tool_inventory.rs` if you add an MCP tool.
+4. Keep commits focused; one concern per commit.
 
-- Never commit credentials or tokens
-- Validate all user inputs
-- Use HTTPS for all API calls
-- Follow OWASP security guidelines
-- Report security issues privately
+## Style
 
-## Performance
+`rustfmt` and `clippy -D warnings` are the style guide. Beyond that:
 
-- Profile before optimizing
-- Minimize allocations in hot paths
-- Use `Arc` for shared immutable data
-- Consider using `parking_lot` for synchronization
-- Batch operations where possible
+- Prefer typed fields over `String`/`Value`; if Schwab's shape is
+  uncertain, say so in a comment and keep the tolerant type on the response
+  side only.
+- Errors go through `schwab_rs::Error`; add a variant rather than stringly
+  errors, and set `ErrorKind`/`is_retryable` correctly.
+- Every metric is declared in `metrics.rs` with its label set; do not emit
+  ad-hoc names.
+- Anything that touches submissions must keep the never-replay rule and the
+  journal `begin_once`/`finish` pairing.
+- Public items carry doc comments; doc examples must compile and pass
+  `cargo test --doc`.
 
-## Documentation Standards
+## Commit messages
 
-### Code Comments
-```rust
-/// Brief description of the function.
-///
-/// # Arguments
-///
-/// * `param` - Description of parameter
-///
-/// # Returns
-///
-/// Description of return value
-///
-/// # Errors
-///
-/// Description of possible errors
-///
-/// # Examples
-///
-/// ```
-/// use schwab_rs::Client;
-/// 
-/// let client = Client::new(config)?;
-/// ```
-pub fn example_function(param: &str) -> Result<String> {
-    // Implementation
-}
-```
+Conventional commit style: `type(scope): summary`, where type is one of
+`feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `perf`, `ci`. The body
+explains why, not what.
 
-## Release Process
+## Releases
 
-1. Update version in Cargo.toml files
-2. Update CHANGELOG.md
-3. Create git tag
-4. Push tag to trigger CI/CD
-5. Publish to crates.io
+1. Bump `version` in the workspace `Cargo.toml`.
+2. Move the `[Unreleased]` section in `CHANGELOG.md` to a dated version.
+3. Tag `vX.Y.Z` and push the tag. `release.yml` builds the binaries, an
+   SBOM and a provenance attestation.
+4. Publish `schwab-types`, then `schwab-rs`, then `schwab-mcp`.
 
-## Getting Help
-
-- Check the documentation
-- Look through existing issues
-- Ask in discussions
-- Review the examples
-
-## Recognition
-
-Contributors will be recognized in:
-- CHANGELOG.md for significant contributions
-- GitHub contributors page
-- Release notes
-
-Thank you for contributing to make this SDK better!
+See [docs/SUPPORT.md](docs/SUPPORT.md) for the compatibility policy.

@@ -4,16 +4,16 @@
 
 Scope: the current working tree based on `c4d6884ed44cbde8db782364d0a35893a394613a`, including the substantial pre-existing uncommitted changes. Reviewed SDK, types, MCP, CI, tests, and the local `../../reference/Schwabdev` implementation, validation, tests, and reference payloads. Production source was not changed. No live account requests or orders were made; probes used temporary token files, synthetic credentials, and localhost mocks. This is a source and local-test audit, not a live broker certification, regulatory assessment, penetration test, or latency benchmark.
 
-**Validation evidence**
+**Validation evidence** (files under `docs/audit/` are local, git-ignored artifacts)
 
 | Check | Result |
 |---|---|
 | `cargo test --workspace --all-targets --locked` | 125 passed, 3 ignored, 0 failed on macOS ARM64 / rustc 1.98.0 |
 | `cargo clippy --workspace --all-targets --locked --offline -- -D warnings` | Passed |
 | `cargo fmt --all -- --check` | Passed on the original audited tree |
-| `cargo +1.85 check --workspace --all-targets --locked --offline` | Failed: locked dependencies require newer compilers; see [log](audit/msrv.log) |
-| Targeted diagnostic probes | 9 passed: each asserts that a defect is present; see [source](audit/probes.rs) and [output](audit/probes.log) |
-| `cargo audit --file Cargo.lock --json` | Failed: 6 vulnerability advisories plus 4 warnings; fresh RustSec database dated 2026-09-09; see [machine-readable evidence](audit/security.json) |
+| `cargo +1.85 check --workspace --all-targets --locked --offline` | Failed: locked dependencies require newer compilers; see `audit/msrv.log` |
+| Targeted diagnostic probes | 9 passed: each asserts that a defect is present; see `audit/probes.rs` and `audit/probes.log` |
+| `cargo audit --file Cargo.lock --json` | Failed: 6 vulnerability advisories plus 4 warnings; fresh RustSec database dated 2026-09-09; see `audit/security.json` |
 
 The passing suite is not a readiness signal: token refresh tests include ignored placeholders, and the existing response fixtures omit the failing order, option, and fundamental-data contracts. Linux/Windows execution, feature combinations, rustdoc, load/soak tests, and broker-side behavior were not independently verified here.
 

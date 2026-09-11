@@ -1,7 +1,8 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 30 tools. Reads and previews are marked
+explicit behavior annotations for all 31 tools (`build_order`, which expands
+an `OrderSpec` locally, was added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.

@@ -1,75 +1,36 @@
-# Rustyschwab Documentation Index
+# Documentation index
 
-**Last Updated:** April 19, 2026
+## Using the SDK
 
-## 📖 User Guides (Start Here)
+- [Setup guide](SETUP_GUIDE.md) — Schwab portal registration, environment, first authentication.
+- [App callback URLs](APP_CALLBACK.md) — redirect URI requirements and local HTTPS.
+- [Placing orders](ORDERS.md) — constructors for single-leg, option, multi-leg and composite orders; the JSON `OrderSpec`.
+- [Real-time streaming](STREAMING.md) — services, field selection, backpressure and reconnect semantics.
+- [Troubleshooting](TROUBLESHOOTING.md) — 401s, symbol formatting, TLS, async pitfalls.
 
-### [Setup Guide](SETUP_GUIDE.md)
-Step-by-step instructions for Schwab portal registration, environment setup, and first-time authentication.
+## Running it in production
 
-### [Placing Orders](ORDERS.md)
-Concrete examples for trading:
-- Market and Limit orders
-- Stop orders and GTC duration
-- Option contract formatting
-- Complex strategies (Vertical Spreads)
-- Using the `preview_order` endpoint
+- [Operations](OPERATIONS.md) — deployment boundary, principal policy JSON, approvals, risk policy, recovery, health and metrics.
+- [Shared authority and broker gateway](SHARED_AUTHORITY.md) — `schwab-authority`, `RemoteBackend`, `schwab-remote`, cross-host workers.
+- [MCP and LLM integration](MCP_LLM_INTEGRATION.md) — tool behavior hints, transport choice, what an LLM client may and may not do.
+- [Paper trading](PAPER_TRADING.md) and [paper limitations](PAPER_LIMITATIONS.md) — the deterministic simulator and what it does not model.
+- [Support and compatibility policy](SUPPORT.md)
 
-### [Real-time Streaming](STREAMING.md)
-Detailed guide for the WebSocket engine:
-- Configuration and backpressure
-- Reconnection and persistence
-- Field-level customization
-- Handling data and heartbeats
+## Contributing
 
-### [Troubleshooting](TROUBLESHOOTING.md)
-Solutions for 401 Unauthorized, symbol formatting errors, SSL issues, and common async Rust pitfalls.
+- [Architecture overview](ARCHITECTURE_OVERVIEW.md) — crates, request pipeline, durable state, streaming, MCP authorization boundary, where to look.
+- [Contributing](../CONTRIBUTING.md) — workflow, checks, style.
+- [Changelog](../CHANGELOG.md)
 
-### [App Callback URLs](APP_CALLBACK.md)
-Detailed technical requirements for OAuth redirect URIs.
+## Enterprise readiness record
 
----
+- [Enterprise audit](ENTERPRISE_AUDIT.md) (2026-09-09, historical) → [remediation](ENTERPRISE_REMEDIATION.md) (historical) → [implementation status](ENTERPRISE_ROADMAP.md) (current).
+- `docs/audit/` — probe sources and qualification evidence; git-ignored, produced locally by `tools/` and published as `qualification.yml` artifacts.
 
-## 🛠 Developer & Contributor Reference
+## Quick answers
 
-### [README](../README.md)
-The primary entry point: feature list, installation, and security highlights.
-
-### [Developer Documentation](DEVELOPER_DOCUMENTATION.md)
-Deep dive for contributors:
-- Architecture diagrams
-- LOC and codebase statistics
-- Build system and dependency details
-- Test suite architecture (110+ tests)
-
-### [Quick Start Developer](QUICK_START.md)
-Immediate productivity guide for making code changes, adding endpoints, and running tests.
-
-### [Architecture Overview](ARCHITECTURE_OVERVIEW.md)
-Comprehensive technical design, component interactions, and security layer details.
-
-### [Contributing](../CONTRIBUTING.md)
-Contribution guidelines, code style, and release process.
-
----
-
-## Navigation Tips
-
-**"I want to trade options..."**
-See [ORDERS.md](ORDERS.md) for symbol formatting and code snippets.
-
-**"I need to debug a 401 error..."**
-See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) section on Authentication.
-
-**"I want to add a new API endpoint..."**
-See [QUICK_START.md](QUICK_START.md) section on Feature Addition.
-
-**"I need help with callback URLs..."**
-See [SETUP_GUIDE.md](SETUP_GUIDE.md) section on Local HTTPS or [APP_CALLBACK.md](APP_CALLBACK.md).
-
-**"Where are the examples?"**
-Check the `examples/` directory:
-- `oauth-flow`: Basic authentication
-- `auth_test`: CLI tool for token lifecycle
-- `comprehensive`: Full API & Streaming demo
-- `streaming-examples`: Specialized WebSocket demos (quotes, processing)
+- **Trade options** — [ORDERS.md](ORDERS.md#options).
+- **Debug a 401** — [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+- **Add an endpoint, tool or stream service** — the "Where to look" table in [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md#where-to-look).
+- **Callback URL problems** — [SETUP_GUIDE.md](SETUP_GUIDE.md) or [APP_CALLBACK.md](APP_CALLBACK.md).
+- **Examples** — workspace packages under `examples/`, run with `cargo run -p <package>`: `oauth-flow`, `auth_test`, `comprehensive`, `streaming-examples` (bins `streaming_demo`, `streaming_quotes`, `streaming_processing`), `enterprise-bench`.

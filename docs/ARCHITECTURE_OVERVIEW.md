@@ -1,936 +1,323 @@
-# Schwab Rust SDK - Comprehensive Architecture Overview
+# Architecture overview
 
-## Executive Summary
+How the workspace is put together and where each responsibility lives. This
+describes the code as it is; for how to run it see the [README](../README.md),
+[operations](OPERATIONS.md), [shared authority](SHARED_AUTHORITY.md) and
+[paper trading](PAPER_TRADING.md).
 
-The **rustyschwab** project is a production-grade Rust SDK for Charles Schwab's Trading and Market Data APIs. It provides comprehensive coverage of OAuth2 authentication, REST API endpoints, WebSocket streaming, and includes world-class security features. Total codebase: **6,485 lines of Rust** across **30 files** organized into 2 main crates.
+## Workspace
 
----
+Three published crates plus example packages, all on the workspace version
+(`0.2.0` candidate, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`):
 
-## 1. Project Purpose and Architecture
+| Crate | Role | Key dependencies |
+|---|---|---|
+| `schwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
+| `schwab-rs` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
+| `schwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 3.3, `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
 
-### Core Mission
-Provide a **type-safe, secure, and performant** Rust binding for the Charles Schwab API ecosystem, enabling:
-- **OAuth2 authentication** with advanced security (PKCE, token refresh, keychain storage)
-- **RESTful API calls** to market data, trading, and account endpoints
-- **WebSocket streaming** for real-time market data with automatic reconnection
-- **Enterprise-grade resilience** through rate limiting, retries, and backpressure control
-
-### High-Level Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                   Applications/Examples                      │
-└─────────────────────────────────────────────────────────────┘
-                            ↑
-┌─────────────────────────────────────────────────────────────┐
-│                  schwab-rs (Main SDK)                       │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  ┌──────────────────┐     ┌──────────────────────────────┐ │
-│  │   SchwabClient   │     │   StreamClient/WebSocket     │ │
-│  │  (REST Access)   │     │   (Real-time Data)           │ │
-│  └──────────────────┘     └──────────────────────────────┘ │
-│         ↓                           ↓                        │
-│  ┌──────────────────┐     ┌──────────────────────────────┐ │
-│  │  AuthManager     │     │  SubscriptionManager         │ │
-│  │  (OAuth2 + Tkn)  │     │  (Service subscriptions)     │ │
-│  └──────────────────┘     └──────────────────────────────┘ │
-│         ↓                           ↓                        │
-│  ┌──────────────────┐     ┌──────────────────────────────┐ │
-│  │ HttpTransport    │     │ WebSocketTransport           │ │
-│  │ (REST over HTTP) │     │ (Streaming over WS)          │ │
-│  └──────────────────┘     └──────────────────────────────┘ │
-│         ↓                           ↓                        │
-│  ┌──────────────────┐     ┌──────────────────────────────┐ │
-│  │ Retry + RateLimit│     │ Heartbeat + Reconnection     │ │
-│  │ (Resilience)     │     │ (Connection Management)      │ │
-│  └──────────────────┘     └──────────────────────────────┘ │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-                            ↑
-┌─────────────────────────────────────────────────────────────┐
-│             schwab-types (Type Definitions)                │
-├─────────────────────────────────────────────────────────────┤
-│  Market Data | Trading | Accounts | Streaming | Common      │
-└─────────────────────────────────────────────────────────────┘
-                            ↑
-┌─────────────────────────────────────────────────────────────┐
-│        Security Layer (Encryption + Auth)                   │
-├─────────────────────────────────────────────────────────────┤
-│  ChaCha20Poly1305 | Keychain | PKCE | SecretString         │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Key Architectural Principles
-
-1. **Layered Design**: Separation of concerns (auth, transport, business logic)
-2. **Security by Default**: Multiple storage backends, encrypted tokens, memory safety
-3. **Resilience Pattern**: Built-in retries, rate limiting, and circuit breaking
-4. **Type Safety**: Full Rust type system utilization for compile-time guarantees
-5. **Async-First**: Tokio-based async runtime for concurrent operations
-6. **Pluggable Storage**: Multiple token storage backends (File, EncryptedFile, Keychain)
-
----
-
-## 2. Main Crates and Modules Structure
-
-### Crate 1: `schwab-rs` (5,244 LOC) - Core SDK
-
-The main SDK implementation containing all business logic and integrations.
+`examples/` holds workspace packages (`oauth-flow`, `auth_test`,
+`comprehensive`, `streaming-examples`, `enterprise-bench`); run them with
+`cargo run -p <package>`, not `cargo run --example`.
 
 ```
-schwab-rs/
-├── src/
-│   ├── lib.rs (52 LOC)
-│   │   └─ Public API surface and module exports
-│   │
-│   ├── client.rs (596 LOC) ⭐ CORE
-│   │   ├─ SchwabClient: Main entry point (REST operations)
-│   │   ├─ SchwabClientBuilder: Fluent configuration
-│   │   ├─ ClientInner: Arc-wrapped internal state
-│   │   ├─ Rate limiting (governor crate)
-│   │   ├─ Retry policy application
-│   │   ├─ Request/response handling
-│   │   └─ Token refresh on 401 errors
-│   │
-│   ├── config.rs (365 LOC)
-│   │   ├─ SchwabConfig: Top-level configuration
-│   │   ├─ ClientConfig: HTTP client settings
-│   │   ├─ StreamConfig: WebSocket configuration
-│   │   ├─ RetryConfig: Exponential backoff settings
-│   │   ├─ RateLimitConfig: Rate limiting parameters
-│   │   ├─ ReconnectConfig: WebSocket reconnection strategy
-│   │   └─ ChannelKind: Bounded queues with explicit gap notifications
-│   │
-│   ├── error.rs (256 LOC)
-│   │   ├─ Error: Main error enum (HttpError, Auth, WebSocket, etc.)
-│   │   ├─ AuthError: Authentication-specific errors
-│   │   ├─ StreamError: Streaming-specific errors
-│   │   └─ Comprehensive error handling and conversion
-│   │
-│   ├── retry.rs (133 LOC)
-│   │   ├─ RetryPolicy: Implements exponential backoff
-│   │   ├─ Configurable max retries and backoff strategy
-│   │   ├─ Status-code based retry decisions
-│   │   └─ 5-minute max elapsed time cap
-│   │
-│   ├── security.rs (391 LOC) ⭐ SECURITY CRITICAL
-│   │   ├─ EncryptedToken: ChaCha20Poly1305 AEAD wrapper
-│   │   ├─ Encryption: Random nonce generation, encryption/decryption
-│   │   ├─ Key management: Random key generation, PBKDF2 derivation
-│   │   ├─ File permissions: Unix 0600 enforcement
-│   │   ├─ PKCE support: Code verifier/challenge generation
-│   │   └─ OWASP-compliant encryption (600k PBKDF2 iterations)
-│   │
-│   ├── utils.rs (224 LOC)
-│   │   ├─ format_list/format_list_str: Symbol list formatting
-│   │   ├─ format_time: Timestamp formatting
-│   │   ├─ TimeFormat enum: Multiple time format options
-│   │   └─ Utility functions for API parameter construction
-│   │
-│   ├── auth/ (918 + 483 = 1,401 LOC) ⭐ AUTHENTICATION
-│   │   ├── mod.rs (918 LOC)
-│   │   │   ├─ AuthManager: OAuth2 flow orchestration
-│   │   │   ├─ OAuthConfig: Detailed OAuth configuration
-│   │   │   ├─ TokenNotification: Event callbacks for token lifecycle
-│   │   │   ├─ TokenStoreKind: Enum for storage backend selection
-│   │   │   ├─ CallbackServer: Axum-based local callback capture
-│   │   │   ├─ Token refresh background task
-│   │   │   ├─ PKCE support (S256 method)
-│   │   │   ├─ 7-day refresh token expiration tracking
-│   │   │   ├─ Auto-refresh with configurable buffer
-│   │   │   └─ State management for concurrent operations
-│   │   │
-│   │   └── token_store.rs (483 LOC) ⭐ SECURE STORAGE
-│   │       ├─ TokenSet: Token container with SecretString wrapping
-│   │       ├─ TokenStore trait: Pluggable storage abstraction
-│   │       ├─ FileTokenStore: Plain JSON with 0600 permissions
-│   │       ├─ EncryptedFileTokenStore: ChaCha20Poly1305 encrypted
-│   │       ├─ KeychainTokenStore: Cross-platform OS-native storage
-│   │       ├─ Token validation (expiry checking)
-│   │       └─ Secure serialization/deserialization
-│   │
-│   ├── streaming/ (1,547 LOC) ⭐ REAL-TIME DATA
-│   │   ├── client.rs (1,396 LOC)
-│   │   │   ├─ StreamClient: Main streaming entry point
-│   │   │   ├─ StreamClientBuilder: Fluent builder pattern
-│   │   │   ├─ ConnectionState: Tracks connection lifecycle
-│   │   │   ├─ MessageSender/MessageReceiver: Tracked bounded delivery and health state
-│   │   │   ├─ Ping/Pong heartbeat (20s interval, 30s timeout)
-│   │   │   ├─ Exponential backoff reconnection (2s-128s)
-│   │   │   ├─ 90-second crash detection
-│   │   │   ├─ Subscription persistence across reconnections
-│   │   │   ├─ Service-specific field selection
-│   │   │   ├─ 13 streaming services fully implemented
-│   │   │   └─ Request ID tracking and ACK handling
-│   │   │
-│   │   ├── subscription.rs (147 LOC)
-│   │   │   ├─ SubscriptionManager: Tracks active subscriptions
-│   │   │   ├─ Subscription: Individual subscription state
-│   │   │   ├─ Field-based subscription batching
-│   │   │   └─ Service state tracking
-│   │   │
-│   │   └── mod.rs (6 LOC)
-│   │       └─ Module re-exports
-│   │
-│   ├── transport/ (160 LOC)
-│   │   ├── mod.rs (4 LOC)
-│   │   │   └─ Module re-exports
-│   │   │
-│   │   ├── http.rs (74 LOC)
-│   │   │   ├─ HttpTransport: Thin wrapper over reqwest
-│   │   │   ├─ Request building (headers, query, body)
-│   │   │   ├─ Response handling
-│   │   │   └─ HTTP status code → Error mapping
-│   │   │
-│   │   └── websocket.rs (82 LOC)
-│   │       ├─ WebSocketTransport: WebSocket wrapper
-│   │       ├─ Connection establishment
-│   │       ├─ Message send/receive operations
-│   │       └─ Stream splitting for concurrent read/write
-│   │
-│   └── (all REST endpoints consolidated into client.rs — no separate
-│       endpoints/ directory since the module was inlined)
-│
-└── Cargo.toml
-    ├─ Dependencies version: 0.1.0
-    ├─ Features: rustls-tls, native-tls, callback-server, full
-    └─ See Cargo.toml section below
+                 ┌──────────────────────────── schwab-mcp ────────────────────────────┐
+                 │ server.rs (31 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ stream_cache.rs  authority.rs (gateway)  bins: admin/authority/     │
+                 │ remote/paper/paper-verify                                            │
+                 └───────────────┬─────────────────────────────────┬──────────────────┘
+                                 │ SchwabClient / StreamClient      │ TradingBackend
+┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐
+│ schwab-rs                                                                            │
+│  auth/        client.rs      streaming/     execution.rs  coordination.rs  risk.rs   │
+│  transport/   retry.rs       reconciliation.rs  recovery.rs  readiness.rs           │
+│  circuit_breaker.rs  request_budget.rs  storage.rs (SQLite)  audit_delivery.rs      │
+│  broker.rs (TradingBackend)  paper/  remote.rs  security.rs  metrics.rs telemetry.rs │
+└──────────────────────────────────────────┬──────────────────────────────────────────┘
+                                           │
+┌──────────────────────────────────────────┴──────────────────────────────────────────┐
+│ schwab-types: market_data  trading (+ builder, spec)  accounts  streaming (+ payload) │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Crate 2: `schwab-types` (1,241 LOC) - Type Definitions
+## schwab-types
 
-Pure data types crate with no business logic (no dependencies on SDK, async, or network code).
+One module per Schwab API area: `market_data`, `trading`, `accounts`,
+`streaming`, `common`. Design rules:
 
-```
-schwab-types/
-├── src/
-│   ├── lib.rs (12 LOC)
-│   │   └─ Module re-exports for public API
-│   │
-│   ├── market_data.rs (470 LOC) ⭐ QUOTES & CHAINS
-│   │   ├─ QuotesResponse: Quote data wrapper
-│   │   ├─ QuoteItem: Individual quote with 4 sub-types (Quote, Fundamental, Extended, Reference)
-│   │   ├─ QuoteQuote: OHLCV, spreads, Greeks
-│   │   ├─ QuoteFundamental: P/E, dividend, margin metrics
-│   │   ├─ OptionChainResponse: Option data structure
-│   │   ├─ OptionExpirationDate: Expiration info
-│   │   ├─ OptionChain: Underlying + expiration map
-│   │   ├─ OptionData: Strike, bid/ask, Greeks (Delta, Gamma, Theta, Vega)
-│   │   ├─ PriceHistoryResponse: OHLCV bars with timestamps
-│   │   ├─ PriceHistoryItem: Individual bar data
-│   │   └─ Serde + serde_with for flexible deserialization
-│   │
-│   ├── trading.rs (242 LOC) ⭐ ORDERS & POSITIONS
-│   │   ├─ Order: Complete order structure
-│   │   ├─ OrderLeg: Individual leg in multi-leg order
-│   │   ├─ OrderInstrument: Equity, option, future identifiers
-│   │   ├─ OrderInstruction: BUY/SELL/BUY_TO_COVER/SELL_SHORT
-│   │   ├─ OrderType: MARKET/LIMIT/STOP/STOP_LIMIT/TRAILING_STOP/etc
-│   │   ├─ OrderSession: NORMAL/EXTENDED
-│   │   ├─ OrderDuration: DAY/GOOD_TIL_CANCEL/FILL_OR_KILL/etc
-│   │   ├─ OrderStatus: AWAITING_PARENT_ORDER/PENDING_ACTIVATION/etc
-│   │   ├─ OrderStrategyType: SINGLE/OCO/BTO/etc
-│   │   ├─ Position: Holdings data
-│   │   ├─ PositionEffect: OPEN/CLOSE/AUTOMATIC
-│   │   └─ ComplexOrderStrategyType: Advanced multi-leg types
-│   │
-│   ├── accounts.rs (147 LOC) ⭐ ACCOUNT DATA
-│   │   ├─ AccountsResponse: List of accounts wrapper
-│   │   ├─ Account: Core account structure
-│   │   ├─ AccountFields: Account data (balances, trading power, etc.)
-│   │   ├─ Position: Holdings information
-│   │   ├─ SecuritiesAccount: Unified container for account data
-│   │   ├─ BalanceFields: Cash, margin, options buying power
-│   │   └─ TransactionItem: Trade history entry
-│   │
-│   ├── streaming.rs (308 LOC) ⭐ REAL-TIME PROTOCOL
-│   │   ├─ StreamRequest: Service subscription request
-│   │   ├─ StreamRequests: Batch request wrapper
-│   │   ├─ StreamCommand: LOGIN/LOGOUT/SUBS/ADD/UNSUBS/VIEW
-│   │   ├─ StreamParameters: Dynamic request parameters
-│   │   ├─ StreamMessage: Enum for all response types
-│   │   │   ├─ Data: Streaming data (market quotes, orders, etc.)
-│   │   │   ├─ Response: Acknowledgment to subscription request
-│   │   │   ├─ Notify: Heartbeat and connection events
-│   │   │   └─ Snapshot: Initial data on subscription
-│   │   ├─ StreamService: 13 services (LevelOneEquities, OptionChains, etc.)
-│   │   ├─ StreamDataType: Data type discriminator
-│   │   ├─ Service-specific data structures (EquityData, OptionData, etc.)
-│   │   └─ serde_json::Value for flexible deserialization
-│   │
-│   └── common.rs (62 LOC)
-│       ├─ Common enums: AssetType, OrderLegType, Instruction
-│       └─ Shared type definitions
-│
-└── Cargo.toml
-    └─ Minimal dependencies (serde, chrono, uuid)
-```
+- **Strict out, tolerant in.** Types the SDK sends (`trading::OrderRequest`,
+  `OrderRequestLeg`, `OrderRequestInstrument`) use `deny_unknown_fields`
+  and exact `Decimal` prices/quantities. Types Schwab returns (`Order`,
+  `Account`, quotes, …) accept unknown fields and use `f64` where Schwab
+  emits numbers.
+- **`Decimal` is re-exported** (`schwab_types::Decimal`, also reachable as
+  `schwab_rs::types::Decimal`) so callers do not depend on `rust_decimal`
+  directly. Decimal fields deserialize from strings or numbers and serialize
+  as strings.
+- **Order construction** lives in `trading::builder` (constructors such as
+  `OrderRequest::limit`, `one_cancels_other`, `bracket`; `OptionSymbol` for
+  the OSI contract format) and `trading::spec` (`OrderSpec`, a JSON
+  composition keyed by `kind` that expands to the same `OrderRequest`).
+  `OrderRequest::validate` checks structure before anything leaves the
+  process. See [ORDERS.md](ORDERS.md).
+- **Streaming payloads** arrive with numbered fields; `streaming::payload`
+  holds the per-service field tables and typed `StreamPayload` variants
+  (`DataItem::decode`). Enum spellings for the Trader API were verified
+  against Schwab's documentation and the Schwabdev 3.0.5 reference client
+  (see the CHANGELOG "wire-shape audit" entries).
+- The `schemars` feature derives `JsonSchema` on the input types so the MCP
+  crate can publish tool schemas without hand-written JSON.
 
----
+## schwab-rs
 
-## 3. Key Dependencies in Cargo.toml Files
+### Configuration and authentication
 
-### Workspace Dependencies (Root)
+`config::SchwabConfig` bundles `OAuthConfig`, `ClientConfig` (base URL,
+timeout, retry, rate limit, circuit breaker) and an optional `StreamConfig`;
+`SchwabConfig::from_env` reads the `SCHWAB_*` variables listed in
+[`.env.example`](../.env.example). `validate()` runs on construction.
 
-```toml
-# Async Runtime (Tokio)
-tokio = "1.41" (features: full)
-tokio-tungstenite = "0.24" (features: native-tls)
-futures-util = "0.3"
-async-trait = "0.1"
+`auth::AuthManager` owns the OAuth authorization-code flow, the token set
+and refresh. Tokens are `SecretString`s held in a `TokenSet`; persistence
+goes through the `TokenStore` trait with three backends
+(`FileTokenStore` 0600 JSON, `EncryptedFileTokenStore` ChaCha20-Poly1305,
+`KeychainTokenStore` via `keyring`). Refresh is serialized across processes
+with a lock file next to the token file, and a rejected access token is
+refreshed once and retried by the client. The optional `callback-server`
+feature adds an axum/rustls HTTPS listener that captures the redirect
+(`capture_callback` / `SCHWAB_CAPTURE_CALLBACK`); without it `authorize`
+returns the URL and the caller passes the code to `exchange_code`. PKCE
+(S256) is implemented but off by default because Schwab's public flow does
+not use it.
 
-# HTTP and Networking
-reqwest = "0.12" (features: json, rustls-tls, cookies, stream)
-hyper = "1.5"
-url = "2.5"
-headers = "0.4"
+`security.rs` is the encryption, key derivation and file-permission code
+used by the stores; `security_windows.rs` applies an owner/SYSTEM DACL on
+Windows.
 
-# Serialization (serde ecosystem)
-serde = "1.0" (features: derive)
-serde_json = "1.0"
-serde_urlencoded = "0.7"
-serde_with = "3.11"
+### REST client
 
-# OAuth2
-oauth2 = "4.4"
-base64 = "0.22"
+`client::SchwabClient` is a cheap-to-clone `Arc` handle. Every endpoint
+method is a thin wrapper that names its operation (`op` label for metrics)
+and calls `execute_resilient`, which runs one logical call as:
 
-# Error Handling
-thiserror = "2.0"
-anyhow = "1.0"
+1. `ensure_live_state` — the durable state file must not belong to a paper
+   run (`meta.execution_mode`).
+2. Fetch the access token from `AuthManager`.
+3. `CircuitBreaker::call` (default: opens after 5 failures, half-open after
+   30 s). Reads run inside `RetryPolicy::execute` (default 3 retries,
+   100 ms → 10 s backoff with jitter, `Retry-After` honoured); **writes are
+   never retried** — an ambiguous outcome becomes `Error::SubmissionUnknown`
+   carrying the attempt ID.
+4. Each attempt: `RequestBudget::admit` (in-process `governor` limiter +
+   rolling per-minute window + shared quota through the `Coordinator`,
+   keyed by app key and API origin; default 2 req/s, burst 10), then for
+   submissions the durable operator halt, `RiskProvider::revalidate`
+   (fenced by a coordination lease when supplied) and the in-process
+   submission gate, then the transport call.
+5. A 401 on a read triggers one `refresh_rejected_token` and one replay.
+6. The whole call is bounded by `ClientConfig.timeout` (default 10 s) and
+   recorded in `schwab_http_requests_total` / `schwab_http_request_duration_seconds`.
 
-# Logging (facade pattern - user chooses impl)
-log = "0.4"
+`transport::HttpTransport` wraps `reqwest`; `request_for_location` handles
+Schwab's `201` + `Location` order responses.
 
-# Time and Date
-chrono = "0.4" (features: serde)
-humantime-serde = "1.1"
+### Order submission and durable state
 
-# Utilities
-once_cell = "1.20"
-parking_lot = "0.12" (RwLock for thread-safe shared state)
-pin-project = "1.1"
-bytes = "1.8"
-uuid = "1.11" (features: v4, serde)
-
-# Security (Best-in-class 2025)
-ring = "0.17" (CSPRNG, cryptography)
-rustls = "0.23" (Memory-safe TLS)
-webpki-roots = "0.26" (Root CA certificates)
-chacha20poly1305 = "0.10" (AEAD encryption - NCC Group audited)
-keyring = "3.6" (OS-native credential storage)
-secrecy = "0.10" (features: serde, Memory-safe secret handling)
-zeroize = "1.8" (features: derive, aarch64, Automatic memory clearing)
-
-# CLI and Config
-clap = "4.5" (features: derive, env)
-config = "0.14"
-dotenvy = "0.15"
-
-# Testing
-wiremock = "0.6"
-mockito = "1.6"
-mockall = "0.13"
-tower = "0.5"
-
-# Rate Limiting & Retry
-backoff = "0.4" (features: tokio, Exponential backoff)
-governor = "0.7" (Rate limiting)
-
-# Web Framework (Optional)
-axum = "0.7" (optional, for callback-server feature)
-```
-
-### Security Dependency Rationale
-
-| Crate | Purpose | Security Audits | Notes |
-|-------|---------|-----------------|-------|
-| `ring` | CSPRNG, cryptography primitives | Used by Google, Mozilla | Random nonce/PKCE generation |
-| `rustls` | TLS implementation | Multiple audits | Memory-safe replacement for OpenSSL |
-| `chacha20poly1305` | AEAD encryption | NCC Group 2020 | Token file encryption |
-| `keyring` | OS credential storage | Cross-platform | Keychain, Credential Manager, Secret Service |
-| `secrecy` | Secret handling | De facto Rust standard | Automatic token zeroization |
-| `zeroize` | Memory clearing | Industry standard | Prevents token leakage in memory dumps |
-
----
-
-## 4. Main Source Files and Their Purposes
-
-### Critical Files (>100 LOC each)
-
-| File | LOC | Purpose | Key Components |
-|------|-----|---------|-----------------|
-| `streaming/client.rs` | 1,396 | WebSocket streaming client | StreamClient, heartbeat, reconnection, subscriptions |
-| `auth/mod.rs` | 918 | OAuth2 authentication flow | AuthManager, token refresh, callback capture |
-| `client.rs` | 596 | REST API client | SchwabClient, rate limiting, retry logic, endpoints |
-| `auth/token_store.rs` | 483 | Secure token storage | TokenSet, FileTokenStore, EncryptedFileTokenStore, KeychainTokenStore |
-| `types/market_data.rs` | 470 | Quote and option chain types | Quotes, Options, Greeks, Price History |
-| `security.rs` | 391 | Encryption and key mgmt | ChaCha20Poly1305, PKCE, file permissions |
-| `config.rs` | 365 | Configuration structures | SchwabConfig, ClientConfig, StreamConfig |
-| `types/trading.rs` | 242 | Order and position types | Order, OrderLeg, Position, Transaction |
-| `utils.rs` | 224 | Utility functions | Symbol formatting, time formatting |
-| `error.rs` | 256 | Error types | Error, AuthError, StreamError enums |
-| `types/streaming.rs` | 308 | WebSocket message types | StreamRequest, StreamMessage, StreamService |
-
-### Endpoint organization
-
-All REST endpoint methods live directly on `SchwabClient` in
-`client.rs` — the former `endpoints/` directory of thin wrappers
-has been consolidated so there's a single place to look up any
-endpoint's signature, instrumentation (`op` label), and URL.
-
----
-
-## 5. Architectural Patterns and Decisions
-
-### 1. **Builder Pattern**
-```rust
-// SchwabClientBuilder for fluent configuration
-let client = SchwabClient::builder()
-    .config(config)
-    .build()?;
-
-// StreamClientBuilder for streaming setup
-let stream = StreamClient::builder()
-    .config(stream_config)
-    .auth_manager(auth_manager)
-    .customer_id(customer_id)
-    .build()?;
-```
-
-### 2. **Arc<RwLock<T>> for Thread-Safe State**
-```rust
-pub struct SchwabClient {
-    inner: Arc<ClientInner>,  // Shareable, cloneable
-}
-
-pub struct StreamClient {
-    inner: Arc<StreamClientInner>,
-}
-```
-**Rationale**: Allows `SchwabClient` to be cloned and shared across threads while maintaining single ownership of internal state.
-
-### 3. **Pluggable Storage Backends (Strategy Pattern)**
-
-```rust
-pub enum TokenStoreKind {
-    File,           // Plain JSON (development)
-    EncryptedFile,  // ChaCha20Poly1305 (production recommended)
-    Keychain,       // OS-native (production best)
-}
-```
-**Rationale**: Allows users to choose security/complexity tradeoff without code changes.
-
-### 4. **Trait-Based Abstraction for Transport**
-
-```rust
-// HTTP transport (thin wrapper over reqwest)
-pub struct HttpTransport { ... }
-
-// WebSocket transport (thin wrapper over tokio-tungstenite)
-pub struct WebSocketTransport { ... }
-```
-**Rationale**: Separates networking details from business logic; enables testing with mocks.
-
-### 5. **Exponential Backoff Retry Policy**
-
-```rust
-pub struct RetryPolicy {
-    config: RetryConfig,
-}
-
-// 1. Initial backoff: 1s
-// 2. Multiplier: 2.0
-// 3. Max backoff: 30s
-// 4. Max elapsed: 5 minutes
-```
-**Rationale**: Prevents thundering herd; respects rate limits gracefully.
-
-### 6. **Rate Limiting with Governor**
-
-```rust
-let quota = Quota::per_second(120).allow_burst(20);
-let rate_limiter = RateLimiter::direct(quota);
-```
-**Default**: 2 req/s with a 10-request burst; configure for application entitlement.
-**Pattern**: Async-aware using `rate_limiter.until_ready().await`
-
-### 7. Bounded streaming delivery
-
-`StreamClient` uses a tracked bounded queue (4,096 messages by default).
-Consumers receive explicit health, generation and loss state. Overflow
-invalidates the session and requires reconciliation; it does not silently
-return an apparently healthy snapshot. The legacy `Unbounded` configuration
-is capped at 65,536 messages. See the enterprise remediation guide for
-freshness and activity-history semantics.
-
-### 8. **Heartbeat + Ping/Pong for Connection Stability**
-
-```rust
-// Streaming client sends Ping every 20s, expects Pong within 30s
-// Automatic reconnection if timeout detected
-config.heartbeat_interval = Duration::from_secs(20);
-config.ping_timeout = Duration::from_secs(30);
-```
-**Rationale**: Detects dead connections before application logic fails; prevents hanging subscriptions.
-
-### 9. **90-Second Crash Detection**
-
-```rust
-connection_start: Arc<RwLock<Option<Instant>>>,
-
-// If connection crashes and reconnects within 90s, 
-// restore subscriptions automatically
-```
-**Rationale**: Schwab broker-side behavior; SDK mirrors it for transparent failover.
-
-### 10. **Security Layering (Defense-in-Depth)**
+`submit_order_request` (behind `place_order`, `replace_order` and their
+`_fenced` variants) validates the request, assigns a `tag` if absent, and
+walks the execution journal:
 
 ```
-Layer 1: Memory      → SecretString (auto-zeroize on drop)
-Layer 2: Storage     → ChaCha20Poly1305 AEAD (EncryptedFile) or Keychain
-Layer 3: Transport   → HTTPS/WSS only (rustls, no OpenSSL)
-Layer 4: Filesystem  → 0600 permissions (owner-only on Unix)
+OrderJournal::begin_once ─► RiskProvider::reserve ─► LeaseSession (execution:<quota key>)
+        │                                                   │
+        │                                          transport (never replayed)
+        ▼                                                   ▼
+  finish(Rejected) on definite failure      finish(Accepted{order_id}) / SubmissionUnknown
 ```
 
-### 11. **PKCE Support (OAuth 2.1)**
-
-```rust
-if config.pkce_enabled {
-    // S256 method:
-    // verifier = 43-char random string
-    // challenge = base64url(sha256(verifier))
-}
-```
-**Rationale**: Protects against authorization code interception attacks.
-
-### 12. **Token Refresh Background Task**
-
-```rust
-// Automatic token refresh before expiry
-pub async fn start(&self) -> AuthResult<()> {
-    // Spawn background task that:
-    // 1. Calculates refresh time (expires_in - buffer)
-    // 2. Waits until refresh time
-    // 3. Calls Schwab refresh endpoint
-    // 4. Saves new tokens securely
-    // 5. Notifies on expiry warnings
-}
-```
-**Rationale**: Transparent token management; application doesn't need to handle refresh.
-
-### 13. **Subscription Batching by Field**
-
-```rust
-// Group subscriptions by service and field set
-// Single request to Schwab for multiple symbols with same fields
-// Reduces API call overhead
-```
-**Rationale**: Efficient use of Schwab API; fewer messages, same data.
-
----
-
-## 6. External Integrations (APIs, Services, etc.)
-
-### A. Charles Schwab APIs
-
-#### REST Endpoints
-- **Market Data APIs**
-  - `/marketdata/v1/quotes` (GET) - Symbol quotes
-  - `/marketdata/v1/chains` (GET) - Option chains
-  - `/marketdata/v1/pricehistory` (GET) - OHLCV bars
-  - `/marketdata/v1/movers/{index}` (GET) - Market movers
-  - `/marketdata/v1/instruments` (GET) - Symbol search
-
-- **Trading APIs**
-  - `/trader/v1/accounts/{accountId}/orders` (GET/POST) - Order management
-  - `/trader/v1/accounts/{accountId}/positions` (GET) - Holdings
-
-- **Account APIs**
-  - `/trader/v1/accounts/{accountId}` (GET) - Account details
-  - `/trader/v1/accounts` (GET) - List accounts
-
-#### OAuth2 Endpoints
-- **Authorization**: `https://auth.schwabapi.com/v1/oauth/authorize`
-- **Token Exchange**: `https://api.schwabapi.com/v1/oauth/token`
-- **Token Refresh**: `https://api.schwabapi.com/v1/oauth/token` (with refresh_token grant)
-
-#### WebSocket Streaming
-- **URL**: `wss://streamer-api.schwabapi.com/streaming` (WSS = WebSocket Secure)
-- **Services**: 13 streaming services
-  - LevelOneEquities
-  - LevelOneOptions
-  - OptionChains
-  - OptionExpires
-  - NewsHeadline
-  - NewsStory
-  - ChartData
-  - ChartHistory
-  - IntraDay
-  - Levelone
-  - Account
-  - Trades
-  - Break
-
-### B. External Crates and Services
-
-#### Security Services
-- **OS Keychains**
-  - macOS: Keychain (via `keyring` crate)
-  - Windows: Credential Manager (via `keyring` crate)
-  - Linux: Secret Service API (GNOME Keyring/KWallet via `keyring` crate)
-
-#### Cryptographic Services
-- **Ring**: OS-level CSPRNG for random number generation
-- **ChaCha20Poly1305**: Hardware-accelerated AEAD encryption (when available)
-
-#### HTTP/WebSocket
-- **Reqwest**: HTTP client with rustls TLS
-- **Tokio-Tungstenite**: WebSocket client
-
-### C. Configuration Sources
-
-```rust
-// 1. Environment variables
-SCHWAB_APP_KEY
-SCHWAB_APP_SECRET
-SCHWAB_OAUTH_CALLBACK_URL
-SCHWAB_TOKENS_FILE
-SCHWAB_TOKEN_STORE           // keychain | encrypted | file (unset = platform default)
-SCHWAB_PKCE_ENABLED          // defaults to false
-SCHWAB_METRICS_BIND          // schwab-mcp: opt-in Prometheus scrape endpoint
-SCHWAB_MCP_REDACT_PII        // schwab-mcp: account-number masking on by default (creds/identity always dropped)
-SCHWAB_MCP_ALLOW_REMOTE      // schwab-mcp: allow non-loopback http/ws bind (bearer policy and TLS proxy required)
-
-// 2. .env files (via dotenvy crate)
-// 3. Code configuration (SchwabConfig)
-```
-
-### D. OAuth Callback Mechanisms
-
-#### Callback Server (Feature: `callback-server`)
-- **Framework**: Axum (Rust web framework)
-- **Purpose**: Captures authorization code from redirect
-- **URL**: `https://127.0.0.1:8080` (default) or `https://0.0.0.0:8080` (with `allow_external_callback`)
-- **Use Cases**:
-  - Local development (primary — 127.0.0.1 + self-signed cert)
-  - Public HTTPS tunnel / reverse proxy fronting TLS (advanced,
-    requires `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true`)
-
-#### Manual Code Entry
-```rust
-// For headless servers, user enters code manually:
-auth_manager.exchange_code(code_from_user).await?
-```
-
----
-
-## 7. Data Flow Diagrams
-
-### OAuth2 Flow (Initial Authentication)
-
-```
-Application
-    ↓
-AuthManager::authorize()
-    ↓
-[Option 1: Callback Server]  [Option 2: Manual Code Entry]
-    ↓                               ↓
-Open https://auth.schwabapi.com → User logs in
-    ↓                               ↓
-Schwab redirects to callback URL ← User provides code
-    ↓                               ↓
-Callback server captures code ← [Manual input]
-    ↓                               ↓
-AuthManager::exchange_code(code)
-    ↓
-POST /v1/oauth/token (with PKCE verifier if enabled)
-    ↓
-Receive: access_token, refresh_token, expires_in
-    ↓
-Store tokens securely (Keychain|EncryptedFile|File)
-    ↓
-TokenSet saved with crypto signature
-```
-
-### Token Refresh Flow (Automatic)
-
-```
-SchwabClient initialized
-    ↓
-AuthManager::start() spawns background task
-    ↓
-[Wait until: (expires_at - refresh_buffer)]
-    ↓
-TokenSet::is_access_token_expired()?
-    ↓
-Call Schwab: POST /v1/oauth/token (refresh_token grant)
-    ↓
-Receive new tokens
-    ↓
-TokenSet updated in memory
-    ↓
-Secure storage updated
-    ↓
-HttpClient recreated (per README requirement)
-    ↓
-Callback fired: TokenNotification::SessionRecreated
-    ↓
-Repeat loop
-```
-
-### REST API Request Flow
-
-```
-Application calls: client.get_quotes(&["AAPL"])
-    ↓
-SchwabClient::request_with_query()
-    ↓
-[Rate Limiter] → rate_limiter.until_ready().await
-    ↓
-[Get Access Token] → auth_manager.get_access_token()
-    ↓
-[Build Request]
-    ├─ URL: base_url + path
-    ├─ Headers: Authorization: Bearer {token}
-    ├─ Method: GET
-    └─ Query params: [symbols=AAPL]
-    ↓
-[Retry Policy] → apply exponential backoff on failure
-    ↓
-HttpTransport::request<T>()
-    ├─ reqwest sends HTTP request
-    ├─ Response.json() deserializes to T
-    └─ Error handling for non-2xx status
-    ↓
-[On 401 Unauthorized]
-    ├─ If first attempt: auth_manager.refresh_token()
-    ├─ Retry request with new token
-    └─ If second 401: return Auth error
-    ↓
-Return Result<T>
-```
-
-### WebSocket Streaming Flow
-
-```
-Application calls: stream_client.connect()
-    ↓
-StreamClient::establish_connection()
-    ├─ Get access token from auth_manager
-    ├─ WebSocketTransport::connect(wss://streamer-api...)
-    └─ Verify connection established
-    ↓
-StreamClient::subscribe(StreamService::LeveloneEquities, &["AAPL"])
-    ↓
-[Build subscription request]
-    ├─ Command: SUBS
-    ├─ Service: LEVELONE_EQUITIES
-    ├─ Keys: AAPL
-    └─ Fields: (configurable)
-    ↓
-[Batch subscriptions by field]
-    ├─ Group by StreamService + field_set
-    └─ Send single request for multiple symbols
-    ↓
-Send to WebSocket
-    ↓
-[Receive responses]
-    ├─ StreamMessage::Response (ACK)
-    ├─ StreamMessage::Snapshot (initial data)
-    └─ StreamMessage::Data (updates)
-    ↓
-[Heartbeat thread]
-    ├─ Every 20s: Send Ping frame
-    ├─ Wait for Pong response
-    └─ If no Pong in 30s: Reconnect
-    ↓
-[On disconnect]
-    ├─ Start exponential backoff (2s, 4s, 8s... 128s)
-    ├─ Reestablish WebSocket connection
-    ├─ Restore subscriptions
-    └─ Send any pending messages
-    ↓
-[Application receives]
-    while let Some(msg) = receiver.recv().await {
-        match msg {
-            StreamMessage::Data(data) => process_data(),
-            StreamMessage::Response(resp) => handle_ack(),
-            StreamMessage::Notify(_) => handle_heartbeat(),
-        }
-    }
-```
-
----
-
-## 8. Code Statistics
-
-### Lines of Code by Component
-
-| Component | LOC | % |
-|-----------|-----|---|
-| schwab-rs | 5,244 | 81% |
-| schwab-types | 1,241 | 19% |
-| **Total** | **6,485** | **100%** |
-
-### Breaking Down schwab-rs by Module
-
-| Module | LOC | Purpose |
-|--------|-----|---------|
-| streaming/client.rs | 1,396 | WebSocket streaming |
-| auth/mod.rs | 918 | OAuth2 authentication |
-| client.rs | 596 | REST API client |
-| auth/token_store.rs | 483 | Token storage backends |
-| security.rs | 391 | Encryption & PKCE |
-| config.rs | 365 | Configuration |
-| error.rs | 256 | Error types |
-| utils.rs | 224 | Utility functions |
-| streaming/subscription.rs | 147 | Subscription mgmt |
-| retry.rs | 133 | Retry logic |
-| transport/http.rs | 74 | HTTP transport |
-| transport/websocket.rs | 82 | WebSocket transport |
-| lib.rs | 52 | Module exports |
-| streaming/mod.rs | 6 | Module exports |
-| transport/mod.rs | 4 | Module exports |
-| **Total** | **5,244** | |
-
-### Types by Category
-
-| Category | LOC | Types | Examples |
-|----------|-----|-------|----------|
-| Market Data | 470 | Quote, Chain, Greeks, History | QuoteItem, OptionChain, PriceHistoryItem |
-| Trading | 242 | Order, Position, Transaction | Order, OrderLeg, Position |
-| Streaming | 308 | StreamRequest, StreamMessage | StreamMessage::Data, StreamMessage::Response |
-| Accounts | 147 | Account, SecuritiesAccount | Account, BalanceFields |
-| Common | 62 | Enums, Shared types | AssetType, OrderInstruction |
-| **Total** | **1,241** | | |
-
----
-
-## 9. Key Design Trade-offs
-
-| Decision | Pros | Cons | Rationale |
-|----------|------|------|-----------|
-| **Arc<RwLock<T>> for client state** | Shareable, cloneable | RwLock overhead | Allows concurrent access without channels |
-| **Thin endpoint wrappers** | Clean API organization | Extra indirection | Easier to maintain, centralized logic |
-| **Bounded tracked channels** | Explicit loss and generation state | Slow consumers require reconciliation | Size queues and monitor loss |
-| **Keychain as default (macOS)** | Best security | Platform-specific | Leverages OS capabilities |
-| **EncryptedFile as default (Linux/Windows)** | Portable, encrypted | Key management complexity | Balances security and usability |
-| **ChaCha20 over AES** | Faster, memory-safe | Less adoption | NCC Group audited, immune to cache timing |
-| **PKCE opt-in (not default)** | Backward compatible | OAuth 2.1 not enforced | Users must enable for strictest security |
-| **90-second crash detection** | Automatic recovery | Matches Schwab behavior | Transparent failover |
-| **Exponential backoff retry** | Respectful rate limiting | Longer recovery time | Prevents thundering herd |
-
----
-
-## 10. Security Architecture Summary
-
-### Threat Model
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  Threat                   │ Mitigation                  │
-├─────────────────────────────────────────────────────────┤
-│ Token exposed in memory   │ SecretString + Zeroize      │
-│ Token written to disk     │ ChaCha20Poly1305 AEAD       │
-│ Token tampered on disk    │ Poly1305 authentication tag │
-│ Unencrypted credentials   │ Keychain (OS-native)        │
-│ Weak file perms (Unix)    │ Enforced 0600               │
-│ Auth code interception    │ PKCE (S256 method)          │
-│ TLS MITM attacks          │ rustls, no OpenSSL vulns    │
-│ Token exposed in logs     │ SecretString hides on Debug │
-│ Timing attacks            │ ChaCha20 immune             │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Security Grade: A+ (per README)
-
-- No high/medium severity vulnerabilities
-- Best-in-class cryptography
-- Memory-safe secret handling
-- OS-native credential storage
-- RFC 7636 PKCE support
-- Thread-safe token management
-
----
-
-## 11. Future Extensibility Points
-
-### Designed-in Extension Points
-
-1. **Additional Token Storage Backends**
-   - Implement TokenStore trait
-   - Add to TokenStoreKind enum
-
-2. **Custom Retry Strategies**
-   - Extend RetryPolicy
-   - Customize backoff curves
-
-3. **Rate Limit Strategies**
-   - Alternative governor configurations
-   - Custom per-endpoint limits
-
-4. **Transport Adapters**
-   - Custom HTTP client
-   - Custom WebSocket implementation
-
-5. **Streaming Service Expansion**
-   - Add new StreamService variants
-   - Define service-specific data types
-
----
-
-## 12. Testing Architecture
-
-### Test Coverage
-
-```
-├─ Unit tests (in-file with #[cfg(test)])
-│  ├─ auth module: Token refresh, expiry handling
-│  ├─ retry module: Backoff calculation, retry decisions
-│  └─ types: Serialization/deserialization
-│
-├─ Integration tests (examples/)
-│  ├─ oauth_flow: Full OAuth2 dance
-│  ├─ streaming_demo: All 13 services
-│  ├─ comprehensive: Combined REST + streaming
-│  └─ auth_test: Token scenarios
-│
-└─ Mocking support
-   ├─ wiremock: Mock HTTP responses
-   ├─ mockito: HTTP mocking
-   └─ mockall: Mock traits
-```
-
-### Test Utilities
-
-```rust
-#[cfg(test)]
-mod tests {
-    use wiremock::{Mock, ResponseTemplate};
-    use mockall::*;
-    use pretty_assertions::assert_eq!;
-}
-```
-
----
-
-## Summary Table: Quick Reference
-
-| Aspect | Technology | Details |
-|--------|-----------|---------|
-| **Language** | Rust 2024 edition | Type-safe, memory-safe |
-| **Async Runtime** | Tokio | Full-featured async ecosystem |
-| **HTTP** | Reqwest + Rustls | Memory-safe TLS, no OpenSSL |
-| **WebSocket** | Tokio-Tungstenite | WebSocket with TLS support |
-| **Serialization** | Serde + serde_json | Zero-copy where possible |
-| **Encryption** | ChaCha20Poly1305 | NCC Group audited AEAD |
-| **Key Storage** | Keyring (3 backends) | OS-native (macOS/Windows/Linux) |
-| **CSPRNG** | Ring | Google/Mozilla standard |
-| **Rate Limiting** | Governor | Token bucket algorithm |
-| **Retry Logic** | Backoff + Exponential | Jitter + configurable strategy |
-| **Error Handling** | Thiserror | Type-safe error types |
-| **Logging** | Log facade | User chooses implementation |
-| **Total LOC** | 6,485 | 2 crates, 30 files |
-
+Pending intents survive crashes and block new submissions for that account
+until reconciled. `execution::ExecutionStore` is the trait; `OrderJournal`
+is the local implementation over `storage::StateDatabase`, a SQLite file in
+WAL mode (`<tokens_file>.orders.store/state.sqlite3`; a pre-0.2 JSON journal
+at `<tokens_file>.orders.json` is imported once). Tables: `submissions`,
+`audit`, `consumed_approvals`, `used_order_tags`, `accounts`, `orders`,
+`executions`, `leases`, `quota`, `quota_config`, `approvals`,
+`reservations`, `meta`, `schema_migrations`. Migrations, online backup and
+restore live in `storage.rs`.
+
+Around the journal:
+
+- `coordination::Coordinator` — renewable ownership leases with epochs and
+  the shared request quota. The local implementation is the same SQLite
+  file, so several processes on one host share limits and fences.
+- `risk::RiskProvider` — pre-trade checks with durable reservations;
+  `PortfolioRisk` enforces per-account open-quantity/notional/position caps
+  from a JSON policy and counts external open orders.
+- `reconciliation` — matches broker orders and activity to journal intents
+  by unique tag, records generation-stamped account snapshots, and treats
+  absence as inconclusive (never as rejection).
+- `recovery::RecoveryWorker` — restartable per-account reconciliation loop
+  that publishes `RecoveryStatus`; `readiness::Readiness` reports what local
+  evidence says about reads and trading being safe.
+- `audit_delivery` — batches the `audit` table to an external sink with
+  acknowledged, replay-safe delivery.
+
+### Backends and the paper engine
+
+`broker::TradingBackend` is the trait the MCP gateway and authority dispatch
+through: `place_order_fenced`, `replace_order_fenced`, `cancel_order`,
+readiness, operator halt. `SchwabClient` implements it as `"live"`.
+`paper::PaperBroker` implements it as an isolated long-equity simulator
+(`paper/engine.rs` execution and accounting, `paper/model.rs` versioned
+inputs and reports, `paper/feed.rs` optional read-only REST quote/calendar
+polling). Paper state is its own SQLite file; a live client refuses to open
+it. `remote::RemoteBackend` implements `ExecutionStore`, `Coordinator` and
+`RiskProvider` over authenticated HTTPS to a `schwab-authority` process so
+workers on other hosts share one journal without holding broker credentials.
+
+### Streaming
+
+`streaming::StreamClient` speaks Schwab's streamer protocol over
+`transport::WebSocketTransport`. It logs in with a `StreamerIdentity` taken
+from `GET /userPreference`, exposes typed `subscribe_*`/`unsubscribe_*`
+helpers for all 13 services, and delivers `StreamMessage`s through a
+tracked bounded queue (`ChannelKind::Bounded(4096)` by default):
+
+- Every queued message carries the connection **generation**; the
+  `MessageReceiver` only yields messages from the current, ready generation
+  and interleaves `StreamMessage::State(StreamStatus { ready, generation,
+  lost_messages })` whenever that changes, so consumers re-baseline instead
+  of consuming stale data.
+- Overflow is never silent: it bumps `lost_messages`, flips `ready` to
+  false and increments `schwab_stream_dropped_messages_total`.
+- Heartbeat: ping every 20 s, reconnect if no pong within 30 s. Reconnect
+  backoff 2 s → 128 s, unlimited by default. Subscriptions are restored on
+  reconnect and only confirmed once Schwab acknowledges them.
+- Field selection per service via `set_service_fields`; incoming frames
+  decode to `StreamPayload` through the field tables in `schwab-types`.
+
+### Observability
+
+The SDK emits `tracing` spans/events and `metrics` facade calls only; both
+are no-ops until the host installs a subscriber and a recorder.
+`metrics.rs` is the closed catalog of every metric name, label set and
+help text (`describe()` registers them), and `telemetry.rs` has `tracing`
+initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
+`ErrorKind`, `http_status()`, `is_retryable()` and a serializable
+`ErrorEnvelope` for transports.
+
+## schwab-mcp
+
+### Server and tools
+
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 31 `#[tool]`
+methods in category order: market data (10), accounts (4), orders read (3),
+orders write (`build_order`, `preview_order`, `place_order`, `cancel_order`,
+`replace_order`), transactions (2), streaming control and cached reads (7).
+Each tool carries explicit read-only/destructive/idempotent/open-world hints;
+`tests/tool_inventory.rs` pins the list. `build_order` expands an
+`OrderSpec` locally so the operator-approved intent and the JSON sent to
+Schwab are the same shape. Responses pass through `redact.rs`, which drops
+streamer credentials and identity fields and masks account numbers unless
+`SCHWAB_MCP_REDACT_PII=0`. `stream_cache.rs` keeps per-service snapshots
+keyed by field name with explicit freshness and a bounded activity log, and
+reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
+
+### Startup and transports (`main.rs`)
+
+1. `.env`, `tracing` to stderr (stdout is the MCP channel), optional
+   Prometheus listener at `SCHWAB_METRICS_BIND`.
+2. `SchwabConfig::from_env` → `SchwabClient`. If `SCHWAB_MCP_ALLOW_TRADING=1`
+   the process also requires `SCHWAB_RISK_POLICY_FILE` and
+   `SCHWAB_RECOVERY_ACCOUNTS`; a `RecoveryWorker` runs for those accounts
+   and `SCHWAB_HEALTH_BIND` (loopback only) serves `/livez` and `/readyz`.
+3. Transport from `SCHWAB_MCP_TRANSPORT`:
+   - `stdio` without a policy file and without trading/cancel enabled runs
+     the plain `SchwabMcp` (local trusted host, read-only tools).
+   - Otherwise `SCHWAB_MCP_POLICY_FILE` is mandatory. It is a list of
+     `policy::PrincipalPolicy` entries; each becomes an `AuthorizedServer`.
+     Stdio picks one by `SCHWAB_MCP_PRINCIPAL`; `http`/`websocket` bind
+     `SCHWAB_MCP_BIND` (loopback unless `SCHWAB_MCP_ALLOW_REMOTE=1` behind a
+     TLS proxy).
+4. SIGTERM/Ctrl-C calls `begin_drain` (no new submissions) and gives open
+   transports 30 s to finish.
+
+### Authorization boundary
+
+- `policy.rs` — `PrincipalPolicy` names the tools, accounts, quantity and
+  notional caps, option multipliers and approval requirement for one
+  principal. `authorize(name, args)` runs before dispatch: it parses
+  `args.order` as `OrderRequest`, computes exposure (rejecting anything it
+  cannot bound, such as market or stop children and multi-leg orders) and,
+  when `require_approval` is set, demands a consumed single-use approval of
+  `intent_digest(name, args)` (SHA-256 over canonically sorted JSON).
+  `AuthorizedServer` wraps `SchwabMcp` as an `McpHandler`, writes the
+  principal's audit journal and hands write tools to a `TradingBackend`.
+- `network.rs` — the axum router authenticates every request first
+  (constant-time comparison of a bearer token's SHA-256 against the policy,
+  or `identity::JwtVerifier` for short-lived RS256 tokens from
+  `SCHWAB_MCP_IDENTITY_FILE`), then routes into that principal's isolated
+  MCP router and session store. The policy file is re-read every 2 s; any
+  change, or an invalid file, revokes existing sessions.
+- `authority.rs` and `bin/schwab-authority.rs` — the shared transactional
+  authority: `/v1/backend` for privileged SDK workers (`RemoteBackend`),
+  `/v1/orders` + `/v1/lease` for trading identities that must not hold
+  broker credentials, `/v1/operator` for verified approvals, halts and
+  revocations. Single writer over its own SQLite file; default bind
+  `127.0.0.1:8766`.
+- `bin/schwab-admin.rs` — trusted local operator commands (digest, approve,
+  halt, resume, audit export) that act on the state file directly and are
+  deliberately not MCP tools. `bin/schwab-remote.rs` submits one typed
+  request to the authority with a protected token file.
+- `bin/schwab-paper.rs` and `bin/schwab-paper-verify.rs` — deterministic
+  replay and transcript verification for the paper engine
+  (`paper_replay.rs` is the shared command decoder).
+
+## Request flows
+
+**REST read**: tool or SDK call → `execute_resilient` → token → circuit
+breaker → retry loop → budget admit → `HttpTransport` → typed response →
+(MCP only) redaction.
+
+**Order through MCP over the network**: bearer/JWT auth → principal router →
+`PrincipalPolicy::authorize` (caps, approval digest) → `TradingBackend::
+place_order_fenced` with a coordination lease → journal `begin_once` → risk
+reserve → single transport attempt → journal `finish` → audit event →
+`OrderSubmitResponse { order_id, location }` or `SubmissionUnknown` (never
+auto-resubmitted; reconcile first).
+
+**Stream recovery**: transport drop → generation bump and `ready=false`
+(`State` message to consumers) → reconnect with backoff → re-login →
+re-subscribe → acknowledgements confirm → `ready=true`; the MCP cache
+additionally re-baselines each service from REST and reports the recovery
+time.
+
+## Verification gates
+
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo doc --workspace --no-deps --locked`,
+`cargo build --workspace --all-targets --locked`,
+`cargo test --workspace --all-targets --all-features --locked`,
+`cargo check -p schwab-rs --no-default-features --locked`, `cargo audit`, an
+MSRV (1.89) build, `cargo-semver-checks`, and the stream soak harness
+(`examples/enterprise_bench` + `tools/soak.py`). `qualification.yml` runs the
+full test suite on Linux, macOS and Windows plus longer soaks; `release.yml`
+builds the binaries with a CycloneDX SBOM and build provenance attestation.
+Property tests use `proptest`;
+HTTP mocking uses `wiremock`. Evidence from local qualification runs is
+written to `docs/audit/`, which is git-ignored; the hosted workflows upload
+the same files as artifacts.
+
+## Where to look
+
+| Task | Start at |
+|---|---|
+| Add or fix a REST endpoint | `crates/schwab-rs/src/client.rs` (one method per endpoint) and the response type in `crates/schwab-types/src/` |
+| Change an order shape or add a constructor | `crates/schwab-types/src/trading.rs`, `trading/builder.rs`, `trading/spec.rs`; `docs/ORDERS.md` |
+| Add a streaming service or field | `crates/schwab-types/src/streaming/payload.rs` field tables, then `StreamClient::subscribe_*` |
+| Add an MCP tool | `crates/schwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` |
+| Change what a principal may do | `crates/schwab-mcp/src/policy.rs`; runtime policy JSON documented in `docs/OPERATIONS.md` |
+| Durable state, migrations, backup | `crates/schwab-rs/src/storage.rs`, `execution.rs` |
+| Metrics or alerts | `crates/schwab-rs/src/metrics.rs`, `crates/schwab-mcp/src/metrics.rs`, `ops/` dashboards and rules |
+| Paper engine behaviour | `crates/schwab-rs/src/paper/`, `docs/PAPER_TRADING.md`, `docs/PAPER_LIMITATIONS.md` |

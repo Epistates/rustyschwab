@@ -72,6 +72,6 @@ Local mock tests prove the specified client behavior. Before production release,
 
 ## Local verification evidence
 
-On 2026-09-09: **161 tests passed, zero failed or ignored** with all workspace targets and features. Clippy with warnings denied, rustdoc with warnings denied, formatting, minimal SDK feature compilation, and Rust 1.89.0 all-feature compilation passed. The Windows file-security module cross-compiled for `x86_64-pc-windows-msvc`; native execution remains a CI gate. The fresh RustSec scan reported **zero advisories and zero warnings**. Logs are in [audit/remediation](audit/remediation/).
+On 2026-09-09: **161 tests passed, zero failed or ignored** with all workspace targets and features. Clippy with warnings denied, rustdoc with warnings denied, formatting, minimal SDK feature compilation, and Rust 1.89.0 all-feature compilation passed. The Windows file-security module cross-compiled for `x86_64-pc-windows-msvc`; native execution remains a CI gate. The fresh RustSec scan reported **zero advisories and zero warnings**. Logs were kept locally under `docs/audit/remediation/` (git-ignored).
 
 The decimal dependency minimum is 1.43: upstream removed its legacy optional rkyv dependency in that release ([upstream release documentation](https://docs.rs/crate/rust_decimal/1.43.0)). Earlier cached versions reintroduced a lockfile advisory even though that optional feature was inactive.

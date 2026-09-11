@@ -95,7 +95,7 @@ CI runs feature/platform/MSRV checks and short soak jobs. The release workflow c
 
 Still required externally: native Windows execution, live broker contract/entitlement qualification, gateway/identity integration, backup restoration on the production filesystem, storage exhaustion exercises and a sustained production-shaped soak. This document does not mark those gates passed.
 
-See [support and compatibility policy](SUPPORT.md) and [local qualification evidence](audit/enterprise/README.md).
+See [support and compatibility policy](SUPPORT.md). Local qualification evidence is written to `docs/audit/` (git-ignored; the same artifacts are uploaded by `qualification.yml`).
 
 ## Extended qualification
 
@@ -111,6 +111,6 @@ Operator halts now use `halt_submissions` / `clear_operator_halt` and are durabl
 
 The stream soak additionally enforces `--max-delivery-gap-seconds` (default ten seconds). A run that delivers briefly and then stalls cannot pass on total-message count alone. REST recovery cycles also have a deadline, with end-to-end tests for timeout, fresh baselines, account reconciliation and operator-halt preservation.
 
-The soak wrapper also rejects RSS sampling gaps longer than five seconds (`--max-sample-gap-seconds`). Each `ps` call has a two-second deadline. Child failures, malformed result metrics and sampling/overall timeouts save failed JSON evidence with process status, elapsed time and a bounded stderr tail; the child is terminated when necessary. Missing build artifacts and invalid command arguments remain invocation errors. Diagnostic files may contain process stderr: review them before sharing. See [deployment qualification evidence](audit/deployment-qualification/README.md).
+The soak wrapper also rejects RSS sampling gaps longer than five seconds (`--max-sample-gap-seconds`). Each `ps` call has a two-second deadline. Child failures, malformed result metrics and sampling/overall timeouts save failed JSON evidence with process status, elapsed time and a bounded stderr tail; the child is terminated when necessary. Missing build artifacts and invalid command arguments remain invocation errors. Diagnostic files may contain process stderr: review them before sharing. See `docs/audit/deployment-qualification/README.md` after a local run.
 
 Execution databases are validated and migrated once per open (the first operation on a `StateDatabase` handle) and reject missing required tables, metadata or schema versions, or a schema from a newer build, at that point; later operations reuse pooled connections. Schema changes are ordered migrations recorded in `schema_migrations`, with `meta.schema` holding the highest applied version. Paper reopen additionally checks account presence and event-history continuity against the cursor. Do not treat these errors as instructions to create replacement tables: recover a verified complete backup or perform an explicitly reviewed migration. Missing state must not reset consumed tags, approval history, cash or event deduplication.

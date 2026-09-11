@@ -50,6 +50,16 @@ temp/
 *_credentials.json
 auth_cache/
 
+# Durable state derived from the token path (order journal, SQLite state
+# directory, refresh/init lock files).
+*.orders.json
+*.orders.store/
+*.sqlite3
+*.sqlite3-*
+*.refresh.lock
+*.init.lock
+*.key.lock
+
 # Cloudflared tunnel config
 .cloudflared/
 tunnel.yml

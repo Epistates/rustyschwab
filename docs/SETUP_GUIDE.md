@@ -53,17 +53,17 @@ in front of a VM.
 
 ## 4. Your First Authentication
 
-Run the `oauth_flow` example to generate your first token:
+Run the `oauth-flow` example package to generate your first token:
 
 ```bash
-cargo run --example oauth_flow
+cargo run -p oauth-flow
 ```
 
 1.  The program will print an authorization URL.
 2.  Open this URL in your browser and log in to Schwab.
 3.  After authorizing, you will be redirected to your callback URL.
-4.  If you enabled the `callback-server` feature, the SDK will capture the code automatically.
-5.  If not, copy the full URL you were redirected to and paste it back into the terminal.
+4.  The example enables the `callback-server` feature by default, so the SDK captures the code automatically.
+5.  With `cargo run -p oauth-flow --no-default-features`, copy the full URL you were redirected to and paste it back into the terminal.
 
 ## 5. Token Persistence
 
@@ -71,7 +71,7 @@ By default, the SDK saves tokens to `schwab_tokens.json`.
 - **macOS**: Uses the system **Keychain** by default (highly secure).
 - **Linux/Windows**: Uses **ChaCha20Poly1305** encrypted file storage by default.
 
-Ensure `schwab_tokens.json` and `schwab_tokens.json.key` are added to your `.gitignore`.
+With the encrypted store the key lives next to the tokens as `schwab_tokens.key`. Both, and the `schwab_tokens.orders.store/` state directory the client creates beside them, must stay out of version control; the repo's `.gitignore` covers all of them.
 
 ## 6. Next Steps
 

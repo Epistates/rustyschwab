@@ -14,7 +14,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 - **[Placing Orders](docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
 - **[Real-time Streaming](docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)**: Common issues and solutions.
-- **[Developer Documentation](docs/DEVELOPER_DOCUMENTATION.md)**: For contributors and architecture review.
+- **[Architecture Overview](docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](CONTRIBUTING.md)**: For contributors.
 
 ## Features
 
@@ -33,7 +33,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - **Three storage backends**: File (basic), EncryptedFile (ChaCha20Poly1305), Keychain (OS-native)
   - **Secure by default**: macOS uses Keychain, other platforms use EncryptedFile
   - **File permissions**: Unix 0600 enforcement on token files
-  - **OWASP compliant**: Best-in-class encryption and key derivation (PBKDF2 600k iterations)
+  - **Key derivation**: PBKDF2-HMAC-SHA256, 600k iterations (OWASP 2023 guidance)
 
 - **Market Data APIs**
   - Real-time quotes and price history
@@ -52,7 +52,6 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 - **Runtime Resilience**
   - Rate limiting tuned to Schwab's 120 requests/minute limit (2 req/s, burst of 10)
   - Exponential backoff retry logic
-  - 90-second crash detection for streaming
   - **WebSocket Ping/Pong heartbeat monitoring** (v0.2.0)
   - **Timeout detection with automatic reconnection** (v0.2.0)
   - Field-based subscription batching (scoped)
@@ -69,16 +68,18 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 
 ## 🔒 Security
 
-This SDK implements **world-class security** with multiple layers of protection, significantly exceeding typical OAuth 2.0 implementations.
+Token handling is layered: secrets are zeroized in memory, encrypted or
+keychain-held at rest, and never written to logs. The table compares the
+defaults with the Python reference client (Schwabdev).
 
 ### Security Features Comparison
 
 | Feature | rustyschwab | Python Reference | Advantage |
 |---------|------------|------------------|-----------|
-| **Encryption at Rest** | ✅ ChaCha20Poly1305 AEAD | ❌ Plaintext JSON | **100% improvement** |
+| **Encryption at Rest** | ✅ ChaCha20Poly1305 AEAD | ❌ Plaintext JSON | **Confidentiality** |
 | **Tamper Detection** | ✅ AEAD authentication tags | ❌ None | **Data integrity** |
 | **Memory Protection** | ✅ SecretString + Zeroize | ❌ Plain strings | **Memory safety** |
-| **Keychain Storage** | ✅ macOS/Windows/Linux | ❌ Not implemented | **Best-in-class** |
+| **Keychain Storage** | ✅ macOS/Windows/Linux | ❌ Not implemented | **OS-managed secrets** |
 | **File Permissions** | ✅ Enforced 0600 (Unix) | ❌ Default perms | **Access control** |
 | **PKCE (RFC 7636)** | ✅ S256 method | ❌ Not implemented | **OAuth 2.1 ready** |
 | **Thread Safety** | ✅ Compile-time safe | ⚠️ GIL-dependent | **Concurrency** |
@@ -818,13 +819,13 @@ config.ping_timeout = Duration::from_secs(30);       // Reconnect if no Pong
 
 ### Complete Examples
 
-See `examples/` directory for production-ready patterns:
-- `streaming_demo.rs` - All 13 services demonstrated
-- `streaming_data_processing.rs` - Async processing pattern
-- `streaming_quotes.rs` - Real-time quotes dashboard
+The `streaming-examples` package in `examples/streaming/` has three bins:
+- `streaming_demo` - all 13 services subscribed once
+- `streaming_processing` - decoupled async processing pattern
+- `streaming_quotes` - real-time quotes for a watchlist
 
 ```bash
-cargo run --example streaming_quotes --features callback-server
+cargo run -p streaming-examples --bin streaming_quotes
 ```
 
 ## Contributing
