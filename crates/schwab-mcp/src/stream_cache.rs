@@ -1,9 +1,13 @@
 //! Service-aware snapshots with explicit freshness and a bounded activity log.
+//!
+//! Content is stored by field name (`bidPrice`, not `"1"`), decoded through
+//! the service's field table, so snapshots read like REST quotes and REST
+//! baselines merge in by name.
 use crate::redact;
 use parking_lot::RwLock;
 use schwab_rs::{
     MessageReceiver,
-    types::streaming::{StreamMessage, StreamStatus},
+    types::streaming::{StreamMessage, StreamService, StreamStatus},
 };
 use serde_json::{Value, json};
 use std::{
@@ -113,16 +117,15 @@ impl StreamCache {
             .map(|((_, key), entry)| {
                 let age = now.saturating_sub(entry.received).max(0);
                 let baseline = cache.baselines.get(&(service.to_owned(), key.clone()));
-                // A snapshot is fresh only when every numbered field was
-                // updated within the window on the current generation.
+                // A snapshot is fresh only when every field was updated
+                // within the window on the current generation.
                 let broker_recent = entry.broker > 0
                     && entry.broker <= now
                     && now.saturating_sub(entry.broker) <= 2000;
                 let fields_recent = entry
                     .field_times
-                    .iter()
-                    .filter(|(key, _)| key.parse::<u32>().is_ok())
-                    .all(|(_, at)| now.saturating_sub(*at) <= 2000);
+                    .values()
+                    .all(|at| now.saturating_sub(*at) <= 2000);
                 let fresh = cache.status.ready
                     && (!cache.baseline_required || baseline.is_some())
                     && age <= 2000
@@ -155,31 +158,18 @@ impl StreamCache {
     pub fn require_baseline(&self) {
         self.inner.write().baseline_required = true;
     }
+    /// Seed a level-one snapshot from a REST quote item. Every REST field
+    /// whose name the service's stream table also uses is copied, so the
+    /// baseline and later deltas describe the same fields.
     pub fn apply_baseline(&self, generation: u64, service: &str, key: &str, quote: Value) -> bool {
         let mut cache = self.inner.write();
         if !cache.status.ready || cache.status.generation != generation {
             return false;
         }
-        let mut content = json!({"key":key});
-        let fields: &[(u32, &str)] = match service {
-            "LEVELONE_EQUITIES" => &[
-                (1, "bidPrice"),
-                (2, "askPrice"),
-                (3, "lastPrice"),
-                (4, "bidSize"),
-                (5, "askSize"),
-                (8, "totalVolume"),
-                (9, "lastSize"),
-            ],
-            "LEVELONE_OPTIONS" => &[
-                (2, "bidPrice"),
-                (3, "askPrice"),
-                (4, "lastPrice"),
-                (8, "totalVolume"),
-                (16, "bidSize"),
-                (17, "askSize"),
-                (18, "lastSize"),
-            ],
+        let table = match StreamService::from_api_str(service) {
+            Some(service @ (StreamService::LeveloneEquities | StreamService::LeveloneOptions)) => {
+                service.fields()
+            }
             _ => return false,
         };
         let Some(prices) = quote.get("quote").and_then(Value::as_object) else {
@@ -193,15 +183,23 @@ impl StreamCache {
         }) {
             return false;
         }
-        for (field, name) in fields {
-            if let Some(v) = prices.get(*name) {
-                content[field.to_string()] = v.clone();
-            }
-        }
         let now = chrono::Utc::now().timestamp_millis();
         let broker = prices.get("quoteTime").and_then(Value::as_i64).unwrap_or(0);
         if broker <= 0 || now < broker || now - broker > 2000 {
             return false;
+        }
+        // `extended` is left out: it reuses `quoteTime`/`totalVolume` for the
+        // extended session.
+        let mut content = json!({ "key": key });
+        for section in ["quote", "reference", "fundamental", "regular"] {
+            let Some(section) = quote.get(section).and_then(Value::as_object) else {
+                continue;
+            };
+            for (name, value) in section {
+                if table.iter().any(|field| field.name == name) {
+                    content[name] = value.clone();
+                }
+            }
         }
         let entry = cache
             .snapshots
@@ -389,11 +387,15 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                 }
                 StreamMessage::Data(data) => {
                     for item in data.data {
+                        // An unknown service keeps its numbered fields.
+                        let table = item.service().map_or(&[][..], StreamService::fields);
                         for content in item.content {
-                            if let Ok(mut value) = serde_json::to_value(&content) {
-                                redact::apply_stream_content(&item.service, &mut value);
-                                cache.put(item.service.clone(), content.key, value, item.timestamp);
+                            let mut value = content.to_named_value(table);
+                            if !value.is_object() {
+                                continue;
                             }
+                            redact::apply_stream_content(&item.service, &mut value);
+                            cache.put(item.service.clone(), content.key, value, item.timestamp);
                         }
                     }
                 }
@@ -420,7 +422,7 @@ mod tests {
         cache.put(
             "LEVELONE_EQUITIES".into(),
             "AAPL".into(),
-            json!({"1":10,"2":11}),
+            json!({"bidPrice":10,"askPrice":11}),
             now - 3000,
         );
         assert_eq!(
@@ -447,14 +449,20 @@ mod tests {
         cache.put(
             "LEVELONE_EQUITIES".into(),
             "AAPL".into(),
-            json!({"1":12}),
+            json!({"bidPrice":12}),
             now,
         );
         assert_eq!(
             cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["fresh"],
             false
         );
-        let quote = json!({"quote":{"bidPrice":10,"askPrice":11,"quoteTime":now}});
+        let quote = json!({
+            "quote": {"bidPrice":10,"askPrice":11,"quoteTime":now,"shortInterest":3},
+            "reference": {"description":"Apple Inc","cusip":"037833100"},
+            "fundamental": {"peRatio":30.5,"beta":1.2},
+            "regular": {"regularMarketLastPrice":10.5},
+            "extended": {"quoteTime":1}
+        });
         assert!(!cache.apply_baseline(1, "LEVELONE_EQUITIES", "AAPL", quote.clone()));
         assert!(!cache.apply_baseline(
             2,
@@ -464,8 +472,20 @@ mod tests {
         ));
         assert!(cache.apply_baseline(2, "LEVELONE_EQUITIES", "AAPL", quote));
         let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
-        assert_eq!(snapshot["AAPL"]["content"]["1"], 12);
-        assert_eq!(snapshot["AAPL"]["content"]["2"], 11);
+        let content = &snapshot["AAPL"]["content"];
+        // The stream delta wins; REST fills the rest by table name only.
+        assert_eq!(content["bidPrice"], 12);
+        assert_eq!(content["askPrice"], 11);
+        assert_eq!(content["quoteTime"], now);
+        assert_eq!(content["description"], "Apple Inc");
+        assert_eq!(content["peRatio"], 30.5);
+        assert_eq!(content["regularMarketLastPrice"], 10.5);
+        for absent in ["shortInterest", "cusip", "beta"] {
+            assert!(
+                content.get(absent).is_none(),
+                "{absent} is not a stream field"
+            );
+        }
         assert_eq!(snapshot["AAPL"]["fresh"], true);
         cache.update_status(StreamStatus {
             ready: false,
@@ -485,23 +505,26 @@ mod tests {
         cache.put(
             "LEVELONE_EQUITIES".into(),
             "AAPL".into(),
-            json!({"1":10,"2":11}),
+            json!({"bidPrice":10,"askPrice":11}),
             100,
         );
         cache.put(
             "LEVELONE_EQUITIES".into(),
             "AAPL".into(),
-            json!({"1":12}),
+            json!({"bidPrice":12}),
             101,
         );
         cache.put(
             "LEVELONE_EQUITIES".into(),
             "AAPL".into(),
-            json!({"1":9}),
+            json!({"bidPrice":9}),
             99,
         );
         let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
-        assert_eq!(snapshot["AAPL"]["content"], json!({"1":12,"2":11}));
+        assert_eq!(
+            snapshot["AAPL"]["content"],
+            json!({"bidPrice":12,"askPrice":11})
+        );
         cache.update_status(StreamStatus {
             ready: false,
             generation: 1,

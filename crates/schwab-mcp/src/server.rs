@@ -844,7 +844,7 @@ impl SchwabMcp {
                 client.subscribe_account_activity().await.map_err(map_err)?;
             } else {
                 client
-                    .subscribe(service.clone(), keys.clone())
+                    .subscribe(service, keys.clone())
                     .await
                     .map_err(map_err)?;
             }
@@ -881,7 +881,7 @@ impl SchwabMcp {
                     .map_err(map_err)?;
             } else {
                 client
-                    .unsubscribe(service.clone(), keys.clone())
+                    .unsubscribe(service, keys.clone())
                     .await
                     .map_err(map_err)?;
             }
@@ -895,9 +895,11 @@ impl SchwabMcp {
         .await
     }
 
-    /// Override the field bitmap (comma-separated field IDs) sent on the
-    /// *next* subscription for `service`. See Schwab's streaming docs for
-    /// valid field IDs per service.
+    /// Override the field list (comma-separated field numbers) sent on the
+    /// *next* subscription for `service`. Field 0 is always the key; the
+    /// numbering per service is the `*Fields` table in
+    /// `schwab_types::streaming` (for example `LevelOneEquityFields`),
+    /// which is also what `stream_snapshot` names the fields by.
     #[tool(
         read_only = false,
         destructive = true,
@@ -914,7 +916,7 @@ impl SchwabMcp {
             let client = guard.as_ref().ok_or_else(|| {
                 McpError::invalid_params("not connected — call stream_connect first")
             })?;
-            client.set_service_fields(service.clone(), fields_csv.clone());
+            client.set_service_fields(service, fields_csv.clone());
             Ok(redact::json_value(serde_json::json!({
                 "status": "updated",
                 "service": service.as_str(),
@@ -926,7 +928,10 @@ impl SchwabMcp {
 
     /// Read the most recent streaming snapshot for `service`. If `keys` is
     /// omitted, returns every cached key for the service; otherwise filters
-    /// to the listed keys. Returns an object keyed by `key`.
+    /// to the listed keys. Returns an object keyed by `key`; each entry's
+    /// `content` uses the same field names as REST quotes (`bidPrice`,
+    /// `lastPrice`, `totalVolume`, …), never the wire's field numbers.
+    /// `ACCT_ACTIVITY` returns the bounded event log instead.
     #[tool(
         read_only = true,
         destructive = false,

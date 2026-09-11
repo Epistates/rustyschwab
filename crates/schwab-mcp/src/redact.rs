@@ -73,7 +73,7 @@ const DROP_FIELDS: &[&str] = &[
 /// round-trip the LLM might need.
 ///
 /// `AccountNumber` (PascalCase) appears in the JSON payload embedded in
-/// `ACCT_ACTIVITY` streamer frames (field `3`).
+/// `ACCT_ACTIVITY` streamer frames (`messageData`).
 const MASK_ACCOUNT_FIELDS: &[&str] = &["accountNumber", "AccountNumber"];
 
 /// Whether account-number masking is on (the `SCHWAB_MCP_REDACT_PII`
@@ -138,14 +138,14 @@ fn redact_object(map: &mut Map<String, Value>, mask_accounts: bool) {
     }
 }
 
-/// Redact a single streamer `DataContent` value before it enters the
-/// snapshot cache. Credential dropping is unconditional; account-number
-/// masking follows the env var (see module docs).
+/// Redact a single streamer content item, already decoded to field names,
+/// before it enters the snapshot cache. Credential dropping is
+/// unconditional; account-number masking follows the env var (see module
+/// docs).
 ///
-/// The name-keyed walk above can't see `ACCT_ACTIVITY` frames: Schwab
-/// sends the raw account number under positional field `"1"` and the
-/// activity payload — JSON serialized *into a string* — under `"3"`.
-/// Mask the former and recursively redact the latter.
+/// The name-keyed walk covers `ACCT_ACTIVITY`'s `accountNumber`; the
+/// activity payload in `messageData` is JSON serialized *into a string*,
+/// which the walk can't see into, so it is parsed and redacted here.
 pub fn apply_stream_content(service: &str, value: &mut Value) {
     redact_stream_content_with(service, value, account_masking_enabled());
 }
@@ -160,21 +160,15 @@ fn redact_stream_content_with(service: &str, value: &mut Value, mask_accounts: b
     if service != "ACCT_ACTIVITY" {
         return;
     }
-    let Value::Object(map) = value else {
-        return;
-    };
-    if let Some(Value::String(s)) = map.get_mut("3") {
-        // Field 3 is JSON for normal activity messages, NULL or plain
-        // text for errors — only rewrite what parses as JSON. Always
-        // recurse so any embedded credentials are dropped even when
-        // account masking is disabled for debugging.
+    if let Some(Value::String(s)) = value.get_mut("messageData") {
+        // JSON for order events, NULL or plain text for errors — only
+        // rewrite what parses as JSON. Always recurse so any embedded
+        // credentials are dropped even when account masking is disabled
+        // for debugging.
         if let Ok(mut inner) = serde_json::from_str::<Value>(s) {
             redact_with(&mut inner, mask_accounts);
             *s = inner.to_string();
         }
-    }
-    if mask_accounts && let Some(Value::String(s)) = map.get_mut("1") {
-        *s = mask_account(s);
     }
 }
 
@@ -312,30 +306,31 @@ mod tests {
     fn acct_activity_drops_inner_credentials_with_masking_off() {
         let mut v = json!({
             "key": "Account Activity",
-            "1": "987654321",
-            "3": "{\"AccountNumber\":\"987654321\",\"login\":\"alice\"}"
+            "accountNumber": "987654321",
+            "messageData": "{\"AccountNumber\":\"987654321\",\"login\":\"alice\"}"
         });
         redact_stream_content_with("ACCT_ACTIVITY", &mut v, false);
         // Account number not masked (debugging), but identity still dropped.
-        assert_eq!(v["1"], "987654321");
-        let inner: Value = serde_json::from_str(v["3"].as_str().unwrap()).unwrap();
+        assert_eq!(v["accountNumber"], "987654321");
+        let inner: Value = serde_json::from_str(v["messageData"].as_str().unwrap()).unwrap();
         assert_eq!(inner["AccountNumber"], "987654321");
         assert!(inner.get("login").is_none());
     }
 
     #[test]
-    fn acct_activity_masks_positional_account_fields() {
+    fn acct_activity_masks_account_fields_inside_message_data() {
         let mut v = json!({
+            "seq": 1,
             "key": "Account Activity",
-            "1": "987654321",
-            "2": "OrderFillCompleted",
-            "3": "{\"SchwabOrderID\":\"1003811730601\",\"AccountNumber\":\"987654321\",\
+            "accountNumber": "987654321",
+            "messageType": "OrderFillCompleted",
+            "messageData": "{\"SchwabOrderID\":\"1003811730601\",\"AccountNumber\":\"987654321\",\
                   \"BaseEvent\":{\"EventType\":\"OrderFillCompletedEvent\"}}"
         });
         redact_stream_content("ACCT_ACTIVITY", &mut v);
-        assert_eq!(v["1"], "***4321");
-        assert_eq!(v["2"], "OrderFillCompleted");
-        let inner: Value = serde_json::from_str(v["3"].as_str().unwrap()).unwrap();
+        assert_eq!(v["accountNumber"], "***4321");
+        assert_eq!(v["messageType"], "OrderFillCompleted");
+        let inner: Value = serde_json::from_str(v["messageData"].as_str().unwrap()).unwrap();
         assert_eq!(inner["AccountNumber"], "***4321");
         assert_eq!(inner["SchwabOrderID"], "1003811730601");
         // Subscription echo key is not an account number — untouched.
@@ -346,22 +341,23 @@ mod tests {
     fn acct_activity_leaves_non_json_message_data_alone() {
         let mut v = json!({
             "key": "Account Activity",
-            "1": "987654321",
-            "2": "ERROR",
-            "3": "Subscription rejected: bad key"
+            "accountNumber": "987654321",
+            "messageType": "ERROR",
+            "messageData": "Subscription rejected: bad key"
         });
         redact_stream_content("ACCT_ACTIVITY", &mut v);
-        assert_eq!(v["1"], "***4321");
-        assert_eq!(v["3"], "Subscription rejected: bad key");
+        assert_eq!(v["accountNumber"], "***4321");
+        assert_eq!(v["messageData"], "Subscription rejected: bad key");
     }
 
     #[test]
-    fn other_services_keep_positional_fields_verbatim() {
-        // LEVELONE_EQUITIES field "1" is the bid price — must not be masked.
-        let mut v = json!({"key": "AAPL", "1": "228.14", "3": "228.16"});
+    fn other_services_keep_message_data_verbatim() {
+        // Only ACCT_ACTIVITY carries JSON-in-a-string; a quote field that
+        // happens to parse as JSON must not be rewritten.
+        let mut v = json!({"key": "AAPL", "bidPrice": 228.14, "messageData": "{\"a\":1 }"});
         redact_stream_content("LEVELONE_EQUITIES", &mut v);
-        assert_eq!(v["1"], "228.14");
-        assert_eq!(v["3"], "228.16");
+        assert_eq!(v["bidPrice"], 228.14);
+        assert_eq!(v["messageData"], "{\"a\":1 }");
     }
 
     #[test]

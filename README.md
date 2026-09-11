@@ -364,7 +364,7 @@ println!("order id: {:?}", response.order_id);
 
 ```rust,ignore
 use schwab_rs::streaming::{StreamClient, StreamMessage};
-use schwab_rs::types::streaming::StreamService;
+use schwab_rs::types::streaming::{StreamPayload, StreamService};
 
 // Build streaming client
 // customer/correl IDs, channel, and function ID come from
@@ -379,17 +379,30 @@ let stream_client = StreamClient::builder()
 stream_client.connect().await?;
 stream_client.subscribe(StreamService::LeveloneEquities, vec!["AAPL".into(), "MSFT".into()]).await?;
 
-// Handle messages
+// Handle messages. Frames arrive with numbered fields; `decode()` turns
+// them into typed payloads named like the REST quotes.
 if let Some(mut receiver) = stream_client.get_receiver() {
     while let Some(msg) = receiver.recv().await {
         match msg {
-            StreamMessage::Data(data) => println!("Market data: {:?}", data),
+            StreamMessage::Data(data) => {
+                for item in &data.data {
+                    for payload in item.decode()? {
+                        if let StreamPayload::LevelOneEquity(quote) = payload {
+                            println!("{} bid {:?} ask {:?}", quote.key, quote.bid_price, quote.ask_price);
+                        }
+                    }
+                }
+            }
             StreamMessage::Response(resp) => println!("Response: {:?}", resp),
             StreamMessage::Notify(hb) => println!("Heartbeat: {}", hb.heartbeat),
         }
     }
 }
 ```
+
+Every data service has a field table (`LevelOneEquityFields`, `BookFields`, …)
+for building subscription field lists and a payload type (`LevelOneEquity`,
+`Book`, `ChartEquity`, `AccountActivity`, …) in `schwab_rs::types::streaming`.
 
 Note: Streaming authentication, reconnection, and subscription handling are fully implemented.
 
@@ -767,13 +780,13 @@ let stream = StreamClient::builder()
 Request only needed fields for bandwidth optimization:
 
 ```rust,ignore
-use schwab_rs::types::streaming::StreamService;
+use schwab_rs::types::streaming::{LevelOneEquityFields as F, StreamService};
 
-// Request lean field set (Symbol, Bid, Ask, Last, Volume)
-stream.set_service_fields(
-    StreamService::LeveloneEquities,
-    "0,1,2,3,8".to_string()
-);
+// Request a lean field set by name; field 0 is always the key.
+let fields = [F::SYMBOL, F::BID_PRICE, F::ASK_PRICE, F::LAST_PRICE, F::TOTAL_VOLUME]
+    .map(|field| field.to_string())
+    .join(",");
+stream.set_service_fields(StreamService::LeveloneEquities, fields);
 
 stream.subscribe_level_one_equities(&["AAPL", "MSFT"]).await?;
 ```

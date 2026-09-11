@@ -18,7 +18,6 @@ use schwab_rs::{
     config::{ChannelKind, StreamConfig},
     types::streaming::StreamService,
 };
-use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -100,15 +99,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let receive_task = tokio::spawn(async move {
             while let Some(msg) = receiver.recv().await {
                 if let StreamMessage::Data(data) = msg {
-                    for service in &data.data {
-                        let service_type = service.service.clone();
-                        let timestamp = service.timestamp;
-                        for content in &service.content {
+                    for item in &data.data {
+                        // Name the numbered fields; an unknown service keeps
+                        // its numbers.
+                        let table = item.service().map_or(&[][..], StreamService::fields);
+                        for content in &item.content {
                             let processed = ProcessedData {
-                                service: service_type.clone(),
+                                service: item.service.clone(),
                                 symbol: content.key.clone(),
-                                timestamp,
-                                fields: content.fields.clone(),
+                                timestamp: item.timestamp,
+                                fields: content.named_fields(table),
                             };
                             if tx.send(processed).await.is_err() {
                                 return;
@@ -147,7 +147,7 @@ struct ProcessedData {
     service: String,
     symbol: String,
     timestamp: i64,
-    fields: HashMap<String, serde_json::Value>,
+    fields: serde_json::Map<String, serde_json::Value>,
 }
 
 fn print_market_data(data: &ProcessedData) {

@@ -5,7 +5,7 @@
 //! - Request types for subscriptions and commands
 //! - Response types for acknowledgments
 //! - Data types for real-time market data
-//! - Service enums and field constants
+//! - Service enums, field tables, and typed payloads per service
 //!
 //! # Services
 //!
@@ -14,6 +14,16 @@
 //! - `LEVELONE_OPTIONS` - Real-time option quotes
 //! - `CHART_EQUITY` - Real-time chart data
 //! - `ACCT_ACTIVITY` - Account activity notifications
+//!
+//! Data frames arrive with numbered fields
+//! ([`DataContent::fields`](crate::streaming::DataContent::fields));
+//! [`DataItem::decode`](crate::streaming::DataItem::decode) and the
+//! per-service `from_content` constructors turn them into
+//! [`StreamPayload`](crate::streaming::StreamPayload) values with named fields.
+
+mod payload;
+
+pub use payload::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -127,6 +137,11 @@ pub struct DataItem {
     pub content: Vec<DataContent>,
 }
 
+/// One item of a data frame as the streamer sends it: the subscription
+/// `key`, the service's envelope keys, and the numbered fields.
+///
+/// Decode into named, typed fields with [`StreamService::decode`] or a
+/// payload's `from_content` (for example [`LevelOneEquity::from_content`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct DataContent {
@@ -139,6 +154,8 @@ pub struct DataContent {
     pub asset_sub_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cusip: Option<String>,
+    /// The numbered fields (`"1"`, `"2"`, …) plus any other key the service
+    /// sends, such as `seq` on chart and account-activity items.
     #[serde(flatten)]
     pub fields: HashMap<String, Value>,
 }
@@ -156,7 +173,7 @@ pub struct NotifyItem {
     pub heartbeat: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StreamService {
@@ -219,229 +236,16 @@ impl StreamService {
 
     /// Default subscription field IDs for this service.
     ///
-    /// Each streamer service has its own field numbering (see Schwab's
-    /// streamer documentation); these defaults cover the full documented
-    /// range for the data-bearing services so subscribers get every field
-    /// unless they narrow the list explicitly.
-    pub fn default_fields(&self) -> String {
-        fn range_csv(max: u32) -> String {
-            (0..=max)
-                .map(|i| i.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        }
+    /// Every field of the service's table ([`fields`](Self::fields)) except
+    /// for `LEVELONE_EQUITIES`, which starts with the quote-sized subset in
+    /// [`LevelOneEquityFields::default_fields`] since watchlists are large.
+    /// Requesting a number beyond a table is rejected by the streamer with a
+    /// bad-command error.
+    pub fn default_fields(self) -> String {
         match self {
-            StreamService::Admin => String::new(),
-            StreamService::LeveloneEquities => LevelOneEquityFields::default_fields(),
-            StreamService::LeveloneOptions => LevelOneOptionFields::default_fields(),
-            StreamService::LeveloneFutures => range_csv(40),
-            // Futures options stop at field 31 (Schwab's streamer guide);
-            // requesting beyond that is rejected with a bad-command error.
-            StreamService::LeveloneFuturesOptions => range_csv(31),
-            StreamService::LeveloneForex => range_csv(29),
-            // Book services carry symbol, snapshot time, bid levels, ask levels
-            StreamService::NyseBook | StreamService::NasdaqBook | StreamService::OptionsBook => {
-                range_csv(3)
-            }
-            StreamService::ChartEquity => ChartEquityFields::default_fields(),
-            StreamService::ChartFutures => range_csv(6),
-            // Screener: symbol, timestamp, sort field, frequency, items
-            StreamService::ScreenerEquity | StreamService::ScreenerOption => range_csv(4),
-            StreamService::AcctActivity => AcctActivityFields::default_fields(),
+            Self::LeveloneEquities => LevelOneEquityFields::default_fields(),
+            service => payload::csv(service.fields().iter().map(|field| field.number)),
         }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LevelOneEquityFields;
-
-impl LevelOneEquityFields {
-    pub const SYMBOL: u32 = 0;
-    pub const BID_PRICE: u32 = 1;
-    pub const ASK_PRICE: u32 = 2;
-    pub const LAST_PRICE: u32 = 3;
-    pub const BID_SIZE: u32 = 4;
-    pub const ASK_SIZE: u32 = 5;
-    pub const ASK_ID: u32 = 6;
-    pub const BID_ID: u32 = 7;
-    pub const TOTAL_VOLUME: u32 = 8;
-    pub const LAST_SIZE: u32 = 9;
-    pub const HIGH_PRICE: u32 = 10;
-    pub const LOW_PRICE: u32 = 11;
-    pub const CLOSE_PRICE: u32 = 12;
-    pub const EXCHANGE_ID: u32 = 13;
-    pub const MARGINABLE: u32 = 14;
-    pub const DESCRIPTION: u32 = 15;
-    pub const LAST_ID: u32 = 16;
-    pub const OPEN_PRICE: u32 = 17;
-    pub const NET_CHANGE: u32 = 18;
-    pub const HIGH_52_WEEK: u32 = 19;
-    pub const LOW_52_WEEK: u32 = 20;
-    pub const PE_RATIO: u32 = 21;
-    pub const DIV_AMOUNT: u32 = 22;
-    pub const DIV_YIELD: u32 = 23;
-    pub const NAV: u32 = 24;
-    pub const EXCHANGE_NAME: u32 = 25;
-    pub const DIV_DATE: u32 = 26;
-    pub const IS_REGULAR_MARKET_QUOTE: u32 = 27;
-    pub const IS_REGULAR_MARKET_TRADE: u32 = 28;
-    pub const REGULAR_MARKET_LAST_PRICE: u32 = 29;
-    pub const REGULAR_MARKET_LAST_SIZE: u32 = 30;
-    pub const REGULAR_MARKET_NET_CHANGE: u32 = 31;
-    pub const SECURITY_STATUS: u32 = 32;
-    pub const MARK: u32 = 33;
-    pub const QUOTE_TIME_MILLIS: u32 = 34;
-    pub const TRADE_TIME_MILLIS: u32 = 35;
-    pub const REGULAR_MARKET_TRADE_MILLIS: u32 = 36;
-    pub const BID_TIME_MILLIS: u32 = 37;
-    pub const ASK_TIME_MILLIS: u32 = 38;
-    pub const ASK_MIC_ID: u32 = 39;
-    pub const BID_MIC_ID: u32 = 40;
-    pub const LAST_MIC_ID: u32 = 41;
-    pub const NET_CHANGE_PERCENT: u32 = 42;
-    pub const REGULAR_MARKET_CHANGE_PERCENT: u32 = 43;
-    pub const MARK_CHANGE: u32 = 44;
-    pub const MARK_CHANGE_PERCENT: u32 = 45;
-    pub const HTB_QUANTITY: u32 = 46;
-    pub const HTB_RATE: u32 = 47;
-    pub const HARD_TO_BORROW: u32 = 48;
-    pub const IS_SHORTABLE: u32 = 49;
-    pub const POST_MARKET_NET_CHANGE: u32 = 50;
-    pub const POST_MARKET_CHANGE_PERCENT: u32 = 51;
-
-    pub fn all_fields() -> String {
-        (0..=51)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    pub fn default_fields() -> String {
-        vec![
-            Self::SYMBOL,
-            Self::BID_PRICE,
-            Self::ASK_PRICE,
-            Self::LAST_PRICE,
-            Self::BID_SIZE,
-            Self::ASK_SIZE,
-            Self::TOTAL_VOLUME,
-            Self::LAST_SIZE,
-            Self::HIGH_PRICE,
-            Self::LOW_PRICE,
-            Self::CLOSE_PRICE,
-            Self::OPEN_PRICE,
-            Self::NET_CHANGE,
-            Self::NET_CHANGE_PERCENT,
-            Self::QUOTE_TIME_MILLIS,
-            Self::TRADE_TIME_MILLIS,
-        ]
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct LevelOneOptionFields;
-
-impl LevelOneOptionFields {
-    pub const SYMBOL: u32 = 0;
-    pub const DESCRIPTION: u32 = 1;
-    pub const BID_PRICE: u32 = 2;
-    pub const ASK_PRICE: u32 = 3;
-    pub const LAST_PRICE: u32 = 4;
-    pub const HIGH_PRICE: u32 = 5;
-    pub const LOW_PRICE: u32 = 6;
-    pub const CLOSE_PRICE: u32 = 7;
-    pub const TOTAL_VOLUME: u32 = 8;
-    pub const OPEN_INTEREST: u32 = 9;
-    pub const VOLATILITY: u32 = 10;
-    pub const INTRINSIC_VALUE: u32 = 11;
-    pub const EXP_YEAR: u32 = 12;
-    pub const MULTIPLIER: u32 = 13;
-    pub const DIGITS: u32 = 14;
-    pub const OPEN_PRICE: u32 = 15;
-    pub const BID_SIZE: u32 = 16;
-    pub const ASK_SIZE: u32 = 17;
-    pub const LAST_SIZE: u32 = 18;
-    pub const NET_CHANGE: u32 = 19;
-    pub const STRIKE_PRICE: u32 = 20;
-    pub const CONTRACT_TYPE: u32 = 21;
-    pub const UNDERLYING: u32 = 22;
-    pub const EXP_MONTH: u32 = 23;
-    pub const DELIVERABLES: u32 = 24;
-    pub const TIME_VALUE: u32 = 25;
-    pub const EXP_DAY: u32 = 26;
-    pub const DAYS_TO_EXP: u32 = 27;
-    pub const DELTA: u32 = 28;
-    pub const GAMMA: u32 = 29;
-    pub const THETA: u32 = 30;
-    pub const VEGA: u32 = 31;
-    pub const RHO: u32 = 32;
-    pub const SECURITY_STATUS: u32 = 33;
-    pub const THEORETICAL_VALUE: u32 = 34;
-    pub const UNDERLYING_PRICE: u32 = 35;
-    pub const UV_EXPIRATION_TYPE: u32 = 36;
-    pub const MARK: u32 = 37;
-    pub const QUOTE_TIME_MILLIS: u32 = 38;
-    pub const TRADE_TIME_MILLIS: u32 = 39;
-    pub const EXCHANGE: u32 = 40;
-    pub const EXCHANGE_NAME: u32 = 41;
-    pub const LAST_TRADING_DAY: u32 = 42;
-    pub const SETTLEMENT_TYPE: u32 = 43;
-    pub const NET_PERCENT_CHANGE: u32 = 44;
-    pub const MARK_NET_CHANGE: u32 = 45;
-    pub const MARK_PERCENT_CHANGE: u32 = 46;
-    pub const IMPLIED_YIELD: u32 = 47;
-    pub const IS_PENNY_PILOT: u32 = 48;
-    pub const OPTION_ROOT: u32 = 49;
-    pub const HIGH_52_WEEK: u32 = 50;
-    pub const LOW_52_WEEK: u32 = 51;
-    pub const INDICATIVE_ASK_PRICE: u32 = 52;
-    pub const INDICATIVE_BID_PRICE: u32 = 53;
-    pub const INDICATIVE_QUOTE_TIME: u32 = 54;
-    pub const EXERCISE_TYPE: u32 = 55;
-
-    pub fn default_fields() -> String {
-        (0..=Self::EXERCISE_TYPE)
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ChartEquityFields;
-
-impl ChartEquityFields {
-    pub const KEY: u32 = 0;
-    pub const SEQUENCE: u32 = 1;
-    pub const OPEN_PRICE: u32 = 2;
-    pub const HIGH_PRICE: u32 = 3;
-    pub const LOW_PRICE: u32 = 4;
-    pub const CLOSE_PRICE: u32 = 5;
-    pub const VOLUME: u32 = 6;
-    pub const CHART_TIME: u32 = 7;
-    pub const CHART_DAY: u32 = 8;
-
-    pub fn default_fields() -> String {
-        (0..=8).map(|i| i.to_string()).collect::<Vec<_>>().join(",")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AcctActivityFields;
-
-impl AcctActivityFields {
-    pub const SEQUENCE: &str = "seq";
-    pub const KEY: &str = "key";
-    pub const ACCOUNT: u32 = 1;
-    pub const MESSAGE_TYPE: u32 = 2;
-    pub const MESSAGE_DATA: u32 = 3;
-
-    pub fn default_fields() -> String {
-        "0,1,2,3".to_string()
     }
 }
 

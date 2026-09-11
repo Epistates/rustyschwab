@@ -164,6 +164,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `schwab-mcp` asserts that the version advertised in `server_info` equals
   `CARGO_PKG_VERSION`, since the server macro only takes a literal.
 
+### Added — typed streaming payloads (breaking for the `*Fields` helpers)
+- Every streamer data service has a field table and a typed payload in
+  `schwab_types::streaming`: `LevelOneEquity`, `LevelOneOption`,
+  `LevelOneFutures`, `LevelOneFuturesOption`, `LevelOneForex`, `Book`
+  (with nested `BookLevel` / `BookMarketMaker`), `ChartEquity`,
+  `ChartFutures`, `Screener` (with `ScreenerItem`) and `AccountActivity`.
+  `DataItem::decode()` / `StreamService::decode()` turn a numbered frame
+  into a `StreamPayload`; `Payload::from_content()` decodes one item.
+  Field names follow the REST quote types (`bidPrice`, `52WeekHigh`,
+  `askMICId`…) so stream deltas and REST quotes merge by name; unknown
+  field numbers land in `extra`. `DataContent::named_fields()` /
+  `to_named_value()` do the renaming without the typing.
+- The `*Fields` tables (`LevelOneEquityFields`, …, plus new
+  `LevelOneFuturesFields`, `LevelOneFuturesOptionFields`,
+  `LevelOneForexFields`, `BookFields`, `ChartFuturesFields`,
+  `ScreenerFields`) expose `FIELDS: &[Field]`, `name(number)`,
+  `all_fields()` and their numeric constants; `StreamService::fields()`
+  returns the table for a service and `default_fields()` is derived from
+  it. Only `LevelOneEquityFields` keeps a narrower `default_fields()`;
+  `LevelOneOptionFields::default_fields()` and
+  `ChartEquityFields::default_fields()` are replaced by `all_fields()`, and
+  the `AcctActivityFields::SEQUENCE` / `KEY` string constants are gone
+  (`seq` is the payload's `seq` field). `StreamService` is now `Copy`,
+  `Eq` and `Hash`.
+- `schwab-mcp` decodes every frame before caching: `stream_snapshot`
+  content and the `ACCT_ACTIVITY` event log carry field names
+  (`bidPrice`, `messageType`, `messageData`) instead of `"1"`, `"2"`,
+  `"3"`. The REST baseline copies every `quote` / `reference` /
+  `fundamental` / `regular` field the stream table also names, replacing
+  the seven-field hand tables; PII redaction of account activity now goes
+  through the same name-keyed walk as REST responses.
+- The `streaming_quotes` example decoded fields 28 and 29 as open price and
+  net change; they are the regular-market trade flag and last price. It now
+  subscribes by `LevelOneEquityFields` constants and prints a
+  `LevelOneEquity`.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

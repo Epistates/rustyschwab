@@ -336,7 +336,7 @@ fn option_chain_validate() {
 
 #[test]
 fn level_one_option_fields_cover_the_full_documented_range() {
-    let fields: Vec<u32> = LevelOneOptionFields::default_fields()
+    let fields: Vec<u32> = LevelOneOptionFields::all_fields()
         .split(',')
         .map(|f| f.parse().unwrap())
         .collect();
@@ -348,7 +348,7 @@ fn level_one_option_fields_cover_the_full_documented_range() {
     assert_eq!(LevelOneOptionFields::EXCHANGE, 40);
     assert_eq!(
         StreamService::LeveloneOptions.default_fields(),
-        LevelOneOptionFields::default_fields()
+        LevelOneOptionFields::all_fields()
     );
 }
 

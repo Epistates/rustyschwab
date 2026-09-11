@@ -16,9 +16,8 @@ use schwab_rs::{
     StreamClient, StreamMessage,
     auth::{AuthManager, OAuthConfig},
     config::StreamConfig,
-    types::streaming::StreamService,
+    types::streaming::{LevelOneEquity, LevelOneEquityFields, StreamService},
 };
-use std::collections::HashMap;
 use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -84,11 +83,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "NVDA".to_string(),
     ];
 
-    // Request only essential fields for quotes
-    stream_client.set_service_fields(
-        StreamService::LeveloneEquities,
-        "0,1,2,3,8,28,29".to_string(),
-    );
+    // Request only the fields the table shows, by name rather than number.
+    let fields = [
+        LevelOneEquityFields::SYMBOL,
+        LevelOneEquityFields::BID_PRICE,
+        LevelOneEquityFields::ASK_PRICE,
+        LevelOneEquityFields::LAST_PRICE,
+        LevelOneEquityFields::TOTAL_VOLUME,
+        LevelOneEquityFields::OPEN_PRICE,
+        LevelOneEquityFields::NET_CHANGE,
+    ]
+    .map(|field| field.to_string())
+    .join(",");
+    stream_client.set_service_fields(StreamService::LeveloneEquities, fields);
 
     println!("📊 Subscribing to watchlist:");
     for symbol in &watchlist {
@@ -107,16 +114,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("║ Symbol ║  Bid  ║  Ask  ║  Last ║   Volume  ║  Open ║ Change ║");
         println!("╠════════╬═══════╬═══════╬═══════╬═══════════╬═══════╬════════╣");
 
-        // Track latest quotes
-        let mut _quotes: HashMap<String, Quote> = HashMap::new();
-
         let message_task = tokio::spawn(async move {
             while let Some(msg) = receiver.recv().await {
                 if let StreamMessage::Data(data) = msg {
-                    for service in &data.data {
-                        for content in &service.content {
-                            if let Some(quote) = Quote::from_content(content) {
-                                display_quote(&quote);
+                    for item in &data.data {
+                        if item.service() != Some(StreamService::LeveloneEquities) {
+                            continue;
+                        }
+                        for content in &item.content {
+                            match LevelOneEquity::from_content(content) {
+                                Ok(quote) => display_quote(&quote),
+                                Err(e) => eprintln!("undecodable quote for {}: {e}", content.key),
                             }
                         }
                     }
@@ -135,42 +143,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct Quote {
-    symbol: String,
-    bid: Option<f64>,
-    ask: Option<f64>,
-    last: Option<f64>,
-    volume: Option<i64>,
-    open: Option<f64>,
-    net_change: Option<f64>,
-}
-
-impl Quote {
-    fn from_content(content: &schwab_rs::types::streaming::DataContent) -> Option<Self> {
-        let symbol = content.key.clone();
-
-        Some(Quote {
-            symbol,
-            bid: content.fields.get("1").and_then(|v| v.as_f64()),
-            ask: content.fields.get("2").and_then(|v| v.as_f64()),
-            last: content.fields.get("3").and_then(|v| v.as_f64()),
-            volume: content.fields.get("8").and_then(|v| v.as_i64()),
-            open: content.fields.get("28").and_then(|v| v.as_f64()),
-            net_change: content.fields.get("29").and_then(|v| v.as_f64()),
-        })
-    }
-}
-
-fn display_quote(quote: &Quote) {
+/// Deltas carry only the fields that changed; a missing field prints as 0.
+fn display_quote(quote: &LevelOneEquity) {
     println!(
         "║ {:6} ║ {:5.2} ║ {:5.2} ║ {:5.2} ║ {:9} ║ {:5.2} ║ {:+6.2} ║",
-        quote.symbol,
-        quote.bid.unwrap_or(0.0),
-        quote.ask.unwrap_or(0.0),
-        quote.last.unwrap_or(0.0),
-        quote.volume.unwrap_or(0),
-        quote.open.unwrap_or(0.0),
+        quote.key,
+        quote.bid_price.unwrap_or(0.0),
+        quote.ask_price.unwrap_or(0.0),
+        quote.last_price.unwrap_or(0.0),
+        quote.total_volume.unwrap_or(0),
+        quote.open_price.unwrap_or(0.0),
         quote.net_change.unwrap_or(0.0)
     );
 }

@@ -48,15 +48,33 @@ stream_client.subscribe(
 ### 3. Handle Incoming Messages
 
 The `StreamClient` provides a receiver that you can use to process messages.
+Data frames arrive with numbered fields whose meaning depends on the service
+(`"1"` is an equity's bid price but an option's description); `decode()`
+turns each item into a typed payload whose fields are named like the REST
+quote types.
 
 ```rust
 use schwab_rs::streaming::StreamMessage;
+use schwab_rs::types::streaming::StreamPayload;
 
 if let Some(mut receiver) = stream_client.get_receiver() {
     while let Some(msg) = receiver.recv().await {
         match msg {
             StreamMessage::Data(data) => {
-                println!("Market Data: {:?}", data);
+                for item in &data.data {
+                    for payload in item.decode()? {
+                        match payload {
+                            StreamPayload::LevelOneEquity(quote) => {
+                                // Deltas carry only the fields that changed.
+                                println!("{} bid {:?}", quote.key, quote.bid_price);
+                            }
+                            StreamPayload::Book(book) => {
+                                println!("{} {:?}", book.key, book.bid_side_levels);
+                            }
+                            other => println!("{other:?}"),
+                        }
+                    }
+                }
             }
             StreamMessage::Response(resp) => {
                 println!("Server Response: {:?}", resp);
@@ -68,6 +86,12 @@ if let Some(mut receiver) = stream_client.get_receiver() {
     }
 }
 ```
+
+Each service's payload (`LevelOneEquity`, `LevelOneOption`, `LevelOneFutures`,
+`LevelOneFuturesOption`, `LevelOneForex`, `Book`, `ChartEquity`, `ChartFutures`,
+`Screener`, `AccountActivity`) also has a `from_content()` constructor for a
+single `DataContent`, and `DataContent::named_fields()` renames without typing
+when you want to keep working with JSON.
 
 ## Available Services
 
@@ -82,14 +106,18 @@ You can subscribe to various services using the `StreamService` enum:
 ## Best Practices
 
 ### Custom Field Selection
-By default, the SDK requests a standard set of fields. You can customize this to reduce bandwidth.
+By default, the SDK requests every field of a service (`StreamService::default_fields()`),
+except for `LEVELONE_EQUITIES`, which starts with a quote-sized subset. Narrow the list
+with the service's field table; field 0 is always the key.
 
 ```rust
-// Request only Symbol (0), Bid (1), and Ask (2)
-stream_client.set_service_fields(
-    StreamService::LeveloneEquities, 
-    "0,1,2".to_string()
-);
+use schwab_rs::types::streaming::LevelOneEquityFields as F;
+
+// Request only the symbol, bid and ask
+let fields = [F::SYMBOL, F::BID_PRICE, F::ASK_PRICE]
+    .map(|field| field.to_string())
+    .join(",");
+stream_client.set_service_fields(StreamService::LeveloneEquities, fields);
 ```
 
 ### Resource Management

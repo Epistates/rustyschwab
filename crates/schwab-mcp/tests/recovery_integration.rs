@@ -69,14 +69,40 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
             };
             for r in request["requests"].as_array().unwrap() {
                 let ack = json!({"response":[{"service":r["service"],"command":r["command"],"requestid":r["requestid"],"SchwabClientCorrelId":"correl","timestamp":1,"content":{"code":0,"msg":"synthetic"}}]});
-                if ws
-                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                        ack.to_string().into(),
-                    ))
-                    .await
-                    .is_err()
-                {
-                    return;
+                let mut frames = vec![ack];
+                // Every subscription is answered with one numbered data frame,
+                // as the broker sends them.
+                let now = chrono::Utc::now().timestamp_millis();
+                match (r["service"].as_str(), r["command"].as_str()) {
+                    (Some("LEVELONE_EQUITIES"), Some("SUBS" | "ADD")) => {
+                        frames.push(json!({"data":[{
+                            "service":"LEVELONE_EQUITIES","timestamp":now,"command":"SUBS",
+                            "content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY",
+                                "1":150.25,"2":150.5}]
+                        }]}))
+                    }
+                    (Some("ACCT_ACTIVITY"), Some("SUBS" | "ADD")) => {
+                        // Field 3 is JSON serialized into a string.
+                        let message =
+                            json!({"SchwabOrderID":"1","BaseEvent":{"AccountNumber":"123456789"}});
+                        frames.push(json!({"data":[{
+                            "service":"ACCT_ACTIVITY","timestamp":now,"command":"SUBS",
+                            "content":[{"seq":1,"key":"Account Activity","1":"123456789",
+                                "2":"OrderCreated","3":message.to_string()}]
+                        }]}));
+                    }
+                    _ => {}
+                }
+                for frame in frames {
+                    if ws
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            frame.to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -137,7 +163,11 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
     );
     tokio::time::sleep(Duration::from_millis(160)).await;
     assert!(client.submissions_suspended());
-    assert!(cache.snapshot("LEVELONE_EQUITIES", None).is_empty());
+    // The delta is cached but cannot be fresh until the REST baseline lands.
+    assert_eq!(
+        cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["fresh"],
+        false
+    );
     healthy.store(true, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -150,10 +180,22 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
     })
     .await
     .unwrap();
-    assert_eq!(
-        cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["fresh"],
-        true
-    );
+    let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+    assert_eq!(snapshot["AAPL"]["fresh"], true);
+    // Snapshots carry field names, not numbers; the stream delta wins over
+    // the REST baseline, which fills what the delta lacked.
+    let content = &snapshot["AAPL"]["content"];
+    assert_eq!(content["bidPrice"], 150.25);
+    assert_eq!(content["askPrice"], 150.5);
+    assert_eq!(content["lastPrice"], 100.01);
+    assert_eq!(content["description"], "Synthetic fixture");
+    assert!(content.get("1").is_none(), "{content}");
+    let events = cache.events();
+    let event = &events["events"][0]["content"];
+    assert_eq!(event["messageType"], "OrderCreated");
+    assert_eq!(event["accountNumber"], "***6789");
+    let message: Value = serde_json::from_str(event["messageData"].as_str().unwrap()).unwrap();
+    assert_eq!(message["BaseEvent"]["AccountNumber"], "***6789");
     assert!(
         client
             .execution_store()
