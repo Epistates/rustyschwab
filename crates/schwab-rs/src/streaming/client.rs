@@ -23,99 +23,105 @@ use tokio::time::{Instant, interval, sleep};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Wrapper for bounded or unbounded sender
+/// Generation-tagged sender feeding the subscriber queue.
 ///
-/// Provides a unified interface for sending messages to subscribers regardless
-/// of whether the underlying channel is bounded or unbounded.
+/// Every message carries the connection generation it was produced under so
+/// the receiver can discard data that predates a reconnect. Queue overflow is
+/// never silent: it flips the shared [`StreamStatus`] to not-ready and bumps
+/// `lost_messages`.
 #[derive(Debug)]
-pub enum MessageSender {
-    Tracked {
-        tx: mpsc::Sender<(u64, StreamMessage)>,
-        state: tokio::sync::watch::Sender<StreamStatus>,
-    },
-    /// Unbounded sender (no backpressure)
-    Unbounded(mpsc::UnboundedSender<StreamMessage>),
-    /// Bounded sender (applies backpressure when buffer full)
-    Bounded(mpsc::Sender<StreamMessage>),
+pub(crate) struct MessageSender {
+    tx: mpsc::Sender<(u64, StreamMessage)>,
+    state: tokio::sync::watch::Sender<StreamStatus>,
 }
 
 impl MessageSender {
-    /// Send a message, handling both bounded and unbounded cases
+    /// Send a message tagged with the current generation.
     ///
-    /// Returns `Err` if the receiver has been dropped or the bounded channel is full.
-    pub fn send(&self, msg: StreamMessage) -> std::result::Result<(), String> {
-        match self {
-            MessageSender::Tracked { tx, state } => {
-                let generation = state.borrow().generation;
-                tx.try_send((generation, msg)).map_err(|_| {
-                    state.send_modify(|s| {
-                        s.lost_messages += 1;
-                        s.ready = false;
-                    });
-                    metrics::counter!("schwab_stream_dropped_messages_total").increment(1);
-                    "Stream queue overflow or receiver closed; reconciliation required".into()
-                })
-            }
-            MessageSender::Unbounded(tx) => tx.send(msg).map_err(|e| e.to_string()),
-            MessageSender::Bounded(tx) => tx.try_send(msg).map_err(|e| e.to_string()),
-        }
+    /// Returns `Err` if the receiver has been dropped or the queue is full.
+    pub(crate) fn send(&self, msg: StreamMessage) -> std::result::Result<(), String> {
+        let generation = self.state.borrow().generation;
+        self.tx.try_send((generation, msg)).map_err(|_| {
+            self.state.send_modify(|s| {
+                s.lost_messages += 1;
+                s.ready = false;
+            });
+            metrics::counter!("schwab_stream_dropped_messages_total").increment(1);
+            "Stream queue overflow or receiver closed; reconciliation required".into()
+        })
     }
 }
 
-/// Wrapper for bounded or unbounded receiver
+/// Subscriber-side handle for stream messages.
 ///
-/// Provides a unified interface for receiving streaming messages regardless of
-/// whether the underlying channel is bounded or unbounded.
+/// Only messages produced under the current, ready generation are delivered;
+/// [`StreamMessage::State`] notifications are interleaved whenever readiness
+/// or the generation changes so consumers can re-baseline.
 #[derive(Debug)]
-pub enum MessageReceiver {
-    Tracked {
-        rx: mpsc::Receiver<(u64, StreamMessage)>,
-        pending: Option<(u64, StreamMessage)>,
-        state: tokio::sync::watch::Receiver<StreamStatus>,
-    },
-    /// Unbounded receiver (no backpressure)
-    Unbounded(mpsc::UnboundedReceiver<StreamMessage>),
-    /// Bounded receiver (backpressure when buffer full)
-    Bounded(mpsc::Receiver<StreamMessage>),
+pub struct MessageReceiver {
+    rx: mpsc::Receiver<(u64, StreamMessage)>,
+    pending: Option<(u64, StreamMessage)>,
+    state: tokio::sync::watch::Receiver<StreamStatus>,
 }
 
 impl MessageReceiver {
-    /// Receive a message, handling both bounded and unbounded cases
+    pub(crate) fn new(
+        rx: mpsc::Receiver<(u64, StreamMessage)>,
+        state: tokio::sync::watch::Receiver<StreamStatus>,
+    ) -> Self {
+        Self {
+            rx,
+            pending: None,
+            state,
+        }
+    }
+
+    /// Receive the next deliverable message.
     ///
-    /// Returns `None` when the channel is closed and all messages have been received.
+    /// Returns `None` when the stream client has been dropped and all
+    /// messages have been received.
     pub async fn recv(&mut self) -> Option<StreamMessage> {
-        match self {
-            MessageReceiver::Tracked { rx, pending, state } => loop {
-                if !state.has_changed().unwrap_or(true)
-                    && let Some((generation, message)) = pending.take()
-                {
-                    let current = state.borrow();
-                    if current.ready && current.generation == generation {
-                        return Some(message);
-                    }
+        let Self { rx, pending, state } = self;
+        loop {
+            if !state.has_changed().unwrap_or(true)
+                && let Some((generation, message)) = pending.take()
+            {
+                let current = state.borrow();
+                if current.ready && current.generation == generation {
+                    return Some(message);
                 }
-                tokio::select! {
-                    biased;
-                    changed = state.changed() => {
-                        if changed.is_err() { return None; }
-                        let current=state.borrow_and_update().clone();
-                        if pending.as_ref().is_some_and(|(generation,_)|!current.ready||*generation!=current.generation){*pending=None;}
-                        if pending.is_none() {
-                            while let Ok((generation,message))=rx.try_recv() {
-                                if current.ready&&generation==current.generation{*pending=Some((generation,message));break;}
+            }
+            tokio::select! {
+                biased;
+                changed = state.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    let current = state.borrow_and_update().clone();
+                    if pending
+                        .as_ref()
+                        .is_some_and(|(generation, _)| !current.ready || *generation != current.generation)
+                    {
+                        *pending = None;
+                    }
+                    if pending.is_none() {
+                        while let Ok((generation, message)) = rx.try_recv() {
+                            if current.ready && generation == current.generation {
+                                *pending = Some((generation, message));
+                                break;
                             }
                         }
-                        return Some(StreamMessage::State(current));
                     }
-                    item = rx.recv() => {
-                        let (generation, msg) = item?;
-                        let current = state.borrow();
-                        if current.ready && current.generation == generation { return Some(msg); }
+                    return Some(StreamMessage::State(current));
+                }
+                item = rx.recv() => {
+                    let (generation, msg) = item?;
+                    let current = state.borrow();
+                    if current.ready && current.generation == generation {
+                        return Some(msg);
                     }
                 }
-            },
-            MessageReceiver::Unbounded(rx) => rx.recv().await,
-            MessageReceiver::Bounded(rx) => rx.recv().await,
+            }
         }
     }
 }
@@ -197,8 +203,6 @@ struct StreamClientInner {
     message_rx: Arc<RwLock<Option<MessageReceiver>>>,
     connection_state: Arc<RwLock<ConnectionState>>,
     identity: StreamerIdentity,
-    /// Track connection start time for 90-second crash detection
-    connection_start: Arc<RwLock<Option<Instant>>>,
     /// Exponential backoff delay (starts at 2s, caps at 128s)
     backoff_delay: Arc<RwLock<Duration>>,
     /// Sender for outgoing WebSocket messages (text and ping) - swapped on each connection
@@ -308,15 +312,11 @@ impl StreamClient {
         };
         let (health, status_rx) = tokio::sync::watch::channel(StreamStatus::default());
         let (tx, rx) = mpsc::channel(capacity);
-        let message_tx = MessageSender::Tracked {
+        let message_tx = MessageSender {
             tx,
             state: health.clone(),
         };
-        let message_rx = MessageReceiver::Tracked {
-            rx,
-            pending: None,
-            state: status_rx,
-        };
+        let message_rx = MessageReceiver::new(rx, status_rx);
 
         let coordinator = crate::storage::StateDatabase::new(
             auth_manager
@@ -339,8 +339,7 @@ impl StreamClient {
             message_rx: Arc::new(RwLock::new(Some(message_rx))),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
             identity,
-            connection_start: Arc::new(RwLock::new(None)),
-            backoff_delay: Arc::new(RwLock::new(initial_backoff)), // Initial backoff delay
+            backoff_delay: Arc::new(RwLock::new(initial_backoff)),
             outgoing_tx: Arc::new(RwLock::new(None)),
             writer_task: Arc::new(RwLock::new(None)),
             pending_acks: Arc::new(RwLock::new(HashMap::new())),
@@ -902,10 +901,6 @@ impl StreamClientInner {
                 metrics::counter!(crate::metrics::STREAM_RECONNECTS_TOTAL).increment(1);
             }
 
-            // Record connection start time for 90-second crash detection
-            let connection_start = Instant::now();
-            *self.connection_start.write() = Some(connection_start);
-
             let coordinator = self.coordinator.read().clone();
             let ownership = crate::coordination::LeaseSession::acquire(
                 coordinator,
@@ -1017,7 +1012,6 @@ impl StreamClientInner {
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 let ws_msg = match msg {
-                    // In tokio-tungstenite 0.26+, Message::Text accepts Into<Utf8Bytes>
                     OutgoingMessage::Text(text) => {
                         tokio_tungstenite::tungstenite::Message::Text(text.into())
                     }
@@ -1165,7 +1159,6 @@ impl StreamClientInner {
                 _ => continue,
             };
             {
-                // In tokio-tungstenite 0.26+, text is Utf8Bytes, convert to String
                 if let Ok(StreamMessage::Response(response)) =
                     serde_json::from_str::<StreamMessage>(text.as_ref())
                     && let Some(item) = response.response.first()
@@ -1277,7 +1270,6 @@ impl StreamClientInner {
         while let Some(msg) = read_half.next().await {
             match msg {
                 Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                    // In tokio-tungstenite 0.26+, text is Utf8Bytes, convert to String
                     match serde_json::from_str::<StreamMessage>(text.as_ref()) {
                         Ok(stream_msg) => {
                             // Resolve acks for response frames
@@ -1601,60 +1593,19 @@ mod tests {
     }
 
     #[test]
-    fn test_unbounded_channel_creation() {
-        let config = StreamConfig {
-            channel_kind: ChannelKind::Unbounded,
-            ..Default::default()
-        };
-
-        let auth_manager = create_test_auth_manager();
-        let customer_id = "test_customer_id".to_string();
-
-        let client = StreamClient::new(
-            config,
-            auth_manager,
-            StreamerIdentity::new(customer_id, "correl"),
-        )
-        .unwrap();
-
-        // Verify we can get a receiver
-        let receiver = client.get_receiver();
-        assert!(receiver.is_some(), "Should be able to get receiver");
-
-        // Verify it's the unbounded variant
-        if let Some(MessageReceiver::Tracked { .. }) = receiver {
-            // Success
-        } else {
-            panic!("Expected Unbounded receiver");
-        }
-    }
-
-    #[test]
-    fn test_bounded_channel_creation() {
-        let config = StreamConfig {
-            channel_kind: ChannelKind::Bounded(1000),
-            ..Default::default()
-        };
-
-        let auth_manager = create_test_auth_manager();
-        let customer_id = "test_customer_id".to_string();
-
-        let client = StreamClient::new(
-            config,
-            auth_manager,
-            StreamerIdentity::new(customer_id, "correl"),
-        )
-        .unwrap();
-
-        // Verify we can get a receiver
-        let receiver = client.get_receiver();
-        assert!(receiver.is_some(), "Should be able to get receiver");
-
-        // Verify it's the bounded variant
-        if let Some(MessageReceiver::Tracked { .. }) = receiver {
-            // Success
-        } else {
-            panic!("Expected Bounded receiver");
+    fn test_every_channel_kind_yields_a_receiver() {
+        for channel_kind in [ChannelKind::Unbounded, ChannelKind::Bounded(1000)] {
+            let config = StreamConfig {
+                channel_kind,
+                ..Default::default()
+            };
+            let client = StreamClient::new(
+                config,
+                create_test_auth_manager(),
+                StreamerIdentity::new("test_customer_id", "correl"),
+            )
+            .unwrap();
+            assert!(client.get_receiver().is_some());
         }
     }
 
@@ -1784,69 +1735,93 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_message_receiver_unbounded_api() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut receiver = MessageReceiver::Unbounded(rx);
+    /// A ready receiver plus the sender halves that feed it.
+    fn tracked_receiver(
+        capacity: usize,
+        initial: StreamStatus,
+    ) -> (
+        mpsc::Sender<(u64, StreamMessage)>,
+        tokio::sync::watch::Sender<StreamStatus>,
+        MessageReceiver,
+    ) {
+        let (tx, rx) = mpsc::channel(capacity);
+        let (status, state) = tokio::sync::watch::channel(initial);
+        (tx, status, MessageReceiver::new(rx, state))
+    }
 
-        // Send a test message
-        let test_msg = StreamMessage::Notify(crate::types::streaming::StreamNotify {
+    fn heartbeat(id: &str) -> StreamMessage {
+        StreamMessage::Notify(crate::types::streaming::StreamNotify {
             notify: vec![crate::types::streaming::NotifyItem {
-                heartbeat: Some("12345".to_string()),
+                heartbeat: Some(id.to_string()),
             }],
-        });
-        tx.send(test_msg.clone()).unwrap();
+        })
+    }
 
-        // Receive it
-        let received = receiver.recv().await;
-        assert!(received.is_some(), "Should receive message");
+    #[tokio::test]
+    async fn receiver_delivers_current_generation_and_drops_stale_messages() {
+        let ready = StreamStatus {
+            ready: true,
+            generation: 2,
+            lost_messages: 0,
+        };
+        let (tx, _status, mut receiver) = tracked_receiver(10, ready);
+        tx.send((1, heartbeat("stale"))).await.unwrap();
+        tx.send((2, heartbeat("current"))).await.unwrap();
 
-        // Verify it matches
-        if let Some(StreamMessage::Notify(notify)) = received {
-            assert_eq!(notify.notify.len(), 1);
-            assert_eq!(notify.notify[0].heartbeat, Some("12345".to_string()));
-        } else {
-            panic!("Expected Notify message");
+        match receiver.recv().await {
+            Some(StreamMessage::Notify(notify)) => {
+                assert_eq!(notify.notify[0].heartbeat.as_deref(), Some("current"));
+            }
+            other => panic!("expected the current-generation heartbeat, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn test_message_receiver_bounded_api() {
-        let (tx, rx) = mpsc::channel(10);
-        let mut receiver = MessageReceiver::Bounded(rx);
-
-        // Send a test message
-        let test_msg = StreamMessage::Notify(crate::types::streaming::StreamNotify {
-            notify: vec![crate::types::streaming::NotifyItem {
-                heartbeat: Some("67890".to_string()),
-            }],
-        });
-        tx.send(test_msg.clone()).await.unwrap();
-
-        // Receive it
-        let received = receiver.recv().await;
-        assert!(received.is_some(), "Should receive message");
-
-        // Verify it matches
-        if let Some(StreamMessage::Notify(notify)) = received {
-            assert_eq!(notify.notify.len(), 1);
-            assert_eq!(notify.notify[0].heartbeat, Some("67890".to_string()));
-        } else {
-            panic!("Expected Notify message");
-        }
-    }
-
-    #[tokio::test]
-    async fn test_message_receiver_channel_closed() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let mut receiver = MessageReceiver::Unbounded(rx);
-
-        // Drop the sender
+    async fn receiver_ends_when_sender_and_status_are_dropped() {
+        let (tx, status, mut receiver) = tracked_receiver(1, StreamStatus::default());
         drop(tx);
+        drop(status);
+        assert!(receiver.recv().await.is_none());
+    }
 
-        // Should receive None when channel is closed
-        let received = receiver.recv().await;
-        assert!(received.is_none(), "Should return None when channel closed");
+    #[tokio::test]
+    async fn state_notifications_drain_stale_queue_without_losing_current_data() {
+        let (tx, status, mut receiver) = tracked_receiver(
+            2,
+            StreamStatus {
+                ready: false,
+                generation: 1,
+                lost_messages: 0,
+            },
+        );
+        let message = || {
+            StreamMessage::State(StreamStatus {
+                ready: true,
+                generation: 2,
+                lost_messages: 0,
+            })
+        };
+        tx.send((1, message())).await.unwrap();
+        tx.send((2, message())).await.unwrap();
+        status
+            .send(StreamStatus {
+                ready: true,
+                generation: 2,
+                lost_messages: 1,
+            })
+            .unwrap();
+        assert!(
+            matches!(receiver.recv().await, Some(StreamMessage::State(s)) if s.lost_messages == 1)
+        );
+        assert_eq!(
+            tx.capacity(),
+            2,
+            "state delivery must free stale queue capacity"
+        );
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if s.lost_messages == 0 && s.generation == 2
+        ));
     }
 
     #[test]

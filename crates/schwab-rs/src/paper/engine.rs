@@ -294,7 +294,7 @@ fn validate_order(order: &OrderRequest) -> Result<()> {
         && (price < Decimal::ONE || !positive_bounded(price) || price.scale() > 2)
     {
         return Err(invalid(
-            "Paper v1 requires prices >= 1 with at most two decimal places",
+            "Paper prices must be >= 1 with at most two decimal places",
         ));
     }
     Ok(())

@@ -206,31 +206,6 @@ impl StreamCache {
         cache.reconciled_generation = None;
     }
 }
-pub fn spawn_cache_feeder(
-    mut rx: MessageReceiver,
-    cache: StreamCache,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                StreamMessage::State(status) => cache.update_status(status),
-                StreamMessage::Data(data) => {
-                    for item in data.data {
-                        for content in item.content {
-                            if let Ok(mut value) = serde_json::to_value(&content) {
-                                redact::apply_stream_content(&item.service, &mut value);
-                                cache.put(item.service.clone(), content.key, value, item.timestamp);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        cache.clear();
-    })
-}
-
 /// Feeds deltas continuously while REST recovery runs independently. A new
 /// generation cancels its predecessor; late baselines cannot mark new data ready.
 #[derive(Clone, Copy)]

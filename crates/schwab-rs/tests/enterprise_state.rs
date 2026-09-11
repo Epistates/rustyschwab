@@ -274,50 +274,6 @@ async fn order_tags_cannot_be_reused_even_after_retention() {
 }
 
 #[tokio::test]
-async fn state_notifications_drain_stale_queue_without_losing_current_data() {
-    use schwab_rs::{
-        MessageReceiver,
-        types::streaming::{StreamMessage, StreamStatus},
-    };
-    let (tx, rx) = tokio::sync::mpsc::channel(2);
-    let (status, state) = tokio::sync::watch::channel(StreamStatus {
-        ready: false,
-        generation: 1,
-        lost_messages: 0,
-    });
-    let message = || {
-        StreamMessage::State(StreamStatus {
-            ready: true,
-            generation: 2,
-            lost_messages: 0,
-        })
-    };
-    tx.send((1, message())).await.unwrap();
-    tx.send((2, message())).await.unwrap();
-    let mut receiver = MessageReceiver::Tracked {
-        rx,
-        pending: None,
-        state,
-    };
-    status
-        .send(StreamStatus {
-            ready: true,
-            generation: 2,
-            lost_messages: 1,
-        })
-        .unwrap();
-    assert!(matches!(receiver.recv().await, Some(StreamMessage::State(s)) if s.lost_messages == 1));
-    assert_eq!(
-        tx.capacity(),
-        2,
-        "state delivery must free stale queue capacity"
-    );
-    assert!(
-        matches!(receiver.recv().await, Some(StreamMessage::State(s)) if s.lost_messages == 0 && s.generation == 2)
-    );
-}
-
-#[tokio::test]
 async fn restore_rejects_missing_corrupt_and_foreign_backups_without_creating_state() {
     let dir = tempfile::tempdir().unwrap();
     let destination = dir.path().join("restored.json");

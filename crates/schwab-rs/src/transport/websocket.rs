@@ -1,10 +1,9 @@
 //! WebSocket transport using tokio-tungstenite.
 
 use crate::error::{Error, Result, StreamError};
-use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{debug, error, info};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::{debug, info};
 use url::Url;
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -38,46 +37,5 @@ impl WebSocketTransport {
         info!("WebSocket connected with status: {}", response.status());
 
         Ok(ws_stream)
-    }
-
-    pub async fn send_message(stream: &mut WsStream, message: &str) -> Result<()> {
-        // In tokio-tungstenite 0.26+, Message::Text accepts Into<Utf8Bytes>
-        stream
-            .send(Message::Text(message.into()))
-            .await
-            .map_err(Error::from)
-    }
-
-    pub async fn receive_message(stream: &mut WsStream) -> Result<Option<String>> {
-        match stream.next().await {
-            // In tokio-tungstenite 0.26+, Text contains Utf8Bytes which implements ToString
-            Some(Ok(Message::Text(text))) => Ok(Some(text.to_string())),
-            // In tokio-tungstenite 0.26+, Binary contains Bytes
-            Some(Ok(Message::Binary(bin))) => String::from_utf8(bin.to_vec())
-                .map(Some)
-                .map_err(|e| Error::Stream(StreamError::InvalidMessage(e.to_string()))),
-            Some(Ok(Message::Ping(_))) => {
-                // Auto-pong is handled by tungstenite
-                Ok(None)
-            }
-            Some(Ok(Message::Pong(_))) => Ok(None),
-            Some(Ok(Message::Close(_))) => {
-                debug!("WebSocket close frame received");
-                Err(Error::ConnectionClosed)
-            }
-            Some(Ok(Message::Frame(_))) => Ok(None),
-            Some(Err(e)) => {
-                error!("WebSocket error: {}", e);
-                Err(Error::from(e))
-            }
-            None => {
-                debug!("WebSocket stream ended");
-                Err(Error::ConnectionClosed)
-            }
-        }
-    }
-
-    pub async fn close(mut stream: WsStream) -> Result<()> {
-        stream.close(None).await.map_err(Error::from)
     }
 }

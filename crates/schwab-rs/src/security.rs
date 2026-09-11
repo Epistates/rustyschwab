@@ -148,7 +148,6 @@ impl EncryptedToken {
 /// # Returns
 ///
 /// Returns a 32-byte key suitable for ChaCha20Poly1305
-#[allow(dead_code)]
 pub fn derive_key_from_password(password: &SecretString, salt: &[u8]) -> Zeroizing<[u8; KEY_SIZE]> {
     use ring::pbkdf2;
     use std::num::NonZeroU32;
@@ -184,7 +183,6 @@ pub fn derive_key_from_password(password: &SecretString, salt: &[u8]) -> Zeroizi
 ///
 /// Returns `AuthError::EncryptionFailed` if the cryptographic RNG is unavailable,
 /// which may indicate a compromised or misconfigured system.
-#[allow(dead_code)]
 pub fn generate_random_key() -> Result<Zeroizing<[u8; KEY_SIZE]>> {
     use ring::rand::{SecureRandom, SystemRandom};
 

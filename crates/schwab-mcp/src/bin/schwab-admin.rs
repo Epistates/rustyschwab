@@ -17,6 +17,14 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Print the approval digest for a tool invocation without touching state.
+    Digest { tool: String, arguments: PathBuf },
+    #[command(flatten)]
+    Durable(DurableCommand),
+}
+/// Commands that operate on the `--state` journal.
+#[derive(Subcommand)]
+enum DurableCommand {
     Status,
     Halt {
         reason: String,
@@ -54,10 +62,6 @@ enum Command {
         #[arg(long)]
         exported_through: i64,
     },
-    Digest {
-        tool: String,
-        arguments: PathBuf,
-    },
     Approve {
         principal: String,
         digest: String,
@@ -83,21 +87,24 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    if let Command::Digest { tool, arguments } = &args.command {
-        let value = serde_json::from_slice(&std::fs::read(arguments)?)?;
-        println!("{}", schwab_mcp::policy::intent_digest(tool, &value));
-        return Ok(());
-    }
+    let command = match args.command {
+        Command::Digest { tool, arguments } => {
+            let value = serde_json::from_slice(&std::fs::read(arguments)?)?;
+            println!("{}", schwab_mcp::policy::intent_digest(&tool, &value));
+            return Ok(());
+        }
+        Command::Durable(command) => command,
+    };
     let state = args
         .state
         .context("--state is required for durable operations")?;
     let journal = OrderJournal::new(state.clone());
-    match args.command {
-        Command::Halt { reason, operator } => {
+    match command {
+        DurableCommand::Halt { reason, operator } => {
             journal.set_operator_halt(Some(reason), &operator).await?
         }
-        Command::Resume { operator } => journal.set_operator_halt(None, &operator).await?,
-        Command::DeliverAudit {
+        DurableCommand::Resume { operator } => journal.set_operator_halt(None, &operator).await?,
+        DurableCommand::DeliverAudit {
             sink_id,
             endpoint,
             token_file,
@@ -115,32 +122,28 @@ async fn main() -> anyhow::Result<()> {
                 )?
             );
         }
-        Command::Status => println!(
+        DurableCommand::Status => println!(
             "{}",
             serde_json::to_string_pretty(&journal.records().await?)?
         ),
-        Command::Export { after, limit } => {
+        DurableCommand::Export { after, limit } => {
             for event in journal.audit_page(after, limit).await? {
                 println!("{}", serde_json::to_string(&event)?);
             }
         }
-        Command::Backup { destination } => journal.database().backup(destination).await?,
-        Command::Restore { destination } => {
+        DurableCommand::Backup { destination } => journal.database().backup(destination).await?,
+        DurableCommand::Restore { destination } => {
             let state = StateDatabase::restore(state, destination).await?;
             println!("{}", state.path().display());
         }
-        Command::Prune {
+        DurableCommand::Prune {
             before_ms,
             exported_through,
         } => println!(
             "{}",
             journal.prune_resolved(before_ms, exported_through).await?
         ),
-        Command::Digest { tool, arguments } => {
-            let value = serde_json::from_slice(&std::fs::read(arguments)?)?;
-            println!("{}", schwab_mcp::policy::intent_digest(&tool, &value));
-        }
-        Command::Approve {
+        DurableCommand::Approve {
             principal,
             digest,
             operator,
@@ -150,8 +153,10 @@ async fn main() -> anyhow::Result<()> {
                 .approve(&principal, &digest, &operator, expires_at)
                 .await?
         }
-        Command::Revoke { digest, operator } => journal.revoke_approval(&digest, &operator).await?,
-        Command::Resolve { attempt, evidence } => {
+        DurableCommand::Revoke { digest, operator } => {
+            journal.revoke_approval(&digest, &operator).await?
+        }
+        DurableCommand::Resolve { attempt, evidence } => {
             journal
                 .finish(
                     &attempt,
@@ -159,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?
         }
-        Command::Reconcile { account } => {
+        DurableCommand::Reconcile { account } => {
             let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig::from_env()?)?;
             anyhow::ensure!(
                 client.order_journal().path() == journal.path(),

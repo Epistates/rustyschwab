@@ -19,15 +19,28 @@
 //!
 //! ## Example
 //!
-//! ```ignore
-//! use schwab_types::trading::{Duration, Order, OrderType, Session};
+//! Outbound orders use the strict [`trading::OrderRequest`] shape: unknown
+//! fields are rejected and prices/quantities are exact decimals.
 //!
-//! let order = Order {
-//!     order_type: OrderType::Limit,
-//!     session: Session::Normal,
-//!     duration: Duration::Day,
-//!     // ... other fields
-//! };
+//! ```
+//! use schwab_types::trading::{OrderRequest, OrderType};
+//!
+//! let order: OrderRequest = serde_json::from_value(serde_json::json!({
+//!     "orderStrategyType": "SINGLE",
+//!     "orderType": "LIMIT",
+//!     "session": "NORMAL",
+//!     "duration": "DAY",
+//!     "price": "150.25",
+//!     "orderLegCollection": [{
+//!         "instruction": "BUY",
+//!         "quantity": "10",
+//!         "instrument": { "symbol": "AAPL", "assetType": "EQUITY" }
+//!     }]
+//! }))
+//! .unwrap();
+//!
+//! assert_eq!(order.order_type, Some(OrderType::Limit));
+//! order.validate().unwrap();
 //! ```
 
 /// Market data types including quotes, price history, and market hours.

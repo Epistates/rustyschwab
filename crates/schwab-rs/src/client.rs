@@ -1208,9 +1208,6 @@ pub struct OptionChainParams {
 
 #[cfg(test)]
 mod tests {
-    use wiremock::matchers::{header, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
     #[test]
     fn order_id_from_location_parses_last_segment() {
         assert_eq!(
@@ -1226,27 +1223,5 @@ mod tests {
             Some("456789".to_string())
         );
         assert_eq!(super::order_id_from_location(""), None);
-    }
-
-    #[tokio::test]
-    async fn test_get_quotes() {
-        let mock_server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/marketdata/v1/quotes"))
-            .and(header("Authorization", "Bearer test_token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "AAPL": {
-                    "symbol": "AAPL",
-                    "assetMainType": "EQUITY",
-                    "quote": {
-                        "lastPrice": 150.00
-                    }
-                }
-            })))
-            .mount(&mock_server)
-            .await;
-
-        // Test would continue here with proper setup
     }
 }

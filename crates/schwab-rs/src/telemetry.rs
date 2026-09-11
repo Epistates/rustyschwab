@@ -114,16 +114,3 @@ pub fn init_tracing_json() {
             .init();
     });
 }
-
-#[cfg(test)]
-mod tests {
-    // Note: These tests can't verify tracing output easily,
-    // but they ensure the initialization doesn't panic.
-
-    #[test]
-    fn test_init_tracing_does_not_panic() {
-        // This is a no-op after the first call, but shouldn't panic
-        // Note: Can't actually test tracing init in unit tests
-        // because it requires global state
-    }
-}

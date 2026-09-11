@@ -48,8 +48,8 @@ pub enum TokenNotification {
     SessionRecreated,
 }
 
+#[cfg(feature = "callback-server")]
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct CallbackParams {
     code: String,
     state: Option<String>,
@@ -205,8 +205,6 @@ pub struct AuthManager {
     client: Arc<RwLock<reqwest::Client>>,
     refresh_lock: Arc<Mutex<()>>,
     refresh_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
-    /// Track if we need to recreate the HTTP client after token refresh
-    needs_client_recreation: Arc<RwLock<bool>>,
     /// Optional PKCE verifier for the current auth session
     pkce_verifier: Arc<RwLock<Option<String>>>,
     /// OAuth state parameter for CSRF protection (RFC 6749 Section 10.12)
@@ -227,10 +225,6 @@ impl std::fmt::Debug for AuthManager {
             .field("client", &"<client>")
             .field("refresh_lock", &"<mutex>")
             .field("refresh_task", &self.refresh_task.read().is_some())
-            .field(
-                "needs_client_recreation",
-                &*self.needs_client_recreation.read(),
-            )
             .field("pkce", &self.config.pkce_enabled)
             .finish()
     }
@@ -386,7 +380,6 @@ impl AuthManager {
             )),
             refresh_lock: Arc::new(Mutex::new(())),
             refresh_task: Arc::new(RwLock::new(None)),
-            needs_client_recreation: Arc::new(RwLock::new(false)),
             pkce_verifier: Arc::new(RwLock::new(None)),
             oauth_state: Arc::new(RwLock::new(None)),
             last_notified_rt_hour: Arc::new(RwLock::new(None)),
