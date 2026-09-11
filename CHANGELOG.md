@@ -389,6 +389,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts) and `start_date`/`end_date`/`types` are now required
   arguments, as the API mandates. `get_account_orders`/`get_all_orders`
   similarly require `fromEnteredTime`/`toEnteredTime`.
+- **Transaction bodies** (breaking): `Transaction` was still the TD
+  Ameritrade shape (`principal`, `accruedInterest`, a `fees` map, one
+  top-level `instrument`), none of which Schwab sends, so every
+  transaction decoded with its contents silently dropped and
+  `get_transactions` (SDK and MCP) reported net amounts with no
+  instruments, quantities or fees. It now matches the Trader API:
+  `transferItems: Vec<TransferItem>` (one per instrument moved and per
+  fee, with `amount`/`cost`/`price`, a typed `FeeType`, and
+  `positionEffect`), `tradeDate`/`settlementDate`, and typed
+  `TransactionType`, `TransactionStatus`, `SubAccount` and
+  `TransactionActivityType`. `TransactionInstrument` is retyped to the
+  spec's base fields plus the option, fixed-income and future extensions
+  with a tolerant `extra` map; `orderId` is a string like every other
+  order ID in the crate. The response-only enums carry Schwab's own
+  `UNKNOWN` as a catch-all, and `type`/`putCall`/`positionEffect` decode
+  through `common::lenient` so an undocumented value degrades to `None`
+  rather than failing the list.
 - **User preferences**: `AccountPreferences` field names corrected to
   the wire format (`primaryAccount`, `nickName`, `displayAcctId`);
   `TransactionUser`/`Offer` fields made optional for tolerance.

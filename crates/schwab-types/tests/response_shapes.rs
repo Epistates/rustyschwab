@@ -295,8 +295,7 @@ fn transaction_tolerates_missing_user_identity_fields() {
         "status": "VALID",
         "accountNumber": "12345678",
         "netAmount": -1500.50,
-        "user": { "userId": 1234567 },
-        "instrument": { "symbol": "AAPL", "assetType": "EQUITY" }
+        "user": { "userId": 1234567 }
     }"#;
 
     let parsed: Transaction = serde_json::from_str(json).unwrap();
@@ -304,6 +303,114 @@ fn transaction_tolerates_missing_user_identity_fields() {
     let user = parsed.user.unwrap();
     assert_eq!(user.user_id, Some(1234567));
     assert!(user.login.is_none());
+}
+
+/// Schwab's documented `transactions` payload: the security leg and each
+/// fee are separate `transferItems`, and there is no top-level instrument.
+#[test]
+fn transactions_decode_transfer_items_with_typed_fees_and_instruments() {
+    use schwab_types::common::AssetType;
+    use schwab_types::trading::{
+        FeeType, PositionEffect, SubAccount, TransactionActivityType, TransactionStatus,
+        TransactionType,
+    };
+    let json = r#"[{
+        "activityId": 95512265692,
+        "time": "2025-01-15T14:31:22+0000",
+        "accountNumber": "12345678",
+        "type": "TRADE",
+        "status": "VALID",
+        "subAccount": "MARGIN",
+        "tradeDate": "2025-01-15T14:31:22+0000",
+        "positionId": 2700000001,
+        "orderId": 1000000000001,
+        "netAmount": -1500.5,
+        "activityType": "EXECUTION",
+        "transferItems": [
+            {
+                "instrument": {
+                    "assetType": "CURRENCY",
+                    "status": "ACTIVE",
+                    "symbol": "CURRENCY_USD",
+                    "description": "USD currency",
+                    "instrumentId": 1,
+                    "closingPrice": 0.0
+                },
+                "amount": 0.0,
+                "cost": 0.0,
+                "feeType": "COMMISSION"
+            },
+            {
+                "instrument": {
+                    "assetType": "CURRENCY",
+                    "status": "ACTIVE",
+                    "symbol": "CURRENCY_USD",
+                    "description": "USD currency",
+                    "instrumentId": 1,
+                    "closingPrice": 0.0
+                },
+                "amount": 0.0,
+                "cost": 0.0,
+                "feeType": "TAF_FEE"
+            },
+            {
+                "instrument": {
+                    "assetType": "EQUITY",
+                    "status": "ACTIVE",
+                    "symbol": "NET",
+                    "instrumentId": 12345678,
+                    "closingPrice": 150.05,
+                    "type": "COMMON_STOCK"
+                },
+                "amount": 10.0,
+                "cost": -1500.5,
+                "price": 150.05,
+                "positionEffect": "OPENING"
+            }
+        ]
+    }]"#;
+    let parsed: Vec<Transaction> = serde_json::from_str(json).unwrap();
+    let trade = &parsed[0];
+    assert_eq!(trade.type_, Some(TransactionType::Trade));
+    assert_eq!(trade.status, Some(TransactionStatus::Valid));
+    assert_eq!(trade.sub_account, Some(SubAccount::Margin));
+    assert_eq!(
+        trade.activity_type,
+        Some(TransactionActivityType::Execution)
+    );
+    assert_eq!(trade.order_id.as_deref(), Some("1000000000001"));
+    assert!(trade.extra.is_empty(), "{:?}", trade.extra);
+    assert_eq!(trade.transfer_items.len(), 3);
+    let fees: Vec<FeeType> = trade
+        .transfer_items
+        .iter()
+        .filter_map(|item| item.fee_type)
+        .collect();
+    assert_eq!(fees, [FeeType::Commission, FeeType::TafFee]);
+    let leg = &trade.transfer_items[2];
+    assert_eq!(leg.position_effect, Some(PositionEffect::Opening));
+    assert_eq!(leg.amount, Some(10.0));
+    assert!(leg.extra.is_empty(), "{:?}", leg.extra);
+    let instrument = leg.instrument.as_ref().unwrap();
+    assert_eq!(instrument.asset_type, AssetType::Equity);
+    assert_eq!(instrument.type_.as_deref(), Some("COMMON_STOCK"));
+    assert_eq!(instrument.status.as_deref(), Some("ACTIVE"));
+    assert!(instrument.extra.is_empty(), "{:?}", instrument.extra);
+    // Values outside the documented sets degrade instead of failing.
+    let odd: Transaction = serde_json::from_value(serde_json::json!({
+        "activityId": 1, "type": "FUTURE_TYPE", "status": "UNKNOWN", "subAccount": "UNKNOWN",
+        "transferItems": [{"feeType": "UNKNOWN", "positionEffect": "UNKNOWN",
+            "instrument": {"assetType": "PRODUCT", "symbol": "?", "putCall": "UNKNOWN"}}]
+    }))
+    .unwrap();
+    assert_eq!(odd.type_, None);
+    assert_eq!(odd.status, Some(TransactionStatus::Unknown));
+    assert_eq!(odd.sub_account, Some(SubAccount::Unknown));
+    assert_eq!(odd.transfer_items[0].fee_type, Some(FeeType::Unknown));
+    assert_eq!(odd.transfer_items[0].position_effect, None);
+    let instrument = odd.transfer_items[0].instrument.as_ref().unwrap();
+    assert_eq!(instrument.asset_type, AssetType::Product);
+    assert_eq!(instrument.put_call, None);
 }
 
 #[test]

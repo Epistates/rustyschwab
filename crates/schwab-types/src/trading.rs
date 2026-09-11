@@ -41,7 +41,7 @@
 //! bracket.validate().unwrap();
 //! ```
 
-use crate::common::{AccountsInstrument, AssetType};
+use crate::common::{AccountsInstrument, AssetType, PutCall};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
@@ -438,8 +438,13 @@ pub struct OrderSubmitResponse {
     pub location: Option<String>,
 }
 
+/// A transaction as Schwab reports it: header fields plus one
+/// [`TransferItem`] per instrument moved and per fee charged. There is no
+/// top-level instrument or fee map; a trade's security leg and each of its
+/// fees are separate items, and the fees are the ones whose
+/// [`fee_type`](TransferItem::fee_type) is set.
 #[skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Transaction {
@@ -449,18 +454,135 @@ pub struct Transaction {
     pub description: Option<String>,
     #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub account_number: Option<String>,
-    #[serde(rename = "type")]
-    pub type_: Option<String>,
-    pub status: Option<String>,
-    pub sub_account: Option<String>,
+    /// `None` for a value outside [`TransactionType`], which is also the
+    /// request-side filter and therefore has no catch-all.
+    #[serde(rename = "type", default, deserialize_with = "crate::common::lenient")]
+    pub type_: Option<TransactionType>,
+    pub status: Option<TransactionStatus>,
+    pub sub_account: Option<SubAccount>,
+    pub trade_date: Option<String>,
+    pub settlement_date: Option<String>,
     pub position_id: Option<i64>,
-    pub order_id: Option<i64>,
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
+    pub order_id: Option<String>,
     pub net_amount: Option<f64>,
-    pub principal: Option<f64>,
-    #[serde(rename = "accruedInterest")]
-    pub accrued_interest: Option<f64>,
-    pub fees: Option<HashMap<String, f64>>,
+    pub activity_type: Option<TransactionActivityType>,
+    #[serde(default)]
+    pub transfer_items: Vec<TransferItem>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Transaction category; the `type` of a [`Transaction`] and the value set
+/// of the `types` filter on `GET .../transactions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransactionType {
+    Trade,
+    ReceiveAndDeliver,
+    DividendOrInterest,
+    AchReceipt,
+    AchDisbursement,
+    CashReceipt,
+    CashDisbursement,
+    ElectronicFund,
+    WireOut,
+    WireIn,
+    Journal,
+    Memorandum,
+    MarginCall,
+    MoneyMarket,
+    SmaAdjustment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransactionStatus {
+    Valid,
+    Invalid,
+    Pending,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Ledger a transaction settled against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SubAccount {
+    Cash,
+    Margin,
+    Short,
+    Div,
+    Income,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransactionActivityType {
+    ActivityCorrection,
+    Execution,
+    OrderAction,
+    Transfer,
+    #[serde(other)]
+    Unknown,
+}
+
+/// One leg of a [`Transaction`]: a security or cash movement, or a fee.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TransferItem {
     pub instrument: Option<TransactionInstrument>,
+    /// Quantity moved (shares, contracts, or currency units).
+    pub amount: Option<f64>,
+    pub cost: Option<f64>,
+    pub price: Option<f64>,
+    /// Set on fee items only.
+    pub fee_type: Option<FeeType>,
+    /// `None` when Schwab reports `UNKNOWN`.
+    #[serde(default, deserialize_with = "crate::common::lenient")]
+    pub position_effect: Option<PositionEffect>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FeeType {
+    Commission,
+    SecFee,
+    StrFee,
+    RFee,
+    CdscFee,
+    OptRegFee,
+    AdditionalFee,
+    MiscellaneousFee,
+    Ftt,
+    FuturesClearingFee,
+    FuturesDeskOfficeFee,
+    FuturesExchangeFee,
+    FuturesGlobexFee,
+    FuturesNfaFee,
+    FuturesPitBrokerageFee,
+    FuturesTransactionFee,
+    LowProceedsCommission,
+    BaseCharge,
+    GeneralCharge,
+    GstFee,
+    TafFee,
+    IndexOptionFee,
+    TefraTax,
+    StateTax,
+    #[serde(other)]
+    Unknown,
 }
 
 #[skip_serializing_none]
@@ -479,20 +601,51 @@ pub struct TransactionUser {
     pub broker_rep_code: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The instrument on a [`TransferItem`] (`TransactionInstrument` in the
+/// Trader API spec). The base fields plus the option, fixed-income and
+/// future extensions are typed; the rest lands in `extra`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct TransactionInstrument {
+    pub asset_type: AssetType,
     pub symbol: String,
-    pub underlying_symbol: Option<String>,
-    pub option_expiration_date: Option<String>,
-    pub option_strike_price: Option<f64>,
-    pub put_call: Option<String>,
     pub cusip: Option<String>,
     pub description: Option<String>,
-    pub asset_type: Option<String>,
-    pub bond_maturity_date: Option<String>,
-    pub bond_interest_rate: Option<f64>,
+    pub instrument_id: Option<i64>,
+    pub net_change: Option<f64>,
+    /// Subtype whose value set depends on `asset_type` (`COMMON_STOCK`,
+    /// `SWEEP_VEHICLE`, `VANILLA`, …).
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    /// Observed on live payloads (`ACTIVE`), undocumented in the spec.
+    pub status: Option<String>,
+    /// Observed on live payloads, undocumented in the spec.
+    pub closing_price: Option<f64>,
+    /// Options and futures.
+    pub expiration_date: Option<String>,
+    /// Options only. `None` when Schwab reports `UNKNOWN`.
+    #[serde(default, deserialize_with = "crate::common::lenient")]
+    pub put_call: Option<PutCall>,
+    /// Options only.
+    pub strike_price: Option<f64>,
+    /// Options only.
+    pub option_premium_multiplier: Option<i64>,
+    /// Options only.
+    pub underlying_symbol: Option<String>,
+    /// Options only.
+    pub underlying_cusip: Option<String>,
+    /// Fixed income only.
+    pub maturity_date: Option<String>,
+    /// Fixed income only.
+    pub factor: Option<f64>,
+    /// Fixed income only.
+    pub variable_rate: Option<f64>,
+    /// Fixed income and futures.
+    pub multiplier: Option<f64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Outgoing orders have a strict schema, separate from tolerant broker responses.
