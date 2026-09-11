@@ -47,10 +47,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "stream_snapshot",
 ];
 
-#[test]
-fn every_expected_tool_is_registered() {
-    // SchwabMcp::new doesn't touch the network — we can construct with a
-    // non-functional client purely to exercise the tool registry.
+/// `SchwabMcp::new` doesn't touch the network, so a non-functional client
+/// is enough to exercise the tool registry and server metadata.
+fn server() -> SchwabMcp {
     let dummy = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
         oauth: schwab_rs::OAuthConfig {
             app_key: "x".repeat(32),
@@ -61,9 +60,21 @@ fn every_expected_tool_is_registered() {
         streaming: None,
     })
     .expect("dummy client");
-    let server = SchwabMcp::new(Arc::new(dummy));
+    SchwabMcp::new(Arc::new(dummy))
+}
 
-    let tools = server.list_tools();
+/// The `#[turbomcp::server]` macro only takes string literals, so the
+/// version it advertises is a copy of the crate version.
+#[test]
+fn server_info_matches_crate_metadata() {
+    let info = server().server_info();
+    assert_eq!(info.name, env!("CARGO_PKG_NAME"));
+    assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn every_expected_tool_is_registered() {
+    let tools = server().list_tools();
     for tool in &tools {
         let annotations = tool
             .annotations

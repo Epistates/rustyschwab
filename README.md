@@ -541,22 +541,34 @@ SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
 curl http://127.0.0.1:9090/metrics
 ```
 
-**Metric catalog:**
+**Metric catalog** (the source of truth is `schwab_rs::metrics::CATALOG` and
+`schwab_mcp::metrics::CATALOG`; a workspace test keeps call sites and docs in
+line with them, and the server registers their help text with Prometheus):
 
 | Name | Kind | Labels | Description |
 |------|------|--------|-------------|
-| `schwab_http_requests_total` | counter | `op`, `method`, `status` | Logical request completions. `status` is a class bucket (`2xx`/`4xx`/`5xx`/`network`/`auth`). |
+| `schwab_http_requests_total` | counter | `op`, `method`, `status` | Logical request completions. `status` is a class bucket (`2xx`…`5xx`, `unknown`) or `error` when no response was obtained. |
 | `schwab_http_request_duration_seconds` | histogram | `op`, `method` | Wall-clock per request (includes retries + token refresh). |
+| `schwab_submission_unknown_total` | counter | — | Order submissions sent with an undetermined outcome; each needs reconciliation. |
 | `schwab_retry_attempts_total` | counter | `outcome` | `succeeded` / `exhausted`. Sums the retries that were *actually fired*. |
 | `schwab_circuit_state` | gauge | — | `0=Closed`, `1=HalfOpen`, `2=Open`. |
 | `schwab_circuit_transitions_total` | counter | `from`, `to` | State changes. |
-| `schwab_token_refresh_total` | counter | `outcome`, `grant` | `success`/`failure` × `refresh_token`/`auto_refresh`. |
+| `schwab_token_refresh_total` | counter | `outcome`, `grant` | One per `/oauth/token` request: `success`/`failure` × `authorization_code`/`refresh_token`. |
+| `schwab_reconciliation_total` | counter | `outcome` | Account reconciliation runs: `ready` / `unresolved`. |
+| `schwab_pending_submissions` | gauge | — | Submissions awaiting reconciliation at the last readiness probe. |
+| `schwab_unreconciled_accounts` | gauge | — | Required accounts without a fresh baseline at the last readiness probe. |
+| `schwab_baseline_age_seconds` | gauge | — | Age of the oldest required-account baseline at the last readiness probe. |
+| `schwab_trading_ready` | gauge | — | `1` when the last readiness probe found trading admissible. |
+| `schwab_recovery_ready` | gauge | — | `1` while the recovery worker has no accounts left to reconcile. |
 | `schwab_stream_connects_total` | counter | `outcome` | `success` / `failure` per connection attempt. |
 | `schwab_stream_reconnects_total` | counter | — | Reconnect loop iterations. |
 | `schwab_stream_connected` | gauge | — | `1` while authenticated, `0` otherwise. |
-| `schwab_stream_messages_total` | counter | `service`, `kind` | `kind ∈ {data, response, notify}`. Control frames use `service="_control"`. |
+| `schwab_stream_messages_total` | counter | `service`, `kind` | `kind ∈ {data, response, notify, dropped}`. Control frames use `service="_control"`, unparseable ones `"_unparsed"`. |
+| `schwab_stream_dropped_messages_total` | counter | — | Frames dropped because the consumer queue was full or closed. |
 | `schwab_mcp_tool_calls_total` | counter | `tool`, `outcome` | `ok` / `error` per MCP tool invocation. |
 | `schwab_mcp_tool_call_duration_seconds` | histogram | `tool` | End-to-end latency per tool. |
+| `schwab_stream_recovery_seconds` | histogram | — | Stream cache recovery time after a reconnect. |
+| `schwab_stream_recovery_ready` | gauge | — | `1` when the last stream recovery completed within its deadline. |
 
 **Starter PromQL:**
 

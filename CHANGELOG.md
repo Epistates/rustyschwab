@@ -137,6 +137,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copies of the extension dance. A reload that contains no principals now
   revokes every session the same way an invalid file does.
 
+### Changed — metric catalog closure
+- `schwab_rs::metrics` gains `Metric`, `MetricKind`, `CATALOG` and
+  `describe()` / `describe_all()`: every metric the SDK emits is declared
+  once with its kind, unit and help text, and a recorder installed by the
+  consumer can register the descriptions in one call. `schwab-mcp` does so
+  after installing the Prometheus recorder, so `/metrics` now carries
+  `# HELP` lines. Its own `schwab_mcp::metrics::CATALOG` covers the tool
+  and stream-recovery series.
+- The eight metrics that were emitted from string literals
+  (`schwab_submission_unknown_total`, `schwab_reconciliation_total`,
+  `schwab_pending_submissions`, `schwab_unreconciled_accounts`,
+  `schwab_baseline_age_seconds`, `schwab_trading_ready`,
+  `schwab_recovery_ready`, `schwab_stream_dropped_messages_total`) and the
+  two in `schwab-mcp` (`schwab_stream_recovery_seconds`,
+  `schwab_stream_recovery_ready`) now have catalog constants and doc rows.
+  A workspace test (`schwab-mcp/tests/metrics_catalog.rs`) fails when a
+  call site uses a literal, records a catalogued name with the wrong
+  instrument, or a catalog entry is missing from the module doc table.
+- `schwab_token_refresh_total` is recorded once per `/oauth/token` request
+  in the single code path that makes them, so on-demand refresh failures
+  (previously only the background task counted failures) and authorization
+  code exchanges (`grant="authorization_code"`) are visible. The README
+  table now matches the emitted labels (`status` buckets are `2xx`…`5xx`,
+  `unknown` or `error`; the `grant` values are the RFC 6749 grant types).
+- `schwab-mcp` asserts that the version advertised in `server_info` equals
+  `CARGO_PKG_VERSION`, since the server macro only takes a literal.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

@@ -366,13 +366,10 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                                 )
                                 .await
                                 .unwrap_or(false);
-                                metrics::histogram!("schwab_stream_recovery_seconds")
+                                metrics::histogram!(crate::metrics::STREAM_RECOVERY_SECONDS)
                                     .record(started.elapsed().as_secs_f64());
-                                metrics::gauge!("schwab_stream_recovery_ready").set(if recovered {
-                                    1.0
-                                } else {
-                                    0.0
-                                });
+                                metrics::gauge!(crate::metrics::STREAM_RECOVERY_READY)
+                                    .set(if recovered { 1.0 } else { 0.0 });
                                 let current = stream.status();
                                 if recovered
                                     && current.ready

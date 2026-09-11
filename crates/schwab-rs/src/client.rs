@@ -518,7 +518,7 @@ impl SchwabClient {
                 && ((e.is_retryable() && !matches!(e, Error::RateLimit { .. }))
                     || matches!(e, Error::OwnershipLost));
             if submission && ambiguous {
-                metrics::counter!("schwab_submission_unknown_total").increment(1);
+                metrics::counter!(crate::metrics::SUBMISSION_UNKNOWN_TOTAL).increment(1);
                 Error::SubmissionUnknown {
                     attempt_id,
                     source: Box::new(e),

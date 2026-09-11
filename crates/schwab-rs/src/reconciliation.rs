@@ -218,7 +218,8 @@ impl StateDatabase {
             } else {
                 "unresolved"
             };
-            metrics::counter!("schwab_reconciliation_total", "outcome" => outcome).increment(1);
+            metrics::counter!(crate::metrics::RECONCILIATION_TOTAL, "outcome" => outcome)
+                .increment(1);
             Ok(report)
         })
         .await

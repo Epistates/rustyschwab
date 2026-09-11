@@ -52,7 +52,7 @@ impl RecoveryWorker {
                         s.last_success = Some(chrono::Utc::now().timestamp_millis());
                     }
                 });
-                metrics::gauge!("schwab_recovery_ready").set(if ready { 1.0 } else { 0.0 });
+                metrics::gauge!(crate::metrics::RECOVERY_READY).set(if ready { 1.0 } else { 0.0 });
                 tokio::time::sleep(interval.max(Duration::from_secs(1))).await;
             }
         });

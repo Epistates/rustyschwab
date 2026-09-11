@@ -141,6 +141,7 @@ fn map_err(e: schwab_rs::Error) -> McpError {
 
 // NOTE: the macro only accepts string literals — keep `version` in sync
 // with the workspace version in the root Cargo.toml when bumping releases.
+// `tests/tool_inventory.rs` fails the build when they drift.
 #[turbomcp::server(
     name = "schwab-mcp",
     version = "0.2.0",

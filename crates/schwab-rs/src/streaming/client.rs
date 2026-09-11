@@ -47,7 +47,7 @@ impl MessageSender {
                 s.lost_messages += 1;
                 s.ready = false;
             });
-            metrics::counter!("schwab_stream_dropped_messages_total").increment(1);
+            metrics::counter!(crate::metrics::STREAM_DROPPED_MESSAGES_TOTAL).increment(1);
             "Stream queue overflow or receiver closed; reconciliation required".into()
         })
     }

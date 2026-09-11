@@ -66,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
             .with_http_listener(addr)
             .install()
             .context("failed to install Prometheus metrics recorder / listener")?;
+        schwab_mcp::metrics::describe();
         tracing::info!(%addr, "metrics: Prometheus scrape endpoint live at http://<bind>/metrics");
     } else {
         tracing::debug!(

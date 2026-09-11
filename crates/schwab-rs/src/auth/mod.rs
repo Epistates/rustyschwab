@@ -242,6 +242,14 @@ enum OAuthGrant {
 }
 
 impl OAuthGrant {
+    /// The RFC 6749 `grant_type` value, also the metric label.
+    fn grant_type(self) -> &'static str {
+        match self {
+            OAuthGrant::AuthCode => "authorization_code",
+            OAuthGrant::Refresh => "refresh_token",
+        }
+    }
+
     fn wrap(self, msg: impl Into<String>) -> AuthError {
         match self {
             OAuthGrant::AuthCode => AuthError::OAuthFlow(msg.into()),
@@ -252,13 +260,29 @@ impl OAuthGrant {
 
 /// Single code path for every `POST /oauth/token` call — handles Basic
 /// auth header construction, form encoding, transient-5xx retry with
-/// jittered backoff, and JSON deserialization.
+/// jittered backoff, JSON deserialization and the per-grant outcome metric.
 ///
 /// Replaces two near-identical implementations that had drifted slightly
 /// in error handling and header construction. 4xx responses are surfaced
 /// immediately (no retry) since they indicate a protocol-level problem
 /// that won't resolve on retry (bad code, invalid_grant, etc.).
 async fn post_oauth_token(
+    client: &reqwest::Client,
+    config: &OAuthConfig,
+    form: &[(&str, String)],
+    grant: OAuthGrant,
+) -> AuthResult<TokenResponse> {
+    let result = post_oauth_token_with_retry(client, config, form, grant).await;
+    metrics::counter!(
+        crate::metrics::TOKEN_REFRESH_TOTAL,
+        "outcome" => if result.is_ok() { "success" } else { "failure" },
+        "grant" => grant.grant_type(),
+    )
+    .increment(1);
+    result
+}
+
+async fn post_oauth_token_with_retry(
     client: &reqwest::Client,
     config: &OAuthConfig,
     form: &[(&str, String)],
@@ -532,12 +556,6 @@ impl AuthManager {
         );
         self.token_store.save(&new_tokens)?;
         *self.tokens.write() = Some(new_tokens);
-        metrics::counter!(
-            crate::metrics::TOKEN_REFRESH_TOTAL,
-            "outcome" => "success",
-            "grant" => "refresh_token"
-        )
-        .increment(1);
         Ok(())
     }
 
@@ -693,7 +711,7 @@ impl AuthManager {
         );
 
         let mut form_params: Vec<(&str, String)> = vec![
-            ("grant_type", "authorization_code".to_string()),
+            ("grant_type", OAuthGrant::AuthCode.grant_type().to_string()),
             ("code", code_with_at.clone()),
             ("redirect_uri", self.config.callback_url.clone()),
         ];
@@ -730,7 +748,7 @@ impl AuthManager {
             &client,
             &self.config,
             &[
-                ("grant_type", "refresh_token".to_string()),
+                ("grant_type", OAuthGrant::Refresh.grant_type().to_string()),
                 ("refresh_token", refresh_token.to_string()),
             ],
             OAuthGrant::Refresh,
@@ -790,12 +808,6 @@ impl AuthManager {
                     warn!(
                         "Automatic token refresh failed; authentication may require intervention"
                     );
-                    metrics::counter!(
-                        crate::metrics::TOKEN_REFRESH_TOTAL,
-                        "outcome" => "failure",
-                        "grant" => "refresh_token"
-                    )
-                    .increment(1);
                 }
             }
         });

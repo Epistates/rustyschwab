@@ -44,11 +44,11 @@ impl SchwabClient {
             && store.operator_halt().await?.is_none()
             && self.risk_provider().is_some()
             && max_age_ms > 0;
-        metrics::gauge!("schwab_pending_submissions").set(pending as f64);
-        metrics::gauge!("schwab_unreconciled_accounts").set(unreconciled as f64);
-        metrics::gauge!("schwab_trading_ready").set(if trading_ready { 1.0 } else { 0.0 });
+        metrics::gauge!(crate::metrics::PENDING_SUBMISSIONS).set(pending as f64);
+        metrics::gauge!(crate::metrics::UNRECONCILED_ACCOUNTS).set(unreconciled as f64);
+        metrics::gauge!(crate::metrics::TRADING_READY).set(if trading_ready { 1.0 } else { 0.0 });
         if let Some(age) = oldest {
-            metrics::gauge!("schwab_baseline_age_seconds").set(age as f64 / 1000.0);
+            metrics::gauge!(crate::metrics::BASELINE_AGE_SECONDS).set(age as f64 / 1000.0);
         }
         Ok(Readiness {
             reads_ready,
