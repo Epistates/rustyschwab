@@ -257,11 +257,18 @@ async fn concurrent_admission_cannot_double_spend_and_tags_are_durable() {
         b.place_order("paper-test", &two)
     );
     assert_ne!(a.is_ok(), z.is_ok());
+    assert!(matches!(
+        a.as_ref().and(z.as_ref()),
+        Err(Error::RiskDenied(_))
+    ));
     let accepted = if a.is_ok() { one } else { two };
     let reopened = PaperBroker::open(dir.path().join("state/paper.sqlite3"), config())
         .await
         .unwrap();
-    assert!(reopened.place_order("paper-test", &accepted).await.is_err());
+    assert!(matches!(
+        reopened.place_order("paper-test", &accepted).await,
+        Err(Error::Duplicate(_))
+    ));
     assert_eq!(
         reopened.orders("paper-test", 0, 100).await.unwrap().len(),
         1
@@ -285,7 +292,10 @@ async fn unknown_ack_is_reconciled_by_durable_order_without_resubmission() {
         Err(Error::SubmissionUnknown { .. })
     ));
     assert_eq!(b.orders("paper-test", 0, 100).await.unwrap().len(), 1);
-    assert!(b.place_order("paper-test", &request).await.is_err());
+    assert!(matches!(
+        b.place_order("paper-test", &request).await,
+        Err(Error::Duplicate(_))
+    ));
     b.place_order("paper-test", &order("next", "BUY", "1", "11"))
         .await
         .unwrap();
@@ -298,11 +308,19 @@ async fn unknown_ack_is_reconciled_by_durable_order_without_resubmission() {
     })
     .await
     .unwrap();
-    assert!(
-        b.place_order("paper-test", &order("reject", "BUY", "1", "11"))
-            .await
-            .is_err()
-    );
+    // Venue rejections carry the same shape as a live broker's 400.
+    let rejection = b
+        .place_order("paper-test", &order("reject", "BUY", "1", "11"))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        &rejection,
+        Error::Broker { status, details, .. }
+            if *status == reqwest::StatusCode::BAD_REQUEST
+                && details[0].title.as_deref() == Some(PAPER_REJECTION_TITLE)
+                && details[0].detail.as_deref() == Some("Injected paper rejection")
+    ));
+    assert!(!rejection.is_retryable());
     assert_eq!(b.orders("paper-test", 0, 100).await.unwrap().len(), 2);
 }
 #[tokio::test]
@@ -320,17 +338,17 @@ async fn halt_and_stale_fencing_deny_submissions_but_not_cancellation() {
         .order_id
         .unwrap();
     b.coordinator().release(&lease).await.unwrap();
-    assert!(
+    assert!(matches!(
         b.place_order_fenced("paper-test", &order("stale", "BUY", "1", "11"), &lease)
-            .await
-            .is_err()
-    );
+            .await,
+        Err(Error::OwnershipLost)
+    ));
     b.halt_submissions("test", "operator").await.unwrap();
-    assert!(
+    assert!(matches!(
         b.place_order("paper-test", &order("halt", "BUY", "1", "11"))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(Error::Halted(_))
+    ));
     b.cancel_order("paper-test", &id).await.unwrap();
     b.apply(quote(3, 250, "10", "10.01", "1")).await.unwrap();
     assert!(b.operator_halt().await.unwrap().is_some());
@@ -354,11 +372,11 @@ async fn event_sequence_and_quote_freshness_fail_closed() {
     })
     .await
     .unwrap();
-    assert!(
+    assert!(matches!(
         b.place_order("paper-test", &order("stale", "BUY", "1", "11"))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(Error::Broker { .. })
+    ));
     b.apply(PaperEvent {
         sequence: 4,
         at_ms: 10000,
@@ -366,11 +384,11 @@ async fn event_sequence_and_quote_freshness_fail_closed() {
     })
     .await
     .unwrap();
-    assert!(
+    assert!(matches!(
         b.place_order("paper-test", &order("gap", "BUY", "1", "11"))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(Error::Broker { .. })
+    ));
 }
 #[tokio::test]
 async fn day_expiry_market_collar_and_unsupported_features_are_explicit() {

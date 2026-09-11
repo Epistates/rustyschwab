@@ -40,7 +40,7 @@ pub use auth::{AuthManager, AuthResult, OAuthConfig, TokenSet};
 pub use circuit_breaker::{CircuitBreaker, CircuitState};
 pub use client::{SchwabClient, SchwabClientBuilder};
 pub use config::{ChannelKind, CircuitBreakerConfig, ClientConfig, SchwabConfig, StreamConfig};
-pub use error::{Error, Result};
+pub use error::{Error, ErrorEnvelope, ErrorKind, Result};
 pub use streaming::{MessageReceiver, StreamClient, StreamMessage, Subscription};
 pub use utils::{TimeFormat, format_list, format_list_str, format_time};
 

@@ -477,9 +477,7 @@ impl SchwabClient {
                         }
                     }
                     if submission && self.inner.execution.operator_halt().await?.is_some() {
-                        return Err(Error::InvalidParameter(
-                            "Operator trading halt is active".into(),
-                        ));
+                        return Err(Error::Halted("Operator trading halt is active".into()));
                     }
                     if let Some((account, attempt, order)) = risk_context {
                         if let Some(risk) = &self.inner.risk {
@@ -496,7 +494,7 @@ impl SchwabClient {
                         }
                     }
                     if submission && self.submissions_suspended() {
-                        return Err(Error::InvalidParameter(
+                        return Err(Error::Halted(
                             "Required data recovery is incomplete; submissions suspended".into(),
                         ));
                     }

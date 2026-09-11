@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
 };
 use schwab_rs::{
-    SchwabClient,
+    ErrorEnvelope, ErrorKind, SchwabClient,
     broker::TradingBackend,
     coordination::Lease,
     execution::{OrderJournal, SubmissionOutcome},
@@ -195,11 +195,11 @@ async fn admit(
     next: axum::middleware::Next,
 ) -> Response {
     let Ok(_permit) = state.capacity.clone().try_acquire_owned() else {
-        return response(Err(StatusCode::SERVICE_UNAVAILABLE));
+        return response(Err(StatusCode::SERVICE_UNAVAILABLE.into()));
     };
     tokio::time::timeout(Duration::from_secs(35), next.run(request))
         .await
-        .unwrap_or_else(|_| response(Err(StatusCode::GATEWAY_TIMEOUT)))
+        .unwrap_or_else(|_| response(Err(StatusCode::GATEWAY_TIMEOUT.into())))
 }
 async fn ready(State(state): State<Arc<Authority>>) -> Response {
     match tokio::time::timeout(
@@ -221,17 +221,82 @@ async fn ready(State(state): State<Arc<Authority>>) -> Response {
             }),
         )
             .into_response(),
-        _ => response(Err(StatusCode::SERVICE_UNAVAILABLE)),
+        _ => response(Err(StatusCode::SERVICE_UNAVAILABLE.into())),
     }
 }
-fn response(result: Result<Value, StatusCode>) -> Response {
+/// A refused request. Protocol refusals (authentication, capacity, limits)
+/// carry only a status; SDK failures cross the wire as an [`ErrorEnvelope`]
+/// so a `RemoteBackend` recovers the typed error.
+enum Denial {
+    Status(StatusCode),
+    Error(schwab_rs::Error),
+}
+impl From<StatusCode> for Denial {
+    fn from(code: StatusCode) -> Self {
+        Self::Status(code)
+    }
+}
+impl From<schwab_rs::Error> for Denial {
+    fn from(error: schwab_rs::Error) -> Self {
+        Self::Error(error)
+    }
+}
+const OPAQUE_DENIAL: &str = "authority request denied or incomplete";
+const OPAQUE_FAILURE: &str = "authority-side failure; consult the authority log";
+fn status_for(kind: ErrorKind) -> StatusCode {
+    match kind {
+        ErrorKind::InvalidParameter => StatusCode::BAD_REQUEST,
+        ErrorKind::ApprovalInvalid => StatusCode::FORBIDDEN,
+        ErrorKind::Duplicate
+        | ErrorKind::ReconciliationRequired
+        | ErrorKind::OwnershipLost
+        | ErrorKind::SubmissionUnknown => StatusCode::CONFLICT,
+        ErrorKind::RiskDenied | ErrorKind::BaselineStale => StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorKind::Halted => StatusCode::LOCKED,
+        ErrorKind::RateLimit => StatusCode::TOO_MANY_REQUESTS,
+        ErrorKind::Storage | ErrorKind::Remote | ErrorKind::CircuitOpen => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+/// Messages the SDK authors for the caller cross the wire verbatim; anything
+/// describing the authority's own internals is logged here and replaced.
+fn envelope(error: &schwab_rs::Error) -> ErrorEnvelope {
+    let mut envelope = ErrorEnvelope::from(error);
+    let relays_message = matches!(
+        envelope.kind,
+        ErrorKind::InvalidParameter
+            | ErrorKind::Halted
+            | ErrorKind::RiskDenied
+            | ErrorKind::BaselineStale
+            | ErrorKind::Duplicate
+            | ErrorKind::ApprovalInvalid
+            | ErrorKind::ReconciliationRequired
+            | ErrorKind::SubmissionUnknown
+            | ErrorKind::OwnershipLost
+            | ErrorKind::CircuitOpen
+            | ErrorKind::RateLimit
+            | ErrorKind::Timeout
+            | ErrorKind::Broker
+    );
+    if !relays_message {
+        tracing::warn!(kind = %envelope.kind, %error, "authority request failed");
+        envelope.message = OPAQUE_FAILURE.into();
+    }
+    envelope
+}
+fn response(result: Result<Value, Denial>) -> Response {
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(code) => (
-            code,
-            Json(json!({"error":"authority request denied or incomplete"})),
-        )
-            .into_response(),
+        Err(Denial::Status(code)) => {
+            (code, Json(json!({ "error": OPAQUE_DENIAL }))).into_response()
+        }
+        Err(Denial::Error(error)) => {
+            let envelope = envelope(&error);
+            (status_for(envelope.kind), Json(envelope)).into_response()
+        }
     }
 }
 fn allowance(identity: &ServiceIdentity) -> Duration {
@@ -252,7 +317,7 @@ async fn backend(
             let (identity, _) = state.authenticate(&headers, Role::Backend).await?;
             if let BackendRequest::SetHalt { reason, operator } = &mut request {
                 if reason.is_none() {
-                    return Err(StatusCode::FORBIDDEN);
+                    return Err(StatusCode::FORBIDDEN.into());
                 }
                 *operator = identity.subject.clone();
             }
@@ -265,14 +330,13 @@ async fn backend(
                 ),
             )
             .await
-            .map_err(|_| StatusCode::GATEWAY_TIMEOUT)?
-            .map_err(|_| StatusCode::CONFLICT)?;
+            .map_err(|_| StatusCode::GATEWAY_TIMEOUT)??;
             if serde_json::to_vec(&value)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
                 .len()
                 > 8 * 1024 * 1024
             {
-                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                return Err(StatusCode::PAYLOAD_TOO_LARGE.into());
             }
             Ok(value)
         }
@@ -333,14 +397,16 @@ async fn operator(
                         principal,
                         digest,
                         expires_at,
-                    } => journal(&principal)?
-                        .approve(&principal, &digest, &identity.subject, expires_at)
-                        .await
-                        .map_err(|_| StatusCode::CONFLICT)?,
-                    OperatorRequest::Revoke { principal, digest } => journal(&principal)?
-                        .revoke_approval(&digest, &identity.subject)
-                        .await
-                        .map_err(|_| StatusCode::CONFLICT)?,
+                    } => {
+                        journal(&principal)?
+                            .approve(&principal, &digest, &identity.subject, expires_at)
+                            .await?
+                    }
+                    OperatorRequest::Revoke { principal, digest } => {
+                        journal(&principal)?
+                            .revoke_approval(&digest, &identity.subject)
+                            .await?
+                    }
                     OperatorRequest::Resolve {
                         principal,
                         attempt,
@@ -349,33 +415,20 @@ async fn operator(
                         let outcome = SubmissionOutcome::Reconciled {
                             evidence: format!("Verified operator {}: {evidence}", identity.subject),
                         };
-                        journal(&principal)?
-                            .finish(&attempt, outcome)
-                            .await
-                            .map_err(|_| StatusCode::CONFLICT)?
+                        journal(&principal)?.finish(&attempt, outcome).await?
                     }
-                    OperatorRequest::Halt { reason } => state
-                        .client
-                        .halt_submissions(&reason, &identity.subject)
-                        .await
-                        .map_err(|_| StatusCode::CONFLICT)?,
-                    OperatorRequest::Resume => state
-                        .client
-                        .clear_operator_halt(&identity.subject)
-                        .await
-                        .map_err(|_| StatusCode::CONFLICT)?,
+                    OperatorRequest::Halt { reason } => {
+                        state
+                            .client
+                            .halt_submissions(&reason, &identity.subject)
+                            .await?
+                    }
+                    OperatorRequest::Resume => {
+                        state.client.clear_operator_halt(&identity.subject).await?
+                    }
                     OperatorRequest::Status => {
-                        let halted = state
-                            .client
-                            .operator_halt()
-                            .await
-                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                        let pending = state
-                            .client
-                            .execution_store()
-                            .pending_count()
-                            .await
-                            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+                        let halted = state.client.operator_halt().await?;
+                        let pending = state.client.execution_store().pending_count().await?;
                         return Ok(json!({
                             "operator_halt": halted,
                             "pending_submissions": pending,
@@ -412,28 +465,21 @@ async fn lease(
                     LeaseRequest::Acquire => serde_json::to_value(
                         coordinator
                             .acquire("gateway", &identity.subject, Duration::from_secs(30))
-                            .await
-                            .map_err(|_| StatusCode::CONFLICT)?,
+                            .await?,
                     ),
                     LeaseRequest::Renew { lease } => {
                         check_owner(&lease, &identity)?;
                         serde_json::to_value(
-                            coordinator
-                                .renew(&lease, Duration::from_secs(30))
-                                .await
-                                .map_err(|_| StatusCode::CONFLICT)?,
+                            coordinator.renew(&lease, Duration::from_secs(30)).await?,
                         )
                     }
                     LeaseRequest::Release { lease } => {
                         check_owner(&lease, &identity)?;
-                        coordinator
-                            .release(&lease)
-                            .await
-                            .map_err(|_| StatusCode::CONFLICT)?;
+                        coordinator.release(&lease).await?;
                         Ok(json!({"ok":true}))
                     }
                 };
-                value.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                value.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
             };
             tokio::time::timeout(allowance(&identity), operation)
                 .await
@@ -485,7 +531,7 @@ async fn order(
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
             {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
             let mut principal = grants
                 .iter()
@@ -510,33 +556,20 @@ async fn order(
             if let Some(id) = args.get("order_id").and_then(Value::as_str)
                 && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()))
             {
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
             if !cancel {
                 let held = request.lease.as_ref().ok_or(StatusCode::FORBIDDEN)?;
                 check_owner(held, &identity)?;
-                if !state
-                    .client
-                    .coordinator()
-                    .valid(held)
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-                {
-                    return Err(StatusCode::CONFLICT);
+                if !state.client.coordinator().valid(held).await? {
+                    return Err(schwab_rs::Error::OwnershipLost.into());
                 }
             }
             let audit = state.journal(&principal.name);
             let digest = intent_digest(tool, &args);
             principal.approved_intents.clear();
-            if audit
-                .is_approved(&principal.name, &digest)
-                .await
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            {
-                let operator = audit
-                    .approval_operator(&digest)
-                    .await
-                    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if audit.is_approved(&principal.name, &digest).await? {
+                let operator = audit.approval_operator(&digest).await?;
                 if grants
                     .iter()
                     .any(|g| g.role == Role::Operator && Some(&g.subject) == operator.as_ref())
@@ -564,8 +597,7 @@ async fn order(
                     json!({"request_id":request.request_id,"arguments":args}),
                     Some(key),
                 )
-                .await
-                .map_err(|_| StatusCode::CONFLICT)?;
+                .await?;
             // After durable dispatch intent, all interruption paths remain pending.
             let execute = async {
                 match request.action {
@@ -609,11 +641,8 @@ async fn order(
                     if !matches!(error, schwab_rs::Error::SubmissionUnknown { .. })
                         && !(cancel && error.is_retryable()) =>
                 {
-                    audit
-                        .finish(&attempt, SubmissionOutcome::Rejected)
-                        .await
-                        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-                    Ok(json!({"mode":state.client.mode(),"status":"rejected","attempt_id":attempt}))
+                    audit.finish(&attempt, SubmissionOutcome::Rejected).await?;
+                    Ok(json!({"mode":state.client.mode(),"status":"rejected","attempt_id":attempt,"error":envelope(&error)}))
                 }
                 _ => Ok(json!({"mode":state.client.mode(),"status":"unknown","attempt_id":attempt})),
             }
@@ -649,9 +678,8 @@ async fn paper_event(
                         subject: identity.subject,
                     },
                 )
-                .await
-                .map_err(|_| StatusCode::CONFLICT)?;
-            serde_json::to_value(result).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                .await?;
+            serde_json::to_value(result).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into())
         }
         .await,
     )
@@ -677,17 +705,11 @@ async fn paper_account(
                 .and_then(|g| g.policy.as_ref())
                 .ok_or(StatusCode::FORBIDDEN)?;
             if !policy.accounts.contains(&query.account) {
-                return Err(StatusCode::FORBIDDEN);
+                return Err(StatusCode::FORBIDDEN.into());
             }
             let paper = state.client.paper().ok_or(StatusCode::NOT_FOUND)?;
-            let snapshot = paper
-                .snapshot(&query.account)
-                .await
-                .map_err(|_| StatusCode::CONFLICT)?;
-            let orders = paper
-                .orders(&query.account, query.after_id, 100)
-                .await
-                .map_err(|_| StatusCode::CONFLICT)?;
+            let snapshot = paper.snapshot(&query.account).await?;
+            let orders = paper.orders(&query.account, query.after_id, 100).await?;
             Ok(json!({"mode":"paper","snapshot":snapshot,"orders":orders}))
         }
         .await,

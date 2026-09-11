@@ -417,7 +417,7 @@ async fn journal_process_probe() {
             Some("one-use".into()),
         )
         .await;
-    assert!(result.is_ok() || matches!(result, Err(Error::InvalidParameter(_))));
+    assert!(result.is_ok() || matches!(result, Err(Error::Duplicate(_))));
 }
 
 #[test]
@@ -450,7 +450,7 @@ async fn recovery_and_process_drain_close_submission_admission_before_wire() {
     client.suspend_submissions("stream gap");
     assert!(matches!(
         client.place_order("hash", &limit_order()).await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Halted(_))
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
     client.resume_submissions();
@@ -460,7 +460,7 @@ async fn recovery_and_process_drain_close_submission_admission_before_wire() {
     assert!(client.clone().submissions_suspended());
     assert!(matches!(
         client.place_order("hash", &limit_order()).await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Halted(_))
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -480,7 +480,10 @@ async fn operator_halt_survives_recovery_and_reopening() {
         schwab_rs::execution::OrderJournal::new(client.order_journal().path().to_owned());
     use schwab_rs::execution::ExecutionStore;
     assert!(reopened.operator_halt().await.unwrap().is_some());
-    assert!(client.place_order("hash", &limit_order()).await.is_err());
+    assert!(matches!(
+        client.place_order("hash", &limit_order()).await,
+        Err(Error::Halted(_))
+    ));
     assert!(server.received_requests().await.unwrap().is_empty());
     client
         .clear_operator_halt("verified-supervisor")
@@ -534,12 +537,18 @@ async fn dispatch_revalidation_runs_after_quota_and_before_wire() {
             assert!(!self.waited.load(Ordering::SeqCst));
             Ok(())
         }
-        async fn revalidate(&self, _: &str, _: &str, _: &OrderRequest) -> schwab_rs::Result<()> {
+        async fn revalidate(
+            &self,
+            account: &str,
+            _: &str,
+            _: &OrderRequest,
+        ) -> schwab_rs::Result<()> {
             assert!(self.waited.load(Ordering::SeqCst));
             self.checked.store(true, Ordering::SeqCst);
-            Err(Error::InvalidParameter(
-                "baseline expired during wait".into(),
-            ))
+            Err(Error::BaselineStale {
+                account: account.into(),
+                reason: "baseline expired during wait".into(),
+            })
         }
         async fn release(&self, _: &str) -> schwab_rs::Result<()> {
             Ok(())
@@ -569,7 +578,7 @@ async fn dispatch_revalidation_runs_after_quota_and_before_wire() {
         .unwrap();
     assert!(matches!(
         client.place_order("hash", &limit_order()).await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::BaselineStale { account, .. }) if account == "hash"
     ));
     assert!(checked.load(Ordering::SeqCst));
     assert!(server.received_requests().await.unwrap().is_empty());

@@ -168,15 +168,41 @@ async fn two_remote_clients_share_intents_quotas_and_fencing() {
         .begin_once("shared", "place_order", json!({"tag":"one"}), None)
         .await
         .unwrap();
-    assert!(
+    // Typed trading-control errors survive the wire; the worker sees the
+    // same variant a local journal would return.
+    assert!(matches!(
         b.begin_once("shared", "place_order", json!({"tag":"two"}), None)
-            .await
-            .is_err()
-    );
+            .await,
+        Err(schwab_rs::Error::ReconciliationRequired { attempt_id }) if attempt_id == id
+    ));
+    let envelope = post(
+        &s,
+        "/v1/backend",
+        'b',
+        json!({"operation":"begin","arguments":{"account":"shared","operation":"place_order","request":{"tag":"two"},"dedup_key":null}}),
+    )
+    .await;
+    assert_eq!(envelope.status(), 409);
+    let envelope: Value = envelope.json().await.unwrap();
+    assert_eq!(envelope["kind"], "reconciliation_required", "{envelope}");
+    assert_eq!(envelope["attempt_id"], id, "{envelope}");
     a.finish(&id, SubmissionOutcome::Rejected).await.unwrap();
-    b.begin_once("shared", "place_order", json!({"tag":"two"}), None)
+    assert!(matches!(
+        a.finish(&id, SubmissionOutcome::Rejected).await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
+    let second = b
+        .begin_once("shared", "place_order", json!({"tag":"two"}), None)
         .await
         .unwrap();
+    b.finish(&second, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    assert!(matches!(
+        a.begin_once("shared", "place_order", json!({"tag":"one"}), None)
+            .await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
     assert!(a.quota("shared-quota", 1, 1).await.unwrap().is_zero());
     assert!(!b.quota("shared-quota", 1, 1).await.unwrap().is_zero());
     let old = a
@@ -195,10 +221,17 @@ async fn two_remote_clients_share_intents_quotas_and_fencing() {
         .await
         .unwrap();
     assert!(b.operator_halt().await.unwrap().is_some());
+    // Protocol refusals stay opaque and never masquerade as a broker reply.
+    let refused = b.set_operator_halt(None, "backend").await.unwrap_err();
     assert!(
-        b.set_operator_halt(None, "backend").await.is_err(),
-        "Only the verified operator endpoint may clear a remote halt"
+        matches!(
+            &refused,
+            schwab_rs::Error::Remote { status, .. } if *status == reqwest::StatusCode::FORBIDDEN
+        ),
+        "Only the verified operator endpoint may clear a remote halt: {refused:?}"
     );
+    assert_eq!(refused.http_status(), None);
+    assert!(!refused.is_retryable());
     s.client.resume_submissions();
     assert!(b.operator_halt().await.unwrap().is_some());
     let audit = a.audit_page(0, 100).await.unwrap();
@@ -299,7 +332,10 @@ async fn verified_approval_gateway_fencing_replay_and_operator_revocation() {
     let second = order("gateway-two");
     approve(&s, &second).await;
     let stale = json!({"request_id":uuid::Uuid::new_v4().to_string(),"account_hash":"A","action":{"kind":"place","order":second},"lease":lease});
-    assert_eq!(post(&s, "/v1/orders", 't', stale).await.status(), 409);
+    let refused = post(&s, "/v1/orders", 't', stale).await;
+    assert_eq!(refused.status(), 409);
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["kind"], "ownership_lost", "{refused}");
     let new_lease: Value = post(&s, "/v1/lease", 't', json!({"action":"acquire"}))
         .await
         .json()
@@ -313,6 +349,45 @@ async fn verified_approval_gateway_fencing_replay_and_operator_revocation() {
     std::fs::write(&s.policy, policy.to_string()).unwrap();
     let revoked = json!({"request_id":uuid::Uuid::new_v4().to_string(),"account_hash":"A","action":{"kind":"place","order":second},"lease":new_lease});
     assert_eq!(post(&s, "/v1/orders", 't', revoked).await.status(), 403);
+    s.broker.verify().await;
+}
+
+#[tokio::test]
+async fn gateway_reports_broker_rejections_with_a_typed_envelope() {
+    let s = setup().await;
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/A/orders"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "errors":[{
+                "id":"e1",
+                "status":"400",
+                "title":"Bad Request",
+                "detail":"Symbol not tradable"
+            }]
+        })))
+        .expect(1)
+        .mount(&s.broker)
+        .await;
+    let order = order("gateway-rejected");
+    approve(&s, &order).await;
+    let lease: Value = post(&s, "/v1/lease", 't', json!({"action":"acquire"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let request = json!({"request_id":uuid::Uuid::new_v4().to_string(),"account_hash":"A","action":{"kind":"place","order":order},"lease":lease});
+    let response = post(&s, "/v1/orders", 't', request).await;
+    assert_eq!(response.status(), 200);
+    let result: Value = response.json().await.unwrap();
+    assert_eq!(result["status"], "rejected", "{result}");
+    assert_eq!(result["error"]["kind"], "broker", "{result}");
+    assert_eq!(result["error"]["status"], 400, "{result}");
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.contains("Symbol not tradable")),
+        "broker detail must not cross the gateway: {result}"
+    );
     s.broker.verify().await;
 }
 

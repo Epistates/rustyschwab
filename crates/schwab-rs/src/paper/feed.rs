@@ -10,6 +10,16 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
+/// Upper bound on one calendar or quote fetch; a slow broker must not stall
+/// the clock indefinitely.
+const FEED_DEADLINE: Duration = Duration::from_secs(10);
+
+fn deadline_exceeded() -> Error {
+    Error::Timeout {
+        duration: FEED_DEADLINE.as_secs(),
+    }
+}
+
 pub fn regular_session_open(hours: &MarketHours, date: &str, at_ms: i64) -> Result<bool> {
     let deny = || Error::InvalidParameter("Missing or invalid broker calendar".into());
     if hours.date.as_deref() != Some(date) {
@@ -147,12 +157,12 @@ impl SchwabPaperFeed {
         // Do not cancel database mutations: blocking SQLite work may outlive a
         // dropped future and otherwise commit after the disconnect event.
         let hours = tokio::time::timeout(
-            Duration::from_secs(10),
+            FEED_DEADLINE,
             self.market_data
                 .get_market(Market::Equity, Some(now.date_naive())),
         )
         .await
-        .map_err(|_| Error::InvalidParameter("Paper calendar deadline exceeded".into()))??;
+        .map_err(|_| deadline_exceeded())??;
         let hours = hours
             .get(Market::Equity.as_str())
             .and_then(|v| v.get("EQ"))
@@ -171,12 +181,9 @@ impl SchwabPaperFeed {
             return Ok(());
         }
         let symbols: Vec<_> = self.symbols.iter().map(String::as_str).collect();
-        let quotes = tokio::time::timeout(
-            Duration::from_secs(10),
-            self.market_data.get_quotes(&symbols),
-        )
-        .await
-        .map_err(|_| Error::InvalidParameter("Paper quote deadline exceeded".into()))??;
+        let quotes = tokio::time::timeout(FEED_DEADLINE, self.market_data.get_quotes(&symbols))
+            .await
+            .map_err(|_| deadline_exceeded())??;
         if !regular_session_open(hours, &date, Utc::now().timestamp_millis())? {
             self.publish(PaperEventKind::Session {
                 session_id: date,

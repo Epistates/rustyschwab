@@ -5,7 +5,7 @@
 //! exchange queue priority or a promise of actual broker fills.
 mod engine;
 mod model;
-pub use engine::PaperBroker;
+pub use engine::{PAPER_REJECTION_TITLE, PaperBroker};
 pub use model::*;
 
 pub mod feed;

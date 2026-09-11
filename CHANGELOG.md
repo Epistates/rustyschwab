@@ -53,6 +53,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add Windows atomic protected file storage, update dependencies and raise the minimum compiler to Rust 1.89.
 - See [migration and validation notes](docs/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
 
+### Changed — error taxonomy (breaking)
+- `schwab_rs::Error`, `AuthError` and `StreamError` are now
+  `#[non_exhaustive]`; exhaustive matches need a fallback arm.
+- Trading-control outcomes have their own variants instead of sharing
+  `InvalidParameter`/`Storage`: `Halted(reason)` (operator halt, drain,
+  suspended recovery), `RiskDenied(reason)`, `BaselineStale { account,
+  reason }`, `Duplicate(reason)` (consumed intents, reused order tags,
+  already-resolved submissions, replayed paper events) and
+  `ApprovalInvalid(reason)`. `InvalidParameter` is now reserved for
+  caller mistakes and `Storage` for durable-state failures.
+- `Error::kind()` returns the new `ErrorKind` (stable `snake_case` wire
+  names). `ErrorEnvelope` is the JSON body an error takes across a process
+  boundary; `From<&Error>` / `From<ErrorEnvelope>` round-trip every typed
+  variant and decode foreign or malformed payloads to `Error::Unknown`
+  rather than fabricating attempt ids.
+- `Error::Remote { status, message }` replaces the `Storage("Remote
+  authority rejected request (HTTP n)")` string. It is retryable on 5xx
+  and deliberately excluded from `http_status()`, so a relayed 401 can
+  never trigger a local token refresh. `RemoteBackend` decodes authority
+  envelopes back into the typed error; authority-side transport kinds
+  (`http`, `api`, `broker`, `auth`, …) are re-homed under `Remote`.
+- The authority (`schwab-mcp`) answers SDK failures with an
+  `ErrorEnvelope` body and a kind-derived status (400 invalid parameter,
+  403 approval invalid, 409 duplicate/reconciliation/ownership, 422 risk
+  or baseline, 423 halted, 429 rate limit, 503 storage/remote/circuit,
+  504 timeout) instead of a fixed 409; gateway `rejected` results include
+  the envelope under `error`. Messages describing authority internals are
+  logged there and replaced before leaving.
+- Paper venue rejections (no fresh quote, replace rules, fee protection,
+  injected rejections, terminal cancels) are `Error::Broker` 400 with an
+  `ApiError { title: PAPER_REJECTION_TITLE, detail }` so live-targeted
+  handling applies unchanged; paper limits are `RiskDenied`, engine
+  invariants are `Storage`, and configuration-shaped refusals are
+  `Config`. `SchwabPaperFeed` reports `Error::Timeout` when a fetch
+  exceeds its deadline.
+- MCP tools surface `Halted`/`BaselineStale`/`CircuitOpen` as
+  `unavailable`, `RiskDenied`/`ApprovalInvalid` as `permission_denied`,
+  `InvalidParameter`/`Duplicate` as `invalid_params`, and rate limits and
+  timeouts under their own kinds; everything else keeps the opaque
+  reference id. `PrincipalPolicy` rejects a price-less order outright
+  instead of pricing it at `Decimal::MAX`.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

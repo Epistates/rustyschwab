@@ -22,6 +22,8 @@ const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUE
 const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)";
 const RESOLVE_SUBMISSION: &str =
     "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
+const SELECT_SUBMISSION_RESOLVED: &str =
+    "SELECT EXISTS(SELECT 1 FROM submissions WHERE id=?1 AND outcome IS NOT NULL)";
 const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,dedup_key \
      FROM submissions ORDER BY created_at,id";
 const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
@@ -121,9 +123,7 @@ impl OrderJournal {
                         .query_row(SELECT_APPROVAL_CONSUMED, [key], |r| r.get(0))
                         .map_err(sql)?;
                     if used {
-                        return Err(Error::InvalidParameter(
-                            "Execution intent already consumed".into(),
-                        ));
+                        return Err(Error::Duplicate("Execution intent already consumed".into()));
                     }
                 }
                 let pending: Option<String> = tx
@@ -146,7 +146,7 @@ impl OrderJournal {
                             .map_err(sql)?
                             != 1
                     {
-                        return Err(Error::InvalidParameter(
+                        return Err(Error::ApprovalInvalid(
                             "Approval expired, revoked or belongs to another principal".into(),
                         ));
                     }
@@ -162,7 +162,7 @@ impl OrderJournal {
                         .map_err(sql)?
                         != 1
                     {
-                        return Err(Error::InvalidParameter(
+                        return Err(Error::Duplicate(
                             "Order tag was already used for this account".into(),
                         ));
                     }
@@ -219,9 +219,14 @@ impl OrderJournal {
                     )
                     .map_err(sql)?;
                 if changed != 1 {
-                    return Err(Error::InvalidParameter(
-                        "Submission is unknown or already resolved".into(),
-                    ));
+                    let resolved: bool = tx
+                        .query_row(SELECT_SUBMISSION_RESOLVED, [&id], |r| r.get(0))
+                        .map_err(sql)?;
+                    return Err(if resolved {
+                        Error::Duplicate("Submission is already resolved".into())
+                    } else {
+                        Error::InvalidParameter("Submission is unknown".into())
+                    });
                 }
                 audit(&tx, "outcome", &id, &serde_json::to_value(&outcome)?)?;
                 tx.commit().map_err(sql)?;

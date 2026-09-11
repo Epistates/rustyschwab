@@ -162,10 +162,13 @@ fn exposure(
             quantity = quantity
                 .checked_add(leg.quantity)
                 .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
+            let price = order.price.ok_or_else(|| {
+                McpError::invalid_params("Policy requires an order with a bounded limit price")
+            })?;
             let exposure = leg
                 .quantity
                 .checked_mul(multiplier)
-                .and_then(|v| v.checked_mul(order.price.unwrap_or(rust_decimal::Decimal::MAX)))
+                .and_then(|v| v.checked_mul(price))
                 .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
             notional = notional
                 .checked_add(exposure)

@@ -2,7 +2,7 @@
 //! Use the broker gateway when workers must not possess broker credentials.
 use crate::{
     coordination::{Coordinator, Lease},
-    error::{Error, Result},
+    error::{Error, ErrorEnvelope, ErrorKind, Result},
     execution::{AuditEvent, ExecutionStore, SubmissionOutcome, SubmissionRecord},
     reconciliation::{AccountState, ReconciliationReport},
     risk::RiskProvider,
@@ -254,14 +254,64 @@ impl RemoteBackend {
             .body(body)
             .send()
             .await?;
-        if !response.status().is_success() {
-            return Err(Error::Storage(format!(
-                "Remote authority rejected request (HTTP {})",
-                response.status().as_u16()
-            )));
+        let status = response.status();
+        if !status.is_success() {
+            let body = bounded_body(response, REJECTION_BODY_LIMIT)
+                .await
+                .unwrap_or_default();
+            return Err(remote_rejection(status, &body));
         }
         let bytes = bounded_body(response, 8 * 1024 * 1024).await?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+/// Rejections are small; anything larger is not an envelope we would trust.
+const REJECTION_BODY_LIMIT: usize = 64 * 1024;
+const REJECTION_MESSAGE_LIMIT: usize = 256;
+/// Authority replies carry an [`ErrorEnvelope`] when the SDK on the far side
+/// produced the failure, so trading-control errors keep their type across the
+/// wire. Kinds describing the authority's own transport or broker session are
+/// re-homed under [`Error::Remote`]: a worker must never mistake them for its
+/// own session (a relayed 401 must not trigger a local token refresh).
+fn remote_rejection(status: reqwest::StatusCode, body: &[u8]) -> Error {
+    if let Ok(envelope) = serde_json::from_slice::<ErrorEnvelope>(body) {
+        return match envelope.kind {
+            ErrorKind::Http
+            | ErrorKind::Api
+            | ErrorKind::Broker
+            | ErrorKind::Auth
+            | ErrorKind::Network
+            | ErrorKind::WebSocket
+            | ErrorKind::Stream
+            | ErrorKind::ConnectionClosed
+            | ErrorKind::Subscription
+            | ErrorKind::UrlParse => Error::Remote {
+                status,
+                message: envelope.message,
+            },
+            _ => Error::from(envelope),
+        };
+    }
+    let message = serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| {
+            String::from_utf8_lossy(body)
+                .trim()
+                .chars()
+                .take(REJECTION_MESSAGE_LIMIT)
+                .collect()
+        });
+    Error::Remote {
+        status,
+        message: if message.is_empty() {
+            status
+                .canonical_reason()
+                .unwrap_or("no response body")
+                .to_owned()
+        } else {
+            message
+        },
     }
 }
 pub fn secure_endpoint(endpoint: &str) -> Result<reqwest::Url> {
@@ -463,5 +513,54 @@ impl RiskProvider for RemoteBackend {
             attempt_id: attempt_id.to_owned(),
         })
         .await
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn envelopes_recover_typed_errors_and_rehome_transport_kinds() {
+        let halted =
+            serde_json::to_vec(&ErrorEnvelope::from(&Error::Halted("review".into()))).unwrap();
+        assert!(matches!(
+            remote_rejection(StatusCode::LOCKED, &halted),
+            Error::Halted(reason) if reason == "review"
+        ));
+        let relayed_401 = serde_json::to_vec(&ErrorEnvelope::from(&Error::Http {
+            status: StatusCode::UNAUTHORIZED,
+            message: "upstream".into(),
+        }))
+        .unwrap();
+        let error = remote_rejection(StatusCode::BAD_GATEWAY, &relayed_401);
+        let Error::Remote { status, message } = &error else {
+            panic!("relayed transport errors must be re-homed under Remote");
+        };
+        assert_eq!(*status, StatusCode::BAD_GATEWAY);
+        assert_eq!(message, "upstream");
+        assert_eq!(error.http_status(), None, "must not trigger token refresh");
+    }
+
+    #[test]
+    fn opaque_and_malformed_bodies_become_remote_errors() {
+        let Error::Remote { status, message } =
+            remote_rejection(StatusCode::FORBIDDEN, br#"{"error":"denied"}"#)
+        else {
+            panic!("opaque bodies must become Remote");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(message, "denied");
+        let long = vec![b'x'; 1000];
+        assert!(matches!(
+            remote_rejection(StatusCode::BAD_GATEWAY, &long),
+            Error::Remote { message, .. } if message.len() == REJECTION_MESSAGE_LIMIT
+        ));
+        assert!(matches!(
+            remote_rejection(StatusCode::SERVICE_UNAVAILABLE, b"  "),
+            Error::Remote { message, .. } if message == "Service Unavailable"
+        ));
+        assert!(remote_rejection(StatusCode::SERVICE_UNAVAILABLE, b"").is_retryable());
+        assert!(!remote_rejection(StatusCode::CONFLICT, b"").is_retryable());
     }
 }

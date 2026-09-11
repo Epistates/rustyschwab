@@ -1,7 +1,7 @@
 //! Shared local paper command execution and bounded JSONL decoding.
 use schwab_rs::{
     broker::TradingBackend,
-    paper::{PaperBroker, PaperCommand},
+    paper::{PAPER_REJECTION_TITLE, PaperBroker, PaperCommand},
 };
 use serde_json::Value;
 use std::io::{BufRead, Read};
@@ -130,7 +130,9 @@ pub async fn verify_backup(
                 PaperCapturedOutcome::InjectedRejection => {
                     anyhow::ensure!(
                         matches!(result.as_ref().err().and_then(|e| e.downcast_ref::<schwab_rs::Error>()),
-                        Some(schwab_rs::Error::InvalidParameter(message)) if message == "Injected paper rejection"),
+                        Some(schwab_rs::Error::Broker { details, .. })
+                            if details.first().is_some_and(|d| d.title.as_deref() == Some(PAPER_REJECTION_TITLE)
+                                && d.detail.as_deref() == Some("Injected paper rejection"))),
                         "Captured rejection mismatch at {}",
                         record.index
                     );

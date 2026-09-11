@@ -94,9 +94,11 @@ impl PortfolioRisk {
         fence: Option<crate::coordination::Lease>,
     ) -> Result<()> {
         order.validate().map_err(Error::InvalidParameter)?;
-        let limits = self.accounts.get(account).cloned().ok_or_else(|| {
-            Error::InvalidParameter("Account has no portfolio risk policy".into())
-        })?;
+        let limits = self
+            .accounts
+            .get(account)
+            .cloned()
+            .ok_or_else(|| Error::RiskDenied("Account has no portfolio risk policy".into()))?;
         if limits.max_open_quantity <= Decimal::ZERO
             || limits.max_open_notional <= Decimal::ZERO
             || limits.max_position_quantity <= Decimal::ZERO
@@ -111,7 +113,7 @@ impl PortfolioRisk {
                 Some(OrderType::Limit | OrderType::StopLimit)
             )
         {
-            return Err(Error::InvalidParameter(
+            return Err(Error::RiskDenied(
                 "Built-in portfolio risk requires a single-leg limit order; \
                  use an external risk provider for strategies"
                     .into(),
@@ -124,15 +126,18 @@ impl PortfolioRisk {
                 OrderInstruction::Buy | OrderInstruction::Sell
             )
         {
-            return Err(Error::InvalidParameter(
+            return Err(Error::RiskDenied(
                 "Built-in portfolio risk supports long equity exposure; \
                  other assets require an external risk provider"
                     .into(),
             ));
         }
         let quantity = leg.quantity;
+        let price = order
+            .price
+            .ok_or_else(|| Error::InvalidParameter("Limit price is required".into()))?;
         let notional = quantity
-            .checked_mul(order.price.unwrap())
+            .checked_mul(price)
             .ok_or_else(|| Error::InvalidParameter("Risk arithmetic overflow".into()))?;
         let sell = leg.instruction == OrderInstruction::Sell;
         let symbol = leg.instrument.symbol.clone();
@@ -150,18 +155,19 @@ impl PortfolioRisk {
                     })
                     .optional()
                     .map_err(sql)?;
-                let (at, valid, body) = state.ok_or_else(|| {
-                    Error::InvalidParameter("Account requires reconciliation before trading".into())
-                })?;
+                let stale = |reason: &str| Error::BaselineStale {
+                    account: account.clone(),
+                    reason: reason.into(),
+                };
+                let (at, valid, body) =
+                    state.ok_or_else(|| stale("Account requires reconciliation before trading"))?;
                 let now = chrono::Utc::now().timestamp_millis();
                 if revalidate {
                     let halted: bool = tx
                         .query_row(SELECT_OPERATOR_HALTED, [], |r| r.get(0))
                         .map_err(sql)?;
                     if halted {
-                        return Err(Error::InvalidParameter(
-                            "Operator trading halt is active".into(),
-                        ));
+                        return Err(Error::Halted("Operator trading halt is active".into()));
                     }
                     if let Some(lease) = fence {
                         let valid: bool = tx
@@ -183,22 +189,16 @@ impl PortfolioRisk {
                 }
 
                 if !valid || now < at || now - at > limits.max_snapshot_age_ms {
-                    return Err(Error::InvalidParameter(
-                        "Account baseline is stale or unreconciled".into(),
-                    ));
+                    return Err(stale("Account baseline is stale or unreconciled"));
                 }
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
                 let account_value = &snapshot["securitiesAccount"];
                 let funds = decimal(account_value.pointer("/currentBalances/availableFunds"))
-                    .ok_or_else(|| {
-                        Error::InvalidParameter("Available funds missing from risk baseline".into())
-                    })?;
+                    .ok_or_else(|| stale("Available funds missing from risk baseline"))?;
                 let position = account_value
                     .get("positions")
                     .and_then(serde_json::Value::as_array)
-                    .ok_or_else(|| {
-                        Error::InvalidParameter("Positions missing from risk baseline".into())
-                    })?
+                    .ok_or_else(|| stale("Positions missing from risk baseline"))?
                     .iter()
                     .filter(|p| {
                         p.pointer("/instrument/symbol")
@@ -206,12 +206,10 @@ impl PortfolioRisk {
                             == Some(&symbol)
                     })
                     .try_fold(Decimal::ZERO, |sum, p| {
-                        let quantity = decimal(p.get("longQuantity")).ok_or_else(|| {
-                            Error::InvalidParameter("Position quantity missing or invalid".into())
-                        })?;
-                        sum.checked_add(quantity).ok_or_else(|| {
-                            Error::InvalidParameter("Position arithmetic overflow".into())
-                        })
+                        let quantity = decimal(p.get("longQuantity"))
+                            .ok_or_else(|| stale("Position quantity missing or invalid"))?;
+                        sum.checked_add(quantity)
+                            .ok_or_else(|| stale("Position arithmetic overflow"))
                     })?;
                 if revalidate {
                     let held: Option<(String, String)> = tx
@@ -223,7 +221,7 @@ impl PortfolioRisk {
                         .optional()
                         .map_err(sql)?;
                     if held != Some((quantity.to_string(), notional.to_string())) {
-                        return Err(Error::InvalidParameter(
+                        return Err(Error::Storage(
                             "Dispatch reservation missing or changed".into(),
                         ));
                     }
@@ -271,10 +269,10 @@ impl PortfolioRisk {
                 drop(orders);
                 let projected_q = open_q
                     .checked_add(quantity)
-                    .ok_or_else(|| Error::InvalidParameter("Risk quantity overflow".into()))?;
+                    .ok_or_else(|| Error::RiskDenied("Risk quantity overflow".into()))?;
                 let projected_n = open_n
                     .checked_add(notional)
-                    .ok_or_else(|| Error::InvalidParameter("Risk notional overflow".into()))?;
+                    .ok_or_else(|| Error::RiskDenied("Risk notional overflow".into()))?;
                 let buy_exceeds = !sell
                     && (projected_n > funds
                         || position
@@ -286,7 +284,7 @@ impl PortfolioRisk {
                     || buy_exceeds
                     || sell_exceeds
                 {
-                    return Err(Error::InvalidParameter(
+                    return Err(Error::RiskDenied(
                         "Portfolio or outstanding-order limit exceeded".into(),
                     ));
                 }
@@ -354,9 +352,8 @@ impl RiskProvider for PortfolioRisk {
 
 /// Conservative gross exposure for broker orders not covered by local holds.
 fn external_exposure(order: &serde_json::Value) -> Result<(Decimal, Decimal)> {
-    let deny = || {
-        Error::InvalidParameter("External open order needs a supported, bounded risk model".into())
-    };
+    let deny =
+        || Error::RiskDenied("External open order needs a supported, bounded risk model".into());
     if matches!(
         order.get("status").and_then(|v| v.as_str()),
         Some("FILLED" | "CANCELED" | "REJECTED" | "EXPIRED" | "REPLACED")

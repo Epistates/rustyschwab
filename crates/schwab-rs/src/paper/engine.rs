@@ -65,8 +65,34 @@ pub struct PaperBroker {
     config: Arc<PaperConfig>,
     draining: Arc<AtomicBool>,
 }
+/// Title carried by every paper venue rejection, so callers can tell a
+/// simulated rejection from a Schwab one without parsing the detail text.
+pub const PAPER_REJECTION_TITLE: &str = "Paper broker rejected the order";
+
+/// Caller supplied an unusable argument, event or command.
 fn invalid(message: &str) -> Error {
     Error::InvalidParameter(message.into())
+}
+/// Durable state or the engine's own arithmetic broke an invariant. Never a
+/// caller error; in a mutation this becomes `SubmissionUnknown`.
+fn corrupt(message: &str) -> Error {
+    Error::Storage(message.into())
+}
+/// The venue declined the command. Shaped like a Schwab HTTP 400 so code
+/// written against live trading handles paper identically; the reason
+/// travels as the `ApiError` detail.
+fn rejected(reason: &str) -> Error {
+    Error::Broker {
+        status: reqwest::StatusCode::BAD_REQUEST,
+        details: vec![crate::error::ApiError {
+            id: None,
+            status: Some("400".into()),
+            title: Some(PAPER_REJECTION_TITLE.into()),
+            detail: Some(reason.into()),
+            source: None,
+        }],
+        request_id: None,
+    }
 }
 // Storage/worker failures can obscure a commit outcome. Never report a
 // conclusive broker rejection merely because persistence returned an error.
@@ -81,19 +107,19 @@ fn mutation_error(error: Error, scope: String) -> Error {
 }
 pub(super) fn add(a: Decimal, b: Decimal) -> Result<Decimal> {
     a.checked_add(b)
-        .ok_or_else(|| invalid("Decimal addition overflow"))
+        .ok_or_else(|| corrupt("Decimal addition overflow"))
 }
 pub(super) fn sub(a: Decimal, b: Decimal) -> Result<Decimal> {
     a.checked_sub(b)
-        .ok_or_else(|| invalid("Decimal subtraction overflow"))
+        .ok_or_else(|| corrupt("Decimal subtraction overflow"))
 }
 pub(super) fn mul(a: Decimal, b: Decimal) -> Result<Decimal> {
     a.checked_mul(b)
-        .ok_or_else(|| invalid("Decimal multiplication overflow"))
+        .ok_or_else(|| corrupt("Decimal multiplication overflow"))
 }
 pub(super) fn div(a: Decimal, b: Decimal) -> Result<Decimal> {
     a.checked_div(b)
-        .ok_or_else(|| invalid("Decimal division overflow"))
+        .ok_or_else(|| corrupt("Decimal division overflow"))
 }
 fn encode(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
@@ -182,13 +208,20 @@ fn effective_clock(mut clock: Clock, config: &PaperConfig) -> Result<Clock> {
     if config.clock == PaperClockMode::Wall {
         let now = chrono::Utc::now().timestamp_millis();
         if now < clock.at_ms {
-            return Err(invalid("Wall clock moved backwards"));
+            return Err(corrupt("Wall clock moved backwards"));
         }
         clock.at_ms = now;
     }
     Ok(clock)
 }
-fn fresh_quote(c: &Connection, symbol: &str, clock: &Clock, config: &PaperConfig) -> Result<Quote> {
+/// The latest quote for `symbol` if the session is open and it is within
+/// `quote_max_age_ms`; `None` when there is no usable quote.
+fn fresh_quote(
+    c: &Connection,
+    symbol: &str,
+    clock: &Clock,
+    config: &PaperConfig,
+) -> Result<Option<Quote>> {
     let value: Option<String> = c
         .query_row(
             "SELECT payload FROM paper_quotes WHERE symbol=?1",
@@ -197,15 +230,14 @@ fn fresh_quote(c: &Connection, symbol: &str, clock: &Clock, config: &PaperConfig
         )
         .optional()
         .map_err(sql)?;
-    let quote: Quote =
-        serde_json::from_str(&value.ok_or_else(|| invalid("Fresh paper quote required"))?)?;
-    if !clock.open
-        || quote.source_at_ms > clock.at_ms
-        || clock.at_ms - quote.source_at_ms > config.quote_max_age_ms
-    {
-        return Err(invalid("Paper quote is stale or session is closed"));
-    }
-    Ok(quote)
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let quote: Quote = serde_json::from_str(&value)?;
+    let fresh = clock.open
+        && quote.source_at_ms <= clock.at_ms
+        && clock.at_ms - quote.source_at_ms <= config.quote_max_age_ms;
+    Ok(fresh.then_some(quote))
 }
 fn symbol_valid(symbol: &str) -> bool {
     !symbol.is_empty()
@@ -236,7 +268,9 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
             id.is_empty() || id.len() > 64 || !(0..=253402300799000_i64).contains(at)
         })
     {
-        return Err(invalid("Invalid paper configuration or model version"));
+        return Err(Error::Config(
+            "Invalid paper configuration or model version".into(),
+        ));
     }
     for (name, account) in &config.accounts {
         if !name.starts_with("paper-")
@@ -250,8 +284,9 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
             || !positive_bounded(account.limits.max_open_notional)
             || !positive_bounded(account.limits.max_position_quantity)
         {
-            return Err(invalid(
-                "Paper account names must start paper- and limits must be positive and bounded",
+            return Err(Error::Config(
+                "Paper account names must start paper- and limits must be positive and bounded"
+                    .into(),
             ));
         }
     }
@@ -373,7 +408,7 @@ fn end_order(
 }
 fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Result<()> {
     if draining {
-        return Err(invalid("Paper broker is draining"));
+        return Err(Error::Halted("Paper broker is draining".into()));
     }
     let halt: bool = c
         .query_row(
@@ -383,7 +418,7 @@ fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Res
         )
         .map_err(sql)?;
     if halt {
-        return Err(invalid("Operator halt is active"));
+        return Err(Error::Halted("Operator halt is active".into()));
     }
     if let Some(fence) = fence {
         let epoch = i64::try_from(fence.epoch).map_err(|_| invalid("Invalid lease epoch"))?;
@@ -396,7 +431,7 @@ fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Res
             )
             .map_err(sql)?;
         if !valid {
-            return Err(invalid("Paper execution lease is no longer valid"));
+            return Err(Error::OwnershipLost);
         }
     }
     Ok(())
@@ -428,10 +463,8 @@ impl PaperBroker {
                     .query_map([], |r| r.get::<_, String>(0))
                     .map_err(sql)?;
                 for symbol in symbols {
-                    match fresh_quote(c, &symbol.map_err(sql)?, &clock, &config) {
-                        Ok(_) => return Ok(true),
-                        Err(Error::InvalidParameter(_)) => {}
-                        Err(error) => return Err(error),
+                    if fresh_quote(c, &symbol.map_err(sql)?, &clock, &config)?.is_some() {
+                        return Ok(true);
                     }
                 }
                 Ok(false)
@@ -521,8 +554,8 @@ impl PaperBroker {
                     )
                     .map_err(sql)?;
                 if used {
-                    return Err(invalid(
-                        "Paper order tag already consumed; inspect order state",
+                    return Err(Error::Duplicate(
+                        "Paper order tag already consumed; inspect order state".into(),
                     ));
                 }
                 let account_state = ledger(&tx, &account)?;
@@ -538,9 +571,13 @@ impl PaperBroker {
                     &request.order_leg_collection[0].instrument.symbol,
                     &clock,
                     &this.config,
-                )?;
+                )?
+                .ok_or_else(|| rejected("No fresh quote; session closed or quote stale"))?;
                 if clock.at_ms - quote.source_at_ms > limits.max_snapshot_age_ms {
-                    return Err(invalid("Paper account quote freshness limit exceeded"));
+                    return Err(Error::BaselineStale {
+                        account: account.clone(),
+                        reason: "Paper account quote freshness limit exceeded".into(),
+                    });
                 }
                 if clock.fault == Some(PaperFault::RejectNext) {
                     clock.fault = None;
@@ -576,14 +613,14 @@ impl PaperBroker {
                 if let Some(id) = &replaces {
                     let mut old = find_order(&tx, &account, id)?;
                     if old.status != PaperOrderStatus::Working {
-                        return Err(invalid("Only working paper orders may be replaced"));
+                        return Err(rejected("Only working paper orders may be replaced"));
                     }
                     if old.request.order_leg_collection[0].instrument.symbol
                         != request.order_leg_collection[0].instrument.symbol
                         || old.request.order_leg_collection[0].instruction
                             != request.order_leg_collection[0].instruction
                     {
-                        return Err(invalid("Replacement must retain symbol and side"));
+                        return Err(rejected("Replacement must retain symbol and side"));
                     }
                     end_order(&tx, &mut old, PaperOrderStatus::Replaced, clock.at_ms)?;
                 }
@@ -603,7 +640,7 @@ impl PaperBroker {
                     )?
                 };
                 if !is_buy && price_bound < this.config.fee_per_share {
-                    return Err(invalid("Paper sell price protection cannot cover fees"));
+                    return Err(rejected("Paper sell price protection cannot cover fees"));
                 }
                 let mut order = PaperOrder {
                     order_id: String::new(),
@@ -617,7 +654,7 @@ impl PaperBroker {
                     eligible_at_ms: clock
                         .at_ms
                         .checked_add(this.config.execution_latency_ms)
-                        .ok_or_else(|| invalid("Clock overflow"))?,
+                        .ok_or_else(|| corrupt("Clock overflow"))?,
                     session_id: clock.session_id.clone(),
                     cancel_at_ms: None,
                     price_bound,
@@ -629,7 +666,9 @@ impl PaperBroker {
                 order.reserved_cash = reserve_cash(&order, &this.config)?;
                 let open = open_orders(&tx)?;
                 if open.len() >= this.config.max_working_orders {
-                    return Err(invalid("Paper working-order capacity reached"));
+                    return Err(Error::RiskDenied(
+                        "Paper working-order capacity reached".into(),
+                    ));
                 }
                 let mut held_cash = order.reserved_cash;
                 let mut open_q = order.remaining_quantity;
@@ -668,7 +707,9 @@ impl PaperBroker {
                     || open_q > limits.max_open_quantity
                     || open_n > limits.max_open_notional
                 {
-                    return Err(invalid("Paper cash, inventory or portfolio limit exceeded"));
+                    return Err(Error::RiskDenied(
+                        "Paper cash, inventory or portfolio limit exceeded".into(),
+                    ));
                 }
                 tx.execute(
                     "INSERT INTO paper_orders(account,active,payload) VALUES(?1,1,'')",
@@ -750,13 +791,11 @@ impl PaperBroker {
             })
             .await
             .map_err(|error| mutation_error(error, scope))?;
-        let response = response.ok_or_else(|| invalid("Injected paper rejection"))?;
+        let response = response.ok_or_else(|| rejected("Injected paper rejection"))?;
         if lost {
             return Err(Error::SubmissionUnknown {
                 attempt_id: format!("paper-{}", response.order_id.as_deref().unwrap_or_default()),
-                source: Box::new(invalid(
-                    "Injected acknowledgement loss; inspect durable paper order",
-                )),
+                source: Box::new(Error::ConnectionClosed),
             });
         }
         Ok(response)
@@ -783,7 +822,7 @@ impl PaperBroker {
                     return Ok(());
                 }
                 if !order.status.is_open() {
-                    return Err(invalid("Paper order is already terminal"));
+                    return Err(rejected("Paper order is already terminal"));
                 }
                 if delay == 0 {
                     end_order(&tx, &mut order, PaperOrderStatus::Canceled, clock.at_ms)?;
@@ -793,7 +832,7 @@ impl PaperBroker {
                         clock
                             .at_ms
                             .checked_add(delay)
-                            .ok_or_else(|| invalid("Clock overflow"))?,
+                            .ok_or_else(|| corrupt("Clock overflow"))?,
                     );
                     save_order(&tx, &order)?;
                     audit(
@@ -877,11 +916,7 @@ impl PaperBroker {
                     if position.quantity.is_zero() {
                         continue;
                     }
-                    let quote = match fresh_quote(&tx, symbol, &clock, &config) {
-                        Ok(quote) => Some(quote),
-                        Err(Error::InvalidParameter(_)) => None,
-                        Err(error) => return Err(error),
-                    };
+                    let quote = fresh_quote(&tx, symbol, &clock, &config)?;
                     market = match (market, quote) {
                         (Some(value), Some(q)) => Some(add(value, mul(position.quantity, q.bid)?)?),
                         _ => None,
@@ -925,7 +960,9 @@ impl PaperBroker {
     ) -> Result<PaperEventResult> {
         validate_source(&source)?;
         if self.config.clock != PaperClockMode::Wall {
-            return Err(invalid("Live ingestion requires wall clock mode"));
+            return Err(Error::Config(
+                "Live ingestion requires wall clock mode".into(),
+            ));
         }
         let config = self.config.clone();
         self.journal
@@ -1016,7 +1053,7 @@ fn capture(c: &Connection, command: PaperCommand, outcome: PaperCapturedOutcome)
     };
     let index = serde_json::from_str::<u64>(&count)?
         .checked_add(1)
-        .ok_or_else(|| invalid("Capture sequence exhausted"))?;
+        .ok_or_else(|| corrupt("Capture sequence exhausted"))?;
     let record = PaperCapturedCommand {
         index,
         command,
@@ -1058,7 +1095,7 @@ fn apply_event(
             .sequence
             .checked_add(1)
             .filter(|n| *n <= i64::MAX as u64)
-            .ok_or_else(|| invalid("Event sequence exhausted"))?;
+            .ok_or_else(|| corrupt("Event sequence exhausted"))?;
         event.at_ms = chrono::Utc::now().timestamp_millis();
     }
     let payload = encode(&canonical_json(&serde_json::to_value(&event)?))?;
@@ -1072,7 +1109,9 @@ fn apply_event(
         .map_err(sql)?;
     if let Some((old, result)) = prior {
         if old != payload && old != payload_receipt(&payload) {
-            return Err(invalid("Divergent replay event"));
+            return Err(Error::Duplicate(
+                "Event sequence already recorded with different content".into(),
+            ));
         }
         let mut result: PaperEventResult = serde_json::from_str(&result)?;
         result.duplicate = true;
@@ -1213,7 +1252,7 @@ fn apply_event(
                 order.eligible_at_ms = clock
                     .at_ms
                     .checked_add(config.execution_latency_ms)
-                    .ok_or_else(|| invalid("Clock overflow"))?;
+                    .ok_or_else(|| corrupt("Clock overflow"))?;
                 save_order(&tx, order)?;
                 continue;
             }
@@ -1349,7 +1388,9 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
         .optional()
         .map_err(sql)?;
     if mode.as_deref().is_some_and(|m| m != "paper") {
-        return Err(invalid("Paper mode cannot use live execution state"));
+        return Err(Error::Config(
+            "Paper mode cannot use live execution state".into(),
+        ));
     }
     let prior: Option<String> = tx
         .query_row("SELECT value FROM meta WHERE key='paper_config'", [], |r| {
@@ -1361,7 +1402,9 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
         if canonical_json(&serde_json::from_str(&prior)?)
             != canonical_json(&serde_json::to_value(config)?)
         {
-            return Err(invalid("Paper configuration differs from durable run"));
+            return Err(Error::Config(
+                "Paper configuration differs from durable run".into(),
+            ));
         }
         let tables: i64 = tx
             .query_row(COUNT_PAPER_TABLES, [], |r| r.get(0))
@@ -1430,7 +1473,9 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
             .query_row(COUNT_LIVE_STATE_ROWS, [], |r| r.get(0))
             .map_err(sql)?;
         if mode.is_some() || paper_tables != 0 || count != 0 {
-            return Err(invalid("Paper mode requires a new dedicated database"));
+            return Err(Error::Config(
+                "Paper mode requires a new dedicated database".into(),
+            ));
         }
         tx.execute_batch(PAPER_SCHEMA).map_err(sql)?;
         for (name, account) in &config.accounts {
@@ -1460,10 +1505,12 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
 fn settlement_at(config: &PaperConfig, clock: &Clock) -> Result<i64> {
     match config.settlement_calendar.get(&clock.session_id) {
         Some(at) if *at >= clock.at_ms => Ok(*at),
-        Some(_) => Err(invalid("Settlement timestamp precedes trade time")),
-        None if config.settlement_required => {
-            Err(invalid("Trading session has no settlement calendar entry"))
-        }
+        Some(_) => Err(Error::Config(
+            "Settlement timestamp precedes trade time".into(),
+        )),
+        None if config.settlement_required => Err(Error::Config(
+            "Trading session has no settlement calendar entry".into(),
+        )),
         None => Ok(clock.at_ms),
     }
 }
@@ -1475,7 +1522,7 @@ fn credit_cash(
     source: String,
 ) -> Result<()> {
     if amount < Decimal::ZERO {
-        return Err(invalid("Negative cash credit"));
+        return Err(corrupt("Negative cash credit"));
     }
     if amount.is_zero() {
         return Ok(());
@@ -1484,7 +1531,7 @@ fn credit_cash(
         account.cash = add(account.cash, amount)?;
     } else {
         if account.pending_cash.len() >= 10000 {
-            return Err(invalid("Pending cash capacity reached"));
+            return Err(corrupt("Pending cash capacity reached"));
         }
         account.pending_cash.push(PendingCash {
             source,
@@ -1561,8 +1608,8 @@ fn corporate_action(
         )
         .map_err(sql)?;
     if used {
-        return Err(invalid(
-            "Corporate action already applied; retry the original event sequence",
+        return Err(Error::Duplicate(
+            "Corporate action already applied; retry the original event sequence".into(),
         ));
     }
     match event {

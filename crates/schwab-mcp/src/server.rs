@@ -102,19 +102,41 @@ impl SchwabMcp {
     }
 }
 
-/// Convert any `schwab_rs::Error` into an `McpError` with the upstream
-/// message attached as context.
+/// Convert a `schwab_rs::Error` into an `McpError`. Trading-control outcomes
+/// the SDK authors for the caller pass through with their JSON-RPC kind;
+/// upstream detail never does, only a reference id that appears in the log.
 fn map_err(e: schwab_rs::Error) -> McpError {
-    if let schwab_rs::Error::SubmissionUnknown { attempt_id, .. }
-    | schwab_rs::Error::ReconciliationRequired { attempt_id } = &e
+    use schwab_rs::{Error, ErrorKind};
+    if let Error::SubmissionUnknown { attempt_id, .. }
+    | Error::ReconciliationRequired { attempt_id } = &e
     {
         return McpError::internal(format!(
             "Submission requires reconciliation; do not resubmit. Attempt {attempt_id}"
         ));
     }
-    let id = uuid::Uuid::new_v4().to_string();
-    tracing::warn!(error_id = %id, status = ?e.http_status(), "Schwab API operation failed");
-    McpError::internal(format!("Schwab API operation failed; reference {id}"))
+    match e.kind() {
+        ErrorKind::InvalidParameter | ErrorKind::Duplicate => {
+            McpError::invalid_params(e.to_string())
+        }
+        ErrorKind::RiskDenied | ErrorKind::ApprovalInvalid => {
+            McpError::permission_denied(e.to_string())
+        }
+        ErrorKind::Halted | ErrorKind::BaselineStale | ErrorKind::CircuitOpen => {
+            McpError::unavailable(format!("{e}; consult the operator"))
+        }
+        ErrorKind::RateLimit => McpError::rate_limited(e.to_string()),
+        ErrorKind::Timeout => McpError::timeout(e.to_string()),
+        _ => {
+            let id = uuid::Uuid::new_v4().to_string();
+            tracing::warn!(
+                error_id = %id,
+                kind = %e.kind(),
+                status = ?e.http_status(),
+                "Schwab API operation failed"
+            );
+            McpError::internal(format!("Schwab API operation failed; reference {id}"))
+        }
+    }
 }
 
 // NOTE: the macro only accepts string literals — keep `version` in sync
