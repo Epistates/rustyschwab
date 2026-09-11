@@ -95,6 +95,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference id. `PrincipalPolicy` rejects a price-less order outright
   instead of pricing it at `Decimal::MAX`.
 
+### Changed — durable state hot path
+- `StateDatabase` validates and migrates its file once per handle (on
+  first use) and then serves operations from a pool of open connections
+  instead of re-opening, re-locking and re-checking the schema on every
+  call. Clones share the pool; a connection left mid-transaction is closed
+  rather than reused. Measured per operation in release builds: no-op
+  `run` 360µs → 7µs, `quota` 719µs → 102µs, `begin`+`finish` 1.6ms →
+  134µs, with the remaining cost being `synchronous=FULL` fsyncs.
+- Schema changes are ordered migrations recorded in a new
+  `schema_migrations(version, name, applied_at)` table; `meta.schema` is
+  the highest applied version (now `2`). Each migration commits together
+  with its history row and the version bump. Version 1 files upgrade in
+  place on first open (the ad hoc `tags_imported` flag becomes migration
+  2); files from a newer build are refused; `restore` accepts any
+  supported version and migrates the copy forward.
+- A tampered file is now detected on the next open, not the next call:
+  reopen with a new `StateDatabase` (or process) to re-validate.
+
 ### Fixed — API wire-shape audit (response shapes verified against Schwab docs + Schwabdev 3.0.5)
 - **Quotes**: `GET /quotes` and `GET /{symbol}/quotes` return a
   **symbol-keyed map**, not a `quotes` array. `QuotesResponse` is now

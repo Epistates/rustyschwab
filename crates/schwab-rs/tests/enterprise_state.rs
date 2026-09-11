@@ -587,7 +587,8 @@ async fn state_reopen_rejects_missing_metadata_and_schema_version() {
             })
             .await
             .unwrap();
-        assert!(database.run(|_| Ok(())).await.is_err());
+        let reopened = StateDatabase::new(database.path().to_owned());
+        assert!(reopened.run(|_| Ok(())).await.is_err());
         let connection = rusqlite::Connection::open(database.path()).unwrap();
         let has_meta: bool = connection
             .query_row(
@@ -607,4 +608,126 @@ async fn state_reopen_rejects_missing_metadata_and_schema_version() {
             assert_eq!(count, 0);
         }
     }
+}
+
+fn meta(connection: &rusqlite::Connection, key: &str) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    connection
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+        .optional()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fresh_state_records_every_migration_and_refuses_newer_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = StateDatabase::new(dir.path().join("fresh.json"));
+    database.run(|_| Ok(())).await.unwrap();
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let applied: Vec<(u32, String)> = connection
+        .prepare("SELECT version,name FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        applied,
+        vec![(1, "baseline".to_string()), (2, "import_order_tags".into())]
+    );
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("2"));
+    assert_eq!(meta(&connection, "tags_imported"), None);
+    connection
+        .execute("UPDATE meta SET value='99' WHERE key='schema'", [])
+        .unwrap();
+    let newer = StateDatabase::new(database.path().to_owned());
+    let error = newer.run(|_| Ok(())).await.unwrap_err();
+    assert!(matches!(error, schwab_rs::Error::Storage(ref m) if m.contains("schema version")));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("99"));
+}
+
+#[tokio::test]
+async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1/state.sqlite3");
+    // Build a complete version 1 file the way the previous release left it,
+    // including its ad hoc tag-import flag and a submission with a tag that
+    // was never copied into used_order_tags.
+    let database = StateDatabase::new(path.clone());
+    database.run(|_| Ok(())).await.unwrap();
+    {
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE schema_migrations;
+                 UPDATE meta SET value='1' WHERE key='schema';
+                 INSERT INTO meta VALUES('tags_imported','1');
+                 INSERT INTO submissions VALUES('a1','A','place_order',1,\
+                    '{\"tag\":\"legacy-tag\"}','{\"status\":\"rejected\"}',NULL);",
+            )
+            .unwrap();
+    }
+    let upgraded = OrderJournal::new(path.clone());
+    assert_eq!(upgraded.records().await.unwrap().len(), 1);
+    assert!(matches!(
+        upgraded
+            .begin("A", "place_order", json!({"tag":"legacy-tag"}))
+            .await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("2"));
+    assert_eq!(meta(&connection, "tags_imported"), None);
+    let history: Vec<u32> = connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(history, vec![2]);
+}
+
+#[tokio::test]
+async fn pooled_connections_never_inherit_an_open_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = StateDatabase::new(dir.path().join("pool.json"));
+    database
+        .run(|c| {
+            c.execute_batch("BEGIN IMMEDIATE; INSERT INTO meta VALUES('leaked','1');")
+                .map_err(|e| schwab_rs::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    let leaked = database
+        .run(|c| {
+            assert!(c.is_autocommit());
+            c.query_row("SELECT COUNT(*) FROM meta WHERE key='leaked'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(|e| schwab_rs::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(leaked, 0, "an abandoned transaction must roll back");
+}
+
+#[tokio::test]
+async fn concurrent_first_use_initializes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = StateDatabase::new(dir.path().join("race.json"));
+    let tasks: Vec<_> = (0..16)
+        .map(|i| {
+            let database = database.clone();
+            tokio::spawn(async move { database.quota(&format!("k{i}"), 10, 10).await })
+        })
+        .collect();
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    let migrations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(migrations, 2);
 }

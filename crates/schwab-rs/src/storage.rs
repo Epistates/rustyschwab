@@ -1,121 +1,157 @@
 //! Private, transactional local state. SQLite files must be on a local filesystem.
+//!
+//! A [`StateDatabase`] validates and migrates its file once, on first use, and
+//! then serves operations from a small pool of open connections. Clones share
+//! the pool; a second handle on the same path is a separate opener, so
+//! cross-process safety comes from SQLite's WAL locking, not from this type.
 use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::{
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
-/// Every table the schema creates; a restore refuses a backup missing any of them.
-const COUNT_STATE_TABLES: &str = "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' \
-     AND name IN ('meta','submissions','audit','consumed_approvals','used_order_tags',\
-     'accounts','orders','executions','leases','quota','quota_config','approvals','reservations')";
+/// Connections kept open per database. Writers serialize on SQLite's lock, so
+/// a small pool bounds blocking threads without starving readers or backups.
+const POOL_SIZE: usize = 4;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+/// Tables created by the baseline migration. Every schema version has them,
+/// and a restore refuses a backup missing any of them.
+const BASELINE_TABLES: [&str; 13] = [
+    "meta",
+    "submissions",
+    "audit",
+    "consumed_approvals",
+    "used_order_tags",
+    "accounts",
+    "orders",
+    "executions",
+    "leases",
+    "quota",
+    "quota_config",
+    "approvals",
+    "reservations",
+];
+
+struct Migration {
+    version: u32,
+    name: &'static str,
+    sql: &'static str,
+}
+
+/// Applied in order inside one transaction each; `meta.schema` records the
+/// highest applied version and `schema_migrations` keeps the history.
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "baseline",
+        sql: "CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, account TEXT NOT NULL, operation TEXT NOT NULL, created_at INTEGER NOT NULL, request TEXT NOT NULL, outcome TEXT, dedup_key TEXT UNIQUE);
+            CREATE INDEX IF NOT EXISTS submissions_account ON submissions(account,created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS one_pending_account ON submissions(account) WHERE outcome IS NULL;
+            CREATE TABLE IF NOT EXISTS audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS consumed_approvals(key TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS used_order_tags(account TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(account,tag));
+            CREATE TABLE IF NOT EXISTS accounts(account TEXT PRIMARY KEY, generation INTEGER NOT NULL, observed_at INTEGER NOT NULL, valid INTEGER NOT NULL, snapshot TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS orders(account TEXT NOT NULL, order_id TEXT NOT NULL, observed_at INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,order_id));
+            CREATE TABLE IF NOT EXISTS executions(account TEXT NOT NULL, execution_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,execution_id));
+            CREATE TABLE IF NOT EXISTS leases(resource TEXT PRIMARY KEY, owner TEXT NOT NULL, epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS quota(key TEXT NOT NULL, at INTEGER NOT NULL);
+            CREATE INDEX IF NOT EXISTS quota_window ON quota(key,at);
+            CREATE TABLE IF NOT EXISTS quota_config(key TEXT PRIMARY KEY, per_second INTEGER NOT NULL, burst INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS approvals(digest TEXT PRIMARY KEY, principal TEXT NOT NULL, expires_at INTEGER NOT NULL, operator TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY, account TEXT NOT NULL, quantity TEXT NOT NULL, notional TEXT NOT NULL, state TEXT NOT NULL);",
+    },
+    // Version 1 files tracked this import with an ad hoc `tags_imported` flag.
+    Migration {
+        version: 2,
+        name: "import_order_tags",
+        sql: "INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(request,'$.tag') FROM submissions WHERE json_type(request,'$.tag')='text';
+            DELETE FROM meta WHERE key='tags_imported';",
+    },
+];
+const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
+
+#[derive(Clone)]
 pub struct StateDatabase {
+    inner: Arc<Inner>,
+}
+struct Inner {
     path: PathBuf,
     legacy: Option<PathBuf>,
+    initialized: tokio::sync::OnceCell<()>,
+    slots: Arc<tokio::sync::Semaphore>,
+    idle: parking_lot::Mutex<Vec<Connection>>,
+}
+impl std::fmt::Debug for StateDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateDatabase")
+            .field("path", &self.inner.path)
+            .finish_non_exhaustive()
+    }
 }
 pub(crate) fn sql(error: rusqlite::Error) -> Error {
     Error::Storage(error.to_string())
 }
 impl StateDatabase {
     pub fn new(path: PathBuf) -> Self {
-        if path.extension().is_some_and(|e| e == "sqlite3") {
-            Self { path, legacy: None }
+        let (path, legacy) = if path.extension().is_some_and(|e| e == "sqlite3") {
+            (path, None)
         } else {
-            Self {
-                path: path.with_extension("store").join("state.sqlite3"),
-                legacy: Some(path),
-            }
+            (
+                path.with_extension("store").join("state.sqlite3"),
+                Some(path),
+            )
+        };
+        Self {
+            inner: Arc::new(Inner {
+                path,
+                legacy,
+                initialized: tokio::sync::OnceCell::new(),
+                slots: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
+                idle: parking_lot::Mutex::new(Vec::with_capacity(POOL_SIZE)),
+            }),
         }
     }
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
+    /// Run `f` on a pooled connection from a blocking thread. The first call
+    /// validates and migrates the file; a failed initialization is retried by
+    /// the next call rather than poisoning the handle.
     pub async fn run<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        static WORKERS: std::sync::LazyLock<std::sync::Arc<tokio::sync::Semaphore>> =
-            std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(32)));
-        let permit = WORKERS
+        let inner = self.inner.clone();
+        inner
+            .initialized
+            .get_or_try_init(|| async {
+                let inner = self.inner.clone();
+                let connection = tokio::task::spawn_blocking(move || inner.initialize())
+                    .await
+                    .map_err(|_| Error::Storage("State worker failed".into()))??;
+                self.inner.idle.lock().push(connection);
+                Ok::<_, Error>(())
+            })
+            .await?;
+        let permit = inner
+            .slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
-        let database = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _permit=permit;
-            let parent = database.path.parent().ok_or_else(|| Error::Config("State path requires a directory".into()))?;
-            crate::security::ensure_private_directory(parent)?;
-            let lock = crate::auth::token_store::open_lock_file(&database.path.with_extension("init.lock"))?;
-            let lock_started=std::time::Instant::now();
-            loop {
-                match lock.try_lock() {
-                    Ok(())=>break,
-                    Err(std::fs::TryLockError::WouldBlock) if lock_started.elapsed()<Duration::from_secs(5)=>std::thread::sleep(Duration::from_millis(10)),
-                    Err(std::fs::TryLockError::WouldBlock)=>return Err(Error::Storage("State initialization lock timed out".into())),
-                    Err(std::fs::TryLockError::Error(error))=>return Err(Error::Io(error)),
-                }
-            }
-            if !database.path.exists() { crate::security::secure_file_write(&database.path, &[])?; }
-            crate::security::verify_file_permissions(&database.path)?;
-            let mut conn = Connection::open(&database.path).map_err(sql)?;
-            conn.busy_timeout(Duration::from_secs(5)).map_err(sql)?;
-            let tables: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'", [], |r|r.get(0)).map_err(sql)?;
-            let has_meta: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')", [], |r|r.get(0)).map_err(sql)?;
-            if tables > 0 && !has_meta { return Err(Error::Storage("Existing state is missing metadata; restore a complete backup".into())); }
-            conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);").map_err(sql)?;
-            let version: Option<String> = conn.query_row("SELECT value FROM meta WHERE key='schema'", [], |r| r.get(0)).optional().map_err(sql)?;
-            if version.as_deref().is_some_and(|v| v != "1") { return Err(Error::Storage("Unsupported state schema version".into())); }
-            if version.is_some() {
-                let required: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('meta','submissions','audit','consumed_approvals','used_order_tags','accounts','orders','executions','leases','quota','quota_config','approvals','reservations')", [], |r|r.get(0)).map_err(sql)?;
-                if required != 13 { return Err(Error::Storage("Existing state is missing required tables; restore a complete backup".into())); }
-            } else {
-                let metadata: i64 = conn.query_row("SELECT COUNT(*) FROM meta", [], |r|r.get(0)).map_err(sql)?;
-                if tables > i64::from(has_meta) || metadata > 0 { return Err(Error::Storage("Existing state is missing its schema version".into())); }
-            }
-            conn.execute_batch("BEGIN IMMEDIATE;
-                CREATE TABLE IF NOT EXISTS submissions(id TEXT PRIMARY KEY, account TEXT NOT NULL, operation TEXT NOT NULL, created_at INTEGER NOT NULL, request TEXT NOT NULL, outcome TEXT, dedup_key TEXT UNIQUE);
-                CREATE INDEX IF NOT EXISTS submissions_account ON submissions(account,created_at);
-                CREATE UNIQUE INDEX IF NOT EXISTS one_pending_account ON submissions(account) WHERE outcome IS NULL;
-                CREATE TABLE IF NOT EXISTS audit(sequence INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, payload TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS consumed_approvals(key TEXT PRIMARY KEY);
-                CREATE TABLE IF NOT EXISTS used_order_tags(account TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(account,tag));
-                CREATE TABLE IF NOT EXISTS accounts(account TEXT PRIMARY KEY, generation INTEGER NOT NULL, observed_at INTEGER NOT NULL, valid INTEGER NOT NULL, snapshot TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS orders(account TEXT NOT NULL, order_id TEXT NOT NULL, observed_at INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,order_id));
-                CREATE TABLE IF NOT EXISTS executions(account TEXT NOT NULL, execution_id TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(account,execution_id));
-                CREATE TABLE IF NOT EXISTS leases(resource TEXT PRIMARY KEY, owner TEXT NOT NULL, epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS quota(key TEXT NOT NULL, at INTEGER NOT NULL);
-                CREATE INDEX IF NOT EXISTS quota_window ON quota(key,at);
-                CREATE TABLE IF NOT EXISTS quota_config(key TEXT PRIMARY KEY, per_second INTEGER NOT NULL, burst INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS approvals(digest TEXT PRIMARY KEY, principal TEXT NOT NULL, expires_at INTEGER NOT NULL, operator TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
-                CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY, account TEXT NOT NULL, quantity TEXT NOT NULL, notional TEXT NOT NULL, state TEXT NOT NULL);
-                INSERT OR IGNORE INTO meta VALUES('schema','1'); COMMIT;").map_err(sql)?;
-            let tags_imported: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='tags_imported')", [], |r| r.get(0)).map_err(sql)?;
-            if !tags_imported {
-                conn.execute_batch("BEGIN IMMEDIATE; INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(request,'$.tag') FROM submissions WHERE json_type(request,'$.tag')='text'; INSERT INTO meta VALUES('tags_imported','1'); COMMIT;").map_err(sql)?;
-            }
-            if let Some(legacy) = database.legacy.filter(|p| p.exists()) {
-                let imported: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_imported')", [], |r| r.get(0)).map_err(sql)?;
-                if !imported {
-                    crate::security::verify_file_permissions(&legacy)?;
-                    let records: std::collections::HashMap<String, crate::execution::SubmissionRecord> = serde_json::from_slice(&std::fs::read(legacy)?)?;
-                    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(sql)?;
-                    for record in records.values() {
-                        if let Some(tag)=record.request.get("tag").and_then(serde_json::Value::as_str){tx.execute("INSERT INTO used_order_tags VALUES(?1,?2)",rusqlite::params![record.account,tag]).map_err(sql)?;}
-                        tx.execute("INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,?6,?7)", rusqlite::params![record.attempt_id,record.account,record.operation,record.created_at,serde_json::to_string(&record.request)?, record.outcome.as_ref().map(serde_json::to_string).transpose()?,record.dedup_key]).map_err(sql)?;
-                        if let Some(key) = &record.dedup_key { tx.execute("INSERT OR IGNORE INTO consumed_approvals VALUES(?1)",[key]).map_err(sql)?; }
-                    }
-                    tx.execute("INSERT INTO meta VALUES('legacy_imported','1')",[]).map_err(sql)?;
-                    tx.commit().map_err(sql)?;
-                }
-            }
-            drop(lock);
-            f(&mut conn)
-        }).await.map_err(|_| Error::Storage("State worker failed".into()))?
+            let _permit = permit;
+            let mut connection = inner.checkout()?;
+            let result = f(&mut connection);
+            inner.checkin(connection);
+            result
+        })
+        .await
+        .map_err(|_| Error::Storage("State worker failed".into()))?
     }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
@@ -140,7 +176,7 @@ impl StateDatabase {
     /// Restore to a NEW state location; never overwrite a running database.
     pub async fn restore(backup: PathBuf, destination: PathBuf) -> Result<Self> {
         let target = Self::new(destination);
-        let target_path = target.path.clone();
+        let target_path = target.inner.path.clone();
         // A restore must never create or initialize its source. Validate the
         // read-only backup before creating any destination state.
         tokio::task::spawn_blocking(move || {
@@ -148,24 +184,19 @@ impl StateDatabase {
             let source =
                 Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
                     .map_err(sql)?;
-            let check: String = source
-                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-                .map_err(sql)?;
-            if check != "ok" {
-                return Err(Error::Storage("Backup integrity check failed".into()));
-            }
+            integrity_check(&source)?;
             let schema: String = source
                 .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
                     r.get(0)
                 })
                 .map_err(sql)?;
-            if schema != "1" {
+            if !schema
+                .parse::<u32>()
+                .is_ok_and(|version| (1..=SCHEMA_VERSION).contains(&version))
+            {
                 return Err(Error::Storage("Unsupported backup schema version".into()));
             }
-            let tables: i64 = source
-                .query_row(COUNT_STATE_TABLES, [], |r| r.get(0))
-                .map_err(sql)?;
-            if tables != 13 {
+            if !baseline_tables_present(&source)? {
                 return Err(Error::Storage(
                     "Backup is missing required state tables".into(),
                 ));
@@ -186,19 +217,250 @@ impl StateDatabase {
         })
         .await
         .map_err(|_| Error::Storage("Restore worker failed".into()))??;
-        target
-            .run(|c| {
-                let check: String = c
-                    .query_row("PRAGMA integrity_check", [], |r| r.get(0))
-                    .map_err(sql)?;
-                if check != "ok" {
-                    return Err(Error::Storage("Backup integrity check failed".into()));
-                }
-                Ok(())
-            })
-            .await?;
+        target.run(|c| integrity_check(c)).await?;
         Ok(target)
     }
+}
+impl Inner {
+    fn checkout(&self) -> Result<Connection> {
+        match self.idle.lock().pop() {
+            Some(connection) => Ok(connection),
+            None => open_connection(&self.path),
+        }
+    }
+    /// A connection left mid-transaction is closed (rolling it back) rather
+    /// than handed to the next caller.
+    fn checkin(&self, connection: Connection) {
+        if connection.is_autocommit() {
+            let mut idle = self.idle.lock();
+            if idle.len() < POOL_SIZE {
+                idle.push(connection);
+            }
+        }
+    }
+    /// Cross-process initialization is serialized by a lock file so two
+    /// openers cannot race the schema migration.
+    fn initialize(&self) -> Result<Connection> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| Error::Config("State path requires a directory".into()))?;
+        crate::security::ensure_private_directory(parent)?;
+        let lock =
+            crate::auth::token_store::open_lock_file(&self.path.with_extension("init.lock"))?;
+        let started = std::time::Instant::now();
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < INIT_LOCK_TIMEOUT => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(Error::Storage("State initialization lock timed out".into()));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+            }
+        }
+        if !self.path.exists() {
+            crate::security::secure_file_write(&self.path, &[])?;
+        }
+        crate::security::verify_file_permissions(&self.path)?;
+        let mut connection = open_connection(&self.path)?;
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL")
+            .map_err(sql)?;
+        validate_existing(&connection)?;
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            )
+            .map_err(sql)?;
+        migrate(&mut connection)?;
+        if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
+            import_legacy(&mut connection, legacy)?;
+        }
+        drop(lock);
+        Ok(connection)
+    }
+}
+fn open_connection(path: &Path) -> Result<Connection> {
+    let connection = Connection::open(path).map_err(sql)?;
+    connection.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
+    connection
+        .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(sql)?;
+    Ok(connection)
+}
+fn integrity_check(connection: &Connection) -> Result<()> {
+    let check: String = connection
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(sql)?;
+    if check != "ok" {
+        return Err(Error::Storage("Backup integrity check failed".into()));
+    }
+    Ok(())
+}
+fn baseline_tables_present(connection: &Connection) -> Result<bool> {
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+        .map_err(sql)?;
+    let names = statement
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(sql)?
+        .collect::<std::result::Result<std::collections::HashSet<_>, _>>()
+        .map_err(sql)?;
+    Ok(BASELINE_TABLES.iter().all(|table| names.contains(*table)))
+}
+/// Refuse files that are not ours or that lost their metadata; a fresh file
+/// and a complete versioned file both pass.
+fn validate_existing(connection: &Connection) -> Result<()> {
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    let has_meta: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    if tables > 0 && !has_meta {
+        return Err(Error::Storage(
+            "Existing state is missing metadata; restore a complete backup".into(),
+        ));
+    }
+    if !has_meta {
+        return Ok(());
+    }
+    match schema_version(connection)? {
+        Some(version) if version > SCHEMA_VERSION => {
+            Err(Error::Storage("Unsupported state schema version".into()))
+        }
+        Some(_) if !baseline_tables_present(connection)? => Err(Error::Storage(
+            "Existing state is missing required tables; restore a complete backup".into(),
+        )),
+        Some(_) => Ok(()),
+        None => {
+            let metadata: i64 = connection
+                .query_row("SELECT COUNT(*) FROM meta", [], |r| r.get(0))
+                .map_err(sql)?;
+            if tables > 1 || metadata > 0 {
+                return Err(Error::Storage(
+                    "Existing state is missing its schema version".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+fn schema_version(connection: &Connection) -> Result<Option<u32>> {
+    let version: Option<String> = connection
+        .query_row("SELECT value FROM meta WHERE key='schema'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(sql)?;
+    version
+        .map(|v| {
+            v.parse()
+                .map_err(|_| Error::Storage("Unsupported state schema version".into()))
+        })
+        .transpose()
+}
+/// Each migration commits together with its history row and the version
+/// bump, so a crash leaves either the previous version or the next, never a
+/// half-applied schema.
+fn migrate(connection: &mut Connection) -> Result<()> {
+    let applied = schema_version(connection)?.unwrap_or(0);
+    for migration in MIGRATIONS.iter().filter(|m| m.version > applied) {
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, \
+             name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+        )
+        .map_err(sql)?;
+        tx.execute_batch(migration.sql).map_err(sql)?;
+        tx.execute(
+            "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
+            rusqlite::params![
+                migration.version,
+                migration.name,
+                chrono::Utc::now().timestamp_millis()
+            ],
+        )
+        .map_err(sql)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta VALUES('schema',?1)",
+            [migration.version.to_string()],
+        )
+        .map_err(sql)?;
+        tx.commit().map_err(sql)?;
+    }
+    Ok(())
+}
+/// One-time import of the pre-SQLite JSON journal, recorded in `meta` so a
+/// retained legacy file is never replayed.
+fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
+    let imported: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='legacy_imported')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    if imported {
+        return Ok(());
+    }
+    crate::security::verify_file_permissions(legacy)?;
+    let records: std::collections::HashMap<String, crate::execution::SubmissionRecord> =
+        serde_json::from_slice(&std::fs::read(legacy)?)?;
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sql)?;
+    for record in records.values() {
+        if let Some(tag) = record
+            .request
+            .get("tag")
+            .and_then(serde_json::Value::as_str)
+        {
+            tx.execute(
+                "INSERT INTO used_order_tags VALUES(?1,?2)",
+                rusqlite::params![record.account, tag],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(
+            "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![
+                record.attempt_id,
+                record.account,
+                record.operation,
+                record.created_at,
+                serde_json::to_string(&record.request)?,
+                record
+                    .outcome
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                record.dedup_key
+            ],
+        )
+        .map_err(sql)?;
+        if let Some(key) = &record.dedup_key {
+            tx.execute("INSERT OR IGNORE INTO consumed_approvals VALUES(?1)", [key])
+                .map_err(sql)?;
+        }
+    }
+    tx.execute("INSERT INTO meta VALUES('legacy_imported','1')", [])
+        .map_err(sql)?;
+    tx.commit().map_err(sql)?;
+    Ok(())
 }
 pub(crate) fn audit(
     conn: &Connection,
