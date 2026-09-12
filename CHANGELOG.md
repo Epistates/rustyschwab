@@ -644,6 +644,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Standalone `auth::PkceSession` helper — no remaining callers; the
   PKCE verifier lifecycle lives directly in `AuthManager`.
+- `schwab_rs::utils::{format_time, TimeFormat, format_list,
+  format_list_str}` and their crate-root re-exports — ports of the Python
+  client's helpers with no callers. The typed query parameters serialize
+  their own dates (`schwab_types::common::schwab_timestamp` is the one
+  timestamp spelling the Trader API accepts) and symbol lists
+  (`std::slice::join(",")`). `utils::canonical_json` stays.
 
 ## [0.1.0] - 2026-02-26
 
