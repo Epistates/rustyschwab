@@ -357,7 +357,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FUTURE`, `FOREX`, `PRODUCT`) and replaces the `String` on
   `OrderRequestInstrument`, order legs and positions; the previous
   `common::AssetType` (Market Data's `assetMainType` values) is renamed
-  `AssetMainType`. Positions and order legs share one instrument type,
+  `AssetMainType` and now types `QuoteItem::asset_main_type`,
+  `DataContent::asset_main_type`, the stream payload envelopes and
+  `Instrument::asset_type` (all previously `Option<String>`), with
+  `common::AssetSubType` (`Copy`/`Eq`/`Hash`, plus `MMF`) on the matching
+  `assetSubType` fields; both read values outside the enum, including
+  Schwab's own `UNKNOWN`, as `Unknown` rather than failing the payload.
+  Positions and order legs share one instrument type,
   `common::AccountsInstrument` (Schwab's `AccountsInstrument`), which
   replaces `accounts::PositionInstrument` and `trading::OrderInstrument`
   and adds the option (`putCall`, `underlyingSymbol`, `optionMultiplier`)

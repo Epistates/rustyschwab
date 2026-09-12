@@ -25,6 +25,7 @@ mod payload;
 
 pub use payload::*;
 
+use crate::common::{AssetMainType, AssetSubType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -149,9 +150,9 @@ pub struct DataContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delayed: Option<bool>,
     #[serde(rename = "assetMainType", skip_serializing_if = "Option::is_none")]
-    pub asset_main_type: Option<String>,
+    pub asset_main_type: Option<AssetMainType>,
     #[serde(rename = "assetSubType", skip_serializing_if = "Option::is_none")]
-    pub asset_sub_type: Option<String>,
+    pub asset_sub_type: Option<AssetSubType>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cusip: Option<String>,
     /// The numbered fields (`"1"`, `"2"`, …) plus any other key the service

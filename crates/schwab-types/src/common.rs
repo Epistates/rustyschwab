@@ -52,9 +52,12 @@ pub enum AssetType {
     Product,
 }
 
-/// Instrument class as Market Data spells `assetMainType` on quotes,
-/// instruments, and stream envelopes. A different value set from the
-/// Trader API's [`AssetType`].
+/// Instrument class as Market Data spells `assetMainType` on quotes and
+/// stream envelopes and `assetType` on instruments. A different value set
+/// from the Trader API's [`AssetType`].
+///
+/// `Unknown` is both Schwab's own `UNKNOWN` and any value added after this
+/// release, so decoding never fails on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -112,7 +115,12 @@ pub struct AccountsInstrument {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Instrument subclass as Market Data spells `assetSubType` beside
+/// [`AssetMainType`]: the equity subtypes (`COE` common stock, `PRF`
+/// preferred, `ADR`/`GDR` depositary receipts, `CEF`, `ETF`, `ETN`, `UIT`,
+/// `WAR` warrant, `RGT` right) and the mutual-fund ones (`OEF`, `CEF`,
+/// `MMF`). Values outside the list decode as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AssetSubType {
@@ -122,11 +130,14 @@ pub enum AssetSubType {
     Etf,
     Etn,
     Gdr,
+    Mmf,
     Oef,
     Prf,
     Rgt,
     Uit,
     War,
+    #[serde(other)]
+    Unknown,
 }
 
 /// Option contract right, as Schwab spells it in `putCall` fields.

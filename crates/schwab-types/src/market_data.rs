@@ -14,6 +14,7 @@
 //! All fields use `camelCase` serialization to match the Schwab API exactly.
 //! Rust fields use `snake_case` as per Rust conventions.
 
+use crate::common::{AssetMainType, AssetSubType};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -56,8 +57,8 @@ pub struct QuoteError {
 #[serde(rename_all = "camelCase")]
 pub struct QuoteItem {
     pub symbol: Option<String>,
-    pub asset_main_type: Option<String>,
-    pub asset_sub_type: Option<String>,
+    pub asset_main_type: Option<AssetMainType>,
+    pub asset_sub_type: Option<AssetSubType>,
     pub quote_type: Option<String>,
     pub realtime: Option<bool>,
     pub ssid: Option<i64>,
@@ -413,7 +414,9 @@ pub struct InstrumentsResponse {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct Instrument {
-    pub asset_type: Option<String>,
+    /// Market Data's classification, the same value set as
+    /// `assetMainType` on quotes.
+    pub asset_type: Option<AssetMainType>,
     pub cusip: Option<String>,
     pub symbol: String,
     pub description: Option<String>,

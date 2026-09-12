@@ -6,6 +6,7 @@
 //! wire shape fails in CI rather than on the first production call.
 
 use schwab_types::accounts::{Account, UserPreferences};
+use schwab_types::common::{AssetMainType, AssetSubType};
 use schwab_types::market_data::{
     InstrumentsResponse, MarketsHoursResponse, MoversResponse, QuotesResponse,
 };
@@ -55,7 +56,8 @@ fn quotes_response_is_symbol_keyed_map() {
     assert_eq!(parsed.quotes.len(), 2);
     let aapl = &parsed.quotes["AAPL"];
     assert_eq!(aapl.symbol.as_deref(), Some("AAPL"));
-    assert_eq!(aapl.asset_main_type.as_deref(), Some("EQUITY"));
+    assert_eq!(aapl.asset_main_type, Some(AssetMainType::Equity));
+    assert_eq!(aapl.asset_sub_type, Some(AssetSubType::Coe));
     assert_eq!(aapl.quote.as_ref().unwrap().last_price, Some(228.15));
     assert_eq!(
         aapl.quote.as_ref().unwrap().fifty_two_week_high,
@@ -96,6 +98,10 @@ fn instruments_response_is_wrapped_in_instruments_key() {
     let parsed: InstrumentsResponse = serde_json::from_str(json).unwrap();
     assert_eq!(parsed.instruments.len(), 1);
     assert_eq!(parsed.instruments[0].symbol, "AAPL");
+    assert_eq!(
+        parsed.instruments[0].asset_type,
+        Some(AssetMainType::Equity)
+    );
 }
 
 /// Quote fundamentals as Schwab sends them: share counts as JSON floats and

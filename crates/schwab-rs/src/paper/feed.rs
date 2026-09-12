@@ -4,7 +4,10 @@
 use super::{PaperBroker, PaperClockMode, PaperEventKind, PaperEventSource};
 use crate::{
     Error, Result, SchwabClient,
-    types::market_data::{Market, MarketHours, QuoteItem},
+    types::{
+        common::AssetMainType,
+        market_data::{Market, MarketHours, QuoteItem},
+    },
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -68,7 +71,7 @@ pub fn normalize_quote(
         )
     };
     if item.realtime != Some(true)
-        || item.asset_main_type.as_deref() != Some("EQUITY")
+        || item.asset_main_type != Some(AssetMainType::Equity)
         || item.symbol.as_deref() != Some(symbol)
         || size_multiplier <= Decimal::ZERO
         || size_multiplier > Decimal::from(1000)

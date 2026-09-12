@@ -35,6 +35,7 @@
 //! ```
 
 use super::{DataContent, DataItem, StreamService};
+use crate::common::{AssetMainType, AssetSubType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -240,8 +241,8 @@ field_table! {
         key = SYMBOL;
         envelope = {
             delayed: bool,
-            asset_main_type: String,
-            asset_sub_type: String,
+            asset_main_type: AssetMainType,
+            asset_sub_type: AssetSubType,
             cusip: String,
         };
         default = [
@@ -324,7 +325,7 @@ field_table! {
     /// A `LEVELONE_OPTIONS` quote. Deltas carry only the changed fields.
     LevelOneOptionFields => LevelOneOption {
         key = SYMBOL;
-        envelope = { delayed: bool, asset_main_type: String };
+        envelope = { delayed: bool, asset_main_type: AssetMainType };
         1 DESCRIPTION description "description": String,
         2 BID_PRICE bid_price "bidPrice": f64,
         3 ASK_PRICE ask_price "askPrice": f64,
@@ -394,7 +395,7 @@ field_table! {
     /// A `LEVELONE_FUTURES` quote. Deltas carry only the changed fields.
     LevelOneFuturesFields => LevelOneFutures {
         key = SYMBOL;
-        envelope = { delayed: bool, asset_main_type: String };
+        envelope = { delayed: bool, asset_main_type: AssetMainType };
         1 BID_PRICE bid_price "bidPrice": f64,
         2 ASK_PRICE ask_price "askPrice": f64,
         3 LAST_PRICE last_price "lastPrice": f64,
@@ -454,7 +455,7 @@ field_table! {
     /// A `LEVELONE_FUTURES_OPTIONS` quote. Deltas carry only the changed fields.
     LevelOneFuturesOptionFields => LevelOneFuturesOption {
         key = SYMBOL;
-        envelope = { delayed: bool, asset_main_type: String };
+        envelope = { delayed: bool, asset_main_type: AssetMainType };
         1 BID_PRICE bid_price "bidPrice": f64,
         2 ASK_PRICE ask_price "askPrice": f64,
         3 LAST_PRICE last_price "lastPrice": f64,
@@ -503,7 +504,7 @@ field_table! {
     /// A `LEVELONE_FOREX` quote. Deltas carry only the changed fields.
     LevelOneForexFields => LevelOneForex {
         key = SYMBOL;
-        envelope = { delayed: bool, asset_main_type: String };
+        envelope = { delayed: bool, asset_main_type: AssetMainType };
         1 BID_PRICE bid_price "bidPrice": f64,
         2 ASK_PRICE ask_price "askPrice": f64,
         3 LAST_PRICE last_price "lastPrice": f64,
@@ -891,6 +892,8 @@ mod tests {
         let quote = LevelOneEquity::from_content(&content).unwrap();
         assert_eq!(quote.key, "AMD");
         assert_eq!(quote.delayed, Some(false));
+        assert_eq!(quote.asset_main_type, Some(AssetMainType::Equity));
+        assert_eq!(quote.asset_sub_type, Some(AssetSubType::Coe));
         assert_eq!(quote.cusip.as_deref(), Some("007903107"));
         assert_eq!(quote.ask_price, Some(217.95));
         assert_eq!(quote.ask_id.as_deref(), Some("P"));
@@ -916,6 +919,17 @@ mod tests {
             Some("SPXW 12/08/2025 6880.00 C")
         );
         assert_eq!(quote.bid_price, Some(10.2));
+    }
+
+    #[test]
+    fn envelope_classes_outside_the_enum_decode_as_unknown() {
+        let quote = LevelOneEquity::from_content(&content(json!({
+            "key": "X", "assetMainType": "CRYPTO", "assetSubType": "NEW", "1": 1.0
+        })))
+        .unwrap();
+        assert_eq!(quote.asset_main_type, Some(AssetMainType::Unknown));
+        assert_eq!(quote.asset_sub_type, Some(AssetSubType::Unknown));
+        assert_eq!(quote.bid_price, Some(1.0));
     }
 
     #[test]
