@@ -561,6 +561,14 @@ require an explicit tool permission.
   `search_instruments`, `get_instrument`, `get_markets`, `get_market`
 - **Accounts** — `get_account_numbers`, `get_accounts`, `get_account`,
   `get_user_preferences`
+- **Projections** — `get_candles` (`[t,o,h,l,c,v]` rows),
+  `get_option_contracts` (one row per contract, ordered by expiration and
+  strike) and `get_positions` (one row per position) take the same
+  parameters as their raw tools and answer in a fraction of the bytes:
+  rows under a `columns` header, paged within
+  `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` (default 64 KiB) or an explicit
+  `limit`, with `truncated: true` and a `nextCursor` to continue from
+  rather than silent clipping
 - **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`
 - **Orders (write)** — `build_order(spec)` expands a compact spec
   (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or

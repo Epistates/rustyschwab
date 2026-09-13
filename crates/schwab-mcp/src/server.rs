@@ -27,6 +27,7 @@ use turbomcp::prelude::*;
 
 use crate::contract::{self, Source, ToolFailure};
 use crate::preflight;
+use crate::projection;
 use crate::query::{OrdersQuery, PriceHistoryQuery, TransactionsQuery};
 use crate::status::{self, SessionCalendar};
 use crate::stream_cache::{StreamCache, spawn_recovering_cache_feeder};
@@ -227,6 +228,42 @@ impl SchwabMcp {
         .await
     }
 
+    /// Price history as compact `[t, o, h, l, c, v]` rows (`t` in epoch
+    /// milliseconds) in time order, the same `params` as
+    /// `get_price_history` at a fraction of the size. A page stops at the
+    /// response budget or `limit` with `truncated: true`; pass its
+    /// `nextCursor` back as `cursor` to continue after the last candle.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_candles(
+        &self,
+        params: PriceHistoryQuery,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> McpResult<ToolResult> {
+        contract::run("get_candles", async {
+            let params = params
+                .into_params()
+                .map_err(ToolFailure::invalid_arguments)?;
+            let resp = self.client.get_price_history(&params).await?;
+            let (header, rows) = projection::candles(resp);
+            let page = projection::page(
+                rows,
+                projection::CANDLE_COLUMNS,
+                header,
+                cursor.as_deref(),
+                limit,
+                projection::budget(),
+            )?;
+            Ok(contract::rest(page.into_payload()?))
+        })
+        .await
+    }
+
     /// Get the options chain for a symbol — calls and puts across expirations.
     #[tool(
         read_only = true,
@@ -238,6 +275,44 @@ impl SchwabMcp {
         contract::run("get_option_chain", async {
             let resp = self.client.get_option_chain(&params).await?;
             Ok(contract::rest(resp))
+        })
+        .await
+    }
+
+    /// The option chain as one compact row per contract (symbol, putCall,
+    /// expiration, strike, bid, ask, mark, last, volume, openInterest,
+    /// delta, gamma, theta, vega, iv, itm, dte) ordered by expiration,
+    /// strike, then calls before puts, with the same `params` as
+    /// `get_option_chain`. Narrow it with `strikeCount`, `contractType`,
+    /// `fromDate`/`toDate` or `expMonth`; spread strategies need the raw
+    /// tool. A page stops at the response budget or `limit` with
+    /// `truncated: true`; pass its `nextCursor` back as `cursor` to
+    /// continue after the last contract.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_option_contracts(
+        &self,
+        params: OptionChainParams,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> McpResult<ToolResult> {
+        contract::run("get_option_contracts", async {
+            projection::check_contract_params(&params)?;
+            let resp = self.client.get_option_chain(&params).await?;
+            let (header, rows) = projection::option_contracts(resp);
+            let page = projection::page(
+                rows,
+                projection::CONTRACT_COLUMNS,
+                header,
+                cursor.as_deref(),
+                limit,
+                projection::budget(),
+            )?;
+            Ok(contract::rest(page.into_payload()?))
         })
         .await
     }
@@ -406,6 +481,41 @@ impl SchwabMcp {
                 .get_account(&account_hash, include_positions)
                 .await?;
             Ok(contract::rest(resp))
+        })
+        .await
+    }
+
+    /// An account's positions as one compact row each (symbol, assetType,
+    /// longQuantity, shortQuantity, averagePrice, marketValue,
+    /// currentDayProfitLoss, longOpenProfitLoss, shortOpenProfitLoss)
+    /// ordered by symbol; `get_account` has the balances and the full
+    /// instruments. A page stops at the response budget or `limit` with
+    /// `truncated: true`; pass its `nextCursor` back as `cursor` to
+    /// continue after the last position.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_positions(
+        &self,
+        account_hash: String,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> McpResult<ToolResult> {
+        contract::run("get_positions", async {
+            let resp = self.client.get_account(&account_hash, true).await?;
+            let (header, rows) = projection::positions(resp);
+            let page = projection::page(
+                rows,
+                projection::POSITION_COLUMNS,
+                header,
+                cursor.as_deref(),
+                limit,
+                projection::budget(),
+            )?;
+            Ok(contract::rest(page.into_payload()?))
         })
         .await
     }

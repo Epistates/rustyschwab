@@ -1,9 +1,10 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 33 tools (`build_order`, which expands
+explicit behavior annotations for all 36 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
-and `get_server_status` were added after the review). Reads and previews are marked
+`get_server_status` and the three projection tools were added after the
+review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -44,7 +45,8 @@ cache is wrapped as `{"asOf": <RFC 3339>, "source": "schwab_rest" |
 (`build_order`, `check_order`, `get_server_status`, stream control
 acknowledgements, `stream_status`) are bare.
 A response that would exceed the transport's 1 MiB message limit is refused
-with `response_too_large` rather than clipped.
+with `response_too_large` rather than clipped; the projection tools below
+stay within a much smaller budget by paging.
 
 A failure is a tool result with `isError: true` whose text and
 `structuredContent` are both
@@ -79,6 +81,38 @@ seven days ending now, and transactions to `TRADE`, so `params` may be
 omitted. Unknown fields are refused rather than ignored, so a misspelled
 bound cannot silently widen a window. The resolved request is still built
 and validated by the SDK, and Schwab's one-year cap still applies.
+
+## Projections
+
+Three tools answer the bulk reads in a fraction of the raw tools' bytes
+(`crates/schwab-mcp/src/projection.rs`), keeping the raw tools for the
+full shape. Each takes the same parameters as its raw counterpart plus
+`limit` and `cursor`, and returns, inside the usual envelope:
+
+```json
+{"asOf": "…", "source": "schwab_rest",
+ "data": {"symbol": "AAPL", "previousClose": 149.5,
+          "columns": ["t", "o", "h", "l", "c", "v"],
+          "rows": [[1736950200000, 150.12, 150.5, 149.9, 150.3, 1234567], "…"],
+          "count": 1300, "total": 3900, "truncated": true, "nextCursor": "1737028200000"}}
+```
+
+| Tool | Raw tool | Row | Order |
+| --- | --- | --- | --- |
+| `get_candles(params, limit?, cursor?)` | `get_price_history` | `[t, o, h, l, c, v]`, `t` in epoch milliseconds | time |
+| `get_option_contracts(params, limit?, cursor?)` | `get_option_chain` | `symbol, putCall, expiration, strike, bid, ask, mark, last, volume, openInterest, delta, gamma, theta, vega, iv, itm, dte` | expiration, strike, calls before puts |
+| `get_positions(account_hash, limit?, cursor?)` | `get_account` | `symbol, assetType, longQuantity, shortQuantity, averagePrice, marketValue, currentDayProfitLoss, longOpenProfitLoss, shortOpenProfitLoss` | symbol |
+
+A page stops at `limit` rows or when its rows reach
+`SCHWAB_MCP_RESPONSE_BUDGET_BYTES` (default 65536, clamped to 4 KiB..1 MiB),
+whichever comes first, and always carries at least one row. `truncated:
+true` means rows remain; `nextCursor` is the last row's ordering key, and
+passing it back as `cursor` re-reads the query from Schwab and continues
+after that key, so rows added or repriced between pages are neither
+skipped nor duplicated. `total` counts the query's rows before paging.
+Values are Schwab's, unconverted; only the shape is projected.
+`get_option_contracts` tabulates single-leg (and `ANALYTICAL`) chains and
+refuses spread strategies, which need the raw tool.
 
 ## Pre-flight
 
@@ -154,7 +188,7 @@ grant it to every principal.
 | Priority | Gap | Completion criteria |
 | --- | --- | --- |
 | High | Paper mode in MCP | Inject an explicit trading backend into MCP; publish mode in discovery and results; prove paper startup requires no live credentials and cannot reach order endpoints. The existing paper authority/CLI does not make the live MCP wrapper paper-capable. |
-| High | Bounded model context | Enforce response budgets and pagination for quotes, option chains, history and account lists; represent truncation explicitly and retain freshness/source information. Never silently truncate financial records. Oversized responses are now refused with `response_too_large`; projections and pagination remain. |
+| Medium | Bounded model context | Done for candles, option contracts and positions (budgeted, paged projections with explicit truncation and provenance); oversized raw responses are refused with `response_too_large`. Remaining: projections for quotes across many symbols and for order and transaction lists. |
 | High | Client interoperability | Exercise initialize, discovery, schemas, structured results, errors, cancellation, token rotation and cross-principal session denial with independent stdio and HTTP clients. Current regression tests are not a complete external conformance certification. |
 | Medium | Model evaluation | Version scenarios for stale data, prompt injection, account confusion, denied approvals, repeated submissions and uncertain fills. Require zero unauthorized executions; record model/version/config, not just aggregate success. |
 | Medium | Optional resources/prompts | Add account-scoped resources and workflow prompts only with matching lookup/call authorization and output budgets. Do not expose approval-granting tools to the proposing model. |

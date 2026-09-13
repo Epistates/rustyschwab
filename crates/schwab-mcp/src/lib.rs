@@ -9,6 +9,7 @@ pub mod network;
 pub mod paper_replay;
 pub mod policy;
 pub mod preflight;
+pub mod projection;
 pub mod query;
 pub mod redact;
 pub mod server;

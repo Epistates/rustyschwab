@@ -22,9 +22,9 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (33 tools)  policy.rs  network.rs  identity.rs  redact.rs │
-                 │ stream_cache.rs  status.rs  authority.rs (gateway)  bins: admin/    │
-                 │ authority/remote/paper/paper-verify                                  │
+                 │ server.rs (36 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ stream_cache.rs  status.rs  projection.rs  authority.rs (gateway)   │
+                 │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend
 ┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐
@@ -217,11 +217,13 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 33 `#[tool]`
-methods in category order: market data (10), accounts (4), orders read (3),
-orders write (`build_order`, `check_order`, `preview_order`, `place_order`,
-`cancel_order`, `replace_order`), transactions (2), streaming control and
-cached reads (7), server (`get_server_status`).
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 36 `#[tool]`
+methods in category order: market data (12, including the `get_candles`
+and `get_option_contracts` projections), accounts (5, including the
+`get_positions` projection), orders read (3), orders write (`build_order`,
+`check_order`, `preview_order`, `place_order`, `cancel_order`,
+`replace_order`), transactions (2), streaming control and cached reads (7),
+server (`get_server_status`).
 Each tool carries explicit read-only/destructive/idempotent/open-world hints;
 `tests/tool_inventory.rs` pins the list. `build_order` expands an
 `OrderSpec` locally so the operator-approved intent and the JSON sent to
@@ -234,7 +236,12 @@ reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
 (trading switches, operator halt, `readiness`, request budget, circuit,
 stream) plus one cached read of Schwab's equity calendar per US-Eastern
 day; `AuthorizedServer` adds the principal section on the policy-gated
-transports.
+transports. `projection.rs` turns a price history, an option chain or an
+account into compact column/row pages: rows are sorted by a typed key
+(candle time, `expiration|strike|C/P`, `symbol#ordinal`), a page stops at
+the caller's `limit` or the `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` budget, and
+`nextCursor` is the last key so re-reading Schwab between pages never
+skips or repeats a row. The raw tools keep Schwab's shape.
 
 ### Startup and transports (`main.rs`)
 

@@ -13,7 +13,9 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_quotes",
     "get_quote",
     "get_price_history",
+    "get_candles",
     "get_option_chain",
+    "get_option_contracts",
     "get_option_expiration_chain",
     "get_movers",
     "search_instruments",
@@ -24,6 +26,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_account_numbers",
     "get_accounts",
     "get_account",
+    "get_positions",
     "get_user_preferences",
     // Orders (read)
     "get_order",

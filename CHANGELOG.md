@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — projection tools
+
+- `get_candles(params, limit?, cursor?)`, `get_option_contracts(params,
+  limit?, cursor?)` and `get_positions(account_hash, limit?, cursor?)`
+  return the same Schwab reads as `get_price_history`, `get_option_chain`
+  and `get_account` as compact pages: a `columns` header, `rows` of
+  arrays, `count`, `total` (rows before paging), `truncated` and, when
+  truncated, `nextCursor`. Rows are sorted by a typed key (candle time,
+  `expiration|strike|C/P`, `symbol#ordinal`) and the cursor is the last
+  key, so re-reading Schwab between pages never skips or repeats a row.
+  A page stops at `limit` or at `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` of
+  encoded rows (default 65536, clamped to 4096..1 MiB) and always holds
+  at least one row. Candles carry `previousClose`; option contracts carry
+  the `underlying` quote and refuse spread strategies (`invalid_arguments`
+  without a request) because Schwab answers those with strategy legs, not
+  contracts; positions always request `fields=positions` and mask
+  `accountNumber` like every other response. The raw tools are unchanged.
+
 ### Added — `get_server_status`
 
 - `get_server_status()` reports, from local evidence, the mode (`live`),
