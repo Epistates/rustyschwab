@@ -217,10 +217,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 31 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 32 `#[tool]`
 methods in category order: market data (10), accounts (4), orders read (3),
-orders write (`build_order`, `preview_order`, `place_order`, `cancel_order`,
-`replace_order`), transactions (2), streaming control and cached reads (7).
+orders write (`build_order`, `check_order`, `preview_order`, `place_order`,
+`cancel_order`, `replace_order`), transactions (2), streaming control and
+cached reads (7).
 Each tool carries explicit read-only/destructive/idempotent/open-world hints;
 `tests/tool_inventory.rs` pins the list. `build_order` expands an
 `OrderSpec` locally so the operator-approved intent and the JSON sent to
@@ -257,9 +258,18 @@ reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
   `args.order` as `OrderRequest`, computes exposure (rejecting anything it
   cannot bound, such as market or stop children and multi-leg orders) and,
   when `require_approval` is set, demands a consumed single-use approval of
-  `intent_digest(name, args)` (SHA-256 over canonically sorted JSON).
+  `intent_digest(name, args)` (SHA-256 over canonically sorted JSON, with a
+  valid `order` first normalized to its `OrderRequest` wire form so the
+  digest binds the order Schwab would receive, not one JSON spelling of
+  it). `authorize` is the first denial of `review`, which keeps them all.
   `AuthorizedServer` wraps `SchwabMcp` as an `McpHandler`, writes the
   principal's audit journal and hands write tools to a `TradingBackend`.
+- `preflight.rs` — `check_order`: the same `review`, plus the trading switch
+  and `SchwabClient::submission_admission` (operator halt, recovery
+  suspension), reported together as a `Verdict` without dispatching or
+  auditing. `AuthorizedServer` evaluates it under the principal with durable
+  approvals merged in; the unauthorized stdio path evaluates it without a
+  policy.
 - `network.rs` — the axum router authenticates every request first
   (constant-time comparison of a bearer token's SHA-256 against the policy,
   or `identity::JwtVerifier` for short-lived RS256 tokens from

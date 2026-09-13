@@ -48,7 +48,7 @@ Example policy (replace the digest with the SHA-256 of a random bearer secret of
   {
     "name": "desk",
     "token_sha256": "REPLACE_WITH_64_HEX_CHARACTERS",
-    "tools": ["get_account", "get_orders", "get_order", "get_quote", "preview_order", "place_order", "cancel_order"],
+    "tools": ["get_account", "get_orders", "get_order", "get_quote", "check_order", "preview_order", "place_order", "cancel_order"],
     "accounts": ["BROKER_ACCOUNT_HASH"],
     "max_quantity": "10",
     "max_notional": "1000",

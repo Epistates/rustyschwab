@@ -564,9 +564,12 @@ require an explicit tool permission.
 - **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`
 - **Orders (write)** — `build_order(spec)` expands a compact spec
   (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
-  contract parts) into the exact `order` JSON the next three accept, locally
-  and without contacting Schwab; `preview_order`, `place_order`,
-  `cancel_order`, `replace_order` *(last three gated)*
+  contract parts) into the exact `order` JSON the write tools accept, locally
+  and without contacting Schwab; `check_order` reports every local reason a
+  submission would fail (validity, policy limits, approval, trading switch,
+  halts) with the intent digest to approve, also without contacting Schwab;
+  `preview_order`, `place_order`, `cancel_order`, `replace_order` *(last
+  three gated)*
 - **Transactions** — `get_transactions`, `get_transaction`
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,

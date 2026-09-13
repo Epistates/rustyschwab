@@ -1,8 +1,9 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 31 tools (`build_order`, which expands
-an `OrderSpec` locally, was added after the review). Reads and previews are marked
+explicit behavior annotations for all 32 tools (`build_order`, which expands
+an `OrderSpec` locally, and `check_order`, the local pre-flight described
+below, were added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -64,6 +65,34 @@ error; JSON-RPC errors are reserved for protocol faults. Schwab's own 4xx
 rejection text (title and detail, describing the submitted request) is relayed
 in `message`; every other upstream detail is logged under a reference id.
 Client middleware that retries must key on `retryable`, never on `isError`.
+
+## Pre-flight
+
+`check_order(account_hash, order, order_id?)` evaluates a `place_order` (or,
+with `order_id`, a `replace_order`) intent against everything this server
+enforces locally and answers without contacting Schwab:
+
+```json
+{"allowed": false,
+ "reasons": [{"code": "approval_required", "disposition": "ask_operator", "intentDigest": "…"}],
+ "exposure": {"quantity": "2", "notional": "100"},
+ "limits": {"maxQuantity": "2", "maxNotional": "100"},
+ "requiresApproval": true, "approved": false,
+ "intentDigest": "…", "tag": "mcp-…", "tradingEnabled": false}
+```
+
+`reasons` are the failures the submission would return, all of them, in the
+order a dispatch finds them: argument validity, the principal's tool and
+account permissions, risk limits, approval (policy or durable), the trading
+switch, and operator halts or a recovery suspension. `intentDigest` is what
+an operator approves with `schwab-admin approve`; `tag` is the order tag the
+submission would carry. The verdict is advisory: every check is repeated on
+submission, and a `duplicate_intent` is only detected there. Nothing is
+audited or approved by checking. Grant `check_order` to any principal that
+holds `place_order` or `replace_order`; without a principal (the local stdio
+transport with trading off) `limits` is null and approval does not apply.
+`preview_order` remains the way to obtain Schwab's own validation, fees and
+buying-power impact.
 
 ## Remaining implementation work
 

@@ -26,6 +26,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
 use crate::contract::{self, Source, ToolFailure};
+use crate::preflight;
 use crate::stream_cache::{StreamCache, spawn_recovering_cache_feeder};
 
 /// Env var that unlocks the write-side order tools
@@ -51,7 +52,7 @@ pub fn cancel_enabled() -> bool {
         .unwrap_or_else(|_| trading_enabled())
 }
 
-fn require_trading_enabled(op: &str) -> Result<(), ToolFailure> {
+pub(crate) fn require_trading_enabled(op: &str) -> Result<(), ToolFailure> {
     let enabled = if op == "cancel_order" {
         cancel_enabled()
     } else {
@@ -518,6 +519,43 @@ impl SchwabMcp {
             let json = serde_json::to_value(order)
                 .map_err(|e| ToolFailure::internal("Order serialization failed", e))?;
             Ok(contract::local(json))
+        })
+        .await
+    }
+
+    /// Check an order against everything this server enforces before
+    /// contacting Schwab — argument validity, the principal's risk limits
+    /// and approval state, the trading switch and operator halts — and
+    /// report every reason at once as the failures `place_order` would
+    /// return. Nothing is submitted, audited or approved, and a duplicate
+    /// intent is only detected on submission. `intentDigest` is what an
+    /// operator approves; `tag` is the tag the submission would carry. Pass
+    /// `order_id` to check a `replace_order` intent. Runs locally; use
+    /// `preview_order` for Schwab's own validation, fees and buying power.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = false
+    )]
+    async fn check_order(
+        &self,
+        account_hash: String,
+        order: OrderRequest,
+        order_id: Option<String>,
+    ) -> McpResult<ToolResult> {
+        // Only reached on the unauthorized stdio transport, where trading is
+        // off and no principal policy applies; `AuthorizedServer` evaluates
+        // the same request under its principal.
+        contract::run("check_order", async {
+            let request = preflight::Request {
+                account_hash,
+                order,
+                order_id,
+            };
+            let (name, args) = request.intent();
+            let verdict = preflight::evaluate(&self.client, None, name, &args).await?;
+            Ok(contract::local(verdict.into_payload()?))
         })
         .await
     }

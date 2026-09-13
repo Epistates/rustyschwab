@@ -31,6 +31,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_all_orders",
     // Orders (write)
     "build_order",
+    "check_order",
     "preview_order",
     "place_order",
     "cancel_order",
@@ -99,7 +100,7 @@ fn every_expected_tool_is_registered() {
             annotations.open_world_hint,
             Some(!matches!(
                 tool.name.as_str(),
-                "build_order" | "stream_status" | "stream_snapshot"
+                "build_order" | "check_order" | "stream_status" | "stream_snapshot"
             ))
         );
         let schema = serde_json::to_value(tool).unwrap();
@@ -205,6 +206,49 @@ async fn build_order_expands_specs_into_order_requests() {
         "fix_arguments"
     );
     assert_eq!(error["structuredContent"]["error"]["retryable"], false);
+}
+
+/// Without a principal, `check_order` still reports what the server itself
+/// enforces: the order's validity and exposure, the trading switch and the
+/// halt, with no limits or approval to speak of. Nothing reaches Schwab.
+#[tokio::test]
+async fn check_order_reports_a_local_verdict_without_a_principal() {
+    let server = server();
+    let ctx = turbomcp::RequestContext::stdio();
+    let order = serde_json::json!({
+        "orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
+        "duration": "DAY", "price": "50",
+        "orderLegCollection": [{"quantity": "2", "instruction": "BUY",
+            "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+    });
+    let result = server
+        .call_tool(
+            "check_order",
+            serde_json::json!({"account_hash": "A", "order": order}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!result.is_error(), "{result:?}");
+    let verdict: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+    assert_eq!(verdict["allowed"], false);
+    assert_eq!(verdict["reasons"].as_array().unwrap().len(), 1);
+    assert_eq!(verdict["reasons"][0]["code"], "not_permitted");
+    assert_eq!(verdict["tradingEnabled"], false);
+    assert_eq!(verdict["requiresApproval"], false);
+    assert_eq!(verdict["limits"], serde_json::Value::Null);
+    assert_eq!(
+        verdict["exposure"],
+        serde_json::json!({"quantity": "2", "notional": "100"})
+    );
+    assert_eq!(verdict["intentDigest"].as_str().unwrap().len(), 64);
+    assert!(
+        verdict["tag"]
+            .as_str()
+            .unwrap()
+            .starts_with(schwab_mcp::policy::INTENT_TAG_PREFIX)
+    );
+    assert!(verdict.get("source").is_none());
 }
 
 /// Data that came from Schwab or the stream cache is wrapped with its

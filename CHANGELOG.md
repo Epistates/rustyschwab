@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — `check_order` pre-flight
+
+- `check_order(account_hash, order, order_id?)` evaluates a `place_order`
+  or `replace_order` intent locally and reports every reason the submission
+  would fail at once, in dispatch order: argument validity, the principal's
+  tool and account permissions, risk limits, approval state (policy or
+  durable), the trading switch, and operator halts or a recovery
+  suspension. The verdict carries the intent digest an operator approves,
+  the tag the submission would carry, the bounded exposure and the
+  principal's limits. Nothing is submitted, audited or approved; a
+  duplicate intent is still only detected on submission. Grant it to
+  trading principals alongside `place_order`.
+- `PrincipalPolicy::review` collects every denial; `authorize` is now its
+  first one.
+- `SchwabClient::submission_admission` exposes the halt and recovery
+  suspension check every submission attempt applies.
+- `intent_digest` normalizes a valid `order` argument to its `OrderRequest`
+  wire form before hashing, so `"10"` and `10` produce one digest and an
+  approval binds the order Schwab would receive. Digests of orders that do
+  not parse strictly are unchanged. Approvals computed before this change
+  with non-canonical spellings (numeric quantities or prices) no longer
+  match; recompute them with `schwab-admin digest`.
+
 ### Changed — MCP result contract (breaking for MCP clients)
 
 - Every tool now answers in one shape (`schwab_mcp::contract`). Schwab and

@@ -70,8 +70,20 @@ impl PrincipalPolicy {
     }
     /// The first reason this principal may not run `name` with `args`.
     pub fn authorize(&self, name: &str, args: &Value) -> Result<(), ToolFailure> {
+        self.review(name, args)
+            .denials
+            .into_iter()
+            .next()
+            .map_or(Ok(()), Err)
+    }
+    /// Every reason this principal may not run `name` with `args`, in the
+    /// order a dispatch would find them, plus the order's exposure when it
+    /// could be computed. Approval is only judged for a valid order, since
+    /// fixing an invalid one changes the intent anyway.
+    pub(crate) fn review(&self, name: &str, args: &Value) -> Review {
+        let mut review = Review::default();
         if !self.tools.contains(name) {
-            return Err(ToolFailure::not_permitted(
+            review.denials.push(ToolFailure::not_permitted(
                 "Operation not authorized for this principal",
             ));
         }
@@ -79,7 +91,7 @@ impl PrincipalPolicy {
             && !self.all_accounts
             && !self.accounts.contains(account)
         {
-            return Err(ToolFailure::not_permitted(
+            review.denials.push(ToolFailure::not_permitted(
                 "Account not authorized for this principal",
             ));
         }
@@ -89,40 +101,68 @@ impl PrincipalPolicy {
         );
         let activity = args.get("service").and_then(Value::as_str) == Some("ACCT_ACTIVITY");
         if !self.all_accounts && (aggregate || activity) {
-            return Err(ToolFailure::not_permitted(
+            review.denials.push(ToolFailure::not_permitted(
                 "Operation requires access to all linked accounts",
             ));
         }
         if matches!(name, "place_order" | "replace_order") {
-            let order: schwab_types::trading::OrderRequest = serde_json::from_value(
-                args.get("order").cloned().unwrap_or(Value::Null),
-            )
-            .map_err(|e| ToolFailure::invalid_arguments(format!("Invalid order request: {e}")))?;
-            order.validate().map_err(ToolFailure::invalid_arguments)?;
-            let (quantity, notional) = exposure(&order, &self.option_multipliers)
-                .map_err(ToolFailure::invalid_arguments)?;
-            let max_quantity = self.max_quantity.unwrap_or(rust_decimal::Decimal::ZERO);
-            let max_notional = self.max_notional.unwrap_or(rust_decimal::Decimal::ZERO);
-            if quantity > max_quantity || notional > max_notional {
-                return Err(ToolFailure::new(
-                    FailureCode::RiskDenied,
-                    format!(
-                        "Order exposure {quantity} units / {notional} notional exceeds the \
-                         principal's limits of {max_quantity} / {max_notional}"
-                    ),
-                ));
+            let order = match order_request(args) {
+                Ok(order) => order,
+                Err(failure) => {
+                    review.denials.push(failure);
+                    return review;
+                }
+            };
+            match exposure(&order, &self.option_multipliers) {
+                Ok((quantity, notional)) => {
+                    review.exposure = Some((quantity, notional));
+                    let max_quantity = self.max_quantity.unwrap_or(rust_decimal::Decimal::ZERO);
+                    let max_notional = self.max_notional.unwrap_or(rust_decimal::Decimal::ZERO);
+                    if quantity > max_quantity || notional > max_notional {
+                        review.denials.push(ToolFailure::new(
+                            FailureCode::RiskDenied,
+                            format!(
+                                "Order exposure {quantity} units / {notional} notional exceeds \
+                                 the principal's limits of {max_quantity} / {max_notional}"
+                            ),
+                        ));
+                    }
+                }
+                Err(reason) => review.denials.push(ToolFailure::invalid_arguments(reason)),
             }
             let digest = intent_digest(name, args);
             if self.require_approval && !self.approved_intents.contains(&digest) {
-                return Err(ToolFailure::new(
-                    FailureCode::ApprovalRequired,
-                    format!("Order requires operator approval of intent {digest}"),
-                )
-                .with_intent(digest));
+                review.denials.push(
+                    ToolFailure::new(
+                        FailureCode::ApprovalRequired,
+                        format!("Order requires operator approval of intent {digest}"),
+                    )
+                    .with_intent(digest),
+                );
             }
         }
-        Ok(())
+        review
     }
+}
+
+/// Outcome of [`PrincipalPolicy::review`].
+#[derive(Default)]
+pub(crate) struct Review {
+    pub denials: Vec<ToolFailure>,
+    /// Bounded (quantity, notional) of the order, when it was valid and priced.
+    pub exposure: Option<(rust_decimal::Decimal, rust_decimal::Decimal)>,
+}
+
+/// The strict, validated order in `args`, or the `invalid_arguments` a
+/// submission would return.
+pub(crate) fn order_request(
+    args: &Value,
+) -> Result<schwab_types::trading::OrderRequest, ToolFailure> {
+    let order: schwab_types::trading::OrderRequest =
+        serde_json::from_value(args.get("order").cloned().unwrap_or(Value::Null))
+            .map_err(|e| ToolFailure::invalid_arguments(format!("Invalid order request: {e}")))?;
+    order.validate().map_err(ToolFailure::invalid_arguments)?;
+    Ok(order)
 }
 /// Validate a principal set as a whole, at startup and on every reload: each
 /// policy is valid on its own, names, static token digests and identity
@@ -271,9 +311,22 @@ pub fn digest(bytes: &[u8]) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+/// SHA-256 over the tool name and canonically sorted arguments. An `order`
+/// argument that parses as a strict `OrderRequest` is digested in its wire
+/// form, so an approval binds the order Schwab would receive rather than one
+/// JSON spelling of it (`"10"` and `10` agree; an order with unknown fields
+/// is digested as written and fails validation later).
 pub fn intent_digest(name: &str, args: &Value) -> String {
+    let mut args = args.clone();
+    if let Some(order) = args.get("order")
+        && let Ok(order) =
+            serde_json::from_value::<schwab_types::trading::OrderRequest>(order.clone())
+        && let Ok(wire) = serde_json::to_value(order)
+    {
+        args["order"] = wire;
+    }
     digest(
-        serde_json::to_vec(&(name, schwab_rs::utils::canonical_json(args)))
+        serde_json::to_vec(&(name, schwab_rs::utils::canonical_json(&args)))
             .unwrap()
             .as_slice(),
     )
@@ -282,20 +335,22 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
 /// Prefix of the order tag derived from an intent digest.
 pub const INTENT_TAG_PREFIX: &str = "mcp-";
 
+/// The order tag a submission of the intent with this digest carries when
+/// the model set none. Paper mode accepts at most 128 characters of
+/// `[A-Za-z0-9_-]`, which bounds the digest prefix.
+pub fn intent_tag(digest: &str) -> String {
+    format!("{INTENT_TAG_PREFIX}{}", &digest[..32])
+}
+
 /// Default an untagged order's `tag` to its intent digest, so the SDK's
 /// per-account tag tombstones turn a resubmitted identical intent into
-/// `duplicate_intent` whether or not approvals are required. Paper mode
-/// accepts at most 128 characters of `[A-Za-z0-9_-]`, which bounds the
-/// digest prefix. An explicit tag is the model's deliberate choice to
-/// submit again and is kept.
+/// `duplicate_intent` whether or not approvals are required. An explicit
+/// tag is the model's deliberate choice to submit again and is kept.
 pub fn tag_intent(mut args: Value, digest: &str) -> Value {
     if let Some(order) = args.get_mut("order").and_then(Value::as_object_mut)
         && order.get("tag").is_none_or(Value::is_null)
     {
-        order.insert(
-            "tag".into(),
-            Value::String(format!("{INTENT_TAG_PREFIX}{}", &digest[..32])),
-        );
+        order.insert("tag".into(), Value::String(intent_tag(digest)));
     }
     args
 }
@@ -377,19 +432,12 @@ impl AuthorizedServer {
         args: Value,
         ctx: &RequestContext,
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
+        if name == "check_order" {
+            return self.check_order(args).await;
+        }
         let submission = matches!(name, "place_order" | "replace_order");
         let digest = intent_digest(name, &args);
-        let mut effective = (*self.principal).clone();
-        if effective.require_approval
-            && submission
-            && self
-                .audit
-                .is_approved(&effective.name, &digest)
-                .await
-                .map_err(|e| ToolFailure::internal("Approval store unavailable", e))?
-        {
-            effective.approved_intents.insert(digest.clone());
-        }
+        let effective = self.effective_policy(name, &digest).await?;
         effective.authorize(name, &args)?;
         let args = if submission {
             tag_intent(args, &digest)
@@ -463,13 +511,207 @@ impl AuthorizedServer {
         }
         Ok(result)
     }
+
+    /// The principal with a durable operator approval of the submission
+    /// intent `digest` merged in, when approvals are required.
+    async fn effective_policy(
+        &self,
+        name: &str,
+        digest: &str,
+    ) -> Result<PrincipalPolicy, ToolFailure> {
+        let mut effective = (*self.principal).clone();
+        if effective.require_approval
+            && matches!(name, "place_order" | "replace_order")
+            && self
+                .audit
+                .is_approved(&effective.name, digest)
+                .await
+                .map_err(|e| ToolFailure::internal("Approval store unavailable", e))?
+        {
+            effective.approved_intents.insert(digest.to_owned());
+        }
+        Ok(effective)
+    }
+
+    /// `check_order` under this principal: the tool and account must be
+    /// permitted, then the submission the arguments describe is evaluated
+    /// as [`dispatch`](Self::dispatch) would judge it, durable approvals
+    /// included. Nothing is audited.
+    async fn check_order(&self, args: Value) -> Result<McpResult<ToolResult>, ToolFailure> {
+        self.principal.authorize("check_order", &args)?;
+        Ok(crate::contract::run("check_order", async {
+            let (name, args) = crate::preflight::Request::parse(args)?.intent();
+            let digest = intent_digest(name, &args);
+            let effective = self.effective_policy(name, &digest).await?;
+            let verdict =
+                crate::preflight::evaluate(&self.inner.client(), Some(&effective), name, &args)
+                    .await?;
+            Ok(crate::contract::local(verdict.into_payload()?))
+        })
+        .await)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     fn policy() -> PrincipalPolicy {
-        serde_json::from_value(serde_json::json!({"name":"desk","token_sha256":"a".repeat(64),"tools":["get_account","get_accounts","place_order","cancel_order","stream_snapshot"],"accounts":["A"],"max_quantity":"2","max_notional":"100","require_approval":true})).unwrap()
+        serde_json::from_value(serde_json::json!({"name":"desk","token_sha256":"a".repeat(64),"tools":["get_account","get_accounts","check_order","place_order","cancel_order","stream_snapshot"],"accounts":["A"],"max_quantity":"2","max_notional":"100","require_approval":true})).unwrap()
+    }
+    fn order(quantity: Value) -> Value {
+        serde_json::json!({"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":quantity,"instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})
+    }
+    /// An approval binds the order Schwab would receive, not one JSON
+    /// spelling of it; an order that is not a strict `OrderRequest` is
+    /// digested as written.
+    #[test]
+    fn intent_digest_normalizes_a_valid_order_to_its_wire_form() {
+        let quoted = serde_json::json!({"account_hash":"A","order":order("2".into())});
+        let bare = serde_json::json!({"account_hash":"A","order":order(2.into())});
+        assert_eq!(
+            intent_digest("place_order", &quoted),
+            intent_digest("place_order", &bare)
+        );
+        let mut unknown = quoted.clone();
+        unknown["order"]["bogus"] = true.into();
+        assert_ne!(
+            intent_digest("place_order", &unknown),
+            intent_digest("place_order", &quoted)
+        );
+        assert_ne!(
+            intent_digest("place_order", &quoted),
+            intent_digest("replace_order", &quoted)
+        );
+    }
+    /// `review` keeps every denial a dispatch would find, in order, with
+    /// the exposure it computed; `authorize` is its first denial.
+    #[test]
+    fn review_collects_every_denial_and_the_exposure() {
+        let p = policy();
+        let args = serde_json::json!({"account_hash":"B","order":order("3".into())});
+        let review = p.review("place_order", &args);
+        let codes: Vec<FailureCode> = review.denials.iter().map(|f| f.code).collect();
+        assert_eq!(
+            codes,
+            [
+                FailureCode::NotPermitted,
+                FailureCode::RiskDenied,
+                FailureCode::ApprovalRequired
+            ]
+        );
+        assert_eq!(
+            review.exposure,
+            Some(("3".parse().unwrap(), "150".parse().unwrap()))
+        );
+        assert_eq!(
+            code(p.authorize("place_order", &args)),
+            Some(FailureCode::NotPermitted)
+        );
+        // Approval is not judged for an order that must change anyway.
+        let invalid = serde_json::json!({"account_hash":"A","order":{"orderType":"LIMIT"}});
+        let review = p.review("place_order", &invalid);
+        assert_eq!(review.denials.len(), 1);
+        assert_eq!(review.denials[0].code, FailureCode::InvalidArguments);
+        assert_eq!(review.exposure, None);
+    }
+    /// `check_order` is judged under the principal, durable approvals
+    /// included, reports every reason at once, and audits nothing.
+    #[tokio::test]
+    async fn check_order_reports_the_principal_verdict_without_dispatching() {
+        let server = authorized();
+        let ctx = RequestContext::stdio();
+        let verdict = |result: McpResult<ToolResult>| {
+            let result = result.unwrap();
+            assert!(!result.is_error(), "{result:?}");
+            serde_json::from_str::<Value>(result.first_text().unwrap()).unwrap()
+        };
+        let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
+        let placement = intent_digest("place_order", &args);
+        let pending = verdict(server.call_tool("check_order", args.clone(), &ctx).await);
+        assert_eq!(pending["allowed"], false);
+        let codes = |v: &Value| {
+            v["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["code"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        // Approval first, then the trading switch, which tests leave off.
+        assert_eq!(codes(&pending), ["approval_required", "not_permitted"]);
+        assert_eq!(pending["reasons"][0]["intentDigest"], placement);
+        assert_eq!(pending["intentDigest"], placement);
+        assert_eq!(pending["tag"], intent_tag(&placement));
+        assert_eq!(
+            pending["exposure"],
+            serde_json::json!({"quantity":"2","notional":"100"})
+        );
+        assert_eq!(
+            pending["limits"],
+            serde_json::json!({"maxQuantity":"2","maxNotional":"100"})
+        );
+        assert_eq!(pending["requiresApproval"], true);
+        assert_eq!(pending["approved"], false);
+        assert_eq!(pending["tradingEnabled"], false);
+
+        server
+            .audit
+            .approve(
+                "desk",
+                &placement,
+                "operator",
+                chrono::Utc::now().timestamp() + 60,
+            )
+            .await
+            .unwrap();
+        let approved = verdict(server.call_tool("check_order", args.clone(), &ctx).await);
+        assert_eq!(approved["approved"], true);
+        assert_eq!(codes(&approved), ["not_permitted"]);
+        assert!(server.audit.records().await.unwrap().is_empty());
+
+        // An `order_id` makes it a replacement, which this principal lacks.
+        let mut replacing = args.clone();
+        replacing["order_id"] = "1".into();
+        let replacement = verdict(server.call_tool("check_order", replacing, &ctx).await);
+        assert_eq!(
+            replacement["intentDigest"],
+            intent_digest(
+                "replace_order",
+                &serde_json::json!({"account_hash":"A","order_id":"1","order":order("2".into())})
+            )
+        );
+        assert_eq!(
+            codes(&replacement),
+            ["not_permitted", "approval_required", "not_permitted"]
+        );
+
+        // The tool's own arguments are the caller's problem, not a verdict.
+        let denied = server
+            .call_tool(
+                "check_order",
+                serde_json::json!({"account_hash":"B","order":order("2".into())}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(denied.is_error());
+        assert_eq!(
+            denied.structured_content.unwrap()["error"]["code"],
+            "not_permitted"
+        );
+        let malformed = server
+            .call_tool(
+                "check_order",
+                serde_json::json!({"account_hash":"A","order":{"orderType":"LIMIT"}}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(malformed.is_error());
+        assert_eq!(
+            malformed.structured_content.unwrap()["error"]["code"],
+            "invalid_arguments"
+        );
     }
     #[test]
     fn approval_digest_is_independent_of_nested_json_object_order() {

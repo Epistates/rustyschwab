@@ -156,6 +156,21 @@ impl SchwabClient {
     pub async fn operator_halt(&self) -> Result<Option<String>> {
         self.inner.execution.operator_halt().await
     }
+    /// Local admission for a new submission: an operator halt or a
+    /// data-recovery suspension refuses it before anything reaches the
+    /// broker. Checked again on every attempt, so a pre-flight answer is
+    /// advisory.
+    pub async fn submission_admission(&self) -> Result<()> {
+        if self.inner.execution.operator_halt().await?.is_some() {
+            return Err(Error::Halted("Operator trading halt is active".into()));
+        }
+        if self.submissions_suspended() {
+            return Err(Error::Halted(
+                "Required data recovery is incomplete; submissions suspended".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn execution_store(&self) -> Arc<dyn crate::execution::ExecutionStore> {
         self.inner.execution.clone()
     }
@@ -464,8 +479,8 @@ impl SchwabClient {
                     if let Some(budget) = &self.inner.rate_limiter {
                         budget.admit(self.inner.coordinator.as_ref()).await?;
                     }
-                    if submission && self.inner.execution.operator_halt().await?.is_some() {
-                        return Err(Error::Halted("Operator trading halt is active".into()));
+                    if submission {
+                        self.submission_admission().await?;
                     }
                     if let Some((account, attempt, order)) = risk_context {
                         if let Some(risk) = &self.inner.risk {
@@ -480,11 +495,6 @@ impl SchwabClient {
                         {
                             return Err(Error::OwnershipLost);
                         }
-                    }
-                    if submission && self.submissions_suspended() {
-                        return Err(Error::Halted(
-                            "Required data recovery is incomplete; submissions suspended".into(),
-                        ));
                     }
                     sent.store(true, std::sync::atomic::Ordering::Relaxed);
                     call(token.clone()).await

@@ -188,6 +188,9 @@ the schema supports, a fixed `price` plus the trailing-stop trio
 server's `build_order` tool takes one and returns the expanded, validated
 `OrderRequest` JSON to pass to `preview_order` / `place_order`, so the
 operator-approved intent and the request Schwab receives stay one shape.
+`check_order` takes that JSON and reports, locally, every reason the
+server itself would refuse the submission (policy limits, approval, the
+trading switch, halts) together with the intent digest to approve.
 `OrderSpec::build()` (or `OrderRequest::try_from(spec)`) does the same in
 Rust for config-driven callers.
 
