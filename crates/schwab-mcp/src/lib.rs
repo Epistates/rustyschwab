@@ -6,6 +6,7 @@ pub mod contract;
 pub mod identity;
 pub mod metrics;
 pub mod network;
+pub mod order_status;
 pub mod paper_replay;
 pub mod policy;
 pub mod portfolio;

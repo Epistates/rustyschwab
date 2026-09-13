@@ -31,6 +31,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_user_preferences",
     // Orders (read)
     "get_order",
+    "get_order_status",
     "get_account_orders",
     "get_all_orders",
     // Orders (write)

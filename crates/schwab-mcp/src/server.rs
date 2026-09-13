@@ -26,6 +26,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
 use crate::contract::{self, Source, ToolFailure};
+use crate::order_status;
 use crate::portfolio;
 use crate::preflight;
 use crate::projection;
@@ -575,6 +576,36 @@ impl SchwabMcp {
         contract::run("get_order", async {
             let resp = self.client.get_order(&account_hash, &order_id).await?;
             Ok(contract::rest(resp))
+        })
+        .await
+    }
+
+    /// One order reduced to what the next decision needs: `status`,
+    /// `terminal` (Schwab will not change it again: filled, canceled,
+    /// rejected, expired or replaced), `filled`, `remaining`,
+    /// `avgFillPrice` (quantity-weighted over the fills; per leg under
+    /// `legs`), `lastUpdate`, `replacedBy`, and each child of a trigger or
+    /// one-cancels-other order reported the same way. With `wait_ms` (at
+    /// most 30000) the call re-reads the order once a second until it is
+    /// terminal or the wait elapses and reports `waited: {ms, reads}`;
+    /// call again to keep waiting. Reads the same endpoint as `get_order`,
+    /// which keeps Schwab's full shape.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_order_status(
+        &self,
+        account_hash: String,
+        order_id: String,
+        wait_ms: Option<u64>,
+    ) -> McpResult<ToolResult> {
+        contract::run("get_order_status", async {
+            let report =
+                order_status::report(&self.client, &account_hash, &order_id, wait_ms).await?;
+            Ok(contract::rest(report))
         })
         .await
     }

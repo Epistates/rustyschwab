@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — `get_order_status`
+
+- `get_order_status(account_hash, order_id, wait_ms?)` reduces one order to
+  what the next decision needs: `status`, `terminal` (Schwab will not change
+  it again: filled, canceled, rejected, expired or replaced; an unknown
+  status is not terminal), `filled`, `remaining` and `fills` (Schwab's own
+  quantities when reported, otherwise derived from the execution
+  activities), `avgFillPrice` (quantity-weighted over the `FILL` executions
+  to four decimals, overall and per leg), `lastUpdate` (the latest of the
+  order's own times and its fill times), `replacedBy` and each `children`
+  order of a trigger or one-cancels-other strategy in the same shape. With
+  `wait_ms` (at most 30000, larger refused as `invalid_arguments`) the call
+  re-reads once a second until the order is terminal or the wait elapses,
+  takes a last read at the deadline, and reports `waited: {ms, reads}`. It
+  reads the same endpoint as `get_order`, which keeps Schwab's full shape.
+- The order legs in `get_portfolio_summary`'s `workingOrders` rows now carry
+  `legId` too; the leg projection is shared with `get_order_status`.
+
 ### Added — `get_portfolio_summary`
 
 - `get_portfolio_summary(account_hash)` answers one account in one bounded

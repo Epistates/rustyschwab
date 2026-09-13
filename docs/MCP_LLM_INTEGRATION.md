@@ -1,10 +1,10 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 37 tools (`build_order`, which expands
+explicit behavior annotations for all 38 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
-`get_server_status`, the three projection tools and `get_portfolio_summary`
-were added after the review). Reads and previews are marked
+`get_server_status`, the three projection tools, `get_portfolio_summary` and
+`get_order_status` were added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -140,8 +140,9 @@ arithmetic between them:
                                         "remainingQuantity", "enteredTime", "legs"],
                             "rows": [["2", null, "WORKING", null, "LIMIT", "DAY", "NORMAL",
                                       150.0, null, 10.0, 0.0, 10.0, "2025-01-15T14:30:00+0000",
-                                      [{"instruction": "BUY", "quantity": 10.0, "symbol": "AAPL",
-                                        "assetType": "EQUITY", "positionEffect": null}]]],
+                                      [{"legId": 1, "instruction": "BUY", "quantity": 10.0,
+                                        "symbol": "AAPL", "assetType": "EQUITY",
+                                        "positionEffect": null}]]],
                             "count": 1, "total": 1, "truncated": false},
           "ordersSince": "2025-01-13T14:30:00.000Z",
           "pendingSubmissions": 0,
@@ -170,6 +171,47 @@ working orders each get half of `SCHWAB_MCP_RESPONSE_BUDGET_BYTES`. The
 account read is essential and fails the call; a failed orders or journal
 read leaves that section null and explained in `warnings`, which carry the
 failure shape above. The call is read-only and not audited.
+
+## Order status
+
+`get_order_status(account_hash, order_id, wait_ms?)` reduces one order to
+what deciding the next step needs (`crates/schwab-mcp/src/order_status.rs`),
+so a model neither walks `orderActivityCollection` itself nor polls
+`get_order` in a loop:
+
+```json
+{"asOf": "…", "source": "schwab_rest",
+ "data": {"orderId": "9", "status": "WORKING", "statusDescription": null, "terminal": false,
+          "cancelable": true, "editable": true, "tag": "mcp-…",
+          "quantity": 10.0, "filled": 4.0, "remaining": 6.0, "avgFillPrice": 150.25, "fills": 1,
+          "legs": [{"legId": 1, "instruction": "BUY", "quantity": 10.0, "symbol": "AAPL",
+                    "assetType": "EQUITY", "positionEffect": null,
+                    "filled": 4.0, "avgFillPrice": 150.25}],
+          "enteredTime": "2025-01-15T14:31:22+0000", "closeTime": null,
+          "lastUpdate": "2025-01-15T14:32:00+0000",
+          "replacedBy": [], "children": [],
+          "waited": {"ms": 1004, "reads": 2}}}
+```
+
+`terminal` is true when Schwab will not change the order again (filled,
+canceled, rejected, expired or replaced); a status this crate does not know
+is reported as `UNKNOWN` and treated as not terminal, so a model keeps
+reconciling rather than assuming. `filled`, `remaining` and `fills` come
+from Schwab's own quantities when it reports them, otherwise from the
+execution activities; `avgFillPrice` is quantity-weighted over the fills,
+to four decimals, overall and per leg, and counts only executions whose
+`executionType` is absent or `FILL` (a `CANCELED` activity carries a zero
+price and is ignored). `lastUpdate` is the latest of the order's entered,
+release, cancel and close times and its fill times, verbatim in Schwab's
+`+0000` form. `replacedBy` lists the ids of orders that replaced this one;
+`children` reports each child of a trigger or one-cancels-other order in
+the same shape. With `wait_ms` (at most 30000; larger is refused as
+`invalid_arguments`) the call re-reads once a second until the order is
+terminal or the wait elapses, takes a last read at the deadline, and
+reports `waited: {ms, reads}`; without it `waited` is null and the call is
+one read. Call again to keep waiting; a working order at the deadline is
+not a failure. The call reads the same endpoint as `get_order`, which
+keeps Schwab's full shape, and is read-only and not audited.
 
 ## Pre-flight
 

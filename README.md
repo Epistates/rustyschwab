@@ -575,7 +575,13 @@ require an explicit tool permission.
   `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` (default 64 KiB) or an explicit
   `limit`, with `truncated: true` and a `nextCursor` to continue from
   rather than silent clipping
-- **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`
+- **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`;
+  `get_order_status(account_hash, order_id, wait_ms?)` reduces one order to
+  what the next decision needs (`status`, `terminal`, `filled`, `remaining`,
+  quantity-weighted `avgFillPrice` overall and per leg, `lastUpdate`,
+  `replacedBy`, children of trigger and OCO orders) and with `wait_ms` (at
+  most 30 s) re-reads once a second until Schwab cannot change the order
+  again
 - **Orders (write)** — `build_order(spec)` expands a compact spec
   (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
   contract parts) into the exact `order` JSON the write tools accept, locally

@@ -22,8 +22,9 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (37 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ server.rs (38 tools)  policy.rs  network.rs  identity.rs  redact.rs │
                  │ stream_cache.rs  status.rs  projection.rs  portfolio.rs             │
+                 │ order_status.rs                                                      │
                  │ authority.rs (gateway)                                               │
                  │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
@@ -218,11 +219,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 37 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 38 `#[tool]`
 methods in category order: market data (12, including the `get_candles`
 and `get_option_contracts` projections), accounts (6, including the
-`get_positions` projection and `get_portfolio_summary`), orders read (3),
-orders write (`build_order`,
+`get_positions` projection and `get_portfolio_summary`), orders read (4,
+including `get_order_status`), orders write (`build_order`,
 `check_order`, `preview_order`, `place_order`, `cancel_order`,
 `replace_order`), transactions (2), streaming control and cached reads (7),
 server (`get_server_status`).
@@ -250,7 +251,13 @@ execution journal: typed balances, P&L summed over positions, the first
 `get_positions` page, the non-terminal orders (`OrderStatus::is_terminal`,
 pinned to reconciliation's SQL) with children flattened, and the count of
 unanswered submissions; the account read is essential, the others degrade
-to a null section plus a warning. Every tool body runs through
+to a null section plus a warning. `order_status.rs` reduces one `Order` to
+`get_order_status`'s report (terminal flag, filled and remaining
+quantities, quantity-weighted average fill price overall and per leg from
+the `FILL` executions, latest update time, replacing and child orders) and
+implements the bounded wait: one `get_order` read per second until the
+order is terminal or `wait_ms` (capped at 30 s) elapses. Its leg projection
+is shared with the portfolio summary's working-order rows. Every tool body runs through
 `contract::run`, which boxes it once so the macro-generated dispatcher's
 future and stack frame stay small however many tools there are.
 

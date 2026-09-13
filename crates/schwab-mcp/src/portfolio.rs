@@ -17,9 +17,10 @@ use schwab_rs::SchwabClient;
 use schwab_types::accounts::{Balance, Position, SecuritiesAccount};
 use schwab_types::trading::{Order, OrdersParams};
 use serde::Serialize;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use crate::contract::ToolFailure;
+use crate::order_status;
 use crate::projection::{self, Page, Row};
 
 /// Schwab lists orders entered at most this many days ago, the horizon
@@ -204,15 +205,7 @@ fn working_rows(orders: Vec<Order>) -> Vec<Row<OrderKey>> {
                     order
                         .order_leg_collection
                         .iter()
-                        .map(|leg| {
-                            json!({
-                                "instruction": leg.instruction,
-                                "quantity": leg.quantity,
-                                "symbol": leg.instrument.symbol,
-                                "assetType": leg.instrument.asset_type,
-                                "positionEffect": leg.position_effect,
-                            })
-                        })
+                        .map(|leg| Value::Object(order_status::leg(leg)))
                         .collect::<Vec<_>>(),
                 ]),
             });
@@ -309,7 +302,6 @@ pub async fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
 
     fn order(value: Value) -> Order {
         serde_json::from_value(value).unwrap()
