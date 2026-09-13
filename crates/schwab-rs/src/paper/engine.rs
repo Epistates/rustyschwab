@@ -555,14 +555,11 @@ impl PaperBroker {
                         reason: "Paper account quote freshness limit exceeded".into(),
                     });
                 }
+                // Like a live broker rejection, this leaves the tag free for a
+                // retry; only accepted orders consume tags.
                 if clock.fault == Some(PaperFault::RejectNext) {
                     clock.fault = None;
                     put(&tx, "paper_clock", &clock)?;
-                    tx.execute(
-                        "INSERT INTO used_order_tags VALUES(?1,?2)",
-                        params![account, tag],
-                    )
-                    .map_err(sql)?;
                     audit(
                         &tx,
                         "paper_injected_rejection",

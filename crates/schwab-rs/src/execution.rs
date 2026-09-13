@@ -19,6 +19,11 @@ const INSERT_APPROVAL: &str =
 const INSERT_CONSUMED_APPROVAL: &str = "INSERT INTO consumed_approvals VALUES(?1)";
 const INSERT_CONSUMED_APPROVAL_IF_NEW: &str = "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)";
 const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)";
+/// A rejected submission frees its tag: the broker holds no order for it, so
+/// the identical request may be retried under the same tag.
+const RELEASE_ORDER_TAG: &str = "DELETE FROM used_order_tags WHERE EXISTS(\
+     SELECT 1 FROM submissions s WHERE s.id=?1 AND s.account=used_order_tags.account \
+       AND json_extract(s.request,'$.tag')=used_order_tags.tag)";
 const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)";
 const RESOLVE_SUBMISSION: &str =
     "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
@@ -171,7 +176,9 @@ impl OrderJournal {
                         != 1
                     {
                         return Err(Error::Duplicate(
-                            "Order tag was already used for this account".into(),
+                            "Order tag already belongs to an accepted or unresolved submission \
+                             for this account"
+                                .into(),
                         ));
                     }
                 }
@@ -206,6 +213,9 @@ impl OrderJournal {
             })
             .await
     }
+    /// Resolve a pending submission. `Rejected` asserts the broker holds no
+    /// order for it and releases its tag for a retry; `Accepted` and
+    /// `Reconciled` keep the tag consumed.
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
             && evidence.trim().is_empty()
@@ -235,6 +245,9 @@ impl OrderJournal {
                     } else {
                         Error::InvalidParameter("Submission is unknown".into())
                     });
+                }
+                if matches!(outcome, SubmissionOutcome::Rejected) {
+                    tx.execute(RELEASE_ORDER_TAG, [&id]).map_err(sql)?;
                 }
                 audit(&tx, "outcome", &id, &serde_json::to_value(&outcome)?)?;
                 tx.commit().map_err(sql)?;

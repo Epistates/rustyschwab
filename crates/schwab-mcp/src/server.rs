@@ -550,7 +550,12 @@ impl SchwabMcp {
     /// Submit an order for execution. **Requires** `SCHWAB_MCP_ALLOW_TRADING=1`
     /// in the server's environment; otherwise fails with `not_permitted`.
     /// On success Schwab responds with the new order's ID (parsed from the
-    /// `Location` header — there is no JSON body).
+    /// `Location` header — there is no JSON body). An omitted `tag` defaults
+    /// to this exact intent's digest, so submitting the identical
+    /// `account_hash` and `order` again fails with `duplicate_intent` once an
+    /// attempt was accepted or is unresolved; a `retryable` failure may be
+    /// repeated unchanged. To place the same order twice on purpose, set a
+    /// distinct `tag`.
     #[tool(
         read_only = false,
         destructive = true,
@@ -592,7 +597,8 @@ impl SchwabMcp {
 
     /// Replace a working order with a new order spec (Schwab atomically
     /// cancels the old one and places the new one). **Requires**
-    /// `SCHWAB_MCP_ALLOW_TRADING=1`.
+    /// `SCHWAB_MCP_ALLOW_TRADING=1`. An omitted `tag` defaults to this exact
+    /// intent's digest, as for `place_order`.
     #[tool(
         read_only = false,
         destructive = true,

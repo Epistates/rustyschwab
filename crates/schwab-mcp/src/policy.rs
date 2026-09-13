@@ -279,6 +279,27 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
     )
 }
 
+/// Prefix of the order tag derived from an intent digest.
+pub const INTENT_TAG_PREFIX: &str = "mcp-";
+
+/// Default an untagged order's `tag` to its intent digest, so the SDK's
+/// per-account tag tombstones turn a resubmitted identical intent into
+/// `duplicate_intent` whether or not approvals are required. Paper mode
+/// accepts at most 128 characters of `[A-Za-z0-9_-]`, which bounds the
+/// digest prefix. An explicit tag is the model's deliberate choice to
+/// submit again and is kept.
+pub fn tag_intent(mut args: Value, digest: &str) -> Value {
+    if let Some(order) = args.get_mut("order").and_then(Value::as_object_mut)
+        && order.get("tag").is_none_or(Value::is_null)
+    {
+        order.insert(
+            "tag".into(),
+            Value::String(format!("{INTENT_TAG_PREFIX}{}", &digest[..32])),
+        );
+    }
+    args
+}
+
 #[derive(Clone)]
 pub struct AuthorizedServer {
     pub inner: SchwabMcp,
@@ -346,29 +367,38 @@ impl AuthorizedServer {
     /// Authorize, audit and dispatch one call. A `ToolFailure` here is a
     /// denial or an audit fault the model must see; the inner result is
     /// whatever the tool itself produced.
+    ///
+    /// The intent digest, and therefore approval, binds the arguments as the
+    /// model sent them; the tag defaulted from it is added only to the
+    /// dispatched copy, which is what the audit record keeps.
     async fn dispatch(
         &self,
         name: &str,
         args: Value,
         ctx: &RequestContext,
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
+        let submission = matches!(name, "place_order" | "replace_order");
+        let digest = intent_digest(name, &args);
         let mut effective = (*self.principal).clone();
-        if effective.require_approval && matches!(name, "place_order" | "replace_order") {
-            let digest = intent_digest(name, &args);
-            if self
+        if effective.require_approval
+            && submission
+            && self
                 .audit
                 .is_approved(&effective.name, &digest)
                 .await
                 .map_err(|e| ToolFailure::internal("Approval store unavailable", e))?
-            {
-                effective.approved_intents.insert(digest);
-            }
+        {
+            effective.approved_intents.insert(digest.clone());
         }
         effective.authorize(name, &args)?;
-        let write = matches!(name, "place_order" | "replace_order" | "cancel_order");
+        let args = if submission {
+            tag_intent(args, &digest)
+        } else {
+            args
+        };
+        let write = submission || name == "cancel_order";
         let audit_id = if write {
-            let digest = intent_digest(name, &args);
-            let dedup = if self.principal.require_approval && name != "cancel_order" {
+            let dedup = if self.principal.require_approval && submission {
                 Some(digest.clone())
             } else {
                 None
@@ -528,6 +558,56 @@ mod tests {
                 .await,
         );
         assert_eq!(malformed["code"], "invalid_arguments");
+    }
+    /// The digest and approval bind the model's arguments; only the
+    /// dispatched copy carries the derived tag, and an explicit tag stays.
+    #[tokio::test]
+    async fn submissions_are_tagged_with_their_intent_digest() {
+        let mut server = authorized();
+        let mut policy = policy();
+        policy.require_approval = false;
+        server.principal = Arc::new(policy);
+        let ctx = RequestContext::stdio();
+        let args = serde_json::json!({"account_hash":"A","order":{"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}});
+        let digest = intent_digest("place_order", &args);
+        assert!(
+            server
+                .call_tool("place_order", args.clone(), &ctx)
+                .await
+                .unwrap()
+                .is_error()
+        );
+        let mut explicit = args.clone();
+        explicit["order"]["tag"] = "desk-7".into();
+        assert!(
+            server
+                .call_tool("place_order", explicit.clone(), &ctx)
+                .await
+                .unwrap()
+                .is_error()
+        );
+        let records = server.audit.records().await.unwrap();
+        assert_eq!(records.len(), 2);
+        let derived = format!("{INTENT_TAG_PREFIX}{}", &digest[..32]);
+        let audited = |tag: &str| {
+            &records
+                .iter()
+                .find(|r| r.request["arguments"]["order"]["tag"] == tag)
+                .unwrap_or_else(|| panic!("no audit record tagged {tag}"))
+                .request
+        };
+        assert_eq!(audited(&derived)["intentDigest"], digest);
+        assert_eq!(
+            audited("desk-7")["intentDigest"],
+            intent_digest("place_order", &explicit)
+        );
+        assert_ne!(audited("desk-7")["intentDigest"], digest);
+
+        let mut null_tag = args.clone();
+        null_tag["order"]["tag"] = Value::Null;
+        assert_eq!(tag_intent(null_tag, &digest)["order"]["tag"], derived);
+        let not_an_order = serde_json::json!({"account_hash":"A","order":"?"});
+        assert_eq!(tag_intent(not_an_order.clone(), &digest), not_an_order);
     }
     #[test]
     fn account_aggregate_activity_and_tool_permissions_fail_closed() {

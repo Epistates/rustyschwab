@@ -245,16 +245,57 @@ async fn crash_transaction_child() {
     }
 }
 
+/// A rejection means the broker holds nothing, so the same tag may carry the
+/// retry; once a submission is accepted its tag is consumed for good.
 #[tokio::test]
-async fn order_tags_cannot_be_reused_even_after_retention() {
+async fn rejected_tags_are_released_and_accepted_tags_outlive_retention() {
     let dir = tempfile::tempdir().unwrap();
     let journal = OrderJournal::new(dir.path().join("tags.json"));
-    let id = journal
+    let rejected = journal
         .begin("A", "place_order", json!({"tag":"caller-tag"}))
         .await
         .unwrap();
+    assert!(matches!(
+        journal
+            .begin("A", "place_order", json!({"tag":"caller-tag"}))
+            .await,
+        Err(schwab_rs::Error::ReconciliationRequired { .. })
+    ));
     journal
-        .finish(&id, SubmissionOutcome::Rejected)
+        .finish(&rejected, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    let accepted = journal
+        .begin("A", "place_order", json!({"tag":"caller-tag"}))
+        .await
+        .expect("a rejected submission releases its tag");
+    journal
+        .finish(
+            &accepted,
+            SubmissionOutcome::Accepted {
+                order_id: Some("1".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        journal
+            .begin("A", "place_order", json!({"tag":"caller-tag"}))
+            .await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
+    // Retire both submissions: the accepted one needs its broker order to be
+    // terminal before retention may drop it.
+    journal
+        .database()
+        .run(|c| {
+            c.execute(
+                "INSERT INTO orders VALUES('A','1',0,'{\"status\":\"FILLED\"}')",
+                [],
+            )
+            .map(|_| ())
+            .map_err(|e| schwab_rs::Error::Storage(e.to_string()))
+        })
         .await
         .unwrap();
     let exported = journal
@@ -264,13 +305,13 @@ async fn order_tags_cannot_be_reused_even_after_retention() {
         .last()
         .unwrap()
         .sequence;
-    journal.prune_resolved(i64::MAX, exported).await.unwrap();
-    assert!(
+    assert_eq!(journal.prune_resolved(i64::MAX, exported).await.unwrap(), 2);
+    assert!(matches!(
         journal
             .begin("A", "place_order", json!({"tag":"caller-tag"}))
-            .await
-            .is_err()
-    );
+            .await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
 }
 
 #[tokio::test]

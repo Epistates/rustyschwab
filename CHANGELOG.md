@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `redact::json_response`/`json_value` are replaced by
   `contract::rest`/`local`/`envelope`.
 
+### Changed — order tags carry intent identity
+
+- The MCP server defaults an omitted order `tag` to `mcp-` plus the first
+  32 hex characters of the intent digest, so an identical `place_order` or
+  `replace_order` intent is refused as `duplicate_intent` whether or not
+  approvals are required. Approval still binds the arguments as the model
+  sent them; the audit record keeps the dispatched, tagged copy.
+- `OrderJournal::finish(.., Rejected)` releases the submission's tag. A
+  rejection (Schwab 4xx, risk refusal, or a failure before transmission)
+  means the broker holds no order, so a caller may retry the same tagged
+  request; accepted and unresolved submissions still consume their tag
+  permanently, including after retention. The paper broker's injected
+  rejection no longer consumes the tag either. Previously any use burned
+  the tag, so a `retryable` failure could not be retried under an
+  idempotency tag.
+
 ### Added — paper trading
 
 - Capture execution mutations atomically for new paper runs, including committed injected rejection and lost acknowledgement.

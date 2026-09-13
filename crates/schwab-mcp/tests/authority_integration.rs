@@ -198,8 +198,21 @@ async fn two_remote_clients_share_intents_quotas_and_fencing() {
     b.finish(&second, SubmissionOutcome::Rejected)
         .await
         .unwrap();
+    // A rejection releases its tag; an acceptance consumes it for every client.
+    let retried = a
+        .begin_once("shared", "place_order", json!({"tag":"one"}), None)
+        .await
+        .unwrap();
+    a.finish(
+        &retried,
+        SubmissionOutcome::Accepted {
+            order_id: Some("1".into()),
+        },
+    )
+    .await
+    .unwrap();
     assert!(matches!(
-        a.begin_once("shared", "place_order", json!({"tag":"one"}), None)
+        b.begin_once("shared", "place_order", json!({"tag":"one"}), None)
             .await,
         Err(schwab_rs::Error::Duplicate(_))
     ));

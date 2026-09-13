@@ -322,6 +322,11 @@ async fn unknown_ack_is_reconciled_by_durable_order_without_resubmission() {
     ));
     assert!(!rejection.is_retryable());
     assert_eq!(b.orders("paper-test", 0, 100).await.unwrap().len(), 2);
+    // A rejection holds nothing at the venue, so the tag carries the retry.
+    b.place_order("paper-test", &order("reject", "BUY", "1", "11"))
+        .await
+        .unwrap();
+    assert_eq!(b.orders("paper-test", 0, 100).await.unwrap().len(), 3);
 }
 #[tokio::test]
 async fn halt_and_stale_fencing_deny_submissions_but_not_cancellation() {
