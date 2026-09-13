@@ -575,6 +575,12 @@ require an explicit tool permission.
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
   `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
 
+The time-windowed reads (`get_account_orders`, `get_all_orders`,
+`get_transactions`, `get_price_history`) take their bounds as a calendar
+date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds; orders and
+transactions default to the last seven days ending now (transactions to
+`TRADE`), so `params` may be omitted entirely.
+
 ### Metrics (Prometheus)
 
 Metrics are **opt-in**. Set `SCHWAB_METRICS_BIND=127.0.0.1:9090` and the

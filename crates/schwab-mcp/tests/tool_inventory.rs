@@ -208,6 +208,50 @@ async fn build_order_expands_specs_into_order_requests() {
     assert_eq!(error["structuredContent"]["error"]["retryable"], false);
 }
 
+/// The time-windowed reads advertise the model-facing query shape: the
+/// window is optional (as is `params` itself where a default window
+/// exists), each bound accepts a date, RFC 3339 or epoch milliseconds,
+/// and the schema says so.
+#[test]
+fn windowed_reads_advertise_flexible_optional_bounds() {
+    let tools = server().list_tools();
+    let schema = |name: &str| {
+        serde_json::to_value(tools.iter().find(|t| t.name == name).unwrap()).unwrap()["inputSchema"]
+            .clone()
+    };
+    let required =
+        |schema: &serde_json::Value| schema["required"].as_array().cloned().unwrap_or_default();
+    for (tool, field) in [
+        ("get_account_orders", "fromEnteredTime"),
+        ("get_all_orders", "toEnteredTime"),
+        ("get_transactions", "startDate"),
+        ("get_price_history", "endDate"),
+    ] {
+        let schema = schema(tool);
+        let text = schema.to_string();
+        assert!(text.contains("YYYY-MM-DD"), "{tool}: {text}");
+        assert!(text.contains(field), "{tool}: {text}");
+        let params = &schema["properties"]["params"];
+        let params = params["anyOf"]
+            .as_array()
+            .and_then(|options| options.iter().find(|o| o["type"] == "object"))
+            .unwrap_or(params);
+        assert!(
+            !required(params).iter().any(|r| r == field),
+            "{tool}: {field} must be optional: {text}"
+        );
+        assert_eq!(
+            required(&schema).iter().any(|r| r == "params"),
+            tool == "get_price_history",
+            "{tool}: only a symbol makes params required: {text}"
+        );
+    }
+    assert_eq!(
+        schema("get_price_history")["properties"]["params"]["required"],
+        serde_json::json!(["symbol"])
+    );
+}
+
 /// Without a principal, `check_order` still reports what the server itself
 /// enforces: the order's validity and exposure, the trading switch and the
 /// halt, with no limits or approval to speak of. Nothing reaches Schwab.

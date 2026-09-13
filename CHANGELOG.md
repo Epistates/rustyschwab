@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — MCP query windows default and accept dates
+
+- `get_account_orders`, `get_all_orders`, `get_transactions` and
+  `get_price_history` take model-facing query types (`schwab_mcp::query`)
+  instead of the SDK parameter structs. Window bounds accept a calendar
+  date (`YYYY-MM-DD`, covering the whole UTC day), RFC 3339, a date-time
+  without an offset (UTC), or epoch milliseconds. Orders and transactions
+  default to the last seven days ending now, transactions to `TRADE`, and
+  `params` may be omitted. Unknown fields are refused. The SDK types and
+  their validation are unchanged.
+
 ### Added — `check_order` pre-flight
 
 - `check_order(account_hash, order, order_id?)` evaluates a `place_order`

@@ -66,6 +66,19 @@ rejection text (title and detail, describing the submitted request) is relayed
 in `message`; every other upstream detail is logged under a reference id.
 Client middleware that retries must key on `retryable`, never on `isError`.
 
+## Query windows
+
+The time-windowed reads (`get_account_orders`, `get_all_orders`,
+`get_transactions`, `get_price_history`) take model-facing query types
+(`crates/schwab-mcp/src/query.rs`) rather than the SDK's strict parameter
+structs. A bound may be a calendar date (`YYYY-MM-DD`, covering that whole
+UTC day), an RFC 3339 timestamp, a date-time without an offset (taken as
+UTC), or epoch milliseconds. Orders and transactions default to the last
+seven days ending now, and transactions to `TRADE`, so `params` may be
+omitted. Unknown fields are refused rather than ignored, so a misspelled
+bound cannot silently widen a window. The resolved request is still built
+and validated by the SDK, and Schwab's one-year cap still applies.
+
 ## Pre-flight
 
 `check_order(account_hash, order, order_id?)` evaluates a `place_order` (or,

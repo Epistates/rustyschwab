@@ -13,20 +13,21 @@
 use std::sync::Arc;
 
 use schwab_rs::SchwabClient;
-use schwab_rs::client::{OptionChainParams, PriceHistoryParams};
+use schwab_rs::client::OptionChainParams;
 use schwab_rs::config::StreamConfig;
 use schwab_rs::streaming::{StreamClient, StreamerIdentity};
 use schwab_types::market_data::{
     Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
 };
 use schwab_types::streaming::StreamService;
-use schwab_types::trading::{OrderRequest, OrderSpec, OrdersParams, TransactionsParams};
+use schwab_types::trading::{OrderRequest, OrderSpec};
 use serde_json::json;
 use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
 use crate::contract::{self, Source, ToolFailure};
 use crate::preflight;
+use crate::query::{OrdersQuery, PriceHistoryQuery, TransactionsQuery};
 use crate::stream_cache::{StreamCache, spawn_recovering_cache_feeder};
 
 /// Env var that unlocks the write-side order tools
@@ -169,16 +170,22 @@ impl SchwabMcp {
         .await
     }
 
-    /// Get OHLCV price history candles for a symbol.
-    /// See `PriceHistoryParams` for period/frequency options.
+    /// Get OHLCV price history candles for a symbol. Choose a `periodType`
+    /// and `period` (e.g. 10 days of minute candles) or a `startDate`/
+    /// `endDate` window; times may be a calendar date (`YYYY-MM-DD`), RFC
+    /// 3339, or epoch milliseconds, and the candles come back with epoch
+    /// millisecond `datetime`s.
     #[tool(
         read_only = true,
         destructive = false,
         idempotent = true,
         open_world = true
     )]
-    async fn get_price_history(&self, params: PriceHistoryParams) -> McpResult<ToolResult> {
+    async fn get_price_history(&self, params: PriceHistoryQuery) -> McpResult<ToolResult> {
         contract::run("get_price_history", async {
+            let params = params
+                .into_params()
+                .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.client.get_price_history(&params).await?;
             Ok(contract::rest(resp))
         })
@@ -404,11 +411,11 @@ impl SchwabMcp {
         .await
     }
 
-    /// List orders for a specific account.
-    /// `params.fromEnteredTime`/`params.toEnteredTime` are **required** by
-    /// Schwab (RFC 3339, e.g. `2025-01-15T00:00:00Z`; max range one year).
-    /// `params.status` values: `AWAITING_PARENT_ORDER`, `WORKING`,
-    /// `FILLED`, `CANCELED`, etc.
+    /// List orders for a specific account entered in a time window, by
+    /// default (no `params`) the last seven days ending now. Times may be
+    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds;
+    /// Schwab caps the window at one year. `params.status` narrows to one
+    /// status (`WORKING`, `FILLED`, `CANCELED`, `REJECTED`, ...).
     #[tool(
         read_only = true,
         destructive = false,
@@ -418,9 +425,13 @@ impl SchwabMcp {
     async fn get_account_orders(
         &self,
         account_hash: String,
-        params: OrdersParams,
+        params: Option<OrdersQuery>,
     ) -> McpResult<ToolResult> {
         contract::run("get_account_orders", async {
+            let params = params
+                .unwrap_or_default()
+                .into_params(chrono::Utc::now())
+                .map_err(ToolFailure::invalid_arguments)?;
             let resp = self
                 .client
                 .get_account_orders(&account_hash, &params)
@@ -430,17 +441,22 @@ impl SchwabMcp {
         .await
     }
 
-    /// List orders across all linked accounts in a time window.
-    /// `params.fromEnteredTime`/`params.toEnteredTime` are **required** by
-    /// Schwab (RFC 3339, e.g. `2025-01-15T00:00:00Z`; max range one year).
+    /// List orders across all linked accounts entered in a time window, by
+    /// default (no `params`) the last seven days ending now. Times may be
+    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds;
+    /// Schwab caps the window at one year.
     #[tool(
         read_only = true,
         destructive = false,
         idempotent = true,
         open_world = true
     )]
-    async fn get_all_orders(&self, params: OrdersParams) -> McpResult<ToolResult> {
+    async fn get_all_orders(&self, params: Option<OrdersQuery>) -> McpResult<ToolResult> {
         contract::run("get_all_orders", async {
+            let params = params
+                .unwrap_or_default()
+                .into_params(chrono::Utc::now())
+                .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.client.get_all_orders(&params).await?;
             Ok(contract::rest(resp))
         })
@@ -451,11 +467,12 @@ impl SchwabMcp {
     // Transactions
     // ============================================================
 
-    /// List transactions for an account.
-    /// `params.startDate`/`params.endDate` are **required** (RFC 3339, e.g.
-    /// `2025-01-15T00:00:00Z`; max range one year), as is at least one
-    /// entry in `params.types`: `TRADE`, `DIVIDEND_OR_INTEREST`,
-    /// `CASH_RECEIPT`, `ELECTRONIC_FUND`, etc.
+    /// List transactions for an account in a time window, by default (no
+    /// `params`) trades in the last seven days ending now. `params.types`
+    /// selects categories (`TRADE`, `DIVIDEND_OR_INTEREST`, `CASH_RECEIPT`,
+    /// `ELECTRONIC_FUND`, ...). Times may be a calendar date
+    /// (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds; Schwab caps the
+    /// window at one year.
     #[tool(
         read_only = true,
         destructive = false,
@@ -465,9 +482,13 @@ impl SchwabMcp {
     async fn get_transactions(
         &self,
         account_hash: String,
-        params: TransactionsParams,
+        params: Option<TransactionsQuery>,
     ) -> McpResult<ToolResult> {
         contract::run("get_transactions", async {
+            let params = params
+                .unwrap_or_default()
+                .into_params(chrono::Utc::now())
+                .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.client.get_transactions(&account_hash, &params).await?;
             Ok(contract::rest(resp))
         })
