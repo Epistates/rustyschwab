@@ -28,6 +28,7 @@ use turbomcp::prelude::*;
 use crate::contract::{self, Source, ToolFailure};
 use crate::preflight;
 use crate::query::{OrdersQuery, PriceHistoryQuery, TransactionsQuery};
+use crate::status::{self, SessionCalendar};
 use crate::stream_cache::{StreamCache, spawn_recovering_cache_feeder};
 
 /// Env var that unlocks the write-side order tools
@@ -51,6 +52,22 @@ pub fn cancel_enabled() -> bool {
     std::env::var("SCHWAB_MCP_ALLOW_CANCEL")
         .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
         .unwrap_or_else(|_| trading_enabled())
+}
+
+/// Env var naming the account hashes whose baselines the recovery worker
+/// maintains and readiness requires (comma-separated).
+pub const RECOVERY_ACCOUNTS_ENV: &str = "SCHWAB_RECOVERY_ACCOUNTS";
+
+/// The accounts readiness is judged against; empty when trading is off and
+/// no recovery worker runs.
+pub fn recovery_accounts() -> Vec<String> {
+    std::env::var(RECOVERY_ACCOUNTS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 pub(crate) fn require_trading_enabled(op: &str) -> Result<(), ToolFailure> {
@@ -81,6 +98,7 @@ pub struct SchwabMcp {
     cache: StreamCache,
     feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
     stream_config: StreamConfig,
+    calendar: SessionCalendar,
 }
 
 impl SchwabMcp {
@@ -97,7 +115,24 @@ impl SchwabMcp {
             cache: StreamCache::new(),
             feeder: Arc::new(AsyncRwLock::new(None)),
             stream_config: StreamConfig::default(),
+            calendar: SessionCalendar::default(),
         }
+    }
+    /// The stream's health as `stream_status` and the status tool report it.
+    async fn stream_report(&self) -> status::Stream {
+        self.stream
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.status())
+            .unwrap_or_default()
+            .into()
+    }
+    /// Every section of `get_server_status`, without a principal; the
+    /// authorized transport adds its own.
+    pub(crate) async fn server_status(&self) -> status::ServerStatus {
+        let stream = self.stream_report().await;
+        status::collect(&self.client, stream, &self.calendar).await
     }
 }
 
@@ -908,20 +943,42 @@ impl SchwabMcp {
     )]
     async fn stream_status(&self) -> McpResult<ToolResult> {
         contract::run("stream_status", async {
-            let status = self
-                .stream
-                .read()
-                .await
-                .as_ref()
-                .map(|c| c.status())
-                .unwrap_or_default();
-            let connected = status.ready;
-            Ok(contract::local(json!({
-                "connected": connected,
-                "generation": status.generation,
-                "lostMessages": status.lost_messages,
-                "reconciliationRequired": status.lost_messages > 0 || status.generation > 1,
-            })))
+            let report = self.stream_report().await;
+            Ok(contract::local(serde_json::to_value(report).map_err(
+                |e| ToolFailure::internal("Stream status serialization", e),
+            )?))
+        })
+        .await
+    }
+
+    // ============================================================
+    // Server
+    // ============================================================
+
+    /// What this server is and what it will let you do right now. Call it
+    /// first, and again after any `halted`, `unavailable` or unexpected
+    /// `not_permitted` failure. `mode` is the execution backend (`live`
+    /// reaches Schwab). `trading.admissible` says whether a submission
+    /// would pass the trading switch and local admission (operator halt,
+    /// recovery suspension); `check_order` judges a specific order.
+    /// `readiness` is the same probe as the `/readyz` health endpoint.
+    /// `requestBudget` is this process's remaining Schwab request budget
+    /// for the trailing minute. `equitySession` places `serverTime` in
+    /// Schwab's equity calendar (`pre_market`, `regular`, `post_market`,
+    /// `closed`) with the next boundary. `principal` is this session's
+    /// policy on the authorized transports. A section that could not be
+    /// determined is null, with the reason in `warnings`.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_server_status(&self) -> McpResult<ToolResult> {
+        // Only reached on the unauthorized stdio transport; `AuthorizedServer`
+        // answers with its principal filled in.
+        contract::run("get_server_status", async {
+            Ok(contract::local(self.server_status().await.into_payload()?))
         })
         .await
     }

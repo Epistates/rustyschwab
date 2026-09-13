@@ -22,9 +22,9 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (31 tools)  policy.rs  network.rs  identity.rs  redact.rs │
-                 │ stream_cache.rs  authority.rs (gateway)  bins: admin/authority/     │
-                 │ remote/paper/paper-verify                                            │
+                 │ server.rs (33 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ stream_cache.rs  status.rs  authority.rs (gateway)  bins: admin/    │
+                 │ authority/remote/paper/paper-verify                                  │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend
 ┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐
@@ -217,11 +217,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 32 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 33 `#[tool]`
 methods in category order: market data (10), accounts (4), orders read (3),
 orders write (`build_order`, `check_order`, `preview_order`, `place_order`,
 `cancel_order`, `replace_order`), transactions (2), streaming control and
-cached reads (7).
+cached reads (7), server (`get_server_status`).
 Each tool carries explicit read-only/destructive/idempotent/open-world hints;
 `tests/tool_inventory.rs` pins the list. `build_order` expands an
 `OrderSpec` locally so the operator-approved intent and the JSON sent to
@@ -230,6 +230,11 @@ streamer credentials and identity fields and masks account numbers unless
 `SCHWAB_MCP_REDACT_PII=0`. `stream_cache.rs` keeps per-service snapshots
 keyed by field name with explicit freshness and a bounded activity log, and
 reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
+`status.rs` assembles `get_server_status` from the client's local evidence
+(trading switches, operator halt, `readiness`, request budget, circuit,
+stream) plus one cached read of Schwab's equity calendar per US-Eastern
+day; `AuthorizedServer` adds the principal section on the policy-gated
+transports.
 
 ### Startup and transports (`main.rs`)
 

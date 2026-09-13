@@ -197,6 +197,14 @@ impl SchwabClient {
     pub fn circuit_state(&self) -> crate::circuit_breaker::CircuitState {
         self.inner.circuit_breaker.state()
     }
+    /// This process's use of the credential's request budget, `None` when
+    /// rate limiting is disabled.
+    pub fn request_budget(&self) -> Option<crate::RequestBudgetUsage> {
+        self.inner
+            .rate_limiter
+            .as_ref()
+            .map(|budget| budget.usage())
+    }
     pub fn coordinator(&self) -> Arc<dyn crate::coordination::Coordinator> {
         self.inner.coordinator.clone()
     }

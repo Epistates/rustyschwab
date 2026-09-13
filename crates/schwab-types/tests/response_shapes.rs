@@ -273,6 +273,67 @@ fn market_hours_are_nested_two_levels() {
     assert_eq!(parsed["option"]["EQO"].product.as_deref(), Some("EQO"));
 }
 
+/// `phase_at` classifies an instant by the calendar's own offsets and
+/// names the next boundary; adjacent windows hand over without a gap, and
+/// a closed day or a malformed window never opens the market.
+#[test]
+fn market_hours_classify_the_session_phase() {
+    use chrono::{DateTime, Utc};
+    use schwab_types::market_data::{MarketHours, SessionPhase};
+    let hours: MarketHours = serde_json::from_str(
+        r#"{
+        "date": "2025-01-15",
+        "isOpen": true,
+        "sessionHours": {
+            "preMarket": [{"start": "2025-01-15T07:00:00-05:00", "end": "2025-01-15T09:30:00-05:00"}],
+            "regularMarket": [{"start": "2025-01-15T09:30:00-05:00", "end": "2025-01-15T16:00:00-05:00"}],
+            "postMarket": [{"start": "2025-01-15T16:00:00-05:00", "end": "2025-01-15T20:00:00-05:00"}]
+        }
+    }"#,
+    )
+    .unwrap();
+    let at = |text: &str| {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    };
+    let (phase, next) = hours.phase_at(at("2025-01-15T06:59:59-05:00"));
+    assert_eq!(phase, SessionPhase::Closed);
+    let next = next.unwrap();
+    assert_eq!(next.phase, SessionPhase::PreMarket);
+    assert_eq!(next.at, at("2025-01-15T07:00:00-05:00"));
+    // The instant two windows meet belongs to the one that opens, and the
+    // caller's clock may be in any zone.
+    let (phase, next) = hours.phase_at(at("2025-01-15T14:30:00Z"));
+    assert_eq!(phase, SessionPhase::Regular);
+    assert_eq!(next.as_ref().unwrap().phase, SessionPhase::PostMarket);
+    assert_eq!(next.unwrap().at, at("2025-01-15T16:00:00-05:00"));
+    let (phase, next) = hours.phase_at(at("2025-01-15T19:59:59-05:00"));
+    assert_eq!(phase, SessionPhase::PostMarket);
+    assert_eq!(next.as_ref().unwrap().phase, SessionPhase::Closed);
+    assert_eq!(
+        hours.phase_at(at("2025-01-15T20:00:00-05:00")).0,
+        SessionPhase::Closed
+    );
+    assert!(hours.phase_at(at("2025-01-15T20:00:00-05:00")).1.is_none());
+
+    let closed: MarketHours =
+        serde_json::from_str(r#"{"date": "2025-01-18", "isOpen": false}"#).unwrap();
+    assert_eq!(
+        closed.phase_at(at("2025-01-18T12:00:00-05:00")),
+        (SessionPhase::Closed, None)
+    );
+    let malformed: MarketHours = serde_json::from_str(
+        r#"{"date": "2025-01-15", "isOpen": true, "sessionHours": {
+            "regularMarket": [{"start": "09:30", "end": "2025-01-15T16:00:00-05:00"}]}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        malformed.phase_at(at("2025-01-15T12:00:00-05:00")),
+        (SessionPhase::Closed, None)
+    );
+}
+
 #[test]
 fn movers_response_uses_screeners_key() {
     let json = r#"{

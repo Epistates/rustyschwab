@@ -19,6 +19,21 @@ type Limiter = RateLimiter<
     governor::state::InMemoryState,
     governor::clock::DefaultClock,
 >;
+
+/// The in-process request budget of one credential at one instant.
+///
+/// `used_last_minute` counts every attempt this process admitted in the
+/// trailing 60 seconds, so `remaining` is what more it may send before the
+/// budget starts waiting; the coordinator's shared quota may still wait
+/// first when other processes use the same credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RequestBudgetUsage {
+    pub per_minute: usize,
+    pub used_last_minute: usize,
+    pub remaining: usize,
+}
+
 pub(crate) struct RequestBudget {
     key: String,
     limiter: Limiter,
@@ -68,18 +83,23 @@ impl RequestBudget {
             tokio::time::sleep(wait).await;
         }
     }
+    /// This process's use of the budget over the trailing minute.
+    pub fn usage(&self) -> RequestBudgetUsage {
+        let mut recent = self.recent.lock();
+        prune(&mut recent, Instant::now());
+        RequestBudgetUsage {
+            per_minute: self.per_minute,
+            used_last_minute: recent.len(),
+            remaining: self.per_minute.saturating_sub(recent.len()),
+        }
+    }
     async fn acquire(&self) {
         self.limiter.until_ready().await;
         loop {
             let wake = {
                 let now = Instant::now();
                 let mut recent = self.recent.lock();
-                while recent
-                    .front()
-                    .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
-                {
-                    recent.pop_front();
-                }
+                prune(&mut recent, now);
                 if recent.len() < self.per_minute {
                     recent.push_back(now);
                     return;
@@ -88,6 +108,16 @@ impl RequestBudget {
             };
             tokio::time::sleep_until(wake).await;
         }
+    }
+}
+
+/// Drop admissions that have left the trailing minute.
+fn prune(recent: &mut VecDeque<Instant>, now: Instant) {
+    while recent
+        .front()
+        .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+    {
+        recent.pop_front();
     }
 }
 
@@ -105,7 +135,17 @@ mod tests {
         let a = RequestBudget::shared(key.clone(), &config).unwrap();
         let b = RequestBudget::shared(key.clone(), &config).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(
+            a.usage(),
+            RequestBudgetUsage {
+                per_minute: 60,
+                used_last_minute: 0,
+                remaining: 60
+            }
+        );
         a.acquire().await;
+        assert_eq!(b.usage().used_last_minute, 1);
+        assert_eq!(b.usage().remaining, 59);
         assert!(
             tokio::time::timeout(Duration::from_millis(20), b.acquire())
                 .await

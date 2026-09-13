@@ -12,7 +12,7 @@
 use anyhow::Context;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use schwab_mcp::SchwabMcp;
-use schwab_mcp::server::trading_enabled;
+use schwab_mcp::server::{RECOVERY_ACCOUNTS_ENV, recovery_accounts, trading_enabled};
 use schwab_rs::{SchwabClient, SchwabConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -102,15 +102,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Schwab client ready — tokens loaded");
 
     let client = Arc::new(client);
-    let recovery_accounts: Vec<String> = std::env::var("SCHWAB_RECOVERY_ACCOUNTS")
-        .unwrap_or_default()
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.trim().to_owned())
-        .collect();
+    let recovery_accounts = recovery_accounts();
     anyhow::ensure!(
         !trading_enabled() || !recovery_accounts.is_empty(),
-        "MCP trading requires SCHWAB_RECOVERY_ACCOUNTS"
+        "MCP trading requires {RECOVERY_ACCOUNTS_ENV}"
     );
     let _recovery = if recovery_accounts.is_empty() {
         None
@@ -161,9 +156,11 @@ async fn main() -> anyhow::Result<()> {
                             }
                             _ => (
                                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                                axum::Json(
-                                    serde_json::json!({"ready":false,"storage_healthy":false}),
-                                ),
+                                axum::Json(serde_json::json!({
+                                    "readsReady": false,
+                                    "tradingReady": false,
+                                    "storageHealthy": false
+                                })),
                             ),
                         }
                     }

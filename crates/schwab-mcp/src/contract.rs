@@ -142,6 +142,14 @@ impl ToolFailure {
         tracing::warn!(error_id = %id, %cause, "{context}");
         Self::new(FailureCode::Internal, format!("{context}; reference {id}"))
     }
+    /// No Schwab session: `unavailable`, but only the operator can re-run
+    /// OAuth, so it is not retryable and the disposition is `ask_operator`.
+    pub fn unauthenticated(message: impl Into<String>) -> Self {
+        let mut failure = Self::new(FailureCode::Unavailable, message);
+        failure.retryable = false;
+        failure.disposition = Disposition::AskOperator;
+        failure
+    }
     pub fn with_attempt(mut self, attempt_id: impl Into<String>) -> Self {
         self.attempt_id = Some(attempt_id.into());
         self
@@ -196,10 +204,8 @@ impl From<schwab_rs::Error> for ToolFailure {
                 return Self::new(code, message);
             }
             Error::Auth(_) => {
-                let mut failure = Self::internal("Schwab session is not authenticated", &e);
-                failure.code = FailureCode::Unavailable;
-                failure.disposition = Disposition::AskOperator;
-                return failure;
+                let logged = Self::internal("Schwab session is not authenticated", &e);
+                return Self::unauthenticated(logged.message);
             }
             _ => {}
         }

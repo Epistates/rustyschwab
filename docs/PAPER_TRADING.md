@@ -135,7 +135,7 @@ This is an authorization change: an `operator` grant alone no longer permits mar
 
 The accepted event's audit record includes the verified authority subject, committed atomically with fills and the event cursor. Caller-supplied provenance in the HTTP event body is rejected. Local SDK events are labeled `local`, and the built-in REST adapter uses `schwab_rest`. SDK attribution is trusted application input, not cryptographic proof. Exact retries retain the original attribution and do not append another acceptance audit record. Pre-existing audit records remain without provenance.
 
-The privileged generic `/v1/backend` API is disabled for paper authorities. Paper readiness reports `tokens_valid: false` because it does not use broker tokens; `mode: paper` identifies the interpretation. Readiness indicates local engine availability and at least one fresh quote; each order still requires its own symbol's fresh quote and sufficient cash/inventory. The [shared authority guide](SHARED_AUTHORITY.md) describes JWT roles, approval consumption, HTTPS proxying and ambiguous gateway replies.
+The privileged generic `/v1/backend` API is disabled for paper authorities. Paper readiness reports `tokensValid: false` because it does not use broker tokens; `mode: paper` identifies the interpretation. Readiness indicates local engine availability and at least one fresh quote; each order still requires its own symbol's fresh quote and sufficient cash/inventory. The [shared authority guide](SHARED_AUTHORITY.md) describes JWT roles, approval consumption, HTTPS proxying and ambiguous gateway replies.
 
 ## Durability, failure tests and audit
 

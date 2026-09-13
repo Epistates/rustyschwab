@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — `get_server_status`
+
+- `get_server_status()` reports, from local evidence, the mode (`live`),
+  version and server time, the trading switches, operator halt, recovery
+  suspension and circuit state summarized as `trading.admissible`, the
+  `/readyz` readiness body, this process's request budget, stream health
+  with `reconciliationRequired`, and the equity session phase
+  (`pre_market`, `regular`, `post_market`, `closed`) with the next
+  transition, read from Schwab's calendar at most once per US-Eastern day
+  and looked ahead up to four days. On the policy-gated transports it also
+  carries the principal's granted tools, accounts, limits and approval
+  requirement. Sections whose probe fails are null and explained in
+  `warnings`; an unauthenticated session performs no network call and
+  yields one `unavailable`/`ask_operator` warning. The tool is read-only,
+  not audited, and should be granted to every principal.
+- `ToolFailure::unauthenticated`: `unavailable` with `ask_operator` and
+  `retryable: false`, now also what an SDK `Error::Auth` maps to.
+- SDK: `MarketHours::phase_at` classifies an instant against a day's
+  sessions and names the next boundary; `market_data::equity_hours` finds
+  the equity entry whether Schwab keyed it `EQ` (open day) or `equity`
+  (closed day). `RequestBudgetUsage` and `SchwabClient::request_budget`
+  expose the trailing-minute quota. `CircuitState` serializes in
+  snake_case.
+- Breaking: `Readiness`, the `/readyz` body of the MCP server and the
+  authority, now serializes in camelCase (`readsReady`, `tradingReady`,
+  `tokensValid`, `storageHealthy`, `pendingSubmissions`,
+  `unreconciledAccounts`, `oldestBaselineAgeMs`, `circuitOpen`); the MCP
+  probe's failure body uses the same names.
+
 ### Changed — MCP query windows default and accept dates
 
 - `get_account_orders`, `get_all_orders`, `get_transactions` and

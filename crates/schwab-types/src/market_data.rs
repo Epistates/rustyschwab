@@ -15,7 +15,7 @@
 //! Rust fields use `snake_case` as per Rust conventions.
 
 use crate::common::{AssetMainType, AssetSubType};
-use chrono::NaiveDate;
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use std::collections::HashMap;
@@ -1222,8 +1222,97 @@ pub struct MarketHours {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+/// A part of the trading day, as the market hours calendar divides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    PreMarket,
+    Regular,
+    PostMarket,
+    Closed,
+}
+
+/// A session boundary: `phase` begins at `at`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTransition {
+    pub phase: SessionPhase,
+    pub at: DateTime<FixedOffset>,
+}
+
+impl MarketHours {
+    /// The phase in effect at `at`, and this calendar day's next boundary.
+    ///
+    /// Windows are compared as the instants their RFC 3339 bounds denote, so
+    /// the caller's clock and the calendar's offsets need not agree, and a
+    /// window that fails to parse is ignored. A day with `isOpen: false` or
+    /// no session windows is `Closed` with no transition; so is the time
+    /// after the last window, since the next day's calendar is a separate
+    /// request.
+    pub fn phase_at(&self, at: DateTime<Utc>) -> (SessionPhase, Option<SessionTransition>) {
+        // Each window opens its phase at `start` and closes the market at
+        // `end`; where two windows meet, the opening wins.
+        let mut events: Vec<(DateTime<FixedOffset>, SessionPhase)> = Vec::new();
+        if self.is_open != Some(false)
+            && let Some(hours) = &self.session_hours
+        {
+            for (phase, windows) in [
+                (SessionPhase::PreMarket, &hours.pre_market),
+                (SessionPhase::Regular, &hours.regular_market),
+                (SessionPhase::PostMarket, &hours.post_market),
+            ] {
+                for window in windows.iter().flatten() {
+                    let parse = |bound: &Option<String>| {
+                        bound
+                            .as_deref()
+                            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                    };
+                    if let (Some(start), Some(end)) = (parse(&window.start), parse(&window.end))
+                        && start < end
+                    {
+                        events.push((end, SessionPhase::Closed));
+                        events.push((start, phase));
+                    }
+                }
+            }
+        }
+        events.sort_by_key(|(at, phase)| (*at, *phase != SessionPhase::Closed));
+        events.dedup_by(|later, earlier| {
+            later.0 == earlier.0 && {
+                earlier.1 = later.1;
+                true
+            }
+        });
+        let phase = events
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= at)
+            .map_or(SessionPhase::Closed, |(_, phase)| *phase);
+        let next = events
+            .iter()
+            .find(|(start, _)| *start > at)
+            .map(|(at, phase)| SessionTransition {
+                phase: *phase,
+                at: *at,
+            });
+        (phase, next)
+    }
+}
+
 /// Map of market type (e.g. `equity`) to product code (e.g. `EQ`) to hours.
 ///
 /// Schwab nests market hours two levels deep:
 /// `{"equity": {"EQ": {"date": ..., "sessionHours": ...}}}`.
 pub type MarketsHoursResponse = HashMap<String, HashMap<String, MarketHours>>;
+
+/// The equity product's hours in a market hours response.
+///
+/// Schwab keys a trading day by product code (`EQ`) and a closed day by the
+/// market name (`equity`), so either spelling is accepted.
+pub fn equity_hours(response: &MarketsHoursResponse) -> Option<&MarketHours> {
+    let market = response.get(Market::Equity.as_str())?;
+    market
+        .get("EQ")
+        .or_else(|| market.get(Market::Equity.as_str()))
+}

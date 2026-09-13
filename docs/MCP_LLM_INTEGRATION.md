@@ -1,9 +1,9 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 32 tools (`build_order`, which expands
-an `OrderSpec` locally, and `check_order`, the local pre-flight described
-below, were added after the review). Reads and previews are marked
+explicit behavior annotations for all 33 tools (`build_order`, which expands
+an `OrderSpec` locally, `check_order`, the local pre-flight described below,
+and `get_server_status` were added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -41,7 +41,8 @@ Every tool answers in one of two shapes (`crates/schwab-mcp/src/contract.rs`).
 A success is compact JSON text. Data that came from Schwab or the stream
 cache is wrapped as `{"asOf": <RFC 3339>, "source": "schwab_rest" |
 "stream_cache", "data": <Schwab's raw shape, redacted>}`; local results
-(`build_order`, stream control acknowledgements, `stream_status`) are bare.
+(`build_order`, `check_order`, `get_server_status`, stream control
+acknowledgements, `stream_status`) are bare.
 A response that would exceed the transport's 1 MiB message limit is refused
 with `response_too_large` rather than clipped.
 
@@ -106,6 +107,47 @@ holds `place_order` or `replace_order`; without a principal (the local stdio
 transport with trading off) `limits` is null and approval does not apply.
 `preview_order` remains the way to obtain Schwab's own validation, fees and
 buying-power impact.
+
+## Server status
+
+`get_server_status()` answers, from local evidence, what this server is and
+what it will let the caller do right now, so a model can plan a session
+instead of discovering the switches one denial at a time:
+
+```json
+{"mode": "live", "version": "0.2.0",
+ "serverTime": {"rfc3339": "2026-09-10T14:30:00.000Z", "epochMs": 1789137000000},
+ "principal": {"name": "desk", "tools": ["check_order", "get_quotes", "place_order"],
+               "accounts": ["…"], "allAccounts": false, "maxQuantity": "2",
+               "maxNotional": null, "requireApproval": true},
+ "trading": {"enabled": true, "cancelEnabled": true, "operatorHalt": null,
+             "submissionsSuspended": false, "circuit": "closed", "admissible": true},
+ "readiness": {"readsReady": true, "tradingReady": true, "tokensValid": true,
+               "storageHealthy": true, "pendingSubmissions": 0,
+               "unreconciledAccounts": 0, "oldestBaselineAgeMs": 1200, "circuitOpen": false},
+ "requestBudget": {"perMinute": 120, "usedLastMinute": 7, "remaining": 113},
+ "stream": {"connected": false, "generation": 0, "lostMessages": 0, "reconciliationRequired": false},
+ "equitySession": {"phase": "regular", "date": "2026-09-10", "tradingDay": true,
+                   "nextTransition": {"phase": "post_market", "at": "2026-09-10T16:00:00-04:00"},
+                   "fetchedAt": "2026-09-10T13:00:05Z"},
+ "warnings": []}
+```
+
+`mode` is `live`: every order tool reaches Schwab. `principal` is the policy
+the session runs as (null on the local stdio transport, where none applies).
+`trading.admissible` means a submission would pass the trading switch,
+operator halt and recovery suspension right now; validity, limits, approval
+and duplicates are still judged per order by `check_order` and on
+submission. `readiness` is the body of the `/readyz` probe, evaluated for
+the accounts in `SCHWAB_RECOVERY_ACCOUNTS`. `requestBudget` is this process's
+own quota (null when rate limiting is disabled). `equitySession` is Schwab's
+equity calendar (`pre_market`, `regular`, `post_market`, `closed`), read at
+most once per US-Eastern day and looked ahead up to four days for the next
+opening; the tool never contacts Schwab for anything else. A section whose
+probe failed is null and explained in `warnings`, which carry the failure
+shape above; an unauthenticated session yields exactly one, asking the
+operator to run OAuth. The call is read-only, not audited, and cheap:
+grant it to every principal.
 
 ## Remaining implementation work
 

@@ -574,6 +574,11 @@ require an explicit tool permission.
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
   `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
+- **Server** — `get_server_status` reports the mode (`live`), the trading
+  switches and operator halt, readiness (the `/readyz` body), this process's
+  request budget, stream health, the principal's own permissions and limits,
+  and the equity session phase from Schwab's calendar (cached per day), so a
+  model can plan a session before spending calls on it
 
 The time-windowed reads (`get_account_orders`, `get_all_orders`,
 `get_transactions`, `get_price_history`) take their bounds as a calendar

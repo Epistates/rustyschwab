@@ -432,8 +432,10 @@ impl AuthorizedServer {
         args: Value,
         ctx: &RequestContext,
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
-        if name == "check_order" {
-            return self.check_order(args).await;
+        match name {
+            "check_order" => return self.check_order(args).await,
+            "get_server_status" => return self.get_server_status(args).await,
+            _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
         let digest = intent_digest(name, &args);
@@ -547,6 +549,18 @@ impl AuthorizedServer {
                 crate::preflight::evaluate(&self.inner.client(), Some(&effective), name, &args)
                     .await?;
             Ok(crate::contract::local(verdict.into_payload()?))
+        })
+        .await)
+    }
+
+    /// `get_server_status` under this principal: the server's status with
+    /// the policy this session runs under.
+    async fn get_server_status(&self, args: Value) -> Result<McpResult<ToolResult>, ToolFailure> {
+        self.principal.authorize("get_server_status", &args)?;
+        Ok(crate::contract::run("get_server_status", async {
+            let mut status = self.inner.server_status().await;
+            status.principal = Some(crate::status::Principal::from(&*self.principal));
+            Ok(crate::contract::local(status.into_payload()?))
         })
         .await)
     }
@@ -712,6 +726,48 @@ mod tests {
             malformed.structured_content.unwrap()["error"]["code"],
             "invalid_arguments"
         );
+    }
+    /// The status a principal sees carries its own policy, and an operator
+    /// halt shows up as inadmissible trading with the reason.
+    #[tokio::test]
+    async fn server_status_carries_the_principal_and_the_halt() {
+        let server = authorized();
+        let ctx = RequestContext::stdio();
+        let denied = server
+            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(denied.is_error(), "not in the tool allowlist");
+        assert_eq!(
+            denied.structured_content.unwrap()["error"]["code"],
+            "not_permitted"
+        );
+
+        let mut policy = policy();
+        policy.tools.insert("get_server_status".into());
+        let server = AuthorizedServer::new(server.inner.client(), policy);
+        server
+            .inner
+            .client()
+            .halt_submissions("desk review", "operator")
+            .await
+            .unwrap();
+        let result = server
+            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error(), "{result:?}");
+        let status: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        assert_eq!(status["principal"]["name"], "desk");
+        assert_eq!(status["principal"]["accounts"], serde_json::json!(["A"]));
+        assert_eq!(status["principal"]["maxQuantity"], "2");
+        assert_eq!(status["principal"]["requireApproval"], true);
+        let tools = status["principal"]["tools"].as_array().unwrap();
+        assert!(tools.iter().any(|t| t == "place_order"), "{tools:?}");
+        assert!(tools.windows(2).all(|w| w[0].as_str() < w[1].as_str()));
+        assert_eq!(status["trading"]["operatorHalt"], "desk review");
+        assert_eq!(status["trading"]["admissible"], false);
+        assert_eq!(status["readiness"]["tradingReady"], false);
     }
     #[test]
     fn approval_digest_is_independent_of_nested_json_object_order() {

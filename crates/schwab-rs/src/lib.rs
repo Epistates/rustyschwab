@@ -41,6 +41,7 @@ pub use circuit_breaker::{CircuitBreaker, CircuitState};
 pub use client::{SchwabClient, SchwabClientBuilder};
 pub use config::{ChannelKind, CircuitBreakerConfig, ClientConfig, SchwabConfig, StreamConfig};
 pub use error::{Error, ErrorEnvelope, ErrorKind, Result};
+pub use request_budget::RequestBudgetUsage;
 pub use streaming::{MessageReceiver, StreamClient, StreamMessage, Subscription};
 
 pub use schwab_types as types;

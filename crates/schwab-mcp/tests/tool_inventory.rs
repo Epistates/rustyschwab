@@ -47,6 +47,8 @@ const EXPECTED_TOOLS: &[&str] = &[
     "stream_unsubscribe",
     "stream_set_service_fields",
     "stream_snapshot",
+    // Server
+    "get_server_status",
 ];
 
 /// `SchwabMcp::new` doesn't touch the network, so a non-functional client
@@ -325,5 +327,49 @@ async fn responses_carry_provenance_envelopes() {
             .unwrap(),
     );
     assert_eq!(status["connected"], false);
+    assert!(status.get("source").is_none());
+}
+
+/// `get_server_status` answers without a Schwab session: the local
+/// sections are complete, the calendar is null with an `ask_operator`
+/// warning, and nothing is wrapped in a provenance envelope.
+#[tokio::test]
+async fn server_status_is_complete_without_a_session() {
+    let server = server();
+    let result = server
+        .call_tool(
+            "get_server_status",
+            serde_json::json!({}),
+            &turbomcp::RequestContext::stdio(),
+        )
+        .await
+        .unwrap();
+    assert!(!result.is_error(), "{result:?}");
+    let status: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+    assert_eq!(status["mode"], "live");
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        status["serverTime"]["rfc3339"]
+            .as_str()
+            .unwrap()
+            .ends_with('Z')
+    );
+    assert!(status["serverTime"]["epochMs"].as_i64().unwrap() > 0);
+    assert_eq!(status["principal"], serde_json::Value::Null);
+    assert_eq!(status["trading"]["enabled"], false);
+    assert_eq!(status["trading"]["admissible"], false);
+    assert_eq!(status["trading"]["operatorHalt"], serde_json::Value::Null);
+    assert_eq!(status["trading"]["circuit"], "closed");
+    assert_eq!(status["readiness"]["tokensValid"], false);
+    assert_eq!(status["readiness"]["readsReady"], false);
+    assert_eq!(status["readiness"]["pendingSubmissions"], 0);
+    assert_eq!(status["requestBudget"]["perMinute"], 120);
+    assert_eq!(status["requestBudget"]["remaining"], 120);
+    assert_eq!(status["stream"]["connected"], false);
+    assert_eq!(status["equitySession"], serde_json::Value::Null);
+    let warnings = status["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0]["code"], "unavailable");
+    assert_eq!(warnings[0]["disposition"], "ask_operator");
     assert!(status.get("source").is_none());
 }

@@ -1,7 +1,10 @@
 //! Readiness is local evidence, not a synthetic live broker probe.
 use crate::{SchwabClient, error::Result};
 use serde::{Deserialize, Serialize};
+/// Serialized in camelCase: this is the body of the `/readyz` health
+/// endpoint and of the MCP `get_server_status` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Readiness {
     pub reads_ready: bool,
     pub trading_ready: bool,

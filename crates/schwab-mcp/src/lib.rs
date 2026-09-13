@@ -12,6 +12,7 @@ pub mod preflight;
 pub mod query;
 pub mod redact;
 pub mod server;
+pub mod status;
 pub mod stream_cache;
 
 pub use server::SchwabMcp;
