@@ -1,6 +1,12 @@
 //! Immutable per-principal authorization. Network authentication selects a
 //! principal-specific handler and session store before MCP dispatch.
+//!
+//! Denials are business outcomes, so they are returned as `isError` tool
+//! results in the [`crate::contract`] shape rather than JSON-RPC errors: the
+//! model reads `not_permitted`, `risk_denied` or `approval_required` and
+//! knows whether to change the order, wait for the operator, or stop.
 use crate::SchwabMcp;
+use crate::contract::{FailureCode, ToolFailure};
 use schwab_rs::{SchwabClient, broker::TradingBackend, execution::OrderJournal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -62,15 +68,20 @@ impl PrincipalPolicy {
     fn owns_streaming(&self) -> bool {
         self.tools.iter().any(|t| t.starts_with("stream_"))
     }
-    pub fn authorize(&self, name: &str, args: &Value) -> McpResult<()> {
+    /// The first reason this principal may not run `name` with `args`.
+    pub fn authorize(&self, name: &str, args: &Value) -> Result<(), ToolFailure> {
         if !self.tools.contains(name) {
-            return Err(McpError::invalid_params("Operation not authorized"));
+            return Err(ToolFailure::not_permitted(
+                "Operation not authorized for this principal",
+            ));
         }
         if let Some(account) = args.get("account_hash").and_then(Value::as_str)
             && !self.all_accounts
             && !self.accounts.contains(account)
         {
-            return Err(McpError::invalid_params("Account not authorized"));
+            return Err(ToolFailure::not_permitted(
+                "Account not authorized for this principal",
+            ));
         }
         let aggregate = matches!(
             name,
@@ -78,29 +89,36 @@ impl PrincipalPolicy {
         );
         let activity = args.get("service").and_then(Value::as_str) == Some("ACCT_ACTIVITY");
         if !self.all_accounts && (aggregate || activity) {
-            return Err(McpError::invalid_params(
+            return Err(ToolFailure::not_permitted(
                 "Operation requires access to all linked accounts",
             ));
         }
         if matches!(name, "place_order" | "replace_order") {
-            let order: schwab_types::trading::OrderRequest =
-                serde_json::from_value(args.get("order").cloned().unwrap_or(Value::Null))
-                    .map_err(|_| McpError::invalid_params("Invalid order request"))?;
-            order.validate().map_err(McpError::invalid_params)?;
-            let (quantity, notional) = exposure(&order, &self.option_multipliers)?;
-            if quantity > self.max_quantity.unwrap_or(rust_decimal::Decimal::ZERO)
-                || notional > self.max_notional.unwrap_or(rust_decimal::Decimal::ZERO)
-            {
-                return Err(McpError::invalid_params(
-                    "Order exceeds configured risk limits",
+            let order: schwab_types::trading::OrderRequest = serde_json::from_value(
+                args.get("order").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|e| ToolFailure::invalid_arguments(format!("Invalid order request: {e}")))?;
+            order.validate().map_err(ToolFailure::invalid_arguments)?;
+            let (quantity, notional) = exposure(&order, &self.option_multipliers)
+                .map_err(ToolFailure::invalid_arguments)?;
+            let max_quantity = self.max_quantity.unwrap_or(rust_decimal::Decimal::ZERO);
+            let max_notional = self.max_notional.unwrap_or(rust_decimal::Decimal::ZERO);
+            if quantity > max_quantity || notional > max_notional {
+                return Err(ToolFailure::new(
+                    FailureCode::RiskDenied,
+                    format!(
+                        "Order exposure {quantity} units / {notional} notional exceeds the \
+                         principal's limits of {max_quantity} / {max_notional}"
+                    ),
                 ));
             }
-            if self.require_approval && !self.approved_intents.contains(&intent_digest(name, args))
-            {
-                return Err(McpError::invalid_params(format!(
-                    "Order requires operator approval of intent {}",
-                    intent_digest(name, args)
-                )));
+            let digest = intent_digest(name, args);
+            if self.require_approval && !self.approved_intents.contains(&digest) {
+                return Err(ToolFailure::new(
+                    FailureCode::ApprovalRequired,
+                    format!("Order requires operator approval of intent {digest}"),
+                )
+                .with_intent(digest));
             }
         }
         Ok(())
@@ -152,10 +170,10 @@ pub fn validate_policies(
 // position its bounded parent opens (same instrument, no more than the
 // parent's quantity) cannot fill for more than the parent paid, so an
 // unbounded stop there is priced at the parent's limit.
-fn exposure(
+pub(crate) fn exposure(
     order: &schwab_types::trading::OrderRequest,
     multipliers: &std::collections::HashMap<String, rust_decimal::Decimal>,
-) -> McpResult<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal), String> {
     exposure_under(order, multipliers, None)
 }
 
@@ -168,7 +186,7 @@ fn exposure_under(
         &schwab_types::trading::OrderRequestLeg,
         rust_decimal::Decimal,
     )>,
-) -> McpResult<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+) -> Result<(rust_decimal::Decimal, rust_decimal::Decimal), String> {
     use schwab_types::trading::{OrderStrategyType, OrderType};
     let mut quantity = rust_decimal::Decimal::ZERO;
     let mut notional = rust_decimal::Decimal::ZERO;
@@ -176,9 +194,7 @@ fn exposure_under(
     if order.order_strategy_type != OrderStrategyType::Oco {
         use schwab_types::{common::AssetType, trading::OrderInstruction};
         let [leg] = order.order_leg_collection.as_slice() else {
-            return Err(McpError::invalid_params(
-                "Multi-leg exposure requires an external portfolio risk engine",
-            ));
+            return Err("Multi-leg exposure requires an external portfolio risk engine".into());
         };
         if matches!(
             leg.instruction,
@@ -186,24 +202,18 @@ fn exposure_under(
                 | OrderInstruction::SellShortExempt
                 | OrderInstruction::SellToOpen
         ) {
-            return Err(McpError::invalid_params(
-                "Opening short exposure requires an external portfolio risk engine",
-            ));
+            return Err("Opening short exposure requires an external portfolio risk engine".into());
         }
         let multiplier = match leg.instrument.asset_type {
             AssetType::Equity => rust_decimal::Decimal::ONE,
             AssetType::Option => *multipliers
                 .get(&leg.instrument.symbol)
                 .filter(|v| **v > rust_decimal::Decimal::ZERO)
-                .ok_or_else(|| {
-                    McpError::invalid_params(
-                        "Option contract requires an operator-verified multiplier",
-                    )
-                })?,
+                .ok_or("Option contract requires an operator-verified multiplier")?,
             _ => {
-                return Err(McpError::invalid_params(
-                    "Risk policy supports standard equity and option contracts only",
-                ));
+                return Err(
+                    "Risk policy supports standard equity and option contracts only".into(),
+                );
             }
         };
         let bounded = matches!(
@@ -220,32 +230,24 @@ fn exposure_under(
             _ => entry
                 .filter(|(opened, _)| closes(leg, opened))
                 .map(|(_, price)| price)
-                .ok_or_else(|| {
-                    McpError::invalid_params("Policy requires an order with a bounded limit price")
-                })?,
+                .ok_or("Policy requires an order with a bounded limit price")?,
         };
         quantity = quantity
             .checked_add(leg.quantity)
-            .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
+            .ok_or("Quantity overflow")?;
         let exposure = leg
             .quantity
             .checked_mul(multiplier)
             .and_then(|v| v.checked_mul(price))
-            .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
-        notional = notional
-            .checked_add(exposure)
-            .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
+            .ok_or("Notional overflow")?;
+        notional = notional.checked_add(exposure).ok_or("Notional overflow")?;
         child_entry =
             (bounded && leg.instruction.opens_long() == Some(true)).then_some((leg, price));
     }
     for child in &order.child_order_strategies {
         let (q, n) = exposure_under(child, multipliers, child_entry)?;
-        quantity = quantity
-            .checked_add(q)
-            .ok_or_else(|| McpError::invalid_params("Quantity overflow"))?;
-        notional = notional
-            .checked_add(n)
-            .ok_or_else(|| McpError::invalid_params("Notional overflow"))?;
+        quantity = quantity.checked_add(q).ok_or("Quantity overflow")?;
+        notional = notional.checked_add(n).ok_or("Notional overflow")?;
     }
 
     Ok((quantity, notional))
@@ -319,6 +321,37 @@ impl McpHandler for AuthorizedServer {
         args: Value,
         ctx: &'a RequestContext,
     ) -> McpResult<ToolResult> {
+        match self.dispatch(name, args, ctx).await {
+            Ok(result) => result,
+            Err(failure) => Ok(failure.into_result()),
+        }
+    }
+    async fn read_resource<'a>(
+        &'a self,
+        uri: &'a str,
+        _ctx: &'a RequestContext,
+    ) -> McpResult<ResourceResult> {
+        Err(McpError::resource_not_found(uri))
+    }
+    async fn get_prompt<'a>(
+        &'a self,
+        name: &'a str,
+        _args: Option<Value>,
+        _ctx: &'a RequestContext,
+    ) -> McpResult<PromptResult> {
+        Err(McpError::prompt_not_found(name))
+    }
+}
+impl AuthorizedServer {
+    /// Authorize, audit and dispatch one call. A `ToolFailure` here is a
+    /// denial or an audit fault the model must see; the inner result is
+    /// whatever the tool itself produced.
+    async fn dispatch(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &RequestContext,
+    ) -> Result<McpResult<ToolResult>, ToolFailure> {
         let mut effective = (*self.principal).clone();
         if effective.require_approval && matches!(name, "place_order" | "replace_order") {
             let digest = intent_digest(name, &args);
@@ -326,7 +359,7 @@ impl McpHandler for AuthorizedServer {
                 .audit
                 .is_approved(&effective.name, &digest)
                 .await
-                .map_err(|_| McpError::internal("Approval store unavailable"))?
+                .map_err(|e| ToolFailure::internal("Approval store unavailable", e))?
             {
                 effective.approved_intents.insert(digest);
             }
@@ -356,49 +389,49 @@ impl McpHandler for AuthorizedServer {
                 .audit
                 .begin_once(&audit_scope, name, request, dedup)
                 .await
-                .map_err(|_| {
-                    McpError::internal(
-                        "Audit persistence failed, approval already consumed, \
-                         or an earlier operation requires reconciliation",
+                .map_err(|e| {
+                    ToolFailure::new(
+                        FailureCode::ReconciliationRequired,
+                        format!(
+                            "Audit refused the dispatch ({e}): the approval was already \
+                             consumed or an earlier operation still requires reconciliation. \
+                             Read the order state; do not resubmit."
+                        ),
                     )
+                    .with_intent(digest)
                 })?;
             Some(id)
         } else {
             None
         };
-        let result = self.inner.call_tool(name, args, ctx).await;
+        let result = self
+            .inner
+            .call_tool(name, args, ctx)
+            .await
+            .map(crate::contract::normalize);
         if let Some(id) = audit_id {
             // The SDK journal owns broker reconciliation. Keep dispatch outcome
             // attribution separately without claiming a tool success is a fill.
+            let succeeded = result.as_ref().is_ok_and(|r| !r.is_error());
             let outcome = schwab_rs::execution::SubmissionOutcome::Reconciled {
-                evidence: if result.is_ok() {
+                evidence: if succeeded {
                     "MCP dispatch completed; consult SDK submission journal".into()
                 } else {
                     "MCP dispatch returned error; consult SDK submission journal".into()
                 },
             };
-            self.audit.finish(&id, outcome).await.map_err(|_| {
-                McpError::internal(
-                    "Execution may have completed; audit commit failed; reconcile before retrying",
+            self.audit.finish(&id, outcome).await.map_err(|e| {
+                ToolFailure::new(
+                    FailureCode::ReconciliationRequired,
+                    format!(
+                        "Execution may have completed but the audit commit failed ({e}); \
+                         reconcile before retrying"
+                    ),
                 )
+                .with_attempt(id)
             })?;
         }
-        result
-    }
-    async fn read_resource<'a>(
-        &'a self,
-        uri: &'a str,
-        _ctx: &'a RequestContext,
-    ) -> McpResult<ResourceResult> {
-        Err(McpError::resource_not_found(uri))
-    }
-    async fn get_prompt<'a>(
-        &'a self,
-        name: &'a str,
-        _args: Option<Value>,
-        _ctx: &'a RequestContext,
-    ) -> McpResult<PromptResult> {
-        Err(McpError::prompt_not_found(name))
+        Ok(result)
     }
 }
 
@@ -429,6 +462,73 @@ mod tests {
         invalid.identity_subject = Some(" ".into());
         assert!(invalid.validate().is_err());
     }
+    fn code(result: Result<(), ToolFailure>) -> Option<FailureCode> {
+        result.err().map(|f| f.code)
+    }
+    fn authorized() -> AuthorizedServer {
+        let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
+            oauth: schwab_rs::OAuthConfig {
+                app_key: "k".repeat(32),
+                app_secret: "s".repeat(16),
+                token_store_kind: schwab_rs::auth::TokenStoreKind::File,
+                tokens_file: std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4())),
+                ..Default::default()
+            },
+            streaming: None,
+            ..Default::default()
+        })
+        .unwrap();
+        AuthorizedServer::new(Arc::new(client), policy())
+    }
+    /// Denials reach the model as `isError` results it can read, never as
+    /// JSON-RPC errors, and carry the code and intent digest it needs next.
+    #[tokio::test]
+    async fn denials_are_structured_tool_results() {
+        let server = authorized();
+        let ctx = RequestContext::stdio();
+        let error = |result: McpResult<ToolResult>| {
+            let result = result.expect("denial is a tool result");
+            assert!(result.is_error());
+            let text: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+            let body = result.structured_content.unwrap();
+            assert_eq!(text, body);
+            body["error"].clone()
+        };
+        let unlisted = error(
+            server
+                .call_tool("get_quote", serde_json::json!({"symbol":"AAPL"}), &ctx)
+                .await,
+        );
+        assert_eq!(unlisted["code"], "not_permitted");
+        assert_eq!(unlisted["retryable"], false);
+        assert_eq!(unlisted["disposition"], "not_permitted");
+        let foreign = error(
+            server
+                .call_tool(
+                    "get_account",
+                    serde_json::json!({"account_hash":"B","include_positions":false}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(foreign["code"], "not_permitted");
+        let args = serde_json::json!({"account_hash":"A","order":{"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}});
+        let pending = error(server.call_tool("place_order", args.clone(), &ctx).await);
+        assert_eq!(pending["code"], "approval_required");
+        assert_eq!(pending["disposition"], "ask_operator");
+        assert_eq!(pending["intentDigest"], intent_digest("place_order", &args));
+        // Arguments the macro cannot extract are normalized into the contract.
+        let malformed = error(
+            server
+                .call_tool(
+                    "stream_snapshot",
+                    serde_json::json!({"service": "NOT_A_SERVICE"}),
+                    &ctx,
+                )
+                .await,
+        );
+        assert_eq!(malformed["code"], "invalid_arguments");
+    }
     #[test]
     fn account_aggregate_activity_and_tool_permissions_fail_closed() {
         let p = policy();
@@ -436,21 +536,24 @@ mod tests {
             p.authorize("get_account", &serde_json::json!({"account_hash":"A"}))
                 .is_ok()
         );
-        assert!(
-            p.authorize("get_account", &serde_json::json!({"account_hash":"B"}))
-                .is_err()
+        assert_eq!(
+            code(p.authorize("get_account", &serde_json::json!({"account_hash":"B"}))),
+            Some(FailureCode::NotPermitted)
         );
-        assert!(p.authorize("get_accounts", &serde_json::json!({})).is_err());
-        assert!(
-            p.authorize(
+        assert_eq!(
+            code(p.authorize("get_accounts", &serde_json::json!({}))),
+            Some(FailureCode::NotPermitted)
+        );
+        assert_eq!(
+            code(p.authorize(
                 "stream_snapshot",
                 &serde_json::json!({"service":"ACCT_ACTIVITY"})
-            )
-            .is_err()
+            )),
+            Some(FailureCode::NotPermitted)
         );
-        assert!(
-            p.authorize("replace_order", &serde_json::json!({"account_hash":"A"}))
-                .is_err()
+        assert_eq!(
+            code(p.authorize("replace_order", &serde_json::json!({"account_hash":"A"}))),
+            Some(FailureCode::NotPermitted)
         );
         assert!(
             p.authorize("cancel_order", &serde_json::json!({"account_hash":"A"}))
@@ -461,14 +564,27 @@ mod tests {
     fn approval_binds_exact_account_order_and_decimal_risk_limits() {
         let mut p = policy();
         let mut args = serde_json::json!({"account_hash":"A","order":{"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}});
-        assert!(p.authorize("place_order", &args).is_err());
+        let pending = p.authorize("place_order", &args).unwrap_err();
+        assert_eq!(pending.code, FailureCode::ApprovalRequired);
+        assert_eq!(
+            pending.intent_digest.as_deref(),
+            Some(intent_digest("place_order", &args).as_str())
+        );
         p.approved_intents
             .insert(intent_digest("place_order", &args));
         p.authorize("place_order", &args).unwrap();
         args["order"]["price"] = "50.0000000000000000000000001".into();
         p.approved_intents
             .insert(intent_digest("place_order", &args));
-        assert!(p.authorize("place_order", &args).is_err());
+        assert_eq!(
+            code(p.authorize("place_order", &args)),
+            Some(FailureCode::RiskDenied)
+        );
+        args["order"]["orderLegCollection"] = serde_json::json!([]);
+        assert_eq!(
+            code(p.authorize("place_order", &args)),
+            Some(FailureCode::InvalidArguments)
+        );
     }
     #[test]
     fn bracket_exits_are_priced_at_the_entry_and_everything_else_stays_bounded() {

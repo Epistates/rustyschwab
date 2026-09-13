@@ -175,9 +175,67 @@ async fn build_order_expands_specs_into_order_requests() {
             &turbomcp::RequestContext::stdio(),
         )
         .await;
-    let rejected = match rejected {
-        Ok(result) => serde_json::to_value(result).unwrap()["isError"] == true,
-        Err(_) => true,
+    let rejected = serde_json::to_value(rejected.unwrap()).unwrap();
+    assert_eq!(rejected["isError"], true, "unknown kinds must be rejected");
+
+    // A spec that parses but cannot expand fails inside the body, so it
+    // carries the failure contract.
+    let empty_trigger = server
+        .call_tool(
+            "build_order",
+            serde_json::json!({"spec": {
+                "kind": "trigger",
+                "entry": {"kind": "limit", "price": "150.25",
+                    "leg": {"instruction": "BUY", "quantity": "10",
+                        "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
+                "children": []
+            }}),
+            &turbomcp::RequestContext::stdio(),
+        )
+        .await
+        .unwrap();
+    let error = serde_json::to_value(empty_trigger).unwrap();
+    assert_eq!(error["isError"], true);
+    assert_eq!(
+        error["structuredContent"]["error"]["code"],
+        "invalid_arguments"
+    );
+    assert_eq!(
+        error["structuredContent"]["error"]["disposition"],
+        "fix_arguments"
+    );
+    assert_eq!(error["structuredContent"]["error"]["retryable"], false);
+}
+
+/// Data that came from Schwab or the stream cache is wrapped with its
+/// provenance; local computations and control acknowledgements are bare.
+#[tokio::test]
+async fn responses_carry_provenance_envelopes() {
+    let server = server();
+    let ctx = turbomcp::RequestContext::stdio();
+    let text = |result: turbomcp::ToolResult| -> serde_json::Value {
+        assert!(!result.is_error());
+        serde_json::from_str(result.first_text().unwrap()).unwrap()
     };
-    assert!(rejected, "unknown kinds must be rejected");
+    let snapshot = text(
+        server
+            .call_tool(
+                "stream_snapshot",
+                serde_json::json!({"service": "LEVELONE_EQUITIES", "keys": ["AAPL"]}),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(snapshot["source"], "stream_cache");
+    assert!(snapshot["asOf"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(snapshot["data"]["count"], 0);
+    let status = text(
+        server
+            .call_tool("stream_status", serde_json::json!({}), &ctx)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(status["connected"], false);
+    assert!(status.get("source").is_none());
 }

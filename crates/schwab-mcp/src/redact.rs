@@ -187,25 +187,6 @@ fn mask_account(num: &str) -> String {
     }
 }
 
-/// Serialize, redact, and wrap in `Json` for an MCP tool response.
-///
-/// Every `#[tool]` handler should funnel through here rather than
-/// building `Json<Value>` by hand, so we can't accidentally skip
-/// redaction for a tool.
-pub fn json_response<T: serde::Serialize>(value: T) -> turbomcp::Json<Value> {
-    let mut v = serde_json::to_value(value).unwrap_or(Value::Null);
-    apply(&mut v);
-    turbomcp::Json(v)
-}
-
-/// Overload of `json_response` for values already in `Value` form
-/// (e.g. the `serde_json::json!(...)` status payloads returned by the
-/// stream control tools).
-pub fn json_value(mut value: Value) -> turbomcp::Json<Value> {
-    apply(&mut value);
-    turbomcp::Json(value)
-}
-
 #[cfg(test)]
 mod tests {
     // Env-driven behavior — `account_masking_enabled()` reading

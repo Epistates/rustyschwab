@@ -58,18 +58,10 @@ pub fn describe() {
 /// Scope guard that records a tool-call metric on drop.
 ///
 /// The default outcome is `error`; call [`ToolTimer::success`] before
-/// returning `Ok(..)` to flip it. This way, `?`-propagated errors
-/// automatically get classified correctly without needing to branch
-/// at every return site.
-///
-/// ```ignore
-/// let timer = ToolTimer::start("get_quote");
-/// let resp = self.client.get_quote(&symbol).await.map_err(map_err)?;
-/// // ^ on `?` short-circuit, timer drops with outcome="error"
-/// let out = redact::json_response(resp);
-/// timer.success();
-/// Ok(out)
-/// ```
+/// returning the encoded success to flip it, so every early return
+/// (including a `ToolFailure` turned into an `isError` result) is
+/// classified without branching at each site. `contract::run` is the one
+/// caller; tools never start a timer themselves.
 pub struct ToolTimer {
     tool: &'static str,
     start: Instant,

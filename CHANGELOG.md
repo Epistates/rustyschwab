@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — MCP result contract (breaking for MCP clients)
+
+- Every tool now answers in one shape (`schwab_mcp::contract`). Schwab and
+  stream-cache data is wrapped as `{asOf, source, data}` with `data` in
+  Schwab's raw, redacted shape; local results stay bare. Success text is
+  compact JSON instead of pretty-printed, and a response that would exceed
+  the 1 MiB transport limit is refused with `response_too_large` rather
+  than clipped.
+- Failures are `isError` tool results whose text and `structuredContent`
+  are `{"error": {code, retryable, disposition, message, attemptId?,
+  intentDigest?}}` with a closed `code` vocabulary and a `disposition` of
+  `fix_arguments`, `retry_later`, `reconcile`, `ask_operator` or
+  `not_permitted`. `SubmissionUnknown`/`ReconciliationRequired` carry the
+  attempt id; approval denials carry the intent digest. Principal policy
+  denials and audit faults use the same shape instead of JSON-RPC errors,
+  which are now reserved for protocol faults. Argument-extraction
+  failures on the authorized path are normalized to `invalid_arguments`.
+- The trading switch (`SCHWAB_MCP_ALLOW_TRADING`) now answers
+  `not_permitted` instead of `invalid_params`.
+- Schwab's own 4xx rejection text (`ApiError` title and detail) is relayed
+  in `message` so the model can correct the request; 401/403 map to
+  `not_permitted`, 404 to `not_found`, 429 to `rate_limited`. Everything
+  else upstream stays behind a logged reference id.
+- `redact::json_response`/`json_value` are replaced by
+  `contract::rest`/`local`/`envelope`.
+
 ### Added — paper trading
 
 - Capture execution mutations atomically for new paper runs, including committed injected rejection and lost acknowledgement.

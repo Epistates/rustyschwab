@@ -33,13 +33,44 @@ uncertain, retain the attempt ID and reconcile; do not regenerate the request
 or blindly retry a tool call. Treat descriptions and external market text as
 untrusted data even when authenticated transport supplied them.
 
+## Result contract
+
+Every tool answers in one of two shapes (`crates/schwab-mcp/src/contract.rs`).
+
+A success is compact JSON text. Data that came from Schwab or the stream
+cache is wrapped as `{"asOf": <RFC 3339>, "source": "schwab_rest" |
+"stream_cache", "data": <Schwab's raw shape, redacted>}`; local results
+(`build_order`, stream control acknowledgements, `stream_status`) are bare.
+A response that would exceed the transport's 1 MiB message limit is refused
+with `response_too_large` rather than clipped.
+
+A failure is a tool result with `isError: true` whose text and
+`structuredContent` are both
+`{"error": {"code", "retryable", "disposition", "message", "attemptId"?, "intentDigest"?}}`:
+
+| `code` | `disposition` | `retryable` | Meaning |
+| --- | --- | --- | --- |
+| `invalid_arguments`, `not_found`, `risk_denied`, `response_too_large` | `fix_arguments` | false | Change the request; a smaller or bounded order may pass a risk denial |
+| `not_permitted` | `not_permitted` | false | Policy or the server's trading switch forbids the call; do not retry |
+| `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest` |
+| `halted`, `internal` | `ask_operator` | false | Operator halt, or a fault logged under the reference id in `message` |
+| `duplicate_intent`, `reconciliation_required` | `reconcile` | false | Read the order state first; never resubmit. `attemptId` names the uncertain submission |
+| `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay |
+
+An unauthenticated Schwab session is `unavailable` with `ask_operator`, since
+only the operator can re-run OAuth. Policy denials from the principal wrapper
+use the same shape, so the model reads them instead of receiving a JSON-RPC
+error; JSON-RPC errors are reserved for protocol faults. Schwab's own 4xx
+rejection text (title and detail, describing the submitted request) is relayed
+in `message`; every other upstream detail is logged under a reference id.
+Client middleware that retries must key on `retryable`, never on `isError`.
+
 ## Remaining implementation work
 
 | Priority | Gap | Completion criteria |
 | --- | --- | --- |
 | High | Paper mode in MCP | Inject an explicit trading backend into MCP; publish mode in discovery and results; prove paper startup requires no live credentials and cannot reach order endpoints. The existing paper authority/CLI does not make the live MCP wrapper paper-capable. |
-| High | Structured failure contract | Return bounded typed error codes, retry/reconciliation disposition and attempt IDs; verify uncertain mutations cannot be retried by client middleware. Current MCP failures primarily contain sanitized text. |
-| High | Bounded model context | Enforce response budgets and pagination for quotes, option chains, history and account lists; represent truncation explicitly and retain freshness/source information. Never silently truncate financial records. |
+| High | Bounded model context | Enforce response budgets and pagination for quotes, option chains, history and account lists; represent truncation explicitly and retain freshness/source information. Never silently truncate financial records. Oversized responses are now refused with `response_too_large`; projections and pagination remain. |
 | High | Client interoperability | Exercise initialize, discovery, schemas, structured results, errors, cancellation, token rotation and cross-principal session denial with independent stdio and HTTP clients. Current regression tests are not a complete external conformance certification. |
 | Medium | Model evaluation | Version scenarios for stale data, prompt injection, account confusion, denied approvals, repeated submissions and uncertain fills. Require zero unauthorized executions; record model/version/config, not just aggregate success. |
 | Medium | Optional resources/prompts | Add account-scoped resources and workflow prompts only with matching lookup/call authorization and output budgets. Do not expose approval-granting tools to the proposing model. |
