@@ -1,10 +1,10 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 36 tools (`build_order`, which expands
+explicit behavior annotations for all 37 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
-`get_server_status` and the three projection tools were added after the
-review). Reads and previews are marked
+`get_server_status`, the three projection tools and `get_portfolio_summary`
+were added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -113,6 +113,63 @@ skipped nor duplicated. `total` counts the query's rows before paging.
 Values are Schwab's, unconverted; only the shape is projected.
 `get_option_contracts` tabulates single-leg (and `ANALYTICAL`) chains and
 refuses spread strategies, which need the raw tool.
+
+## Portfolio summary
+
+`get_portfolio_summary(account_hash)` answers "where does this account
+stand" in one bounded read (`crates/schwab-mcp/src/portfolio.rs`), so a
+model does not chain `get_account`, `get_account_orders` and the
+arithmetic between them:
+
+```json
+{"asOf": "…", "source": "schwab_rest",
+ "data": {"accountNumber": "***6789", "type": "MARGIN", "isDayTrader": false,
+          "roundTrips": 1, "isClosingOnlyRestricted": null,
+          "balances": {"liquidationValue": 2000.0, "equity": null, "cashBalance": 200.0,
+                       "availableFunds": 150.0, "buyingPower": 300.0,
+                       "dayTradingBuyingPower": 600.0, "longMarketValue": 1800.0,
+                       "shortMarketValue": null, "maintenanceRequirement": 540.0,
+                       "maintenanceCall": 0.0, "regTCall": null, "cashCall": null,
+                       "unsettledCash": null, "inCall": false},
+          "pnl": {"day": 3.75, "open": 490.0},
+          "positions": {"columns": ["symbol", "assetType", "…"], "rows": ["…"],
+                        "count": 2, "total": 2, "truncated": false},
+          "workingOrders": {"columns": ["orderId", "parentOrderId", "status", "strategy",
+                                        "orderType", "duration", "session", "price",
+                                        "stopPrice", "quantity", "filledQuantity",
+                                        "remainingQuantity", "enteredTime", "legs"],
+                            "rows": [["2", null, "WORKING", null, "LIMIT", "DAY", "NORMAL",
+                                      150.0, null, 10.0, 0.0, 10.0, "2025-01-15T14:30:00+0000",
+                                      [{"instruction": "BUY", "quantity": 10.0, "symbol": "AAPL",
+                                        "assetType": "EQUITY", "positionEffect": null}]]],
+                            "count": 1, "total": 1, "truncated": false},
+          "ordersSince": "2025-01-13T14:30:00.000Z",
+          "pendingSubmissions": 0,
+          "warnings": []}}
+```
+
+The summary is two Schwab reads, not an atomic snapshot: the orders
+entered within the last 59 days (Schwab's list horizon; an older working
+order is reachable by `get_order` only), then the account with its
+positions, in that order so an order that fills in between shows as both
+working and held rather than as neither. `balances` are Schwab's current
+balances typed, with a cash account's `cashAvailableForTrading` standing in
+for `buyingPower` and `availableFunds`, and `inCall` from the projected
+block; `pnl` sums the per-position day and open (unrealized, long and
+short) figures to cents and is null when no position reports one, and
+realized profit and loss is not here: `get_transactions` has the trades.
+`positions` is literally the first page of `get_positions`, whose
+`nextCursor` continues there. `workingOrders` holds every order Schwab may
+still change, children of trigger and one-cancels-other orders flattened
+beside their `parentOrderId`, oldest first, and carries no cursor:
+`truncated: true` says to list the rest with `get_account_orders`.
+`pendingSubmissions` counts this server's own submissions for the account
+whose outcome Schwab has not answered, so an order may exist that
+`workingOrders` does not show; reconcile before acting on it. Positions and
+working orders each get half of `SCHWAB_MCP_RESPONSE_BUDGET_BYTES`. The
+account read is essential and fails the call; a failed orders or journal
+read leaves that section null and explained in `warnings`, which carry the
+failure shape above. The call is read-only and not audited.
 
 ## Pre-flight
 

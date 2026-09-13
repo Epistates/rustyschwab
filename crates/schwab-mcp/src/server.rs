@@ -26,6 +26,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 use turbomcp::prelude::*;
 
 use crate::contract::{self, Source, ToolFailure};
+use crate::portfolio;
 use crate::preflight;
 use crate::projection;
 use crate::query::{OrdersQuery, PriceHistoryQuery, TransactionsQuery};
@@ -516,6 +517,28 @@ impl SchwabMcp {
                 projection::budget(),
             )?;
             Ok(contract::rest(page.into_payload()?))
+        })
+        .await
+    }
+
+    /// One account in one bounded answer: current balances (buying power,
+    /// available funds, cash, liquidation value, calls), day and open P&L
+    /// summed over positions, the first page of `get_positions`, the
+    /// orders Schwab may still change (entered in the last 59 days, its
+    /// list horizon; `truncated` means `get_account_orders` has more), and
+    /// how many of this server's submissions Schwab has not yet answered.
+    /// Two Schwab reads, not an atomic snapshot; sections whose read failed
+    /// are null and explained in `warnings`.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_portfolio_summary(&self, account_hash: String) -> McpResult<ToolResult> {
+        contract::run("get_portfolio_summary", async {
+            let summary = portfolio::collect(&self.client, &account_hash).await?;
+            Ok(contract::rest(summary))
         })
         .await
     }

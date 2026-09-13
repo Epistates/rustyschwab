@@ -468,3 +468,41 @@ impl SchwabClient {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::trading::OrderStatus;
+
+    /// The SQL's idea of a terminal status is the type's.
+    #[test]
+    fn terminal_statuses_match_the_type() {
+        for status in [
+            OrderStatus::AwaitingParentOrder,
+            OrderStatus::AwaitingCondition,
+            OrderStatus::AwaitingStopCondition,
+            OrderStatus::AwaitingManualReview,
+            OrderStatus::Accepted,
+            OrderStatus::AwaitingUrOut,
+            OrderStatus::PendingActivation,
+            OrderStatus::Queued,
+            OrderStatus::Working,
+            OrderStatus::Rejected,
+            OrderStatus::PendingCancel,
+            OrderStatus::Canceled,
+            OrderStatus::PendingReplace,
+            OrderStatus::Replaced,
+            OrderStatus::Filled,
+            OrderStatus::Expired,
+            OrderStatus::New,
+            OrderStatus::AwaitingReleaseTime,
+            OrderStatus::PendingAcknowledgement,
+            OrderStatus::PendingRecall,
+            OrderStatus::Unknown,
+        ] {
+            let wire = serde_json::to_string(&status).unwrap();
+            let in_sql = SELECT_TERMINAL_SUBMISSIONS.contains(&wire.replace('"', "'"));
+            assert_eq!(in_sql, status.is_terminal(), "{status:?}");
+        }
+    }
+}

@@ -292,23 +292,33 @@ pub fn local(mut value: Value) -> Value {
 /// and the duration histogram, encode the success compactly, and turn a
 /// [`ToolFailure`] into its `isError` result. Never returns `Err`, so the
 /// transport carries every outcome as a tool result.
-pub(crate) async fn run(
+///
+/// The body is boxed here, once, so every tool's future is a pointer
+/// wide. The `#[server]` macro dispatches all tools from one `async fn`
+/// whose state and, in unoptimized builds, stack frame hold every tool's
+/// future side by side; left inline, the bodies' client calls made that
+/// frame close to a megabyte and the deeper tools overflowed a 2 MiB
+/// thread.
+pub(crate) fn run(
     tool: &'static str,
-    body: impl Future<Output = Result<Value, ToolFailure>>,
-) -> McpResult<ToolResult> {
-    let timer = crate::metrics::ToolTimer::start(tool);
-    let failure = match body.await {
-        Ok(value) => match encode(&value) {
-            Ok(text) => {
-                timer.success();
-                return Ok(ToolResult::text(text));
-            }
+    body: impl Future<Output = Result<Value, ToolFailure>> + Send,
+) -> impl Future<Output = McpResult<ToolResult>> + Send {
+    let body = Box::pin(body);
+    async move {
+        let timer = crate::metrics::ToolTimer::start(tool);
+        let failure = match body.await {
+            Ok(value) => match encode(&value) {
+                Ok(text) => {
+                    timer.success();
+                    return Ok(ToolResult::text(text));
+                }
+                Err(failure) => failure,
+            },
             Err(failure) => failure,
-        },
-        Err(failure) => failure,
-    };
-    tracing::debug!(tool, code = ?failure.code, "tool call failed");
-    Ok(failure.into_result())
+        };
+        tracing::debug!(tool, code = ?failure.code, "tool call failed");
+        Ok(failure.into_result())
+    }
 }
 
 /// Bring an argument-extraction failure into the contract.

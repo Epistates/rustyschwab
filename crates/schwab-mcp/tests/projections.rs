@@ -1,53 +1,10 @@
 //! The projection tools over a mocked Schwab: envelope, redaction, paging
 //! and the raw tools' unchanged shape.
-use schwab_mcp::SchwabMcp;
-use schwab_rs::{
-    SchwabClient, SchwabConfig,
-    auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
-};
+mod common;
+
+use common::{call, mocked_server as server};
 use serde_json::{Value, json};
-use std::sync::Arc;
-use turbomcp::prelude::*;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
-
-async fn server(rest: &MockServer) -> (SchwabMcp, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    let mut config = SchwabConfig::default();
-    config.oauth.app_key = "k".repeat(32);
-    config.oauth.app_secret = "s".repeat(16);
-    config.oauth.tokens_file = dir.path().join("tokens.json");
-    config.oauth.token_store_kind = TokenStoreKind::File;
-    config.oauth.auto_refresh = false;
-    config.oauth.capture_callback = false;
-    config.client.base_url = rest.uri();
-    config.client.rate_limit.enabled = false;
-    config.streaming = None;
-    FileTokenStore::new(config.oauth.tokens_file.clone())
-        .save(&TokenSet::new(
-            "synthetic".into(),
-            "synthetic".into(),
-            "".into(),
-            "Bearer".into(),
-            1800,
-            "".into(),
-            chrono::Utc::now(),
-        ))
-        .unwrap();
-    let client = Arc::new(SchwabClient::new(config).unwrap());
-    (SchwabMcp::new(client), dir)
-}
-
-async fn call(server: &SchwabMcp, tool: &str, args: Value) -> Value {
-    let result = server
-        .call_tool(tool, args, &RequestContext::stdio())
-        .await
-        .unwrap();
-    let result = serde_json::to_value(result).unwrap();
-    if result["isError"] == true {
-        return result["structuredContent"].clone();
-    }
-    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
-}
 
 fn candle(t: i64) -> Value {
     json!({"datetime": t, "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 100})

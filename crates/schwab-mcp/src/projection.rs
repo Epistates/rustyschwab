@@ -13,7 +13,7 @@
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
-use schwab_types::accounts::Account;
+use schwab_types::accounts::{Account, Position};
 use schwab_types::market_data::{
     OptionChainParams, OptionChainResponse, OptionContract, OptionStrategy, PriceHistoryResponse,
 };
@@ -356,7 +356,17 @@ impl FromStr for PositionKey {
 /// One row per position; the account number is masked by redaction.
 pub fn positions(account: Account) -> (Map<String, Value>, Vec<Row<PositionKey>>) {
     let account = account.securities_account;
-    let mut positions = account.positions.unwrap_or_default();
+    let rows = position_rows(account.positions.unwrap_or_default());
+    let mut header = Map::new();
+    header.insert("accountNumber".into(), json!(account.account_number));
+    if let Some(kind) = account.account_type {
+        header.insert("type".into(), json!(kind));
+    }
+    (header, rows)
+}
+
+/// The rows of [`positions`], for callers that keep the account.
+pub fn position_rows(mut positions: Vec<Position>) -> Vec<Row<PositionKey>> {
     positions.sort_by(|a, b| symbol_of(a).cmp(symbol_of(b)));
     let mut rows: Vec<Row<PositionKey>> = Vec::with_capacity(positions.len());
     for position in positions {
@@ -384,15 +394,10 @@ pub fn positions(account: Account) -> (Map<String, Value>, Vec<Row<PositionKey>>
             ]),
         });
     }
-    let mut header = Map::new();
-    header.insert("accountNumber".into(), json!(account.account_number));
-    if let Some(kind) = account.account_type {
-        header.insert("type".into(), json!(kind));
-    }
-    (header, rows)
+    rows
 }
 
-fn symbol_of(position: &schwab_types::accounts::Position) -> &str {
+fn symbol_of(position: &Position) -> &str {
     position
         .instrument
         .as_ref()

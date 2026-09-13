@@ -303,6 +303,18 @@ pub enum OrderStatus {
     Unknown,
 }
 
+impl OrderStatus {
+    /// Schwab will not change the order again: it filled, was canceled,
+    /// rejected, expired or replaced. Every other status, including one
+    /// this crate does not know, may still fill.
+    pub const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Canceled | Self::Rejected | Self::Expired | Self::Replaced
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]

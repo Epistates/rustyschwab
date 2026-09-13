@@ -1,13 +1,11 @@
+mod common;
+
+use common::mocked_client;
 use futures_util::{SinkExt, StreamExt};
 use schwab_mcp::stream_cache::{
     RecoveryPolicy, StreamCache, spawn_recovering_cache_feeder_with_policy,
 };
-use schwab_rs::{
-    SchwabClient, SchwabConfig, StreamClient,
-    auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
-    config::StreamConfig,
-    streaming::StreamerIdentity,
-};
+use schwab_rs::{StreamClient, config::StreamConfig, streaming::StreamerIdentity};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -107,28 +105,7 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
             }
         }
     });
-    let mut config = SchwabConfig::default();
-    config.oauth.app_key = "k".repeat(32);
-    config.oauth.app_secret = "s".repeat(16);
-    config.oauth.tokens_file = dir.path().join("tokens.json");
-    config.oauth.token_store_kind = TokenStoreKind::File;
-    config.oauth.auto_refresh = false;
-    config.oauth.capture_callback = false;
-    config.client.base_url = rest.uri();
-    config.client.rate_limit.enabled = false;
-    config.streaming = None;
-    FileTokenStore::new(config.oauth.tokens_file.clone())
-        .save(&TokenSet::new(
-            "synthetic".into(),
-            "synthetic".into(),
-            "".into(),
-            "Bearer".into(),
-            1800,
-            "".into(),
-            chrono::Utc::now(),
-        ))
-        .unwrap();
-    let client = Arc::new(SchwabClient::new(config).unwrap());
+    let client = mocked_client(&rest.uri(), dir.path());
     client
         .halt_submissions("operator investigation", "supervisor")
         .await

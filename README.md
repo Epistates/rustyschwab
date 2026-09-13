@@ -560,7 +560,13 @@ require an explicit tool permission.
   `get_option_chain`, `get_option_expiration_chain`, `get_movers`,
   `search_instruments`, `get_instrument`, `get_markets`, `get_market`
 - **Accounts** — `get_account_numbers`, `get_accounts`, `get_account`,
-  `get_user_preferences`
+  `get_user_preferences`; `get_portfolio_summary(account_hash)` answers
+  "where does this account stand" in one bounded read: typed balances
+  (buying power, available funds, cash, liquidation value, calls), day
+  and open P&L summed over positions, the first page of `get_positions`,
+  the orders Schwab may still change (entered in the last 59 days) and
+  how many of this server's submissions Schwab has not yet answered, with
+  any section whose read failed set to null and explained in `warnings`
 - **Projections** — `get_candles` (`[t,o,h,l,c,v]` rows),
   `get_option_contracts` (one row per contract, ordered by expiration and
   strike) and `get_positions` (one row per position) take the same

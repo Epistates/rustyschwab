@@ -70,6 +70,11 @@ pub struct Position {
     pub current_cost: Option<f64>,
 }
 
+/// One of an account's three balance blocks. Margin and cash accounts
+/// report different fields, and the initial, current and projected blocks
+/// each carry a subset, so everything is optional: a cash account's
+/// spending power is `cash_available_for_trading`, a margin account's is
+/// `buying_power` and `available_funds`.
 #[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -105,6 +110,29 @@ pub struct Balance {
     pub sma: Option<f64>,
     pub mutual_fund_value: Option<f64>,
     pub bond_value: Option<f64>,
+    pub margin_balance: Option<f64>,
+    pub long_stock_value: Option<f64>,
+    pub short_stock_value: Option<f64>,
+    pub account_value: Option<f64>,
+    pub day_trading_equity_call: Option<f64>,
+    /// Projected block of a margin account.
+    pub stock_buying_power: Option<f64>,
+    /// Projected block: the account is in a margin or cash call.
+    pub is_in_call: Option<bool>,
+    /// Cash accounts (and a margin account's initial block).
+    pub cash_available_for_trading: Option<f64>,
+    /// Cash accounts.
+    pub cash_available_for_withdrawal: Option<f64>,
+    /// Cash accounts.
+    pub cash_call: Option<f64>,
+    /// Cash accounts.
+    pub cash_debit_call_value: Option<f64>,
+    /// Cash accounts.
+    pub long_non_marginable_market_value: Option<f64>,
+    /// Cash accounts.
+    pub total_cash: Option<f64>,
+    /// Cash accounts.
+    pub unsettled_cash: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

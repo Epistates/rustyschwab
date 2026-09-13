@@ -22,8 +22,9 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (36 tools)  policy.rs  network.rs  identity.rs  redact.rs │
-                 │ stream_cache.rs  status.rs  projection.rs  authority.rs (gateway)   │
+                 │ server.rs (37 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ stream_cache.rs  status.rs  projection.rs  portfolio.rs             │
+                 │ authority.rs (gateway)                                               │
                  │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend
@@ -217,10 +218,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 36 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 37 `#[tool]`
 methods in category order: market data (12, including the `get_candles`
-and `get_option_contracts` projections), accounts (5, including the
-`get_positions` projection), orders read (3), orders write (`build_order`,
+and `get_option_contracts` projections), accounts (6, including the
+`get_positions` projection and `get_portfolio_summary`), orders read (3),
+orders write (`build_order`,
 `check_order`, `preview_order`, `place_order`, `cancel_order`,
 `replace_order`), transactions (2), streaming control and cached reads (7),
 server (`get_server_status`).
@@ -241,7 +243,16 @@ account into compact column/row pages: rows are sorted by a typed key
 (candle time, `expiration|strike|C/P`, `symbol#ordinal`), a page stops at
 the caller's `limit` or the `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` budget, and
 `nextCursor` is the last key so re-reading Schwab between pages never
-skips or repeats a row. The raw tools keep Schwab's shape.
+skips or repeats a row. The raw tools keep Schwab's shape. `portfolio.rs`
+composes `get_portfolio_summary` from two client reads (orders within
+Schwab's 59-day list horizon, then the account with positions) and the
+execution journal: typed balances, P&L summed over positions, the first
+`get_positions` page, the non-terminal orders (`OrderStatus::is_terminal`,
+pinned to reconciliation's SQL) with children flattened, and the count of
+unanswered submissions; the account read is essential, the others degrade
+to a null section plus a warning. Every tool body runs through
+`contract::run`, which boxes it once so the macro-generated dispatcher's
+future and stack frame stay small however many tools there are.
 
 ### Startup and transports (`main.rs`)
 

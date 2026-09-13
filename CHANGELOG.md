@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
-### Added — projection tools
+### Added — `get_portfolio_summary`
+
+- `get_portfolio_summary(account_hash)` answers one account in one bounded
+  read: `balances` typed from Schwab's current balances (a cash account's
+  `cashAvailableForTrading` stands in for `buyingPower` and
+  `availableFunds`; `inCall` comes from the projected block), `pnl` (day
+  and open profit and loss summed over positions to cents), `positions`
+  (the first page of `get_positions`, whose cursor continues there),
+  `workingOrders` (every order Schwab may still change among those entered
+  in the last 59 days, its list horizon, children flattened beside their
+  `parentOrderId`; `truncated` means `get_account_orders` has more) and
+  `pendingSubmissions` (this server's submissions Schwab has not answered).
+  Orders are read before the account so an order that fills in between
+  shows as both working and held rather than as neither. The account read
+  is essential; a failed orders or journal read leaves a null section
+  explained in `warnings`.
+- `schwab_types::accounts::Balance` gains the typed fields Schwab reports
+  for cash accounts and the projected block (`cashAvailableForTrading`,
+  `cashAvailableForWithdrawal`, `cashCall`, `unsettledCash`, `totalCash`,
+  `isInCall`, `stockBuyingPower`, `marginBalance`, `accountValue`, …)
+  instead of leaving them to `extra`.
+- `OrderStatus::is_terminal` names the statuses Schwab will not change
+  again, pinned by a test to the set reconciliation already used in SQL.
+- Tool bodies are boxed once in `contract::run`. The `#[server]` macro
+  dispatches every tool from one `async fn`, whose future and unoptimized
+  stack frame held all tool futures side by side (about a megabyte for 37
+  tools); the deeper tools overflowed a 2 MiB thread in debug builds.
 
 - `get_candles(params, limit?, cursor?)`, `get_option_contracts(params,
   limit?, cursor?)` and `get_positions(account_hash, limit?, cursor?)`

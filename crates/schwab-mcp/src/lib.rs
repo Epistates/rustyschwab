@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod network;
 pub mod paper_replay;
 pub mod policy;
+pub mod portfolio;
 pub mod preflight;
 pub mod projection;
 pub mod query;

@@ -27,6 +27,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_accounts",
     "get_account",
     "get_positions",
+    "get_portfolio_summary",
     "get_user_preferences",
     // Orders (read)
     "get_order",
