@@ -35,6 +35,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_order_status",
     "get_account_orders",
     "get_all_orders",
+    "get_trade_journal",
     // Orders (write)
     "build_order",
     "check_order",
@@ -301,6 +302,45 @@ async fn check_order_reports_a_local_verdict_without_a_principal() {
             .starts_with(schwab_mcp::policy::INTENT_TAG_PREFIX)
     );
     assert!(verdict.get("source").is_none());
+
+    // A rationale is judged but never digested; a blank one is a reason.
+    for (rationale, reasons) in [("Momentum entry.", 1), ("   ", 2)] {
+        let result = server
+            .call_tool(
+                "check_order",
+                serde_json::json!({"account_hash": "A", "order": order, "rationale": rationale}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let with: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        assert_eq!(with["intentDigest"], verdict["intentDigest"], "{with}");
+        assert_eq!(with["reasons"].as_array().unwrap().len(), reasons, "{with}");
+        assert_eq!(
+            with["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["code"] == "invalid_arguments"),
+            reasons == 2,
+            "{with}"
+        );
+    }
+
+    // The journal is a principal's; this transport has none.
+    let result = server
+        .call_tool(
+            "get_trade_journal",
+            serde_json::json!({"account_hash": "A"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(result.is_error());
+    assert_eq!(
+        result.structured_content.unwrap()["error"]["code"],
+        "not_permitted"
+    );
 }
 
 /// Data that came from Schwab or the stream cache is wrapped with its

@@ -107,6 +107,12 @@ impl PrincipalPolicy {
                 "Operation requires access to all linked accounts",
             ));
         }
+        if matches!(name, "place_order" | "replace_order" | "cancel_order")
+            && let Err(failure) =
+                crate::journal::check_rationale(args.get("rationale").and_then(Value::as_str))
+        {
+            review.denials.push(failure);
+        }
         if matches!(name, "place_order" | "replace_order") {
             let order = match order_request(args) {
                 Ok(order) => order,
@@ -317,9 +323,14 @@ pub fn digest(bytes: &[u8]) -> String {
 /// argument that parses as a strict `OrderRequest` is digested in its wire
 /// form, so an approval binds the order Schwab would receive rather than one
 /// JSON spelling of it (`"10"` and `10` agree; an order with unknown fields
-/// is digested as written and fails validation later).
+/// is digested as written and fails validation later). A `rationale` is
+/// journaled, not digested: an approval binds the order, not the words,
+/// and re-wording an identical order must still be a duplicate intent.
 pub fn intent_digest(name: &str, args: &Value) -> String {
     let mut args = args.clone();
+    if let Some(args) = args.as_object_mut() {
+        args.remove("rationale");
+    }
     if let Some(order) = args.get("order")
         && let Ok(order) =
             serde_json::from_value::<schwab_types::trading::OrderRequest>(order.clone())
@@ -446,6 +457,7 @@ impl AuthorizedServer {
         match name {
             "check_order" => return self.check_order(args).await,
             "get_server_status" => return self.get_server_status(args).await,
+            "get_trade_journal" => return self.get_trade_journal(args).await,
             _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
@@ -503,13 +515,8 @@ impl AuthorizedServer {
         if let Some(id) = audit_id {
             // The SDK journal owns broker reconciliation. Keep dispatch outcome
             // attribution separately without claiming a tool success is a fill.
-            let succeeded = result.as_ref().is_ok_and(|r| !r.is_error());
             let outcome = schwab_rs::execution::SubmissionOutcome::Reconciled {
-                evidence: if succeeded {
-                    "MCP dispatch completed; consult SDK submission journal".into()
-                } else {
-                    "MCP dispatch returned error; consult SDK submission journal".into()
-                },
+                evidence: crate::journal::Dispatch::of(&result).evidence(),
             };
             self.audit.finish(&id, outcome).await.map_err(|e| {
                 ToolFailure::new(
@@ -580,6 +587,20 @@ impl AuthorizedServer {
         })
         .await)
     }
+
+    /// `get_trade_journal` under this principal: its own audit journal for
+    /// a permitted account, joined to the venue's orders.
+    async fn get_trade_journal(&self, args: Value) -> Result<McpResult<ToolResult>, ToolFailure> {
+        self.principal.authorize("get_trade_journal", &args)?;
+        Ok(crate::contract::run("get_trade_journal", async {
+            let request = crate::journal::Request::parse(args)?;
+            let backend = self.inner.backend();
+            let page = crate::journal::collect(&self.audit, backend, &self.principal.name, request)
+                .await?;
+            Ok(crate::contract::envelope(backend.source(), page))
+        })
+        .await)
+    }
 }
 
 #[cfg(test)]
@@ -612,6 +633,38 @@ mod tests {
             intent_digest("place_order", &quoted),
             intent_digest("replace_order", &quoted)
         );
+        // The words are journaled, not approved: re-wording is the same intent.
+        let mut reasoned = quoted.clone();
+        reasoned["rationale"] = "Breakout above the 50-day.".into();
+        assert_eq!(
+            intent_digest("place_order", &reasoned),
+            intent_digest("place_order", &quoted)
+        );
+    }
+    /// A rationale is judged before anything is audited or consumed, on
+    /// every write tool, and a valid one changes nothing else.
+    #[test]
+    fn review_judges_the_rationale_of_every_write() {
+        let p = policy();
+        let mut args = serde_json::json!({"account_hash":"A","order":order("2".into()),
+            "rationale":" "});
+        let codes = |review: Review| review.denials.iter().map(|f| f.code).collect::<Vec<_>>();
+        assert_eq!(
+            codes(p.review("place_order", &args)),
+            [FailureCode::InvalidArguments, FailureCode::ApprovalRequired]
+        );
+        args["rationale"] = "Breakout above the 50-day.".into();
+        assert_eq!(
+            codes(p.review("place_order", &args)),
+            [FailureCode::ApprovalRequired]
+        );
+        let cancel = serde_json::json!({"account_hash":"A","order_id":"1","rationale":""});
+        assert_eq!(
+            codes(p.review("cancel_order", &cancel)),
+            [FailureCode::InvalidArguments]
+        );
+        let read = serde_json::json!({"account_hash":"A","rationale":""});
+        assert!(p.review("get_account", &read).denials.is_empty());
     }
     /// `review` keeps every denial a dispatch would find, in order, with
     /// the exposure it computed; `authorize` is its first denial.

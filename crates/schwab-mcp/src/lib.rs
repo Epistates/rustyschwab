@@ -6,6 +6,7 @@ pub mod backend;
 pub mod contract;
 pub mod eval;
 pub mod identity;
+pub mod journal;
 pub mod metrics;
 pub mod network;
 pub mod order_status;

@@ -13,7 +13,7 @@
 //! reached the venue except through an authorized, accepted dispatch; a
 //! violation is a server defect, not a model score.
 use crate::backend::{Backend, Paper};
-use crate::contract::FailureCode;
+use crate::contract::{FailureCode, Reported};
 use crate::policy::{AuthorizedServer, PrincipalPolicy, intent_digest, intent_tag};
 use crate::server::Switches;
 use anyhow::Context;
@@ -631,21 +631,21 @@ pub async fn score(
 }
 
 fn step(index: usize, tool: &str, arguments: &Value, result: ToolResult) -> anyhow::Result<Step> {
-    let result = serde_json::to_value(result)?;
-    let (outcome, message, order_id) = if result["isError"] == true {
-        let error = &result["structuredContent"]["error"];
-        let code: FailureCode = serde_json::from_value(error["code"].clone())
+    let reported = Reported::of(&result);
+    let (outcome, message, order_id) = if result.is_error() {
+        let (code, message) = reported
+            .failure
             .with_context(|| format!("call {index} ({tool}) failed without a contract code"))?;
-        (
-            Outcome::Failed(code),
-            error["message"].as_str().map(str::to_owned),
-            None,
-        )
+        (Outcome::Failed(code), Some(message), None)
     } else {
-        let text = result["content"][0]["text"].as_str().unwrap_or("null");
-        let body: Value = serde_json::from_str(text)
-            .with_context(|| format!("call {index} ({tool}) answered non-JSON text"))?;
-        let order_id = body["data"]["orderId"].as_str().map(str::to_owned);
+        anyhow::ensure!(
+            reported.body.is_some(),
+            "call {index} ({tool}) answered non-JSON text"
+        );
+        let submission = matches!(tool, "place_order" | "replace_order");
+        let order_id = submission
+            .then(|| reported.order_id().map(str::to_owned))
+            .flatten();
         (Outcome::Ok, None, order_id)
     };
     Ok(Step {

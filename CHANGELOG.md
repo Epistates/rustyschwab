@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — trade journal
+
+- `place_order`, `replace_order`, `cancel_order` and `check_order` accept
+  an optional `rationale` (non-blank, at most 2000 characters; otherwise
+  `invalid_arguments`, judged by the policy review before any approval is
+  consumed and by the tool itself). It is kept in the principal's audit
+  journal with the dispatched arguments, never sent to the venue, and
+  excluded from `intent_digest`, so an approval binds the order rather than
+  the words and a re-worded identical order is still a `duplicate_intent`.
+- `get_trade_journal(account_hash, since?, limit?, cursor?)` lists the
+  principal's own write dispatches for one account, newest first, within
+  the response budget: when and which tool, how the dispatch ended
+  (`completed`, `error` with the failure code, or `pending`), the venue
+  order id (a replacement also names the order it `replaces`), the venue's
+  current `status`, `filled` and `avgFillPrice` for that order, the order
+  as requested (type, price, stop, duration, legs), `tag`, `rationale`,
+  `intentDigest` and `attemptId`. One backend read of the orders entered
+  within the window (clamped to Schwab's 59-day list horizon) joins the
+  rows by id, or by tag for a submission whose acknowledgement was lost,
+  so the working order a model was never told about surfaces with its id;
+  a failed join degrades to a `warnings` entry. `since` defaults to seven
+  days ago and may not be in the future. Only the principal wrapper keeps
+  a journal; the stdio transport without one answers `not_permitted`.
+  Documented in `docs/MCP_LLM_INTEGRATION.md#trade-journal`.
+- The audit outcome's evidence for an MCP dispatch is now structured
+  (`journal::Dispatch`): `MCP dispatch completed; venue order <id>` or
+  `MCP dispatch returned error (<code>); consult SDK submission journal`.
+  The previous wording still parses. `contract::FailureCode` implements
+  `Display` and `FromStr` in the wire spelling, and `contract::Reported`
+  reads a tool result's failure or body through the contract for both the
+  journal and the evaluation harness.
+
 ### Added — model evaluation harness
 
 - `schwab-eval` scores a model's tool use against the paper venue without

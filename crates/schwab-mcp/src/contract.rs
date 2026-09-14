@@ -88,6 +88,24 @@ pub enum Disposition {
     NotPermitted,
 }
 
+/// The wire spelling (`risk_denied`), so logs and audit evidence read as
+/// the contract does.
+impl std::fmt::Display for FailureCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match serde_json::to_value(self) {
+            Ok(Value::String(name)) => f.write_str(&name),
+            _ => write!(f, "{self:?}"),
+        }
+    }
+}
+
+impl std::str::FromStr for FailureCode {
+    type Err = ();
+    fn from_str(name: &str) -> Result<Self, ()> {
+        serde_json::from_value(Value::String(name.to_owned())).map_err(|_| ())
+    }
+}
+
 impl FailureCode {
     /// Default disposition; `Auth` failures override it to `AskOperator`.
     fn disposition(self) -> Disposition {
@@ -338,6 +356,51 @@ pub fn normalize(result: ToolResult) -> ToolResult {
         return ToolFailure::invalid_arguments(message).into_result();
     }
     result
+}
+
+/// What a tool result reports, read back through the contract: the failure
+/// an `isError` result carries, or the parsed JSON text of a success. The
+/// policy layer attributes a dispatch with it and the evaluation harness
+/// scores with it, so neither parses result text on its own.
+#[derive(Debug, Default)]
+pub struct Reported {
+    /// The failure and its message, when the result is an error with a
+    /// contract code.
+    pub failure: Option<(FailureCode, String)>,
+    /// The success text as JSON; `None` for an error or non-JSON text.
+    pub body: Option<Value>,
+}
+
+impl Reported {
+    pub fn of(result: &ToolResult) -> Self {
+        if result.is_error() {
+            let failure = result.structured_content.as_ref().and_then(|content| {
+                let error = &content["error"];
+                let code = serde_json::from_value(error["code"].clone()).ok()?;
+                let message = error["message"].as_str().unwrap_or_default().to_owned();
+                Some((code, message))
+            });
+            return Self {
+                failure,
+                body: None,
+            };
+        }
+        Self {
+            failure: None,
+            body: result
+                .first_text()
+                .and_then(|text| serde_json::from_str(text).ok()),
+        }
+    }
+
+    /// The venue order id a submission (`data.orderId`) or a cancellation
+    /// (`data.order_id`) reported.
+    pub fn order_id(&self) -> Option<&str> {
+        let data = &self.body.as_ref()?["data"];
+        data["orderId"]
+            .as_str()
+            .or_else(|| data["order_id"].as_str())
+    }
 }
 
 /// Compact JSON text, refused rather than clipped when it would exceed the

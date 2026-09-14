@@ -19,7 +19,9 @@ use schwab_mcp::policy::{AuthorizedServer, PrincipalPolicy};
 use schwab_mcp::server::Switches;
 use schwab_rs::SchwabClient;
 use schwab_rs::broker::TradingBackend;
-use schwab_rs::paper::{MODEL_VERSION, PaperBroker, PaperConfig, PaperEvent, PaperEventKind};
+use schwab_rs::paper::{
+    MODEL_VERSION, PaperBroker, PaperConfig, PaperEvent, PaperEventKind, PaperFault,
+};
 use serde_json::{Value, json};
 use turbomcp::McpHandler;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
@@ -63,7 +65,8 @@ fn policy() -> PrincipalPolicy {
         "token_sha256": "a".repeat(64),
         "tools": ["get_server_status", "get_account", "get_quotes", "get_price_history",
                   "get_order", "get_order_status", "get_account_orders", "get_all_orders",
-                  "get_portfolio_summary", "check_order", "place_order", "cancel_order"],
+                  "get_portfolio_summary", "get_trade_journal", "check_order", "place_order",
+                  "cancel_order"],
         "accounts": [ACCOUNT],
         "max_quantity": "10",
         "max_notional": "1000",
@@ -405,4 +408,189 @@ async fn the_operator_halt_and_the_write_switches_gate_paper_orders() {
     let placed = call(&server, "place_order", intent).await;
     assert_eq!(placed["source"], "paper", "{placed}");
     assert!(placed["data"]["orderId"].is_string());
+}
+
+/// The journal keeps every dispatch this principal made for the account,
+/// newest first, with the rationale given and the venue's side of it: a
+/// denied dispatch never reaches it, a failed one keeps its code, and an
+/// order the venue holds for a lost acknowledgement surfaces by its tag.
+#[tokio::test]
+async fn the_trade_journal_records_why_and_what_the_venue_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, now) = venue(dir.path()).await;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy());
+    let with = |order: Value, rationale: &str| json!({"account_hash": ACCOUNT, "order": order, "rationale": rationale});
+
+    // Denied by policy before any audit: a blank rationale, then exposure.
+    let blank = call(&server, "place_order", with(order("BUY", "1", "11"), " ")).await;
+    assert_eq!(blank["error"]["code"], "invalid_arguments", "{blank}");
+    let oversized = call(
+        &server,
+        "place_order",
+        with(order("BUY", "20", "11"), "Big."),
+    )
+    .await;
+    assert_eq!(oversized["error"]["code"], "risk_denied", "{oversized}");
+
+    let placed = call(
+        &server,
+        "place_order",
+        with(order("BUY", "2", "11"), "Breakout above 10.90 on volume."),
+    )
+    .await;
+    let first = placed["data"]["orderId"].as_str().unwrap().to_owned();
+
+    // Admitted by policy, refused by the venue: journaled with its code.
+    broker
+        .halt_submissions("desk review", "operator")
+        .await
+        .unwrap();
+    let halted = call(
+        &server,
+        "place_order",
+        with(order("BUY", "1", "10.5"), "Add."),
+    )
+    .await;
+    assert_eq!(halted["error"]["code"], "halted", "{halted}");
+    broker.clear_operator_halt("operator").await.unwrap();
+
+    // The venue keeps the order but the acknowledgement is lost. The clock
+    // stays at `now` so the venue's entry times sit inside the journal's
+    // window, which ends at wall time.
+    broker
+        .apply(PaperEvent {
+            sequence: 3,
+            at_ms: now,
+            kind: PaperEventKind::Fault {
+                fault: PaperFault::LoseNextAcknowledgement,
+            },
+        })
+        .await
+        .unwrap();
+    let lost = call(
+        &server,
+        "place_order",
+        with(order("BUY", "1", "10.25"), "Scale in."),
+    )
+    .await;
+    assert_eq!(lost["error"]["code"], "reconciliation_required", "{lost}");
+
+    let canceled = call(
+        &server,
+        "cancel_order",
+        json!({"account_hash": ACCOUNT, "order_id": first, "rationale": "Thesis broke."}),
+    )
+    .await;
+    assert_eq!(canceled["data"]["status"], "canceled", "{canceled}");
+
+    let journal = call(
+        &server,
+        "get_trade_journal",
+        json!({"account_hash": ACCOUNT}),
+    )
+    .await;
+    assert_eq!(journal["source"], "paper", "{journal}");
+    let data = &journal["data"];
+    assert_eq!(data["principal"], "paper-desk");
+    assert_eq!(data["warnings"], json!([]));
+    assert_eq!(data["count"], 4, "{data}");
+    assert_eq!(data["total"], 4);
+    assert_eq!(data["truncated"], false);
+    let columns: Vec<&str> = data["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    let column =
+        |row: &Value, name: &str| row[columns.iter().position(|c| *c == name).unwrap()].clone();
+    let rows = data["rows"].as_array().unwrap();
+    let at = |row: &Value| column(row, "at").as_str().unwrap().to_owned();
+    assert!(
+        rows.windows(2).all(|pair| at(&pair[0]) >= at(&pair[1])),
+        "newest first: {rows:?}"
+    );
+    let by_rationale = |text: &str| {
+        rows.iter()
+            .find(|row| column(row, "rationale") == text)
+            .unwrap_or_else(|| panic!("no row for {text:?}: {rows:?}"))
+    };
+
+    let cancel = by_rationale("Thesis broke.");
+    assert_eq!(column(cancel, "tool"), "cancel_order");
+    assert_eq!(column(cancel, "dispatch"), "completed");
+    assert_eq!(column(cancel, "orderId"), first);
+    assert_eq!(column(cancel, "status"), "PENDING_CANCEL");
+    assert_eq!(column(cancel, "legs")[0]["symbol"], "ABC");
+
+    let unacknowledged = by_rationale("Scale in.");
+    assert_eq!(column(unacknowledged, "tool"), "place_order");
+    assert_eq!(column(unacknowledged, "dispatch"), "error");
+    assert_eq!(column(unacknowledged, "failure"), "reconciliation_required");
+    let held = column(unacknowledged, "orderId");
+    assert!(
+        held.is_string(),
+        "the venue's order surfaces by tag: {unacknowledged}"
+    );
+    assert_ne!(held, first);
+    assert_eq!(column(unacknowledged, "status"), "WORKING");
+    assert_eq!(column(unacknowledged, "price"), "10.25");
+
+    let refused = by_rationale("Add.");
+    assert_eq!(column(refused, "dispatch"), "error");
+    assert_eq!(column(refused, "failure"), "halted");
+    assert_eq!(column(refused, "orderId"), Value::Null);
+    assert_eq!(column(refused, "status"), Value::Null);
+
+    let entry = by_rationale("Breakout above 10.90 on volume.");
+    assert_eq!(column(entry, "dispatch"), "completed");
+    assert_eq!(column(entry, "orderId"), first);
+    assert_eq!(column(entry, "status"), "PENDING_CANCEL");
+    assert_eq!(column(entry, "filled"), 0.0);
+    assert_eq!(column(entry, "orderType"), "LIMIT");
+    assert_eq!(column(entry, "price"), "11");
+    assert_eq!(column(entry, "legs")[0]["quantity"], "2");
+    assert_eq!(column(entry, "intentDigest").as_str().unwrap().len(), 64);
+    assert!(
+        column(entry, "tag")
+            .as_str()
+            .unwrap()
+            .starts_with(schwab_mcp::policy::INTENT_TAG_PREFIX)
+    );
+    assert!(column(entry, "attemptId").is_string());
+
+    // Paging continues into the past; a window excludes what came before it.
+    let page = call(
+        &server,
+        "get_trade_journal",
+        json!({"account_hash": ACCOUNT, "limit": 3}),
+    )
+    .await;
+    assert_eq!(page["data"]["count"], 3);
+    assert_eq!(page["data"]["truncated"], true);
+    let rest = call(
+        &server,
+        "get_trade_journal",
+        json!({"account_hash": ACCOUNT, "cursor": page["data"]["nextCursor"]}),
+    )
+    .await;
+    assert_eq!(rest["data"]["count"], 1, "{rest}");
+    assert_eq!(
+        column(&rest["data"]["rows"][0], "rationale"),
+        "Breakout above 10.90 on volume."
+    );
+    let future = call(
+        &server,
+        "get_trade_journal",
+        json!({"account_hash": ACCOUNT, "since": now + 3_600_000}),
+    )
+    .await;
+    assert_eq!(future["error"]["code"], "invalid_arguments", "{future}");
+    let other = call(
+        &server,
+        "get_trade_journal",
+        json!({"account_hash": "nobody"}),
+    )
+    .await;
+    assert_eq!(other["error"]["code"], "not_permitted", "{other}");
 }

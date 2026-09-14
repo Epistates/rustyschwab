@@ -6,6 +6,7 @@
 //! advisory.
 use crate::backend::Backend;
 use crate::contract::ToolFailure;
+use crate::journal;
 use crate::policy::{self, PrincipalPolicy};
 use crate::server::Switches;
 use rust_decimal::Decimal;
@@ -66,6 +67,9 @@ pub struct Request {
     pub order: OrderRequest,
     #[serde(default)]
     pub order_id: Option<String>,
+    /// Judged as the submission would judge it; never part of the digest.
+    #[serde(default)]
+    pub rationale: Option<String>,
 }
 
 impl Request {
@@ -78,19 +82,16 @@ impl Request {
     /// The submission these arguments stand for, as its tool would receive
     /// it: `replace_order` of `order_id` when given, else `place_order`.
     pub fn intent(self) -> (&'static str, Value) {
+        let mut args = json!({ "account_hash": self.account_hash, "order": self.order });
+        if let Some(rationale) = self.rationale {
+            args["rationale"] = Value::String(rationale);
+        }
         match self.order_id {
-            Some(order_id) => (
-                "replace_order",
-                json!({
-                    "account_hash": self.account_hash,
-                    "order_id": order_id,
-                    "order": self.order,
-                }),
-            ),
-            None => (
-                "place_order",
-                json!({ "account_hash": self.account_hash, "order": self.order }),
-            ),
+            Some(order_id) => {
+                args["order_id"] = Value::String(order_id);
+                ("replace_order", args)
+            }
+            None => ("place_order", args),
         }
     }
 }
@@ -127,6 +128,11 @@ pub async fn evaluate(
             )
         }
         None => {
+            if let Err(failure) =
+                journal::check_rationale(args.get("rationale").and_then(Value::as_str))
+            {
+                reasons.push(failure);
+            }
             let exposure = match policy::order_request(args) {
                 Ok(order) => policy::exposure(&order, &Default::default()).ok(),
                 Err(failure) => {

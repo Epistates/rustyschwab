@@ -26,11 +26,12 @@ use turbomcp::prelude::*;
 
 use crate::backend::Backend;
 use crate::contract::{self, Source, ToolFailure};
+use crate::journal;
 use crate::order_status;
 use crate::portfolio;
 use crate::preflight;
 use crate::projection;
-use crate::query::{OrdersQuery, PriceHistoryQuery, TransactionsQuery};
+use crate::query::{FlexibleTime, OrdersQuery, PriceHistoryQuery, TransactionsQuery};
 use crate::status::{self, SessionCalendar};
 use crate::stream_cache::{StreamCache, spawn_recovering_cache_feeder};
 
@@ -733,6 +734,42 @@ impl SchwabMcp {
         .await
     }
 
+    /// Your own trade journal for an account: every `place_order`,
+    /// `replace_order` and `cancel_order` this principal dispatched since
+    /// `since` (default seven days ago), newest first, with the
+    /// `rationale` given, how the dispatch ended (`dispatch` is
+    /// `completed`, `error` with its `failure` code, or `pending` when the
+    /// process died mid-call), and the venue's current `status`, `filled`
+    /// and `avgFillPrice` for the order it produced. An order the venue
+    /// holds for a dispatch that never got its acknowledgement shows here
+    /// with its `orderId`. Rows are `columns`-ordered arrays; pass
+    /// `nextCursor` back as `cursor` to continue into the past. The
+    /// journal is per principal: the unauthorized stdio transport has none.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_trade_journal(
+        &self,
+        account_hash: String,
+        since: Option<FlexibleTime>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    ) -> McpResult<ToolResult> {
+        // Only reached on the unauthorized stdio transport, which dispatches
+        // no writes and keeps no journal; `AuthorizedServer` answers from
+        // its principal's.
+        let _ = (account_hash, since, limit, cursor);
+        contract::run("get_trade_journal", async {
+            Err(ToolFailure::not_permitted(
+                "The trade journal belongs to a principal; this transport has none",
+            ))
+        })
+        .await
+    }
+
     // ============================================================
     // Transactions
     // ============================================================
@@ -835,6 +872,7 @@ impl SchwabMcp {
         account_hash: String,
         order: OrderRequest,
         order_id: Option<String>,
+        rationale: Option<String>,
     ) -> McpResult<ToolResult> {
         // Only reached on the unauthorized stdio transport, where trading is
         // off and no principal policy applies; `AuthorizedServer` evaluates
@@ -844,6 +882,7 @@ impl SchwabMcp {
                 account_hash,
                 order,
                 order_id,
+                rationale,
             };
             let (name, args) = request.intent();
             let verdict =
@@ -889,6 +928,10 @@ impl SchwabMcp {
     /// `retryable` failure may be repeated unchanged. To place the same
     /// order twice on purpose, set a distinct `tag`. The result's `source`
     /// says which venue accepted it: `paper` orders never reach Schwab.
+    /// `rationale` (at most 2000 characters) is why you are placing this
+    /// order, kept in the trade journal for `get_trade_journal` and the
+    /// operator's audit; it is never sent to the venue and does not
+    /// change the intent digest.
     #[tool(
         read_only = false,
         destructive = true,
@@ -899,9 +942,11 @@ impl SchwabMcp {
         &self,
         account_hash: String,
         order: OrderRequest,
+        rationale: Option<String>,
     ) -> McpResult<ToolResult> {
         contract::run("place_order", async {
             self.switches.require("place_order")?;
+            journal::check_rationale(rationale.as_deref())?;
             let resp = self.backend.place_order(&account_hash, &order).await?;
             Ok(contract::envelope(self.backend.source(), resp))
         })
@@ -910,15 +955,22 @@ impl SchwabMcp {
 
     /// Cancel a working order. **Requires** `SCHWAB_MCP_ALLOW_TRADING=1`
     /// (or `SCHWAB_MCP_ALLOW_CANCEL=1` to allow cancels alone).
+    /// `rationale` is journaled as for `place_order`.
     #[tool(
         read_only = false,
         destructive = true,
         idempotent = false,
         open_world = true
     )]
-    async fn cancel_order(&self, account_hash: String, order_id: String) -> McpResult<ToolResult> {
+    async fn cancel_order(
+        &self,
+        account_hash: String,
+        order_id: String,
+        rationale: Option<String>,
+    ) -> McpResult<ToolResult> {
         contract::run("cancel_order", async {
             self.switches.require("cancel_order")?;
+            journal::check_rationale(rationale.as_deref())?;
             self.backend.cancel_order(&account_hash, &order_id).await?;
             Ok(contract::envelope(
                 self.backend.source(),
@@ -935,7 +987,7 @@ impl SchwabMcp {
     /// Replace a working order with a new order spec (the venue atomically
     /// cancels the old one and places the new one). **Requires**
     /// `SCHWAB_MCP_ALLOW_TRADING=1`. An omitted `tag` defaults to this exact
-    /// intent's digest, as for `place_order`.
+    /// intent's digest, and `rationale` is journaled, as for `place_order`.
     #[tool(
         read_only = false,
         destructive = true,
@@ -947,9 +999,11 @@ impl SchwabMcp {
         account_hash: String,
         order_id: String,
         order: OrderRequest,
+        rationale: Option<String>,
     ) -> McpResult<ToolResult> {
         contract::run("replace_order", async {
             self.switches.require("replace_order")?;
+            journal::check_rationale(rationale.as_deref())?;
             let resp = self
                 .backend
                 .replace_order(&account_hash, &order_id, &order)

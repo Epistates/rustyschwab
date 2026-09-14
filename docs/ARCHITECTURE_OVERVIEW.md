@@ -22,9 +22,9 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (38 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ server.rs (39 tools)  policy.rs  network.rs  identity.rs  redact.rs │
                  │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
-                 │ projection.rs  portfolio.rs  order_status.rs                         │
+                 │ projection.rs  portfolio.rs  order_status.rs  journal.rs             │
                  │ authority.rs (gateway)                                               │
                  │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
@@ -219,11 +219,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 38 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl with 39 `#[tool]`
 methods in category order: market data (12, including the `get_candles`
 and `get_option_contracts` projections), accounts (6, including the
-`get_positions` projection and `get_portfolio_summary`), orders read (4,
-including `get_order_status`), orders write (`build_order`,
+`get_positions` projection and `get_portfolio_summary`), orders read (5,
+including `get_order_status` and `get_trade_journal`), orders write (`build_order`,
 `check_order`, `preview_order`, `place_order`, `cancel_order`,
 `replace_order`), transactions (2), streaming control and cached reads (7),
 server (`get_server_status`).
@@ -274,7 +274,13 @@ quantities, quantity-weighted average fill price overall and per leg from
 the `FILL` executions, latest update time, replacing and child orders) and
 implements the bounded wait: one `get_order` read per second until the
 order is terminal or `wait_ms` (capped at 30 s) elapses. Its leg projection
-is shared with the portfolio summary's working-order rows. Every tool body runs through
+is shared with the portfolio summary's working-order rows. `journal.rs`
+validates the write tools' optional `rationale` (journal-only text, excluded
+from the intent digest), records how each audited dispatch ended as
+structured evidence (`Dispatch`: the venue order id, or the failure code)
+and composes `get_trade_journal`: the principal's audit records for one
+account joined, by order id or by tag, to one backend read of the orders
+entered within the window, paged newest first. Every tool body runs through
 `contract::run`, which boxes it once so the macro-generated dispatcher's
 future and stack frame stay small however many tools there are.
 

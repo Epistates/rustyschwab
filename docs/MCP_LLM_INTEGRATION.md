@@ -1,10 +1,10 @@
 # MCP and LLM integration review
 
 Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
-explicit behavior annotations for all 38 tools (`build_order`, which expands
+explicit behavior annotations for all 39 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
-`get_server_status`, the three projection tools, `get_portfolio_summary` and
-`get_order_status` were added after the review). Reads and previews are marked
+`get_server_status`, the three projection tools, `get_portfolio_summary`,
+`get_order_status` and `get_trade_journal` were added after the review). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -218,9 +218,10 @@ keeps Schwab's full shape, and is read-only and not audited.
 
 ## Pre-flight
 
-`check_order(account_hash, order, order_id?)` evaluates a `place_order` (or,
-with `order_id`, a `replace_order`) intent against everything this server
-enforces locally and answers without contacting Schwab:
+`check_order(account_hash, order, order_id?, rationale?)` evaluates a
+`place_order` (or, with `order_id`, a `replace_order`) intent against
+everything this server enforces locally and answers without contacting
+Schwab:
 
 ```json
 {"allowed": false,
@@ -243,6 +244,56 @@ holds `place_order` or `replace_order`; without a principal (the local stdio
 transport with trading off) `limits` is null and approval does not apply.
 `preview_order` remains the way to obtain Schwab's own validation, fees and
 buying-power impact.
+
+## Trade journal
+
+`place_order`, `replace_order`, `cancel_order` and `check_order` accept an
+optional `rationale`: the model's own words for why, at most 2000
+characters and not blank (either is `invalid_arguments`, judged before any
+approval is consumed). It is kept in the principal's audit journal beside
+the arguments as dispatched, is never sent to the venue, and is not part
+of the intent digest, so an approval binds the order rather than the
+words and re-wording an identical order is still a `duplicate_intent`.
+
+`get_trade_journal(account_hash, since?, limit?, cursor?)` reads that
+journal back for one account, newest first, joined to what the venue did
+(`crates/schwab-mcp/src/journal.rs`), so a model resuming a session, or
+an operator reviewing one, sees each decision, its reason and its outcome
+in one bounded read:
+
+```json
+{"asOf": "…", "source": "schwab_rest",
+ "data": {"principal": "desk", "since": "2026-09-03T14:30:00.000Z", "warnings": [],
+          "columns": ["at", "tool", "dispatch", "failure", "orderId", "replaces", "status",
+                      "filled", "avgFillPrice", "orderType", "price", "stopPrice", "duration",
+                      "legs", "tag", "rationale", "intentDigest", "attemptId"],
+          "rows": [["2026-09-10T14:31:22.104Z", "place_order", "completed", null, "9", null,
+                    "WORKING", 0.0, null, "LIMIT", "11", null, "DAY",
+                    [{"instruction": "BUY", "quantity": "2", "symbol": "ABC", "assetType": "EQUITY"}],
+                    "mcp-…", "Breakout above 10.90 on volume.", "…", "…"]],
+          "count": 1, "total": 1, "truncated": false}}
+```
+
+Each row is one write dispatch. `dispatch` is `completed` (the tool
+answered a success), `error` (it answered the [failure](#result-contract)
+named in `failure`) or `pending` (the process died mid-dispatch; reconcile).
+`orderId` is the venue's id for the order placed, replaced or canceled, and
+`replaces` the id a replacement superseded; `status`, `filled` and
+`avgFillPrice` are the venue's current view of that order, as
+`get_order_status` reports them, and null when the venue holds no such
+order. The order fields and `legs` are what the model asked for, and for a
+cancellation what the venue holds. A submission whose acknowledgement was
+lost (`reconciliation_required`) is joined by its tag, so the working
+order the model was never told about surfaces here with its id. The
+window defaults to the last seven days and `since` may not be in the
+future; the venue join reads the orders entered within Schwab's 59-day
+list horizon once per call and degrades to a `warnings` entry, leaving the
+rows with the audit's side alone. Paging follows the
+[projections](#projections). Writes the policy refused (invalid arguments,
+a permission, risk or approval denial) never reached the audit and are not
+rows; those the server dispatched and the venue or a switch refused are,
+with their `failure`. Only the principal wrapper keeps a journal; the
+local stdio transport answers `not_permitted`.
 
 ## Server status
 

@@ -607,7 +607,12 @@ require an explicit tool permission.
   quantity-weighted `avgFillPrice` overall and per leg, `lastUpdate`,
   `replacedBy`, children of trigger and OCO orders) and with `wait_ms` (at
   most 30 s) re-reads once a second until Schwab cannot change the order
-  again
+  again; `get_trade_journal(account_hash, since?, limit?, cursor?)` lists
+  the principal's own write dispatches newest first, each with the
+  `rationale` it was given, how the dispatch ended (`completed`, `error`
+  with the failure code, or `pending`) and the venue's current status of
+  the order it produced, so a model resuming a session sees what it
+  decided, why, and what came of it
 - **Orders (write)** — `build_order(spec)` expands a compact spec
   (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
   contract parts) into the exact `order` JSON the write tools accept, locally
@@ -615,7 +620,9 @@ require an explicit tool permission.
   submission would fail (validity, policy limits, approval, trading switch,
   halts) with the intent digest to approve, also without contacting Schwab;
   `preview_order`, `place_order`, `cancel_order`, `replace_order` *(last
-  three gated)*
+  three gated)*. The write tools and `check_order` accept an optional
+  `rationale` (at most 2000 characters): the model's reason, kept in the
+  audit journal, never sent to Schwab, and excluded from the intent digest
 - **Transactions** — `get_transactions`, `get_transaction`
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
