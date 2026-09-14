@@ -370,6 +370,9 @@ impl SchwabClient {
             let mut orders = std::collections::BTreeMap::new();
             let mut pages = 0;
             while let Some((from, to)) = windows.pop() {
+                // One day inside Schwab's 60-day order list horizon. A wider
+                // window is answered with what it holds, so splitting keeps
+                // each request's span meaningful rather than silently short.
                 if to - from > chrono::Duration::days(59) {
                     let split = from + chrono::Duration::days(59);
                     windows.push((split, to));

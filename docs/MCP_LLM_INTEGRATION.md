@@ -85,7 +85,14 @@ UTC), or epoch milliseconds. Orders and transactions default to the last
 seven days ending now, and transactions to `TRADE`, so `params` may be
 omitted. Unknown fields are refused rather than ignored, so a misspelled
 bound cannot silently widen a window. The resolved request is still built
-and validated by the SDK, and Schwab's one-year cap still applies.
+and validated by the SDK, and Schwab's own limits still apply: a window
+wider than they allow is answered with what they hold, not refused. The
+two limits are different, and a model that reads one for the other will
+misread an empty answer. Orders are listed only for the last 60 days,
+however far back `fromEnteredTime` reaches, which is why the 59-day
+horizon appears wherever this server reads "the orders Schwab may still
+change" ([portfolio summary](#portfolio-summary), [trade
+journal](#trade-journal)). Transactions reach back a year.
 
 ## Projections
 
@@ -155,8 +162,8 @@ arithmetic between them:
 ```
 
 The summary is two Schwab reads, not an atomic snapshot: the orders
-entered within the last 59 days (Schwab's list horizon; an older working
-order is reachable by `get_order` only), then the account with its
+entered within the last 59 days (inside Schwab's 60-day list horizon; an
+older working order is reachable by `get_order` only), then the account with its
 positions, in that order so an order that fills in between shows as both
 working and held rather than as neither. `balances` are Schwab's current
 balances typed, with a cash account's `cashAvailableForTrading` standing in
@@ -288,8 +295,8 @@ cancellation what the venue holds. A submission whose acknowledgement was
 lost (`reconciliation_required`) is joined by its tag, so the working
 order the model was never told about surfaces here with its id. The
 window defaults to the last seven days and `since` may not be in the
-future; the venue join reads the orders entered within Schwab's 59-day
-list horizon once per call and degrades to a `warnings` entry, leaving the
+future; the venue join reads the orders entered within the same 59-day
+window once per call and degrades to a `warnings` entry, leaving the
 rows with the audit's side alone. Paging follows the
 [projections](#projections). Writes the policy refused (invalid arguments,
 a permission, risk or approval denial) never reached the audit and are not

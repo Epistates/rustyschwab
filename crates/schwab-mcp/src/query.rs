@@ -85,7 +85,8 @@ fn window(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrdersQuery {
     /// Earliest entry time; default seven days before `toEnteredTime`.
-    /// Schwab caps the window at one year.
+    /// Schwab returns only orders entered in the last 60 days, whatever
+    /// this asks for.
     #[serde(default, alias = "from_entered_time")]
     pub from_entered_time: Option<FlexibleTime>,
     /// Latest entry time; default now.
@@ -121,7 +122,8 @@ impl OrdersQuery {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransactionsQuery {
     /// Earliest transaction time; default seven days before `endDate`.
-    /// Schwab caps the window at one year.
+    /// Schwab caps the window at one year — transaction history reaches
+    /// back further than the 60-day order list.
     #[serde(default, alias = "start_date")]
     pub start_date: Option<FlexibleTime>,
     /// Latest transaction time; default now.

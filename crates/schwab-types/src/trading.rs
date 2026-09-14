@@ -459,7 +459,9 @@ pub struct OrderSubmitResponse {
 ///
 /// Both bounds are required by Schwab, which formats them as
 /// [`schwab_timestamp`](crate::common::schwab_timestamp) on the wire and
-/// caps the window at one year.
+/// lists only orders entered in the last 60 days, however far back the
+/// window reaches. Callers that want the whole horizon should stay just
+/// inside it; the SDK's own reads use 59 days.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -744,6 +746,9 @@ pub struct TransactionInstrument {
 /// Both bounds and at least one type are required by Schwab, which formats
 /// the bounds as [`schwab_timestamp`](crate::common::schwab_timestamp) on
 /// the wire, joins the types with commas, and caps the window at one year.
+/// Transaction history reaches back that far; the order list
+/// ([`OrdersParams`]) reaches back only 60 days. The two limits are
+/// different, and neither is enforced here: Schwab answers the request.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — the documented order window is 60 days, not a year
+
+- `OrdersParams`, `OrdersQuery`, `get_account_orders` and `get_orders`
+  documented "Schwab caps the window at one year", which is the
+  transaction limit. Schwab lists only orders entered in the last 60 days,
+  however far back `fromEnteredTime` reaches, which is why the 59-day
+  figure appears in `portfolio::ORDER_LOOKBACK_DAYS` and reconciliation's
+  window chunking. The two limits now read as the different limits they
+  are, and the places that say 59 days say what it is: one day inside
+  Schwab's horizon, not the horizon itself. Documentation only; no
+  behaviour changed.
+
 ### Fixed — the paper feed reads closed days as closed
 
 - `paper::feed` looked the equity calendar up as `equity.EQ`, the key

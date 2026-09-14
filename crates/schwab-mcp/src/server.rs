@@ -604,8 +604,9 @@ impl SchwabMcp {
     /// One account in one bounded answer: current balances (buying power,
     /// available funds, cash, liquidation value, calls), day and open P&L
     /// summed over positions, the first page of `get_positions`, the
-    /// orders Schwab may still change (entered in the last 59 days, its
-    /// list horizon; `truncated` means `get_account_orders` has more), and
+    /// orders Schwab may still change (entered in the last 59 days, inside
+    /// its 60-day list horizon; `truncated` means `get_account_orders` has
+    /// more), and
     /// how many of this server's submissions Schwab has not yet answered.
     /// Two Schwab reads, not an atomic snapshot; sections whose read failed
     /// are null and explained in `warnings`. In paper mode `paper` adds the
@@ -693,9 +694,10 @@ impl SchwabMcp {
 
     /// List orders for a specific account entered in a time window, by
     /// default (no `params`) the last seven days ending now. Times may be
-    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds;
-    /// Schwab caps the window at one year. `params.status` narrows to one
-    /// status (`WORKING`, `FILLED`, `CANCELED`, `REJECTED`, ...).
+    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds.
+    /// Schwab lists only orders entered in the last 60 days, however far
+    /// back the window reaches. `params.status` narrows to one status
+    /// (`WORKING`, `FILLED`, `CANCELED`, `REJECTED`, ...).
     #[tool(
         read_only = true,
         destructive = false,
@@ -720,8 +722,9 @@ impl SchwabMcp {
 
     /// List orders across all linked accounts entered in a time window, by
     /// default (no `params`) the last seven days ending now. Times may be
-    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds;
-    /// Schwab caps the window at one year.
+    /// a calendar date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds.
+    /// Schwab lists only orders entered in the last 60 days, however far
+    /// back the window reaches.
     #[tool(
         read_only = true,
         destructive = false,
@@ -785,7 +788,8 @@ impl SchwabMcp {
     /// selects categories (`TRADE`, `DIVIDEND_OR_INTEREST`, `CASH_RECEIPT`,
     /// `ELECTRONIC_FUND`, ...). Times may be a calendar date
     /// (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds; Schwab caps the
-    /// window at one year. Not available in paper mode, where fills are on
+    /// window at one year, so transactions reach back further than the
+    /// 60-day order list. Not available in paper mode, where fills are on
     /// each order.
     #[tool(
         read_only = true,

@@ -23,9 +23,10 @@ use crate::contract::ToolFailure;
 use crate::order_status;
 use crate::projection::{self, Page, Row};
 
-/// Schwab lists orders entered at most this many days ago, the horizon
-/// reconciliation scans too; an older working order is reachable by
-/// `get_order` only.
+/// How far back to ask for orders: one day inside Schwab's 60-day list
+/// horizon, so a window built from a slightly skewed clock still lands
+/// within it. Reconciliation chunks its scan the same way. An order
+/// entered before the horizon is reachable by `get_order` only.
 pub const ORDER_LOOKBACK_DAYS: i64 = 59;
 
 /// The summary as `get_portfolio_summary` reports it.

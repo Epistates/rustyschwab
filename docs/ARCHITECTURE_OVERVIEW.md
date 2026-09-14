@@ -266,8 +266,9 @@ account into compact column/row pages: rows are sorted by a typed key
 the caller's `limit` or the `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` budget, and
 `nextCursor` is the last key so re-reading Schwab between pages never
 skips or repeats a row. The raw tools keep Schwab's shape. `portfolio.rs`
-composes `get_portfolio_summary` from two backend reads (orders within
-Schwab's 59-day list horizon, then the account with positions) and the
+composes `get_portfolio_summary` from two backend reads (orders from the
+last 59 days, inside Schwab's 60-day list horizon, then the account with
+positions) and the
 execution journal: typed balances, P&L summed over positions, the first
 `get_positions` page, the non-terminal orders (`OrderStatus::is_terminal`,
 pinned to reconciliation's SQL) with children flattened, the count of
