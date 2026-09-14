@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — the paper feed reads closed days as closed
+
+- `paper::feed` looked the equity calendar up as `equity.EQ`, the key
+  Schwab uses for a trading day. On a holiday or a weekend Schwab keys the
+  same payload by market name, so every poll failed with "Equity calendar
+  absent", appended a durable `Disconnect` and returned an error to the
+  driver. It now uses the shared `market_data::equity_hours` lookup, which
+  accepts both spellings, and a closed day closes the venue's session
+  instead.
+
 ### Added — synthetic quotes from price history for backtesting
 
 - `schwab_rs::paper::synthetic::SyntheticBbo` derives a replay-ready event

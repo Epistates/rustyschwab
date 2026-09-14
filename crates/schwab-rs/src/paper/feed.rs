@@ -6,7 +6,7 @@ use crate::{
     Error, Result, SchwabClient,
     types::{
         common::AssetMainType,
-        market_data::{Market, MarketHours, QuoteItem},
+        market_data::{Market, MarketHours, QuoteItem, equity_hours},
     },
 };
 use chrono::{DateTime, Utc};
@@ -166,9 +166,10 @@ impl SchwabPaperFeed {
         )
         .await
         .map_err(|_| deadline_exceeded())??;
-        let hours = hours
-            .get(Market::Equity.as_str())
-            .and_then(|v| v.get("EQ"))
+        // Schwab keys a trading day by product code and a closed day by market
+        // name, so the shared lookup decides; reading only `EQ` would turn every
+        // holiday and weekend into a feed error and a disconnect.
+        let hours = equity_hours(&hours)
             .ok_or_else(|| Error::InvalidParameter("Equity calendar absent".into()))?;
         let open = regular_session_open(hours, &date, Utc::now().timestamp_millis())?;
         if self.paper.market_session().await? != (date.clone(), open) {

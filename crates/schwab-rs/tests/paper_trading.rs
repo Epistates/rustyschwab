@@ -1,3 +1,5 @@
+mod common;
+
 use rust_decimal::Decimal;
 use schwab_rs::{Error, broker::TradingBackend, paper::*, types::trading::OrderRequest};
 use serde_json::json;
@@ -1116,6 +1118,44 @@ fn calendar_respects_offsets_early_closes_and_unknown_dates() {
     assert!(feed::regular_session_open(&hours, "2026-11-27", at).unwrap());
     assert!(!feed::regular_session_open(&hours, "2026-11-27", at + 1000).unwrap());
     assert!(feed::regular_session_open(&hours, "2026-11-28", at).is_err());
+}
+/// A holiday or weekend is a closed session, not a broken feed: Schwab keys
+/// a closed day by market name rather than product code, and reading only
+/// `EQ` disconnected the venue every day it was shut.
+#[tokio::test]
+async fn a_closed_calendar_day_closes_the_session_instead_of_faulting_the_feed() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let (client, _tokens_dir, _) = common::mock_client(&server, false);
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/markets/equity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "equity": {"equity": {
+                "date": today, "marketType": "EQUITY", "product": "EQ", "isOpen": false,
+            }}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config.clock = PaperClockMode::Wall;
+    let b = PaperBroker::open(dir.path().join("state/paper.sqlite3"), config)
+        .await
+        .unwrap();
+    let feed = feed::SchwabPaperFeed::new(
+        std::sync::Arc::new(client),
+        b.clone(),
+        vec!["ABC".into()],
+        d("100"),
+    )
+    .unwrap();
+    feed.tick().await.unwrap();
+    assert_eq!(b.market_session().await.unwrap(), (today, false));
+    // The feed stops at the closed calendar rather than asking for quotes.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 #[test]
 fn feed_requires_realtime_identity_side_timestamps_and_explicit_size_units() {
