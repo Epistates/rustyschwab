@@ -34,6 +34,8 @@ use crate::redact;
 pub enum Source {
     SchwabRest,
     StreamCache,
+    /// The paper venue: simulated accounts, orders, fills and its own quotes.
+    Paper,
     Local,
 }
 

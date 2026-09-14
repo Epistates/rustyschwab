@@ -539,6 +539,25 @@ SCHWAB_MCP_TRANSPORT=websocket SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwa
 Tokens must already exist on disk (run the `oauth_flow` example first, or any
 `AuthManager`-based flow that persists to `SCHWAB_TOKENS_FILE`).
 
+#### Paper mode
+
+```bash
+# The same server over the local paper venue; no Schwab credential needed
+SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json \
+SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
+SCHWAB_MCP_ALLOW_TRADING=1 cargo run -p schwab-mcp --release
+```
+
+With `SCHWAB_MCP_PAPER_CONFIG` set, orders, fills, accounts and quotes are
+the [paper venue's](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)
+simulation and no Schwab trading endpoint is reachable. Set `SCHWAB_APP_KEY`
+as well and a read-only Schwab client serves price history, option chains,
+movers, instruments, market hours and the stream. The mode is announced in
+`serverInfo.title`, `get_server_status` (`mode`, plus a `paper` section
+describing the venue), `/readyz`, and as `source: "paper"` on every read
+and mutation the venue served. Policy, approval, the trading switches and
+the operator halt gate paper orders exactly as they gate live ones.
+
 Network transports require `SCHWAB_MCP_POLICY_FILE` and a bearer token on
 every request. Principals have explicit account/tool permissions and isolated
 sessions. Remote access also requires a TLS proxy and
@@ -594,8 +613,8 @@ require an explicit tool permission.
 - **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
   `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
-- **Server** — `get_server_status` reports the mode (`live`), the trading
-  switches and operator halt, readiness (the `/readyz` body), this process's
+- **Server** — `get_server_status` reports the mode (`live` or `paper`), the
+  trading switches and operator halt, readiness (the `/readyz` body), this process's
   request budget, stream health, the principal's own permissions and limits,
   and the equity session phase from Schwab's calendar (cached per day), so a
   model can plan a session before spending calls on it
@@ -947,4 +966,4 @@ configuration and external release gates. This candidate has not been published.
 
 For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](https://github.com/epistates/rustyschwab/blob/main/docs/SHARED_AUTHORITY.md).
 
-See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper-mode gaps, and the TurboMCP v4 migration criteria.
+See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper mode, and the TurboMCP v4 migration criteria.

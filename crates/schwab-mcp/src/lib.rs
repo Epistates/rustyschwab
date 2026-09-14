@@ -2,6 +2,7 @@
 //! and integration tests.
 
 pub mod authority;
+pub mod backend;
 pub mod contract;
 pub mod identity;
 pub mod metrics;

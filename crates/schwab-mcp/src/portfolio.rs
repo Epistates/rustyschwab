@@ -2,23 +2,23 @@
 //! orders and profit and loss in one bounded answer, so a model reads a
 //! portfolio without three calls and the arithmetic in between.
 //!
-//! Two Schwab reads (the orders entered within Schwab's list horizon,
+//! Two venue reads (the orders entered within Schwab's list horizon,
 //! then the account with its positions, in that order so an order that
 //! fills in between shows as both working and held rather than as
-//! neither) plus this server's own record of submissions Schwab has not
-//! answered. The reads are not an atomic snapshot. The account read is
-//! essential; the others degrade to a null section and a warning.
+//! neither) plus this server's own record of submissions the venue has
+//! not answered. The reads are not an atomic snapshot. The account read
+//! is essential; the others degrade to a null section and a warning.
 
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
 use chrono::{Duration, Utc};
-use schwab_rs::SchwabClient;
 use schwab_types::accounts::{Balance, Position, SecuritiesAccount};
 use schwab_types::trading::{Order, OrdersParams};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::backend::{Backend, PaperLedger};
 use crate::contract::ToolFailure;
 use crate::order_status;
 use crate::projection::{self, Page, Row};
@@ -51,10 +51,13 @@ pub struct PortfolioSummary {
     /// `warnings`).
     pub working_orders: Option<Page>,
     pub orders_since: String,
-    /// Submissions this server made for the account whose outcome Schwab
-    /// has not answered; an order may exist that `workingOrders` does not
-    /// show. Null when the journal could not be read.
+    /// Submissions this server made for the account whose outcome the
+    /// venue has not answered; an order may exist that `workingOrders`
+    /// does not show. Null when the journal could not be read.
     pub pending_submissions: Option<usize>,
+    /// The paper venue's own figures for the account (realized profit and
+    /// loss, fees); null in live mode.
+    pub paper: Option<PaperLedger>,
     pub warnings: Vec<ToolFailure>,
 }
 
@@ -239,28 +242,28 @@ fn order_page(orders: Vec<Order>, budget: usize) -> Result<Page, ToolFailure> {
 /// Assemble the summary, spending half the response budget on positions
 /// and half on working orders.
 pub async fn collect(
-    client: &SchwabClient,
+    backend: &Backend,
     account_hash: &str,
 ) -> Result<PortfolioSummary, ToolFailure> {
     let now = Utc::now();
     let since = now - Duration::days(ORDER_LOOKBACK_DAYS);
     let budget = projection::budget() / 2;
     let mut warnings = Vec::new();
-    let working_orders = match client
-        .get_account_orders(account_hash, &OrdersParams::new(since, now))
+    let working_orders = match backend
+        .account_orders(account_hash, &OrdersParams::new(since, now))
         .await
     {
         Ok(orders) => Some(order_page(orders, budget)?),
         Err(e) => {
-            warnings.push(ToolFailure::from(e));
+            warnings.push(e);
             None
         }
     };
-    let account = client
-        .get_account(account_hash, true)
+    let account = backend
+        .account(account_hash, true)
         .await?
         .securities_account;
-    let pending_submissions = match client.execution_store().records().await {
+    let pending_submissions = match backend.trading().execution_store().records().await {
         Ok(records) => Some(
             records
                 .iter()
@@ -269,6 +272,13 @@ pub async fn collect(
         ),
         Err(e) => {
             warnings.push(ToolFailure::from(e));
+            None
+        }
+    };
+    let paper = match backend.paper_ledger(account_hash).await {
+        Ok(ledger) => ledger,
+        Err(e) => {
+            warnings.push(e);
             None
         }
     };
@@ -295,6 +305,7 @@ pub async fn collect(
         working_orders,
         orders_since: since.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         pending_submissions,
+        paper,
         warnings,
     })
 }

@@ -7,11 +7,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 use schwab_mcp::SchwabMcp;
+use schwab_mcp::backend::Backend;
+use schwab_mcp::server::Switches;
 use schwab_rs::{
     SchwabClient, SchwabConfig,
     auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
 };
 use serde_json::Value;
+use turbomcp::McpHandler;
 use turbomcp::prelude::*;
 use wiremock::MockServer;
 
@@ -42,17 +45,20 @@ pub fn mocked_client(rest_uri: &str, dir: &Path) -> Arc<SchwabClient> {
     Arc::new(SchwabClient::new(config).unwrap())
 }
 
-/// The MCP server over a mocked Schwab; keep the directory alive for the
-/// test's duration.
+/// The MCP server over a mocked Schwab with both write switches off; keep
+/// the directory alive for the test's duration.
 pub async fn mocked_server(rest: &MockServer) -> (SchwabMcp, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let client = mocked_client(&rest.uri(), dir.path());
-    (SchwabMcp::new(client), dir)
+    (
+        SchwabMcp::new(Backend::Live(client), Switches::default()),
+        dir,
+    )
 }
 
-/// Call a tool and return what the model reads: the parsed success text,
-/// or the structured failure.
-pub async fn call(server: &SchwabMcp, tool: &str, args: Value) -> Value {
+/// Call a tool on either transport's server and return what the model
+/// reads: the parsed success text, or the structured failure.
+pub async fn call<S: McpHandler>(server: &S, tool: &str, args: Value) -> Value {
     let result = server
         .call_tool(tool, args, &RequestContext::stdio())
         .await

@@ -8,8 +8,9 @@ an `OrderSpec` locally, `check_order`, the local pre-flight described below,
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
-Server discovery describes live trading, untrusted returned text, stale caches,
-and the requirement to reconcile uncertain submissions before further action.
+Server discovery describes untrusted returned text, stale caches, the
+requirement to reconcile uncertain submissions before further action, and
+where to read the execution mode (live or [paper](#paper-mode)).
 
 ## Recommended integration boundary
 
@@ -39,11 +40,13 @@ untrusted data even when authenticated transport supplied them.
 
 Every tool answers in one of two shapes (`crates/schwab-mcp/src/contract.rs`).
 
-A success is compact JSON text. Data that came from Schwab or the stream
-cache is wrapped as `{"asOf": <RFC 3339>, "source": "schwab_rest" |
-"stream_cache", "data": <Schwab's raw shape, redacted>}`; local results
-(`build_order`, `check_order`, `get_server_status`, stream control
-acknowledgements, `stream_status`) are bare.
+A success is compact JSON text. Data that came from Schwab, the stream
+cache or the paper venue is wrapped as `{"asOf": <RFC 3339>, "source":
+"schwab_rest" | "stream_cache" | "paper", "data": <Schwab's raw shape,
+redacted>}`; local results (`build_order`, `check_order`,
+`get_server_status`, stream control acknowledgements, `stream_status`) are
+bare. Order mutations carry the venue that accepted them in `source`, so a
+`paper` placement can never be mistaken for a live one.
 A response that would exceed the transport's 1 MiB message limit is refused
 with `response_too_large` rather than clipped; the projection tools below
 stay within a much smaller budget by paging.
@@ -263,17 +266,21 @@ instead of discovering the switches one denial at a time:
  "equitySession": {"phase": "regular", "date": "2026-09-10", "tradingDay": true,
                    "nextTransition": {"phase": "post_market", "at": "2026-09-10T16:00:00-04:00"},
                    "fetchedAt": "2026-09-10T13:00:05Z"},
+ "paper": null,
  "warnings": []}
 ```
 
-`mode` is `live`: every order tool reaches Schwab. `principal` is the policy
+`mode` is `live`, every order tool reaches Schwab, or `paper`, orders, fills
+and accounts are the paper venue's simulation (see [Paper mode](#paper-mode));
+`paper` then describes the venue. `principal` is the policy
 the session runs as (null on the local stdio transport, where none applies).
 `trading.admissible` means a submission would pass the trading switch,
 operator halt and recovery suspension right now; validity, limits, approval
 and duplicates are still judged per order by `check_order` and on
 submission. `readiness` is the body of the `/readyz` probe, evaluated for
-the accounts in `SCHWAB_RECOVERY_ACCOUNTS`. `requestBudget` is this process's
-own quota (null when rate limiting is disabled). `equitySession` is Schwab's
+the accounts in `SCHWAB_RECOVERY_ACCOUNTS` (the venue's accounts in paper
+mode). `requestBudget` is this process's own quota (null when rate limiting
+is disabled or there is no Schwab client). `equitySession` is Schwab's
 equity calendar (`pre_market`, `regular`, `post_market`, `closed`), read at
 most once per US-Eastern day and looked ahead up to four days for the next
 opening; the tool never contacts Schwab for anything else. A section whose
@@ -282,11 +289,52 @@ shape above; an unauthenticated session yields exactly one, asking the
 operator to run OAuth. The call is read-only, not audited, and cheap:
 grant it to every principal.
 
+## Paper mode
+
+The same server runs over the [paper venue](PAPER_TRADING.md) instead of
+Schwab when `SCHWAB_MCP_PAPER_CONFIG` names a paper configuration and
+`SCHWAB_MCP_PAPER_STATE` the venue's private state database. Every tool
+holds an execution backend (`crates/schwab-mcp/src/backend.rs`), live or
+paper, rather than a Schwab client, so the paper server answers account,
+order and quote reads from the venue's durable state in Schwab's shapes and
+routes `place_order`, `replace_order` and `cancel_order` to the venue. No
+Schwab credential is read unless `SCHWAB_APP_KEY` is set, in which case a
+read-only market-data client serves `get_price_history`, option chains,
+movers, instruments, market hours and the stream; the venue never routes an
+order through it, and the integration tests assert that a paper session
+sends nothing under `/trader/`.
+
+The mode is published everywhere a model or client can look: `serverInfo.title`
+is `Schwab MCP (paper)` at initialize time, `get_server_status` reports
+`mode: "paper"` with a `paper` section (`clock`, the current `session`, the
+venue's `accounts` and `modelVersion`), `/readyz` carries `mode`, and every
+read and mutation served by the venue carries `source: "paper"`. Never infer
+the mode from behaviour.
+
+What the venue models is answered by the venue: `get_quotes` and `get_quote`
+return its quotes, the ones fills are judged against, each with a
+non-Schwab `fresh` flag saying whether an order would fill against it now;
+`get_account` is a Schwab-shaped `CASH` account marked at the fresh bid;
+`get_portfolio_summary` adds a `paper` section with the venue's realized
+profit and loss, fees and `modelVersion`; orders carry their fills as
+`orderActivityCollection` executions. What it does not model is refused with
+`not_permitted` and a pointer to the paper equivalent: `preview_order`
+(`check_order` is the paper pre-flight), `get_transactions` and
+`get_transaction` (fills are on each order), `get_user_preferences`
+(accounts are listed by `get_account_numbers`), and an `ACCT_ACTIVITY`
+subscription, which streams Schwab's account activity. An unknown paper
+account or order is `not_found`, as Schwab's would be.
+
+Everything else is unchanged: principal policy, approval, the intent digest
+and its default tag (which the venue requires), the audit journal (kept
+beside the venue's state), the trading and cancel switches, and the operator
+halt all gate paper orders exactly as they gate live ones, so a model
+evaluated in paper mode meets the same denials it would meet live.
+
 ## Remaining implementation work
 
 | Priority | Gap | Completion criteria |
 | --- | --- | --- |
-| High | Paper mode in MCP | Inject an explicit trading backend into MCP; publish mode in discovery and results; prove paper startup requires no live credentials and cannot reach order endpoints. The existing paper authority/CLI does not make the live MCP wrapper paper-capable. |
 | Medium | Bounded model context | Done for candles, option contracts and positions (budgeted, paged projections with explicit truncation and provenance); oversized raw responses are refused with `response_too_large`. Remaining: projections for quotes across many symbols and for order and transaction lists. |
 | High | Client interoperability | Exercise initialize, discovery, schemas, structured results, errors, cancellation, token rotation and cross-principal session denial with independent stdio and HTTP clients. Current regression tests are not a complete external conformance certification. |
 | Medium | Model evaluation | Version scenarios for stale data, prompt injection, account confusion, denied approvals, repeated submissions and uncertain fills. Require zero unauthorized executions; record model/version/config, not just aggregate success. |

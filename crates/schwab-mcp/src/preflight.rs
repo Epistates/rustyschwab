@@ -1,13 +1,14 @@
 //! Local pre-flight for an order intent: every check a `place_order` or
-//! `replace_order` call would apply before contacting Schwab, reported
+//! `replace_order` call would apply before contacting the venue, reported
 //! together instead of as the first failure. Nothing is dispatched, audited
 //! or approved. A duplicate intent is only detected by the submission
 //! journal at dispatch, and every check is repeated then, so a verdict is
 //! advisory.
+use crate::backend::Backend;
 use crate::contract::ToolFailure;
 use crate::policy::{self, PrincipalPolicy};
+use crate::server::Switches;
 use rust_decimal::Decimal;
-use schwab_rs::SchwabClient;
 use schwab_types::trading::OrderRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,7 +17,7 @@ use serde_json::{Value, json};
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Verdict {
-    /// The submission would be dispatched to Schwab.
+    /// The submission would be dispatched to the venue.
     pub allowed: bool,
     /// Every failure the submission would return, in the order a dispatch
     /// would find them.
@@ -98,8 +99,9 @@ impl Request {
 /// `args` under `policy`, or without one on the unauthorized transport.
 /// `policy` must already carry any durable approvals.
 pub async fn evaluate(
-    client: &SchwabClient,
+    backend: &Backend,
     policy: Option<&PrincipalPolicy>,
+    switches: Switches,
     name: &str,
     args: &Value,
 ) -> Result<Verdict, ToolFailure> {
@@ -135,11 +137,11 @@ pub async fn evaluate(
             (exposure, None, false, false)
         }
     };
-    if let Err(failure) = crate::server::require_trading_enabled(name) {
+    if let Err(failure) = switches.require(name) {
         reasons.push(failure);
     }
-    if let Err(halted) = client.submission_admission().await {
-        reasons.push(halted.into());
+    if let Err(halted) = backend.submission_admission().await {
+        reasons.push(halted);
     }
     Ok(Verdict {
         allowed: reasons.is_empty(),
@@ -150,6 +152,6 @@ pub async fn evaluate(
         approved,
         intent_digest,
         tag,
-        trading_enabled: crate::server::trading_enabled(),
+        trading_enabled: switches.allows(name),
     })
 }

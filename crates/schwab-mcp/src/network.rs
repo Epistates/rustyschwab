@@ -67,14 +67,17 @@ pub fn router_reloadable(
     identity: Option<Arc<crate::identity::JwtVerifier>>,
     policy_path: Option<std::path::PathBuf>,
 ) -> Router {
-    let client = servers.first().map(|s| s.inner.client());
+    // Reloaded principals share the first server's backend and switches.
+    let shared = servers
+        .first()
+        .map(|s| (s.inner.backend().clone(), s.inner.switches()));
     let (revoked, _) = tokio::sync::watch::channel(0);
     let state = Arc::new(NetworkState {
         entries: parking_lot::RwLock::new(entries(servers, websocket)),
         identity,
         revoked,
     });
-    if let (Some(path), Some(client)) = (policy_path, client) {
+    if let (Some(path), Some((backend, switches))) = (policy_path, shared) {
         let weak = Arc::downgrade(&state);
         let initial = std::fs::read(&path).ok();
         tokio::spawn(async move {
@@ -103,7 +106,7 @@ pub fn router_reloadable(
                     policies
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|policy| AuthorizedServer::new(client.clone(), policy))
+                        .map(|policy| AuthorizedServer::new(backend.clone(), switches, policy))
                         .collect(),
                     websocket,
                 );
@@ -406,7 +409,11 @@ mod tests {
             serde_json::json!({"name":name,"token_sha256":digest(token.as_bytes()),"token_expires_at":chrono::Utc::now().timestamp()+3600,"tools":tools}),
         )
         .unwrap();
-        AuthorizedServer::new(Arc::new(client), policy)
+        AuthorizedServer::new(
+            crate::backend::Backend::Live(Arc::new(client)),
+            crate::server::Switches::default(),
+            policy,
+        )
     }
     #[tokio::test]
     async fn every_network_request_requires_a_valid_bearer_token() {

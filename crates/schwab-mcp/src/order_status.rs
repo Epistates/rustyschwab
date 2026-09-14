@@ -12,11 +12,11 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset};
-use schwab_rs::SchwabClient;
 use schwab_types::trading::{Order, OrderActivityType, OrderLeg, OrderStatus};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::backend::Backend;
 use crate::contract::ToolFailure;
 
 /// The longest a call may wait for a terminal status.
@@ -201,10 +201,10 @@ impl OrderStatusReport {
 }
 
 /// Read the order, and with `wait_ms` keep reading once a second until
-/// Schwab will not change it again or the wait elapses, whichever is
+/// the venue will not change it again or the wait elapses, whichever is
 /// first; the last read lands at the deadline.
 pub async fn report(
-    client: &SchwabClient,
+    backend: &Backend,
     account_hash: &str,
     order_id: &str,
     wait_ms: Option<u64>,
@@ -221,7 +221,7 @@ pub async fn report(
     let started = Instant::now();
     let mut reads = 0;
     loop {
-        let mut report = OrderStatusReport::of(client.get_order(account_hash, order_id).await?);
+        let mut report = OrderStatusReport::of(backend.order(account_hash, order_id).await?);
         reads += 1;
         let Some(wait) = wait else {
             return Ok(report);

@@ -6,8 +6,10 @@
 //! model reads `not_permitted`, `risk_denied` or `approval_required` and
 //! knows whether to change the order, wait for the operator, or stop.
 use crate::SchwabMcp;
+use crate::backend::Backend;
 use crate::contract::{FailureCode, ToolFailure};
-use schwab_rs::{SchwabClient, broker::TradingBackend, execution::OrderJournal};
+use crate::server::Switches;
+use schwab_rs::execution::OrderJournal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashSet, sync::Arc};
@@ -363,20 +365,29 @@ pub struct AuthorizedServer {
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
-    /// the client's token file under the principal's name digest.
-    pub fn new(client: Arc<SchwabClient>, policy: PrincipalPolicy) -> Self {
-        let audit =
-            OrderJournal::new(client.principal_journal_path(&digest(policy.name.as_bytes())));
+    /// the backend's own state under the principal's name digest.
+    pub fn new(backend: Backend, switches: Switches, policy: PrincipalPolicy) -> Self {
+        let audit = OrderJournal::new(
+            backend
+                .trading()
+                .principal_journal_path(&digest(policy.name.as_bytes())),
+        );
         Self {
-            inner: SchwabMcp::new(client),
+            inner: SchwabMcp::new(backend, switches),
             principal: Arc::new(policy),
             audit,
         }
     }
 }
 impl McpHandler for AuthorizedServer {
+    /// The inner server's identity with the execution mode in its title, so
+    /// a client sees `paper` at initialize time, before any tool call.
     fn server_info(&self) -> turbomcp::ServerInfo {
-        self.inner.server_info()
+        let mode = self.inner.backend().mode();
+        let info = self.inner.server_info();
+        let description = info.description.clone().unwrap_or_default();
+        info.with_title(format!("Schwab MCP ({mode})"))
+            .with_description(format!("Execution mode: {mode}. {description}"))
     }
     fn list_tools(&self) -> Vec<turbomcp::Tool> {
         self.inner
@@ -545,9 +556,14 @@ impl AuthorizedServer {
             let (name, args) = crate::preflight::Request::parse(args)?.intent();
             let digest = intent_digest(name, &args);
             let effective = self.effective_policy(name, &digest).await?;
-            let verdict =
-                crate::preflight::evaluate(&self.inner.client(), Some(&effective), name, &args)
-                    .await?;
+            let verdict = crate::preflight::evaluate(
+                self.inner.backend(),
+                Some(&effective),
+                self.inner.switches(),
+                name,
+                &args,
+            )
+            .await?;
             Ok(crate::contract::local(verdict.into_payload()?))
         })
         .await)
@@ -745,10 +761,12 @@ mod tests {
 
         let mut policy = policy();
         policy.tools.insert("get_server_status".into());
-        let server = AuthorizedServer::new(server.inner.client(), policy);
+        let server =
+            AuthorizedServer::new(server.inner.backend().clone(), Switches::default(), policy);
         server
             .inner
-            .client()
+            .backend()
+            .trading()
             .halt_submissions("desk review", "operator")
             .await
             .unwrap();
@@ -806,7 +824,11 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        AuthorizedServer::new(Arc::new(client), policy())
+        AuthorizedServer::new(
+            Backend::Live(Arc::new(client)),
+            Switches::default(),
+            policy(),
+        )
     }
     /// Denials reach the model as `isError` results it can read, never as
     /// JSON-RPC errors, and carry the code and intent digest it needs next.

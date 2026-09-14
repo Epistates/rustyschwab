@@ -1,8 +1,10 @@
 //! `schwab-mcp` — MCP server exposing the rustyschwab SDK as MCP tools.
 //!
-//! Reads OAuth credentials + token store path from environment variables
-//! (see README), refreshes tokens on the fly via `AuthManager`, and offers
-//! every `SchwabClient` method as an MCP tool.
+//! Live mode reads OAuth credentials + token store path from environment
+//! variables (see README), refreshes tokens on the fly via `AuthManager`,
+//! and offers every `SchwabClient` method as an MCP tool. Paper mode
+//! (`SCHWAB_MCP_PAPER_CONFIG` + `SCHWAB_MCP_PAPER_STATE`) serves the same
+//! tools over the isolated paper venue and needs no Schwab credentials.
 //!
 //! Transport is selected at runtime via `SCHWAB_MCP_TRANSPORT`:
 //! - unset / `stdio` (default) — for Claude Desktop + local MCP clients
@@ -12,15 +14,24 @@
 use anyhow::Context;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use schwab_mcp::SchwabMcp;
-use schwab_mcp::server::{RECOVERY_ACCOUNTS_ENV, recovery_accounts, trading_enabled};
+use schwab_mcp::backend::{Backend, Paper};
+use schwab_mcp::server::{RECOVERY_ACCOUNTS_ENV, Switches, recovery_accounts};
+use schwab_rs::paper::{PaperBroker, PaperConfig};
 use schwab_rs::{SchwabClient, SchwabConfig};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 use turbomcp::prelude::*;
 
 /// Env var that opts a network transport into binding beyond loopback.
 const ALLOW_REMOTE_ENV: &str = "SCHWAB_MCP_ALLOW_REMOTE";
+
+/// Env vars that select paper mode: the venue's configuration and its
+/// durable state file, the same pair `schwab-paper` and `schwab-authority
+/// --paper` take.
+const PAPER_CONFIG_ENV: &str = "SCHWAB_MCP_PAPER_CONFIG";
+const PAPER_STATE_ENV: &str = "SCHWAB_MCP_PAPER_STATE";
 
 fn remote_bind_allowed() -> bool {
     matches!(
@@ -75,83 +86,47 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let config = SchwabConfig::from_env().context(
-        "failed to load SchwabConfig from environment \
-         (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.)",
-    )?;
-
-    let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
-    match std::env::var("SCHWAB_RISK_POLICY_FILE") {
-        Ok(path) => {
-            let accounts = serde_json::from_slice(&std::fs::read(path)?)?;
-            let risk = schwab_rs::risk::PortfolioRisk {
-                database: client.order_journal().database().clone(),
-                accounts,
-            };
-            client = client.with_risk_provider(Arc::new(risk))?;
-        }
-        Err(_) if trading_enabled() => anyhow::bail!(
-            "MCP trading requires SCHWAB_RISK_POLICY_FILE and a reconciled portfolio baseline"
-        ),
-        Err(_) => {}
-    }
-    client
-        .init()
-        .await
-        .context("SchwabClient::init failed — are OAuth tokens present at SCHWAB_TOKENS_FILE?")?;
-    tracing::info!("Schwab client ready — tokens loaded");
-
-    let client = Arc::new(client);
-    let recovery_accounts = recovery_accounts();
-    anyhow::ensure!(
-        !trading_enabled() || !recovery_accounts.is_empty(),
-        "MCP trading requires {RECOVERY_ACCOUNTS_ENV}"
-    );
-    let _recovery = if recovery_accounts.is_empty() {
-        None
-    } else {
-        Some(schwab_rs::recovery::RecoveryWorker::start(
-            client.clone(),
-            recovery_accounts.clone(),
-            0,
-            std::time::Duration::from_secs(2),
-        ))
+    let switches = Switches::from_env();
+    let (backend, _recovery) = match std::env::var_os(PAPER_CONFIG_ENV) {
+        Some(config) => (paper_backend(PathBuf::from(config)).await?, None),
+        None => live_backend(switches).await?,
     };
+    tracing::info!(mode = backend.mode(), "MCP execution backend ready");
     let _health = if let Ok(bind) = std::env::var("SCHWAB_HEALTH_BIND") {
         let addr: SocketAddr = bind.parse()?;
         anyhow::ensure!(
             addr.ip().is_loopback(),
             "Health listener must bind to loopback; expose it through your operations gateway"
         );
-        let readiness_client = client.clone();
-        let accounts = recovery_accounts.clone();
+        let readiness_backend = backend.clone();
         let health = axum::Router::new()
             .route("/livez", axum::routing::get(|| async { "ok" }))
             .route(
                 "/readyz",
                 axum::routing::get(move || {
-                    let client = readiness_client.clone();
-                    let accounts = accounts.clone();
+                    let backend = readiness_backend.clone();
                     async move {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(2),
-                            client.readiness(&accounts, 5000),
+                            backend.readiness(5000),
                         )
                         .await
                         {
                             Ok(Ok(report)) => {
-                                let ready = if trading_enabled() {
+                                let ready = if switches.trading {
                                     report.trading_ready
                                 } else {
                                     report.reads_ready
                                 };
+                                let mut body = serde_json::to_value(report).unwrap_or_default();
+                                body["mode"] = backend.mode().into();
                                 (
                                     if ready {
                                         axum::http::StatusCode::OK
                                     } else {
                                         axum::http::StatusCode::SERVICE_UNAVAILABLE
                                     },
-                                    axum::Json(serde_json::to_value(report).unwrap_or_default()),
+                                    axum::Json(body),
                                 )
                             }
                             _ => (
@@ -159,7 +134,8 @@ async fn main() -> anyhow::Result<()> {
                                 axum::Json(serde_json::json!({
                                     "readsReady": false,
                                     "tradingReady": false,
-                                    "storageHealthy": false
+                                    "storageHealthy": false,
+                                    "mode": backend.mode(),
                                 })),
                             ),
                         }
@@ -177,13 +153,8 @@ async fn main() -> anyhow::Result<()> {
     let policies: Vec<schwab_mcp::policy::PrincipalPolicy> =
         match std::env::var("SCHWAB_MCP_POLICY_FILE") {
             Ok(path) => serde_json::from_slice(&std::fs::read(path)?)?,
-            Err(_)
-                if transport == "stdio"
-                    && !trading_enabled()
-                    && !std::env::var("SCHWAB_MCP_ALLOW_CANCEL")
-                        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE")) =>
-            {
-                let inner = SchwabMcp::new(client.clone());
+            Err(_) if transport == "stdio" && switches == Switches::default() => {
+                let inner = SchwabMcp::new(backend, switches);
                 inner.run_stdio().await?;
                 return Ok(());
             }
@@ -196,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let servers: Vec<_> = policies
         .into_iter()
-        .map(|policy| schwab_mcp::policy::AuthorizedServer::new(client.clone(), policy))
+        .map(|policy| schwab_mcp::policy::AuthorizedServer::new(backend.clone(), switches, policy))
         .collect();
     if transport == "stdio" {
         let principal = std::env::var("SCHWAB_MCP_PRINCIPAL")
@@ -243,7 +214,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             result = &mut serving => result?,
             _ = shutdown_signal() => {
-                client.begin_drain();
+                backend.trading().begin_drain();
                 let _ = stop.send(());
                 // Long-lived transports must not prevent bounded process exit.
                 let grace = std::time::Duration::from_secs(30);
@@ -255,6 +226,92 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The live Schwab backend: credentials, risk policy when trading is on,
+/// and the recovery worker that keeps the trading accounts' baselines.
+async fn live_backend(
+    switches: Switches,
+) -> anyhow::Result<(Backend, Option<schwab_rs::recovery::RecoveryWorker>)> {
+    let config = SchwabConfig::from_env().context(
+        "failed to load SchwabConfig from environment \
+         (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.; or SCHWAB_MCP_PAPER_CONFIG for paper mode)",
+    )?;
+
+    let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
+    match std::env::var("SCHWAB_RISK_POLICY_FILE") {
+        Ok(path) => {
+            let accounts = serde_json::from_slice(&std::fs::read(path)?)?;
+            let risk = schwab_rs::risk::PortfolioRisk {
+                database: client.order_journal().database().clone(),
+                accounts,
+            };
+            client = client.with_risk_provider(Arc::new(risk))?;
+        }
+        Err(_) if switches.trading => anyhow::bail!(
+            "MCP trading requires SCHWAB_RISK_POLICY_FILE and a reconciled portfolio baseline"
+        ),
+        Err(_) => {}
+    }
+    client
+        .init()
+        .await
+        .context("SchwabClient::init failed — are OAuth tokens present at SCHWAB_TOKENS_FILE?")?;
+    tracing::info!("Schwab client ready — tokens loaded");
+
+    let client = Arc::new(client);
+    let recovery_accounts = recovery_accounts();
+    anyhow::ensure!(
+        !switches.trading || !recovery_accounts.is_empty(),
+        "MCP trading requires {RECOVERY_ACCOUNTS_ENV}"
+    );
+    let recovery = if recovery_accounts.is_empty() {
+        None
+    } else {
+        Some(schwab_rs::recovery::RecoveryWorker::start(
+            client.clone(),
+            recovery_accounts,
+            0,
+            std::time::Duration::from_secs(2),
+        ))
+    };
+    Ok((Backend::Live(client), recovery))
+}
+
+/// The paper venue from its configuration and state files. No Schwab
+/// credential is read unless `SCHWAB_APP_KEY` is set, in which case a
+/// client is built for market data only; the venue never routes an order
+/// to it.
+async fn paper_backend(config: PathBuf) -> anyhow::Result<Backend> {
+    let state = std::env::var_os(PAPER_STATE_ENV)
+        .map(PathBuf::from)
+        .with_context(|| format!("{PAPER_CONFIG_ENV} requires {PAPER_STATE_ENV}"))?;
+    let config: PaperConfig = serde_json::from_slice(
+        &std::fs::read(&config).with_context(|| format!("failed to read {}", config.display()))?,
+    )
+    .context("invalid paper configuration")?;
+    let broker = Arc::new(
+        PaperBroker::open(state, config)
+            .await
+            .context("failed to open the paper broker")?,
+    );
+    let market_data = if std::env::var_os("SCHWAB_APP_KEY").is_some() {
+        let config =
+            SchwabConfig::from_env().context("failed to load SchwabConfig for market data")?;
+        let client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
+        client.init().await.context(
+            "SchwabClient::init failed — are OAuth tokens present at SCHWAB_TOKENS_FILE?",
+        )?;
+        tracing::info!("Schwab market data ready for the paper venue — tokens loaded");
+        Some(Arc::new(client))
+    } else {
+        tracing::info!("Paper venue without Schwab market data: quotes are the venue's own");
+        None
+    };
+    Ok(Backend::Paper(Paper {
+        broker,
+        market_data,
+    }))
 }
 
 async fn shutdown_signal() {

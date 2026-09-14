@@ -2,12 +2,14 @@
 //! right now, and whether what it depends on is ready. Everything is local
 //! evidence except the equity session calendar, which is Schwab's and is
 //! cached until it can no longer answer.
+use crate::backend::Backend;
 use crate::contract::{FailureCode, ToolFailure};
 use crate::policy::PrincipalPolicy;
-use crate::server;
+use crate::server::Switches;
 use chrono::{DateTime, Days, FixedOffset, NaiveDate, TimeDelta, Utc};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
+use schwab_rs::paper::PaperClockMode;
 use schwab_rs::{CircuitState, RequestBudgetUsage, SchwabClient, readiness::Readiness};
 use schwab_types::market_data::{self, Market, MarketHours, SessionPhase, SessionTransition};
 use schwab_types::streaming::StreamStatus;
@@ -15,9 +17,6 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
-
-/// Execution backend of this server: every order tool reaches Schwab.
-pub const MODE: &str = "live";
 
 /// Readiness treats an account baseline older than this as stale, as the
 /// `/readyz` endpoint does.
@@ -41,7 +40,8 @@ const MAX_AGE: TimeDelta = TimeDelta::hours(6);
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerStatus {
-    /// `live`: every order tool reaches Schwab.
+    /// `live`: every order tool reaches Schwab. `paper`: orders, fills and
+    /// accounts are the paper venue's simulation.
     pub mode: &'static str,
     pub version: &'static str,
     pub server_time: ServerTime,
@@ -51,11 +51,13 @@ pub struct ServerStatus {
     pub trading: Trading,
     /// Null when the execution store could not be probed (see `warnings`).
     pub readiness: Option<Readiness>,
-    /// Null when rate limiting is disabled.
+    /// Null when rate limiting is disabled or there is no Schwab client.
     pub request_budget: Option<RequestBudgetUsage>,
     pub stream: Stream,
     /// Null when Schwab's calendar could not be read (see `warnings`).
     pub equity_session: Option<EquitySession>,
+    /// The paper venue; null in live mode.
+    pub paper: Option<PaperVenue>,
     /// Sections that could not be determined, with why.
     pub warnings: Vec<ToolFailure>,
 }
@@ -158,6 +160,28 @@ impl From<StreamStatus> for Stream {
     }
 }
 
+/// The paper venue as it stands: its clock, the session its fills are
+/// judged in, and the accounts it simulates.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperVenue {
+    /// `replay`: time advances only with events. `wall`: real time, and
+    /// quotes age against it.
+    pub clock: PaperClockMode,
+    /// The venue's session, set by its feed or replay; orders only fill
+    /// while it is open. Not Schwab's calendar.
+    pub session: PaperSession,
+    pub accounts: Vec<String>,
+    pub model_version: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaperSession {
+    pub id: String,
+    pub open: bool,
+}
+
 /// Where the current instant falls in Schwab's equity calendar.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,70 +201,90 @@ pub struct EquitySession {
 /// Collect every section. Probes that fail become `warnings` and leave
 /// their section null, so the answer is always complete about the rest.
 pub async fn collect(
-    client: &SchwabClient,
+    backend: &Backend,
+    switches: Switches,
     stream: Stream,
     calendar: &SessionCalendar,
 ) -> ServerStatus {
     let now = Utc::now();
     let mut warnings = Vec::new();
-    let (operator_halt, halt_known) = match client.operator_halt().await {
+    let (operator_halt, halt_known) = match backend.trading().operator_halt().await {
         Ok(halt) => (halt, true),
         Err(e) => {
             warnings.push(ToolFailure::from(e));
             (None, false)
         }
     };
-    let enabled = server::trading_enabled();
-    let submissions_suspended = client.submissions_suspended();
+    let enabled = switches.trading;
+    let submissions_suspended = backend.submissions_suspended();
     let trading = Trading {
         enabled,
-        cancel_enabled: server::cancel_enabled(),
+        cancel_enabled: switches.cancel,
         admissible: enabled && halt_known && operator_halt.is_none() && !submissions_suspended,
         operator_halt,
         submissions_suspended,
-        circuit: client.circuit_state(),
+        circuit: backend.circuit_state(),
     };
-    let readiness = match tokio::time::timeout(
-        PROBE_DEADLINE,
-        client.readiness(&server::recovery_accounts(), BASELINE_MAX_AGE_MS),
-    )
-    .await
-    {
-        Ok(Ok(readiness)) => Some(readiness),
-        Ok(Err(e)) => {
-            warnings.push(ToolFailure::from(e));
-            None
-        }
-        Err(_) => {
-            warnings.push(timeout("Readiness probe"));
-            None
-        }
-    };
-    let equity_session = if client.auth_manager().has_valid_tokens() {
-        match calendar.session(client, now).await {
-            Ok(session) => Some(session),
-            Err(e) => {
+    let readiness =
+        match tokio::time::timeout(PROBE_DEADLINE, backend.readiness(BASELINE_MAX_AGE_MS)).await {
+            Ok(Ok(readiness)) => Some(readiness),
+            Ok(Err(e)) => {
                 warnings.push(e);
                 None
             }
+            Err(_) => {
+                warnings.push(timeout("Readiness probe"));
+                None
+            }
+        };
+    let equity_session = match backend.market_data("The equity calendar") {
+        Ok(schwab) if schwab.auth_manager().has_valid_tokens() => {
+            match calendar.session(schwab, now).await {
+                Ok(session) => Some(session),
+                Err(e) => {
+                    warnings.push(e);
+                    None
+                }
+            }
         }
-    } else {
-        warnings.push(ToolFailure::unauthenticated(
-            "Schwab session is not authenticated, so the equity calendar was not read; \
-             the operator must run the OAuth flow",
-        ));
-        None
+        Ok(_) => {
+            warnings.push(ToolFailure::unauthenticated(
+                "Schwab session is not authenticated, so the equity calendar was not read; \
+                 the operator must run the OAuth flow",
+            ));
+            None
+        }
+        Err(e) => {
+            warnings.push(e);
+            None
+        }
+    };
+    let paper = match backend.trading().paper() {
+        Some(broker) => match broker.market_session().await {
+            Ok((id, open)) => Some(PaperVenue {
+                clock: broker.config().clock,
+                session: PaperSession { id, open },
+                accounts: broker.config().accounts.keys().cloned().collect(),
+                model_version: broker.config().model_version.clone(),
+            }),
+            Err(e) => {
+                warnings.push(ToolFailure::from(e));
+                None
+            }
+        },
+        None => None,
     };
     ServerStatus {
-        mode: MODE,
+        mode: backend.mode(),
         version: env!("CARGO_PKG_VERSION"),
         server_time: now.into(),
         principal: None,
         trading,
         readiness,
-        request_budget: client.request_budget(),
+        request_budget: backend.request_budget(),
         stream,
         equity_session,
+        paper,
         warnings,
     }
 }

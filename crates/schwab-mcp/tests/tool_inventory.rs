@@ -2,7 +2,8 @@
 //!
 //! This catches accidental `#[tool]` removal or macro mis-registration.
 
-use schwab_mcp::server::SchwabMcp;
+use schwab_mcp::backend::Backend;
+use schwab_mcp::server::{SchwabMcp, Switches};
 use std::sync::Arc;
 use turbomcp::McpHandler;
 
@@ -69,7 +70,7 @@ fn server() -> SchwabMcp {
         streaming: None,
     })
     .expect("dummy client");
-    SchwabMcp::new(Arc::new(dummy))
+    SchwabMcp::new(Backend::Live(Arc::new(dummy)), Switches::default())
 }
 
 /// The `#[turbomcp::server]` macro only takes string literals, so the

@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — paper mode for the MCP server
+
+- `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` run `schwab-mcp`
+  over the paper venue instead of Schwab. Startup reads no Schwab
+  environment and initializes no OAuth unless `SCHWAB_APP_KEY` is also set,
+  which adds a read-only market-data client for price history, chains,
+  movers, instruments, market hours and the stream; the venue never routes
+  an order through it, and the integration tests assert that a paper
+  session sends nothing under `/trader/`. The venue's per-account limits
+  stand in for `SCHWAB_RISK_POLICY_FILE`; no recovery worker runs.
+- Every tool holds an execution `backend::Backend` (`Live(Arc<SchwabClient>)`
+  or `Paper { broker, market_data }`) instead of a Schwab client. The paper
+  backend answers `get_account_numbers`, `get_accounts`, `get_account`,
+  `get_positions`, `get_portfolio_summary`, `get_order`, `get_order_status`,
+  `get_account_orders`, `get_all_orders`, `get_quotes` and `get_quote` from
+  the venue's durable state in Schwab's shapes (a `CASH` account marked at
+  the fresh bid; orders with their fills as `orderActivityCollection`
+  executions; quotes with a non-Schwab `fresh` flag saying whether an order
+  would fill against them now), parsed back through the Schwab types so a
+  paper read can never carry a shape a live one could not. `place_order`,
+  `replace_order` and `cancel_order` reach the venue. `preview_order`,
+  `get_transactions`, `get_transaction`, `get_user_preferences` and an
+  `ACCT_ACTIVITY` subscription are refused as `not_permitted` with the
+  paper equivalent named; an unknown paper account or order is `not_found`.
+- The mode is published wherever a client can look: `serverInfo.title` is
+  `Schwab MCP (paper)` (or `live`) and its description leads with the
+  mode; `get_server_status` reports `mode` and a `paper` section (`clock`,
+  the current `session`, the venue's `accounts`, `modelVersion`);
+  `/readyz` carries `mode`; every read and mutation the venue served
+  carries `source: "paper"`; `get_portfolio_summary` adds a `paper`
+  section with the venue's realized profit and loss, fees and
+  `modelVersion`. The server description tells the model to read the mode
+  from `get_server_status` rather than infer it.
+- Principal policy, approval, the intent digest and its default tag (which
+  the venue requires), the audit journal (kept beside the venue's state as
+  `<state stem>.<principal digest>.paper-audit.sqlite3`), the trading and cancel
+  switches and the operator halt gate paper orders exactly as they gate
+  live ones.
+- `PaperBroker::fills(account, order_id)` and `PaperBroker::quote(symbol)`
+  (a `PaperQuote` with `fresh`) expose per-order fills and the venue's
+  current quote to SDK callers.
+- Breaking (unreleased): `SchwabMcp::new(backend, switches)` and
+  `AuthorizedServer::new(backend, switches, policy)` take a `Backend` and
+  the new `server::Switches` (`from_env`, `allows`), read once at startup,
+  in place of a client and per-call environment reads; `server::trading_enabled`
+  is gone. `preflight::evaluate`, `status::collect`, `portfolio::collect`
+  and `order_status::report` take the backend; `status::MODE` is replaced by
+  `Backend::mode`. `contract::Source` gains `Paper`. `cancel_order` answers
+  the same `{asOf, source, data}` envelope as the other mutations. The
+  paper venue reports an unknown account or order as a Schwab-shaped 404
+  (`Error::Broker`, title `PAPER_NOT_FOUND_TITLE`) instead of
+  `InvalidParameter`. `schwab-authority` relays a broker rejection's own
+  4xx status (a paper 404 or 400, a Schwab 400) where it used to answer
+  500, and reports broker session and server failures as 502.
+
 ### Added — `get_order_status`
 
 - `get_order_status(account_hash, order_id, wait_ms?)` reduces one order to

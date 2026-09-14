@@ -138,6 +138,60 @@ async fn partial_fills_reservations_cost_basis_and_realized_pnl_survive_restart(
     assert_eq!(snapshot.reserved_cash, Decimal::ZERO);
 }
 #[tokio::test]
+async fn fills_and_the_venue_quote_are_readable_per_order_and_symbol() {
+    let (_dir, b) = setup().await;
+    let seen = b.quote("ABC").await.unwrap().unwrap();
+    assert_eq!(
+        (seen.bid, seen.ask, seen.source_at_ms, seen.fresh),
+        (d("10"), d("10.01"), 100, true)
+    );
+    assert_eq!(b.quote("XYZ").await.unwrap(), None);
+    let id = b
+        .place_order("paper-test", &order("buy", "BUY", "2", "11"))
+        .await
+        .unwrap()
+        .order_id
+        .unwrap();
+    assert!(b.fills("paper-test", &id).await.unwrap().is_empty());
+    b.apply(quote(3, 200, "10", "10.01", "1")).await.unwrap();
+    b.apply(quote(4, 300, "10.02", "10.03", "1")).await.unwrap();
+    let fills: Vec<_> = b
+        .fills("paper-test", &id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.event_sequence, f.quantity, f.price))
+        .collect();
+    assert_eq!(fills, [(3, d("1"), d("10.01")), (4, d("1"), d("10.03"))]);
+    // Unknown orders and accounts answer like Schwab's 404, not as bad input.
+    for (account, order_id) in [("paper-test", "999"), ("other", id.as_str())] {
+        let error = b.fills(account, order_id).await.unwrap_err();
+        assert!(
+            matches!(&error, Error::Broker { status, details, .. }
+                if status.as_u16() == 404
+                    && details[0].title.as_deref() == Some(PAPER_NOT_FOUND_TITLE)),
+            "{error:?}"
+        );
+    }
+    assert!(matches!(
+        b.snapshot("other").await,
+        Err(Error::Broker { status, .. }) if status.as_u16() == 404
+    ));
+    // The clock moving past the quote's age limit keeps it readable but stale.
+    b.apply(PaperEvent {
+        sequence: 5,
+        at_ms: 20_000,
+        kind: PaperEventKind::Clock,
+    })
+    .await
+    .unwrap();
+    let stale = b.quote("ABC").await.unwrap().unwrap();
+    assert_eq!(
+        (stale.ask, stale.source_at_ms, stale.fresh),
+        (d("10.03"), 300, false)
+    );
+}
+#[tokio::test]
 async fn finite_liquidity_is_shared_and_only_later_eligible_events_fill() {
     let (_dir, b) = setup().await;
     let a = b

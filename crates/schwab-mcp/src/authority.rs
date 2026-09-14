@@ -243,9 +243,22 @@ impl From<schwab_rs::Error> for Denial {
 }
 const OPAQUE_DENIAL: &str = "authority request denied or incomplete";
 const OPAQUE_FAILURE: &str = "authority-side failure; consult the authority log";
-fn status_for(kind: ErrorKind) -> StatusCode {
-    match kind {
+fn status_for(envelope: &ErrorEnvelope) -> StatusCode {
+    match envelope.kind {
         ErrorKind::InvalidParameter => StatusCode::BAD_REQUEST,
+        // The venue's own answer to a caller mistake (a paper 404 for an
+        // unknown account, a Schwab 400 for an untradable symbol) crosses the
+        // gateway as is; its session and server failures are ours to report.
+        ErrorKind::Broker => match envelope.status.and_then(|s| StatusCode::from_u16(s).ok()) {
+            Some(status)
+                if status.is_client_error()
+                    && status != StatusCode::UNAUTHORIZED
+                    && status != StatusCode::FORBIDDEN =>
+            {
+                status
+            }
+            _ => StatusCode::BAD_GATEWAY,
+        },
         ErrorKind::ApprovalInvalid => StatusCode::FORBIDDEN,
         ErrorKind::Duplicate
         | ErrorKind::ReconciliationRequired
@@ -295,7 +308,7 @@ fn response(result: Result<Value, Denial>) -> Response {
         }
         Err(Denial::Error(error)) => {
             let envelope = envelope(&error);
-            (status_for(envelope.kind), Json(envelope)).into_response()
+            (status_for(&envelope), Json(envelope)).into_response()
         }
     }
 }

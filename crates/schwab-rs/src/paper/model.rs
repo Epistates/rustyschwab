@@ -182,6 +182,19 @@ pub struct PaperFill {
     pub fee: Decimal,
 }
 
+/// The venue's latest best bid and offer for a symbol: the quote paper fills
+/// are judged against, which is not a Schwab quote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaperQuote {
+    pub symbol: String,
+    pub source_at_ms: i64,
+    pub bid: Decimal,
+    pub ask: Decimal,
+    /// Whether an order would fill against this quote now: the session is
+    /// open and the quote is within `quote_max_age_ms` of the venue clock.
+    pub fresh: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperSnapshot {
     pub mode: String,

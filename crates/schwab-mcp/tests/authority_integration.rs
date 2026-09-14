@@ -438,7 +438,7 @@ async fn paper_gateway_uses_verified_approvals_and_isolates_market_ingestion() {
     );
     let policy = dir.path().join("policy.json");
     let mut roles = grants();
-    roles[2]["policy"]["accounts"] = json!(["paper-demo"]);
+    roles[2]["policy"]["accounts"] = json!(["paper-demo", "ghost"]);
     std::fs::write(&policy, roles.to_string()).unwrap();
     let app = router(Arc::new(Authority::new_paper(
         paper.clone(),
@@ -498,6 +498,12 @@ async fn paper_gateway_uses_verified_approvals_and_isolates_market_ingestion() {
             .0,
         403
     );
+    // Granted by policy but unknown to the venue: the venue's 404 crosses the
+    // gateway as the venue shaped it, not as an authority failure.
+    let (status, missing) = call(&app, "/v1/paper/account", "t", json!({"account":"ghost"})).await;
+    assert_eq!(status, 404, "{missing}");
+    assert_eq!(missing["kind"], "broker");
+    assert_eq!(missing["status"], 404);
     let (_, report) = call(
         &app,
         "/v1/paper/account",

@@ -23,12 +23,12 @@ Three published crates plus example packages, all on the workspace version
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
                  │ server.rs (38 tools)  policy.rs  network.rs  identity.rs  redact.rs │
-                 │ stream_cache.rs  status.rs  projection.rs  portfolio.rs             │
-                 │ order_status.rs                                                      │
+                 │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
+                 │ projection.rs  portfolio.rs  order_status.rs                         │
                  │ authority.rs (gateway)                                               │
                  │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
-                                 │ SchwabClient / StreamClient      │ TradingBackend
+                                 │ SchwabClient / StreamClient      │ TradingBackend / PaperBroker
 ┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐
 │ schwab-rs                                                                            │
 │  auth/        client.rs      streaming/     execution.rs  coordination.rs  risk.rs   │
@@ -228,30 +228,47 @@ including `get_order_status`), orders write (`build_order`,
 `replace_order`), transactions (2), streaming control and cached reads (7),
 server (`get_server_status`).
 Each tool carries explicit read-only/destructive/idempotent/open-world hints;
-`tests/tool_inventory.rs` pins the list. `build_order` expands an
+`tests/tool_inventory.rs` pins the list. Tools hold a `backend::Backend`
+rather than a `SchwabClient`: `Live(Arc<SchwabClient>)` or
+`Paper { broker: Arc<PaperBroker>, market_data: Option<Arc<SchwabClient>> }`.
+The backend answers account, order and quote reads and routes mutations to
+its venue; in paper mode the venue's `PaperOrder`, `PaperFill`, snapshot
+and quote are rendered in Schwab's shapes and parsed back through the
+Schwab types, so a paper read can never carry a shape a live one could
+not, and everything the venue does not model (`preview_order`,
+transactions, user preferences, `ACCT_ACTIVITY`) is refused as
+`not_permitted`. `Backend::market_data(what)` is the Schwab client for
+market data and the stream: the live client, or the optional read-only
+one, which the venue never routes an order through. `Backend::source()`
+labels every read and mutation the backend served (`schwab_rest` or
+`paper`). `server::Switches` carries the two write switches, read once at
+startup, so a server built without the environment cannot trade.
+`build_order` expands an
 `OrderSpec` locally so the operator-approved intent and the JSON sent to
 Schwab are the same shape. Responses pass through `redact.rs`, which drops
 streamer credentials and identity fields and masks account numbers unless
 `SCHWAB_MCP_REDACT_PII=0`. `stream_cache.rs` keeps per-service snapshots
 keyed by field name with explicit freshness and a bounded activity log, and
 reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
-`status.rs` assembles `get_server_status` from the client's local evidence
-(trading switches, operator halt, `readiness`, request budget, circuit,
-stream) plus one cached read of Schwab's equity calendar per US-Eastern
-day; `AuthorizedServer` adds the principal section on the policy-gated
-transports. `projection.rs` turns a price history, an option chain or an
+`status.rs` assembles `get_server_status` from the backend's local evidence
+(mode, trading switches, operator halt, `readiness`, request budget,
+circuit, stream, the paper venue's clock and session) plus one cached read
+of Schwab's equity calendar per US-Eastern day; `AuthorizedServer` adds the
+principal section on the policy-gated transports and puts the mode in
+`serverInfo.title`. `projection.rs` turns a price history, an option chain or an
 account into compact column/row pages: rows are sorted by a typed key
 (candle time, `expiration|strike|C/P`, `symbol#ordinal`), a page stops at
 the caller's `limit` or the `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` budget, and
 `nextCursor` is the last key so re-reading Schwab between pages never
 skips or repeats a row. The raw tools keep Schwab's shape. `portfolio.rs`
-composes `get_portfolio_summary` from two client reads (orders within
+composes `get_portfolio_summary` from two backend reads (orders within
 Schwab's 59-day list horizon, then the account with positions) and the
 execution journal: typed balances, P&L summed over positions, the first
 `get_positions` page, the non-terminal orders (`OrderStatus::is_terminal`,
-pinned to reconciliation's SQL) with children flattened, and the count of
-unanswered submissions; the account read is essential, the others degrade
-to a null section plus a warning. `order_status.rs` reduces one `Order` to
+pinned to reconciliation's SQL) with children flattened, the count of
+unanswered submissions and, in paper mode, the venue's own ledger; the
+account read is essential, the others degrade to a null section plus a
+warning. `order_status.rs` reduces one `Order` to
 `get_order_status`'s report (terminal flag, filled and remaining
 quantities, quantity-weighted average fill price overall and per leg from
 the `FILL` executions, latest update time, replacing and child orders) and
@@ -265,10 +282,16 @@ future and stack frame stay small however many tools there are.
 
 1. `.env`, `tracing` to stderr (stdout is the MCP channel), optional
    Prometheus listener at `SCHWAB_METRICS_BIND`.
-2. `SchwabConfig::from_env` → `SchwabClient`. If `SCHWAB_MCP_ALLOW_TRADING=1`
+2. `server::Switches::from_env`, then the backend. Live:
+   `SchwabConfig::from_env` → `SchwabClient`; if `SCHWAB_MCP_ALLOW_TRADING=1`
    the process also requires `SCHWAB_RISK_POLICY_FILE` and
-   `SCHWAB_RECOVERY_ACCOUNTS`; a `RecoveryWorker` runs for those accounts
-   and `SCHWAB_HEALTH_BIND` (loopback only) serves `/livez` and `/readyz`.
+   `SCHWAB_RECOVERY_ACCOUNTS`, and a `RecoveryWorker` runs for those
+   accounts. Paper (`SCHWAB_MCP_PAPER_CONFIG` + `SCHWAB_MCP_PAPER_STATE`):
+   `PaperBroker::open` over the venue's config and state, reading no Schwab
+   environment unless `SCHWAB_APP_KEY` is set, which adds the read-only
+   market-data client; the venue's per-account limits stand in for the
+   risk file and no recovery worker runs. `SCHWAB_HEALTH_BIND` (loopback
+   only) serves `/livez` and `/readyz`, whose body carries `mode`.
 3. Transport from `SCHWAB_MCP_TRANSPORT`:
    - `stdio` without a policy file and without trading/cancel enabled runs
      the plain `SchwabMcp` (local trusted host, read-only tools).
@@ -295,9 +318,9 @@ future and stack frame stay small however many tools there are.
   `AuthorizedServer` wraps `SchwabMcp` as an `McpHandler`, writes the
   principal's audit journal and hands write tools to a `TradingBackend`.
 - `preflight.rs` — `check_order`: the same `review`, plus the trading switch
-  and `SchwabClient::submission_admission` (operator halt, recovery
-  suspension), reported together as a `Verdict` without dispatching or
-  auditing. `AuthorizedServer` evaluates it under the principal with durable
+  and `Backend::submission_admission` (operator halt, recovery suspension
+  or the paper venue draining), reported together as a `Verdict` without
+  dispatching or auditing. `AuthorizedServer` evaluates it under the principal with durable
   approvals merged in; the unauthorized stdio path evaluates it without a
   policy.
 - `network.rs` — the axum router authenticates every request first

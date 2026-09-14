@@ -50,6 +50,11 @@ const SELECT_CAPTURE_EXPECTED: &str = "SELECT \
      OR EXISTS(SELECT 1 FROM audit WHERE kind='paper_command')";
 const SELECT_ORDER_PAGE: &str =
     "SELECT payload FROM paper_orders WHERE account=?1 AND id>?2 ORDER BY id LIMIT ?3";
+/// Fills are audit rows keyed by order ID; the index keeps per-order reads
+/// from scanning the whole audit trail.
+const INDEX_FILLS: &str = "CREATE INDEX IF NOT EXISTS paper_fills ON audit(kind,subject,sequence)";
+const SELECT_FILLS: &str =
+    "SELECT payload FROM audit WHERE kind='paper_fill' AND subject=?1 ORDER BY sequence";
 const UPSERT_QUOTE_WATERMARK: &str = "INSERT INTO paper_quote_watermarks VALUES(?1,?2) \
      ON CONFLICT(symbol) DO UPDATE SET source_at=excluded.source_at";
 const UPSERT_QUOTE: &str = "INSERT INTO paper_quotes VALUES(?1,?2) \
@@ -69,6 +74,8 @@ pub struct PaperBroker {
 /// Title carried by every paper venue rejection, so callers can tell a
 /// simulated rejection from a Schwab one without parsing the detail text.
 pub const PAPER_REJECTION_TITLE: &str = "Paper broker rejected the order";
+/// Title carried when the venue has no such account or order.
+pub const PAPER_NOT_FOUND_TITLE: &str = "Paper broker has no such account or order";
 
 /// Caller supplied an unusable argument, event or command.
 fn invalid(message: &str) -> Error {
@@ -79,21 +86,37 @@ fn invalid(message: &str) -> Error {
 fn corrupt(message: &str) -> Error {
     Error::Storage(message.into())
 }
-/// The venue declined the command. Shaped like a Schwab HTTP 400 so code
-/// written against live trading handles paper identically; the reason
-/// travels as the `ApiError` detail.
-fn rejected(reason: &str) -> Error {
+/// A venue answer shaped like a Schwab HTTP error so code written against
+/// live trading handles paper identically; the reason travels as the
+/// `ApiError` detail.
+fn venue_error(status: reqwest::StatusCode, title: &str, detail: &str) -> Error {
     Error::Broker {
-        status: reqwest::StatusCode::BAD_REQUEST,
+        status,
         details: vec![crate::error::ApiError {
             id: None,
-            status: Some("400".into()),
-            title: Some(PAPER_REJECTION_TITLE.into()),
-            detail: Some(reason.into()),
+            status: Some(status.as_u16().to_string()),
+            title: Some(title.into()),
+            detail: Some(detail.into()),
             source: None,
         }],
         request_id: None,
     }
+}
+/// The venue declined the command, as a 400.
+fn rejected(reason: &str) -> Error {
+    venue_error(
+        reqwest::StatusCode::BAD_REQUEST,
+        PAPER_REJECTION_TITLE,
+        reason,
+    )
+}
+/// The account or order does not exist at the venue, as a 404.
+fn missing(what: &str) -> Error {
+    venue_error(
+        reqwest::StatusCode::NOT_FOUND,
+        PAPER_NOT_FOUND_TITLE,
+        &format!("Unknown paper {what}"),
+    )
 }
 // Storage/worker failures can obscure a commit outcome. Never report a
 // conclusive broker rejection merely because persistence returned an error.
@@ -132,7 +155,7 @@ fn get<T: DeserializeOwned>(c: &Connection, key: &str) -> Result<T> {
 fn put(c: &Connection, key: &str, value: &impl Serialize) -> Result<()> {
     meta::put_json(c, key, value)
 }
-fn ledger(c: &Connection, account: &str) -> Result<PaperAccount> {
+fn load_ledger(c: &Connection, account: &str) -> Result<Option<PaperAccount>> {
     let value: Option<String> = c
         .query_row(
             "SELECT payload FROM paper_accounts WHERE account=?1",
@@ -141,9 +164,15 @@ fn ledger(c: &Connection, account: &str) -> Result<PaperAccount> {
         )
         .optional()
         .map_err(sql)?;
-    Ok(serde_json::from_str(
-        &value.ok_or_else(|| invalid("Unknown paper account"))?,
-    )?)
+    value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
+}
+/// A caller-named account; absence is the caller's error.
+fn ledger(c: &Connection, account: &str) -> Result<PaperAccount> {
+    load_ledger(c, account)?.ok_or_else(|| missing("account"))
+}
+/// A configured account; absence means the durable state is incomplete.
+fn configured_ledger(c: &Connection, account: &str) -> Result<PaperAccount> {
+    load_ledger(c, account)?.ok_or_else(|| corrupt("Paper account state is incomplete"))
 }
 fn save_ledger(c: &Connection, account: &str, value: &PaperAccount) -> Result<()> {
     c.execute(
@@ -163,7 +192,7 @@ fn find_order(c: &Connection, account: &str, id: &str) -> Result<PaperOrder> {
         .optional()
         .map_err(sql)?;
     Ok(serde_json::from_str(
-        &value.ok_or_else(|| invalid("Unknown paper order"))?,
+        &value.ok_or_else(|| missing("order"))?,
     )?)
 }
 fn open_orders(c: &Connection) -> Result<Vec<PaperOrder>> {
@@ -208,14 +237,8 @@ fn effective_clock(mut clock: Clock, config: &PaperConfig) -> Result<Clock> {
     }
     Ok(clock)
 }
-/// The latest quote for `symbol` if the session is open and it is within
-/// `quote_max_age_ms`; `None` when there is no usable quote.
-fn fresh_quote(
-    c: &Connection,
-    symbol: &str,
-    clock: &Clock,
-    config: &PaperConfig,
-) -> Result<Option<Quote>> {
+/// The latest quote the venue has seen for `symbol`, fresh or not.
+fn load_quote(c: &Connection, symbol: &str) -> Result<Option<Quote>> {
     let value: Option<String> = c
         .query_row(
             "SELECT payload FROM paper_quotes WHERE symbol=?1",
@@ -224,14 +247,24 @@ fn fresh_quote(
         )
         .optional()
         .map_err(sql)?;
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let quote: Quote = serde_json::from_str(&value)?;
-    let fresh = clock.open
+    value.map(|v| Ok(serde_json::from_str(&v)?)).transpose()
+}
+/// Whether orders are judged against `quote` now: the session is open and
+/// the quote is within `quote_max_age_ms`.
+fn is_fresh(quote: &Quote, clock: &Clock, config: &PaperConfig) -> bool {
+    clock.open
         && quote.source_at_ms <= clock.at_ms
-        && clock.at_ms - quote.source_at_ms <= config.quote_max_age_ms;
-    Ok(fresh.then_some(quote))
+        && clock.at_ms - quote.source_at_ms <= config.quote_max_age_ms
+}
+/// The latest quote for `symbol` if it is fresh; `None` when there is no
+/// usable quote.
+fn fresh_quote(
+    c: &Connection,
+    symbol: &str,
+    clock: &Clock,
+    config: &PaperConfig,
+) -> Result<Option<Quote>> {
+    Ok(load_quote(c, symbol)?.filter(|quote| is_fresh(quote, clock, config)))
 }
 fn symbol_valid(symbol: &str) -> bool {
     !symbol.is_empty()
@@ -539,7 +572,7 @@ impl PaperBroker {
                     .config
                     .accounts
                     .get(&account)
-                    .ok_or_else(|| invalid("Unknown paper account"))?
+                    .ok_or_else(|| missing("account"))?
                     .limits;
                 settlement_at(&this.config, &clock)?;
                 let quote = fresh_quote(
@@ -838,6 +871,45 @@ impl PaperBroker {
         self.journal
             .database()
             .run(move |c| find_order(c, &account, &id))
+            .await
+    }
+    /// Every fill recorded for the account's order `id`, in execution order.
+    pub async fn fills(&self, account: &str, id: &str) -> Result<Vec<PaperFill>> {
+        let account = account.to_owned();
+        let id = id.to_owned();
+        self.journal
+            .database()
+            .run(move |c| {
+                find_order(c, &account, &id)?;
+                let mut statement = c.prepare(SELECT_FILLS).map_err(sql)?;
+                statement
+                    .query_map([id], |r| r.get::<_, String>(0))
+                    .map_err(sql)?
+                    .map(|v| Ok(serde_json::from_str(&v.map_err(sql)?)?))
+                    .collect()
+            })
+            .await
+    }
+    /// The venue's latest quote for `symbol`, or `None` if it has never seen
+    /// one. `fresh` tells whether an order would fill against it now.
+    pub async fn quote(&self, symbol: &str) -> Result<Option<PaperQuote>> {
+        let symbol = symbol.to_owned();
+        let config = self.config.clone();
+        self.journal
+            .database()
+            .run(move |c| {
+                let Some(quote) = load_quote(c, &symbol)? else {
+                    return Ok(None);
+                };
+                let clock = effective_clock(get(c, "paper_clock")?, &config)?;
+                Ok(Some(PaperQuote {
+                    fresh: is_fresh(&quote, &clock, &config),
+                    symbol,
+                    source_at_ms: quote.source_at_ms,
+                    bid: quote.bid,
+                    ask: quote.ask,
+                }))
+            })
             .await
     }
     /// Bounded order history, ascending ID. Persist the last ID as the next cursor.
@@ -1411,7 +1483,7 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
             return Err(Error::Storage("Paper account state is incomplete".into()));
         }
         for name in config.accounts.keys() {
-            ledger(&tx, name)?;
+            configured_ledger(&tx, name)?;
         }
     } else {
         let paper_tables: i64 = tx
@@ -1450,6 +1522,7 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
         put(&tx, "paper_capture_version", &1_u32)?;
         put(&tx, "paper_capture_count", &0_u64)?;
     }
+    tx.execute_batch(INDEX_FILLS).map_err(sql)?;
     tx.commit().map_err(sql)
 }
 
@@ -1494,7 +1567,7 @@ fn credit_cash(
 }
 fn settle_cash(c: &Connection, config: &PaperConfig, at: i64) -> Result<()> {
     for name in config.accounts.keys() {
-        let mut account = ledger(c, name)?;
+        let mut account = configured_ledger(c, name)?;
         let due: Vec<_> = account
             .pending_cash
             .iter()
@@ -1584,7 +1657,7 @@ fn corporate_action(
         }
     }
     for name in config.accounts.keys() {
-        let mut account = ledger(c, name)?;
+        let mut account = configured_ledger(c, name)?;
         let Some(position) = account.positions.get_mut(symbol) else {
             continue;
         };
@@ -1665,7 +1738,7 @@ impl PaperBroker {
                 }
                 let open = open_orders(&tx)?;
                 for (name, settings) in &config.accounts {
-                    let account = ledger(&tx, name)?;
+                    let account = configured_ledger(&tx, name)?;
                     let basis =
                         account
                             .positions
