@@ -642,7 +642,8 @@ until an operator clears it, and trips it again while the loss persists. See
   `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
   `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
 - **Server** — `get_server_status` reports the mode (`live` or `paper`), the
-  trading switches and operator halt, readiness (the `/readyz` body), this process's
+  trading switches and whether an operator halt is active (its reason only
+  for a principal granted every account), readiness (the `/readyz` body), this process's
   request budget, stream health, the principal's own permissions and limits,
   and the equity session phase from Schwab's calendar (cached per day), so a
   model can plan a session before spending calls on it

@@ -615,13 +615,14 @@ impl AuthorizedServer {
         .await)
     }
 
-    /// `get_server_status` under this principal: the server's status with
-    /// the policy this session runs under.
+    /// `get_server_status` under this principal: the server's status,
+    /// scoped to what this principal may see, with the policy it runs
+    /// under.
     async fn get_server_status(&self, args: Value) -> Result<McpResult<ToolResult>, ToolFailure> {
         self.principal.authorize("get_server_status", &args)?;
         Ok(crate::contract::run("get_server_status", async {
             let mut status = self.inner.server_status().await;
-            status.principal = Some(crate::status::Principal::from(&*self.principal));
+            status.scope_to(&self.principal);
             Ok(crate::contract::local(status.into_payload()?))
         })
         .await)
@@ -836,7 +837,8 @@ mod tests {
         );
     }
     /// The status a principal sees carries its own policy, and an operator
-    /// halt shows up as inadmissible trading with the reason.
+    /// halt shows up as inadmissible trading whose reason a scoped
+    /// principal is not told.
     #[tokio::test]
     async fn server_status_carries_the_principal_and_the_halt() {
         let server = authorized();
@@ -853,8 +855,11 @@ mod tests {
 
         let mut policy = policy();
         policy.tools.insert("get_server_status".into());
-        let server =
-            AuthorizedServer::new(server.inner.backend().clone(), Switches::default(), policy);
+        let server = AuthorizedServer::new(
+            server.inner.backend().clone(),
+            Switches::default(),
+            policy.clone(),
+        );
         server
             .inner
             .backend()
@@ -875,9 +880,28 @@ mod tests {
         let tools = status["principal"]["tools"].as_array().unwrap();
         assert!(tools.iter().any(|t| t == "place_order"), "{tools:?}");
         assert!(tools.windows(2).all(|w| w[0].as_str() < w[1].as_str()));
-        assert_eq!(status["trading"]["operatorHalt"], "desk review");
+        // The halt is visible; the operator's words, which a control writes
+        // with another account's equity, loss and cap, are not.
+        assert_eq!(
+            status["trading"]["operatorHalt"],
+            crate::status::HALT_WITHHELD
+        );
         assert_eq!(status["trading"]["admissible"], false);
         assert_eq!(status["readiness"]["tradingReady"], false);
+
+        // A principal granted every account is operator-grade and reads it.
+        let mut all = policy.clone();
+        all.tools.insert("get_server_status".into());
+        all.accounts.clear();
+        all.all_accounts = true;
+        let server =
+            AuthorizedServer::new(server.inner.backend().clone(), Switches::default(), all);
+        let result = server
+            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        assert_eq!(status["trading"]["operatorHalt"], "desk review");
     }
     #[test]
     fn approval_digest_is_independent_of_nested_json_object_order() {

@@ -63,6 +63,21 @@ pub struct ServerStatus {
 }
 
 impl ServerStatus {
+    /// Name the principal this session runs as and answer only what it may
+    /// see. The halt stays visible either way — it is why submissions are
+    /// refused — but a principal scoped to particular accounts is not told
+    /// its reason, which is operator text and, when a control wrote it,
+    /// carries another account's equity, loss and cap. The full reason
+    /// stays in the audit journal and on the operator's own surfaces.
+    pub fn scope_to(&mut self, principal: &crate::policy::PrincipalPolicy) {
+        if !principal.all_accounts
+            && let Some(reason) = self.trading.operator_halt.as_mut()
+        {
+            *reason = HALT_WITHHELD.to_owned();
+        }
+        self.principal = Some(Principal::from(principal));
+    }
+
     /// The status as a tool's local payload.
     pub fn into_payload(self) -> Result<Value, ToolFailure> {
         serde_json::to_value(self)
@@ -119,13 +134,22 @@ impl From<&PrincipalPolicy> for Principal {
     }
 }
 
+/// What a principal is told about an active halt. The reason is operator
+/// text, and when an automatic control wrote it, it names an account and
+/// its equity, loss and cap: a session scoped to particular accounts has
+/// no claim on either.
+pub const HALT_WITHHELD: &str = "An operator halt is active. Its reason is recorded for the operator, \
+     who is the only one who can clear it.";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Trading {
     /// The server's trading switch (`SCHWAB_MCP_ALLOW_TRADING`) is on.
     pub enabled: bool,
     pub cancel_enabled: bool,
-    /// The reason for a persisted operator halt, else null.
+    /// The reason for a persisted operator halt, else null. Withheld as
+    /// [`HALT_WITHHELD`] from a principal that is not granted every
+    /// account; see [`ServerStatus::scope_to`].
     pub operator_halt: Option<String>,
     /// Submissions are suspended while a required stream recovers or the
     /// process drains; cancellations and reads continue.

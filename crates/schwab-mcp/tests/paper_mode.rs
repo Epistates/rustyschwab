@@ -403,7 +403,10 @@ async fn the_operator_halt_and_the_write_switches_gate_paper_orders() {
     let halted = call(&server, "place_order", intent.clone()).await;
     assert_eq!(halted["error"]["code"], "halted", "{halted}");
     let status = call(&server, "get_server_status", json!({})).await;
-    assert_eq!(status["trading"]["operatorHalt"], "desk review");
+    assert_eq!(
+        status["trading"]["operatorHalt"],
+        schwab_mcp::status::HALT_WITHHELD
+    );
     assert_eq!(status["trading"]["admissible"], false);
     assert_eq!(status["readiness"]["tradingReady"], false);
 
@@ -415,9 +418,10 @@ async fn the_operator_halt_and_the_write_switches_gate_paper_orders() {
 }
 
 /// The venue's daily-loss control halts the desk the moment its marked
-/// equity has fallen past the cap, and the status says why.
+/// equity has fallen past the cap. The desk is told it is halted; the
+/// figures behind it are for a principal that holds every account.
 #[tokio::test]
-async fn the_daily_loss_control_halts_paper_orders_and_the_status_says_why() {
+async fn the_daily_loss_control_halts_paper_orders_and_withholds_its_figures() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = config();
     config
@@ -455,13 +459,25 @@ async fn the_daily_loss_control_halts_paper_orders_and_the_status_says_why() {
     assert_eq!(verdict["allowed"], false);
     assert_eq!(verdict["reasons"][0]["code"], "halted", "{verdict}");
     let status = call(&server, "get_server_status", json!({})).await;
+    assert_eq!(
+        status["trading"]["operatorHalt"],
+        schwab_mcp::status::HALT_WITHHELD
+    );
+    assert_eq!(status["trading"]["admissible"], false);
+    assert_eq!(status["readiness"]["tradingReady"], false);
+
+    // The account, the equity either side of the fall, the loss and the cap
+    // are the operator's to read.
+    let mut operator = policy();
+    operator.accounts.clear();
+    operator.all_accounts = true;
+    let operator = AuthorizedServer::new(backend(broker, None), TRADING, operator);
+    let status = call(&operator, "get_server_status", json!({})).await;
     let reason = status["trading"]["operatorHalt"].as_str().unwrap();
     assert!(
         reason.starts_with("Daily loss 6.20 exceeds the 5 limit for account paper-test: equity"),
         "{reason}"
     );
-    assert_eq!(status["trading"]["admissible"], false);
-    assert_eq!(status["readiness"]["tradingReady"], false);
 }
 
 /// The journal keeps every dispatch this principal made for the account,

@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — the halt's reason is the operator's, not every principal's
+
+- `get_server_status` reported `trading.operatorHalt` verbatim to whoever
+  asked. The reason is operator text, and when the daily-loss control
+  writes it, it carries an account's identifier, its equity either side of
+  the fall, the loss and the cap — for an account the asking principal
+  need not be granted, since the halt is server-wide. A principal without
+  `all_accounts` is now told that a halt is active and that only an
+  operator can clear it, and nothing else (`status::HALT_WITHHELD`);
+  `all_accounts` principals, the local stdio session, the audit journal
+  and `schwab-admin` are unchanged. `trading.admissible` and every
+  `halted` failure are unchanged, so nothing a model needs to act on is
+  hidden.
+
 ### Fixed — the documented order window is 60 days, not a year
 
 - `OrdersParams`, `OrdersQuery`, `get_account_orders` and `get_orders`

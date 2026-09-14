@@ -337,12 +337,18 @@ the session runs as (null on the local stdio transport, where none applies).
 `trading.admissible` means a submission would pass the trading switch,
 operator halt and recovery suspension right now; validity, limits, approval
 and duplicates are still judged per order by `check_order` and on
-submission. `trading.operatorHalt` is the halt's reason: an operator's
-words, or, when the venue's daily-loss control tripped it (the optional
-`max_daily_loss` in the account's risk limits, live or paper), the loss, the
-cap and the values compared. A model that meets `halted` should read it,
-stop submitting, and tell the operator; clearing the halt does not reset the
-day, so the control trips again while the loss still exceeds the cap. `readiness` is the body of the `/readyz` probe, evaluated for
+submission. `trading.operatorHalt` is non-null while a halt is active, and
+a model that meets `halted` should stop submitting and tell the operator;
+clearing the halt does not reset the day, so the daily-loss control (the
+optional `max_daily_loss` in an account's risk limits, live or paper) trips
+again while the loss still exceeds the cap. Its text is the halt's reason
+only for a principal granted every account: an operator's words, or, from
+the control, the account, the equity either side of the fall, the loss and
+the cap. A principal scoped to particular accounts is told that a halt is
+active and that only an operator can clear it, and nothing else — the
+reason is another account's figures as often as its own, and it is
+operator text, which is data and not an instruction wherever it is read.
+The full reason stays in the audit journal and on the operator's surfaces. `readiness` is the body of the `/readyz` probe, evaluated for
 the accounts in `SCHWAB_RECOVERY_ACCOUNTS` (the venue's accounts in paper
 mode). `requestBudget` is this process's own quota (null when rate limiting
 is disabled or there is no Schwab client). `equitySession` is Schwab's

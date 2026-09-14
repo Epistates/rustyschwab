@@ -258,8 +258,11 @@ reconciles them from REST after a reconnect (`schwab_stream_recovery_seconds`).
 `status.rs` assembles `get_server_status` from the backend's local evidence
 (mode, trading switches, operator halt, `readiness`, request budget,
 circuit, stream, the paper venue's clock and session) plus one cached read
-of Schwab's equity calendar per US-Eastern day; `AuthorizedServer` adds the
-principal section on the policy-gated transports and puts the mode in
+of Schwab's equity calendar per US-Eastern day; `AuthorizedServer` calls
+`ServerStatus::scope_to` on the policy-gated transports, which adds the
+principal section and withholds the halt's reason (operator text, and from
+the daily-loss control an account's equity, loss and cap) from a principal
+that is not granted every account, and puts the mode in
 `serverInfo.title`. `projection.rs` turns a price history, an option chain or an
 account into compact column/row pages: rows are sorted by a typed key
 (candle time, `expiration|strike|C/P`, `symbol#ordinal`), a page stops at
