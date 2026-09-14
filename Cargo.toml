@@ -69,6 +69,7 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 
 # Time and date
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 humantime-serde = "1.1"
 
 # Utilities

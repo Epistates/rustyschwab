@@ -1,6 +1,6 @@
 # Paper trading and deterministic replay
 
-`PaperBroker` provides persistent simulated long-equity execution. It owns no HTTP transport or OAuth credentials. `schwab-paper` runs offline command replays or an explicitly enabled read-only market feed; `schwab-authority --paper` exposes the same engine through verified identity, policy, approval and lease enforcement. Paper execution never routes to Schwab or thinkorswim paperMoney.
+`PaperBroker` provides persistent simulated long-equity execution. It owns no HTTP transport or OAuth credentials. `schwab-paper` runs offline command replays, an explicitly enabled read-only market feed, or turns price history into a synthetic quote stream for [backtesting](#backtesting-over-price-history); `schwab-authority --paper` exposes the same engine through verified identity, policy, approval and lease enforcement. Paper execution never routes to Schwab or thinkorswim paperMoney.
 
 ## Run the included replay
 
@@ -107,6 +107,35 @@ Only this explicit mode initializes OAuth. The authority can run separately agai
 
 Events start at sequence one and are contiguous across symbols and sessions. Reordered, conflicting duplicate, stale and crossed quote events fail without advancing the durable cursor. Give one trusted producer ownership of that sequence. `append_live` assigns wall time and the next sequence within the write transaction; explicit replay events still require a positive sequence. A stopped feed, missing sequence or unsupported event must be resolved by the producer; the engine does not guess missing market history.
 
+## Backtesting over price history
+
+The venue is quote-driven and Schwab's price history is OHLCV, so a backtest needs quotes the history never recorded. `schwab-paper --synthesize` derives them under a declared model, `candle-bbo-v1`, and writes them as `event` commands for the replay above. **This is a modeling assumption, not broker conformance**: a candle says where a bar opened, ranged and closed, not what was bid or offered, in what size, or in which order its extremes printed. The model fixes each of those by rule, and every session it emits carries the model's name in its id (`candle-bbo-v1:2024-05-17`), so a run built on synthetic quotes is never mistaken for one fed by observed ones. The engine's own model version is unchanged; fills follow the [execution contract](#execution-and-accounting-contract) exactly as they do for any other event.
+
+The rules, each an assumption:
+
+- A candle becomes four marks a quarter of a candle apart: the open, then the low and the high (low first when the bar closed at or above its open, high first when it closed below), then the close.
+- Around each mark the bid and ask sit half of `--spread-bps` below and above it, the bid rounded down to the cent and the ask rounded up. A mark whose bid would fall below the venue's one-unit minimum is an error, not a clipped quote.
+- Each mark offers, on each side, `--participation-bps` of the candle's volume divided across its four marks, in whole shares. A candle without volume quotes prices nobody trades against.
+- A candle belongs to the New York calendar date it opened on, and each date is one venue session across every symbol: it opens at the date's first candle and closes when its last candle ends (`--candle-ms` after it opened), or when the next date's first candle opens if that comes first. DAY orders expire at that close, as at any session close.
+
+An order accepted at one mark fills at a later mark's synthetic bid or ask plus configured slippage, never at its own limit price, and only up to the liquidity that mark offers; a resting limit therefore fills inside the first bar that trades through it, at that bar's extreme rather than at the limit. Marks within a candle are evenly spaced and carry no information about when the bar's extremes actually printed.
+
+Each input file is one `PriceHistoryResponse` as `SchwabClient::get_price_history` returns it and as the `get_price_history` tool carries under `data`; candles must be in time order at least one candle apart, and no symbol may appear twice. Multiple symbols merge into one time-ordered stream, symbols in name order at a shared instant, numbered contiguously from `--first-sequence` (default 1):
+
+```sh
+schwab-paper --synthesize aapl.json msft.json \
+  --candle-ms 60000 --spread-bps 5 --participation-bps 1000 > events.jsonl
+```
+
+Nothing is opened or written; there is no OAuth and no state. To backtest offline, interleave `place`, `cancel` and `snapshot` commands between the events and replay the file with `--commands` against a fresh replay-mode state, then verify the transcript as usual. To backtest a model, start the MCP server or the authority over that state and replay only the events, paced:
+
+```sh
+schwab-paper --config paper-replay.json --state ./backtest/state.sqlite3 \
+  --commands events.jsonl --pace-ms 1000
+```
+
+`--pace-ms` waits that long between commands, so virtual time advances one mark per second while the model trades through the server against the same venue. The event and command transcripts, the histories and the three model parameters together reproduce the run.
+
 ## Authenticated gateway
 
 ```sh
@@ -140,7 +169,7 @@ The privileged generic `/v1/backend` API is disabled for paper authorities. Pape
 
 ## MCP server
 
-The MCP server runs over the same venue when `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` are set, with the same startup posture as the authority: no Schwab environment configuration is read and no OAuth is initialized unless `SCHWAB_APP_KEY` is present, which adds a read-only market-data client the venue never routes an order through. Every tool then answers from the venue in Schwab's shapes, reports `source: "paper"`, and the mode is published in `serverInfo.title`, `get_server_status` and `/readyz`. The MCP server does not ingest market events: drive the venue from a separate process against the same state and exact configuration, `schwab-paper --live-feed` or the authority's ingestion routes, as the authority itself is driven. The [MCP integration review](MCP_LLM_INTEGRATION.md#paper-mode) lists what the venue answers and what it refuses.
+The MCP server runs over the same venue when `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` are set, with the same startup posture as the authority: no Schwab environment configuration is read and no OAuth is initialized unless `SCHWAB_APP_KEY` is present, which adds a read-only market-data client the venue never routes an order through. Every tool then answers from the venue in Schwab's shapes, reports `source: "paper"`, and the mode is published in `serverInfo.title`, `get_server_status` and `/readyz`. The MCP server does not ingest market events: drive the venue from a separate process against the same state and exact configuration, `schwab-paper --live-feed`, a paced `schwab-paper --commands` replay of [synthetic quotes](#backtesting-over-price-history), or the authority's ingestion routes, as the authority itself is driven. The [MCP integration review](MCP_LLM_INTEGRATION.md#paper-mode) lists what the venue answers and what it refuses.
 
 `schwab-eval` builds on this to score a model's tool use: each of its scenarios seeds a private copy of the venue (a stale quote, a working order whose tag carries an injected instruction, a lost acknowledgement fault) behind the policy-gated server, serves it over stdio while recording the model's calls, and replays the transcript deterministically for the report. See [model evaluation](MCP_LLM_INTEGRATION.md#model-evaluation).
 

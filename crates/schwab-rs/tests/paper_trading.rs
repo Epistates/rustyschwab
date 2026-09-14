@@ -1286,3 +1286,80 @@ async fn command_capture_failure_rolls_back_order_and_tag_acceptance() {
     broker.place_order("paper-test", &request).await.unwrap();
     assert_eq!(broker.captured_command_count().await.unwrap(), 3);
 }
+
+#[tokio::test]
+async fn synthetic_candle_quotes_drive_a_replay_venue_and_fill_within_the_bar() {
+    use schwab_rs::{
+        paper::synthetic::{SYNTHETIC_MODEL, SyntheticBbo},
+        types::market_data::{Candle, PriceHistoryResponse},
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let b = PaperBroker::open(dir.path().join("state/paper.sqlite3"), config())
+        .await
+        .unwrap();
+    let candle = |datetime: i64, open: f64, high: f64, low: f64, close: f64| Candle {
+        open,
+        high,
+        low,
+        close,
+        volume: 4000,
+        datetime,
+        extra: Default::default(),
+    };
+    // 2024-05-17 09:30 and 09:31 America/New_York.
+    let open = 1_715_952_600_000;
+    let events = SyntheticBbo {
+        candle_ms: 60_000,
+        spread_bps: d("10"),
+        participation_bps: d("1000"),
+    }
+    .events(
+        &[PriceHistoryResponse {
+            symbol: "ABC".into(),
+            empty: false,
+            previous_close: None,
+            previous_close_date: None,
+            candles: vec![
+                candle(open, 10.0, 10.2, 9.8, 10.1),
+                candle(open + 60_000, 10.1, 10.3, 10.0, 10.25),
+            ],
+            extra: Default::default(),
+        }],
+        1,
+    )
+    .unwrap();
+    let mut events = events.into_iter();
+    // The session opens under the model's name, then the open mark prints.
+    b.apply(events.next().unwrap()).await.unwrap();
+    b.apply(events.next().unwrap()).await.unwrap();
+    let session_id = format!("{SYNTHETIC_MODEL}:2024-05-17");
+    assert_eq!(
+        b.market_session().await.unwrap(),
+        (session_id.clone(), true)
+    );
+    // A limit buy under the open's ask (10.01) rests, then fills at the low
+    // mark's synthetic ask (9.81), not at its own limit.
+    let id = b
+        .place_order("paper-test", &order("synthetic-buy", "BUY", "5", "9.95"))
+        .await
+        .unwrap()
+        .order_id
+        .unwrap();
+    let fills = b.apply(events.next().unwrap()).await.unwrap().fills;
+    assert_eq!(
+        fills
+            .iter()
+            .map(|f| (f.order_id.as_str(), f.quantity, f.price))
+            .collect::<Vec<_>>(),
+        vec![(id.as_str(), d("5"), d("9.81"))]
+    );
+    // The rest of the bars replay and the session closes at the last one's end.
+    for event in events {
+        b.apply(event).await.unwrap();
+    }
+    assert_eq!(b.market_session().await.unwrap(), (session_id, false));
+    let snapshot = b.snapshot("paper-test").await.unwrap();
+    assert_eq!(snapshot.at_ms, open + 120_000);
+    assert_eq!(snapshot.ledger.positions["ABC"].quantity, d("5"));
+    assert_eq!(snapshot.ledger.cash, d("950.90"));
+}

@@ -183,8 +183,9 @@ readiness, operator halt. `SchwabClient` implements it as `"live"`.
 `paper::PaperBroker` implements it as an isolated long-equity simulator
 (`paper/engine.rs` execution and accounting, `paper/model.rs` versioned
 inputs and reports, `paper/feed.rs` optional read-only REST quote/calendar
-polling). Paper state is its own SQLite file; a live client refuses to open
-it. `remote::RemoteBackend` implements `ExecutionStore`, `Coordinator` and
+polling, `paper/synthetic.rs` quotes derived from OHLCV candles under the
+declared `candle-bbo-v1` model for backtesting). Paper state is its own
+SQLite file; a live client refuses to open it. `remote::RemoteBackend` implements `ExecutionStore`, `Coordinator` and
 `RiskProvider` over authenticated HTTPS to a `schwab-authority` process so
 workers on other hosts share one journal without holding broker credentials.
 
@@ -356,8 +357,10 @@ future and stack frame stay small however many tools there are.
   deliberately not MCP tools. `bin/schwab-remote.rs` submits one typed
   request to the authority with a protected token file.
 - `bin/schwab-paper.rs` and `bin/schwab-paper-verify.rs` — deterministic
-  replay and transcript verification for the paper engine
-  (`paper_replay.rs` is the shared command decoder).
+  replay (paced with `--pace-ms` when a served venue should advance in
+  virtual time), synthetic quote generation from price history, and
+  transcript verification for the paper engine (`paper_replay.rs` is the
+  shared command decoder).
 - `eval.rs` and `bin/schwab-eval.rs` — model evaluation over the paper
   venue. `Scenario` fixes a seeded venue, a principal policy and a task;
   `Fixture::open` builds them under a private directory behind an

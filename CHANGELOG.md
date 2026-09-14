@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — synthetic quotes from price history for backtesting
+
+- `schwab_rs::paper::synthetic::SyntheticBbo` derives a replay-ready event
+  stream from `PriceHistoryResponse` candles under the declared model
+  `candle-bbo-v1`: four evenly spaced marks per bar (open, then low and
+  high in the direction the bar closed, then close), a configured spread
+  rounded outward to the cent, a configured participation share of the
+  bar's volume per side in whole shares, and one venue session per New
+  York calendar date (`chrono-tz`), closing when the date's last candle
+  ends or the next date opens. Every session id carries the model's name;
+  the engine's own model version is unchanged. Malformed bars, out-of-order
+  candles, repeated symbols and marks the venue could not quote are errors
+  rather than clipped quotes.
+- `schwab-paper --synthesize <history.json>... --candle-ms --spread-bps
+  --participation-bps [--first-sequence]` writes those events as `event`
+  commands on stdout with no state, configuration or OAuth, for the
+  existing `--commands` replay and transcript verification.
+- `schwab-paper --commands ... --pace-ms N` waits `N` milliseconds between
+  replayed commands, so a venue served by the MCP server or the authority
+  advances in paced virtual time while a model trades against it.
+- Documented in `docs/PAPER_TRADING.md` as a modeling assumption, not
+  broker conformance, with a matching row in the capability checklist.
+
 ### Added — order-spec resource and propose_trade prompt
 
 - The resource `schwab://order-spec` (`text/markdown`) is the `OrderSpec`

@@ -354,14 +354,18 @@ fn enforce_daily_loss(tx: &Connection, config: &PaperConfig, clock: &Clock) -> R
     }
     Ok(())
 }
-fn symbol_valid(symbol: &str) -> bool {
+/// Latest instant the venue clocks: 9999-12-31T23:59:59Z.
+pub(super) const MAX_AT_MS: i64 = 253402300799000;
+/// Largest per-side size a quote may offer.
+pub(super) const MAX_QUOTE_SIZE: u64 = 1_000_000_000;
+pub(super) fn symbol_valid(symbol: &str) -> bool {
     !symbol.is_empty()
         && symbol.len() <= 32
         && symbol
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
 }
-fn positive_bounded(v: Decimal) -> bool {
+pub(super) fn positive_bounded(v: Decimal) -> bool {
     v > Decimal::ZERO && v <= Decimal::from(1_000_000_000_000_i64)
 }
 fn validate_config(config: &PaperConfig) -> Result<()> {
@@ -379,9 +383,10 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
         || config.fee_per_share < Decimal::ZERO
         || config.fee_per_share > Decimal::ONE
         || config.settlement_calendar.len() > 10000
-        || config.settlement_calendar.iter().any(|(id, at)| {
-            id.is_empty() || id.len() > 64 || !(0..=253402300799000_i64).contains(at)
-        })
+        || config
+            .settlement_calendar
+            .iter()
+            .any(|(id, at)| id.is_empty() || id.len() > 64 || !(0..=MAX_AT_MS).contains(at))
     {
         return Err(Error::Config(
             "Invalid paper configuration or model version".into(),
@@ -1141,7 +1146,7 @@ impl PaperBroker {
         validate_source(&source)?;
         if event.sequence == 0
             || event.sequence > i64::MAX as u64
-            || !(0..=253402300799000_i64).contains(&event.at_ms)
+            || !(0..=MAX_AT_MS).contains(&event.at_ms)
         {
             return Err(invalid("Invalid paper event sequence or time"));
         }
@@ -1291,8 +1296,8 @@ fn apply_event(
                 || bid > ask
                 || *bid_size < Decimal::ZERO
                 || *ask_size < Decimal::ZERO
-                || *bid_size > Decimal::from(1_000_000_000_u64)
-                || *ask_size > Decimal::from(1_000_000_000_u64)
+                || *bid_size > Decimal::from(MAX_QUOTE_SIZE)
+                || *ask_size > Decimal::from(MAX_QUOTE_SIZE)
                 || !bid_size.fract().is_zero()
                 || !ask_size.fract().is_zero()
             {
@@ -1697,7 +1702,7 @@ fn corporate_action(
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         || !symbol_valid(symbol)
         || pay_at < clock.at_ms
-        || pay_at > 253402300799000_i64
+        || pay_at > MAX_AT_MS
     {
         return Err(invalid("Invalid corporate action identity/time"));
     }

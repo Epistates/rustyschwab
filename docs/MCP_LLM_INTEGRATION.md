@@ -438,6 +438,16 @@ beside the venue's state), the trading and cancel switches, and the operator
 halt all gate paper orders exactly as they gate live ones, so a model
 evaluated in paper mode meets the same denials it would meet live.
 
+The server does not ingest market events; a separate process drives the
+venue. For a backtest that process is `schwab-paper --commands events.jsonl
+--pace-ms N` over quotes that `schwab-paper --synthesize` derived from
+price history under the declared `candle-bbo-v1` model, described in
+[backtesting over price history](PAPER_TRADING.md#backtesting-over-price-history):
+virtual time advances one mark per `N` milliseconds while the model trades
+through the server, and the `session` that `get_server_status` reports
+under `paper` names the model, so the model can see, and should say, that
+its quotes are synthetic.
+
 ## Model evaluation
 
 `schwab-eval` (`crates/schwab-mcp/src/eval.rs`) scores a model's tool use

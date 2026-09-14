@@ -18,7 +18,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 
 ## Features
 
-- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency and authenticated gateway support. Start with `ops/paper/replay.jsonl`.
+- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency, authenticated gateway support and backtesting over price history under a declared synthetic-quote model. Start with `ops/paper/replay.jsonl`.
 
 - **OAuth2 Authentication**
   - Authorization code flow with built-in callback server
@@ -557,6 +557,14 @@ movers, instruments, market hours and the stream. The mode is announced in
 describing the venue), `/readyz`, and as `source: "paper"` on every read
 and mutation the venue served. Policy, approval, the trading switches and
 the operator halt gate paper orders exactly as they gate live ones.
+
+To backtest over price history, `schwab-paper --synthesize` turns Schwab
+candles into a quote stream under a declared model (`candle-bbo-v1`: four
+marks per bar, a configured spread and participation, New York dates as
+sessions), and a paced `--commands` replay advances the venue in virtual
+time while the model trades through the server. It is a modeling
+assumption, labeled as such in every session id, not broker conformance;
+see [backtesting over price history](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md#backtesting-over-price-history).
 
 To score a model against that venue, `schwab-eval serve` is the same
 policy-gated server over a seeded scenario (stale quote, injected

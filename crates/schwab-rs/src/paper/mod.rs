@@ -9,3 +9,4 @@ pub use engine::{PAPER_NOT_FOUND_TITLE, PAPER_REJECTION_TITLE, PaperBroker};
 pub use model::*;
 
 pub mod feed;
+pub mod synthetic;

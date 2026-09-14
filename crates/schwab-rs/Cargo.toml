@@ -57,6 +57,7 @@ metrics = { workspace = true }
 
 # Time and date
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 humantime-serde = { workspace = true }
 
 # Utilities
