@@ -5,6 +5,7 @@ pub mod authority;
 pub mod backend;
 pub mod contract;
 pub mod eval;
+pub mod guidance;
 pub mod identity;
 pub mod journal;
 pub mod metrics;

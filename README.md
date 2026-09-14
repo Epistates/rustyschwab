@@ -638,6 +638,17 @@ until an operator clears it, and trips it again while the loss persists. See
   request budget, stream health, the principal's own permissions and limits,
   and the equity session phase from Schwab's calendar (cached per day), so a
   model can plan a session before spending calls on it
+- **Prompts and resources** — the resource `schwab://order-spec` is the
+  `OrderSpec` grammar as markdown (every kind, the leg and instrument forms,
+  the rules the schema cannot express, what a principal policy accepts,
+  worked examples with their expansions); the prompt
+  `propose_trade(account_hash, symbol?, thesis?)` walks a model from
+  `get_server_status` through the market and account reads, `build_order`,
+  `check_order` with a rationale, and a preview to a proposal it presents
+  and waits on, submitting only where the session can and the user has
+  confirmed. Both name only the tools the session holds, are listed and
+  served only to principals holding an order tool, and the prompt only for
+  the principal's own accounts
 
 The time-windowed reads (`get_account_orders`, `get_all_orders`,
 `get_transactions`, `get_price_history`) take their bounds as a calendar

@@ -4,7 +4,9 @@ Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
 explicit behavior annotations for all 39 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
 `get_server_status`, the three projection tools, `get_portfolio_summary`,
-`get_order_status` and `get_trade_journal` were added after the review). Reads and previews are marked
+`get_order_status` and `get_trade_journal` were added after the review, as
+were the one resource and one prompt described under
+[Prompts and resources](#prompts-and-resources)). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
 and non-idempotent. Cached stream reads are marked closed-world. These are
 client hints, not authorization controls. Read-only does not imply public data.
@@ -345,6 +347,55 @@ shape above; an unauthenticated session yields exactly one, asking the
 operator to run OAuth. The call is read-only, not audited, and cheap:
 grant it to every principal.
 
+## Prompts and resources
+
+The server offers one resource and one prompt, both about composing an
+order, and neither grants anything: every step they describe is judged by
+the tool it names.
+
+`schwab://order-spec` (`text/markdown`) is the `OrderSpec` grammar
+`build_order` accepts: every kind with its fields and expansion, the leg
+and instrument forms, the settings and their defaults, the rules the JSON
+schema cannot express (bracket ordering, trigger children, nesting depth),
+what a principal policy accepts (one leg that is not an opening short, a
+bounded price, an operator multiplier for options), and worked examples
+with the `OrderRequest` each expands to. It is the reference a model reads
+once instead of discovering the grammar one `invalid_arguments` at a time;
+a test expands every example in it.
+
+`propose_trade(account_hash, symbol?, thesis?)` renders the workflow from
+first read to confirmation as one user message: read `get_server_status`
+and stop on an operator halt; read the market and the account; compose the
+order as an `OrderSpec` and expand it with `build_order`; run it through
+`check_order` with a rationale and act on each reason (`approval_required`
+is carried into the proposal, since no tool the model holds approves it);
+preview it in live mode; present it and wait for the user; and only then,
+where the session can, `place_order` with the checked order and read the
+outcome back. The steps name only tools the session can call: what the
+principal is granted, less the write tools the operator's switches keep
+off. A session that cannot submit is told why (the trading switch, or
+`place_order` not granted) and ends by handing the proposal, with its
+`intentDigest`, to the operator. The prompt never tells the model to stop
+merely because `trading.admissible` is false, which is the normal state on
+a session that does not submit.
+
+On the authorized transports both follow the principal: a principal without
+an order tool (`build_order`, `check_order`, `preview_order`, `place_order`,
+`replace_order`) is not shown the resource; one without `check_order` is not
+shown the prompt; `initialize` then omits the capability, and a direct read
+answers `resource not found` or `prompt not found`. The prompt is rendered
+only for an account the principal holds; another account is refused before
+rendering. No account data is exposed as a resource: the tools already serve
+it, under the same authorization and the response budgets a resource read
+would lack.
+
+TurboMCP renders an `Err` from a `#[prompt]` handler as a user message
+reading `Error: …` rather than a JSON-RPC error. On the stdio transport a
+blank `account_hash` therefore comes back as that message, and only a
+missing one as the macro's own JSON-RPC error; the authorized wrapper
+validates the arguments before rendering and answers a JSON-RPC error for
+either.
+
 ## Paper mode
 
 The same server runs over the [paper venue](PAPER_TRADING.md) instead of
@@ -446,7 +497,7 @@ release.
 | Medium | Bounded model context | Done for candles, option contracts and positions (budgeted, paged projections with explicit truncation and provenance); oversized raw responses are refused with `response_too_large`. Remaining: projections for quotes across many symbols and for order and transaction lists. |
 | High | Client interoperability | Exercise initialize, discovery, schemas, structured results, errors, cancellation, token rotation and cross-principal session denial with independent stdio and HTTP clients. Current regression tests are not a complete external conformance certification. |
 | Medium | Model evaluation | Done: `schwab-eval` scores stale data, prompt injection, account confusion, denied approvals, unknown submissions and repeated submissions, requires zero unauthorized executions and records model, prompt and config per report. Remaining: partial and uncertain fills, and a batch runner that drives a model across every scenario. |
-| Medium | Optional resources/prompts | Add account-scoped resources and workflow prompts only with matching lookup/call authorization and output budgets. Do not expose approval-granting tools to the proposing model. |
+| Medium | Optional resources/prompts | Done: the `OrderSpec` grammar resource and the `propose_trade` prompt, listed, read and rendered only for principals holding the tools they are about, and only for their accounts. No approval-granting tool is exposed. Account data stays behind the budgeted tools rather than resources. |
 
 ## TurboMCP v4 decision
 

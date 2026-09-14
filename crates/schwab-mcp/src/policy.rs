@@ -8,6 +8,7 @@
 use crate::SchwabMcp;
 use crate::backend::Backend;
 use crate::contract::{FailureCode, ToolFailure};
+use crate::guidance;
 use crate::server::Switches;
 use schwab_rs::execution::OrderJournal;
 use serde::{Deserialize, Serialize};
@@ -70,6 +71,10 @@ impl PrincipalPolicy {
     fn owns_streaming(&self) -> bool {
         self.tools.iter().any(|t| t.starts_with("stream_"))
     }
+    /// Whether this principal may act on `account`.
+    pub fn grants_account(&self, account: &str) -> bool {
+        self.all_accounts || self.accounts.contains(account)
+    }
     /// The first reason this principal may not run `name` with `args`.
     pub fn authorize(&self, name: &str, args: &Value) -> Result<(), ToolFailure> {
         self.review(name, args)
@@ -90,8 +95,7 @@ impl PrincipalPolicy {
             ));
         }
         if let Some(account) = args.get("account_hash").and_then(Value::as_str)
-            && !self.all_accounts
-            && !self.accounts.contains(account)
+            && !self.grants_account(account)
         {
             review.denials.push(ToolFailure::not_permitted(
                 "Account not authorized for this principal",
@@ -407,11 +411,24 @@ impl McpHandler for AuthorizedServer {
             .filter(|t| self.principal.tools.contains(t.name.as_str()))
             .collect()
     }
+    /// Resources and prompts follow the tools they are about: a principal
+    /// without an order tool is shown neither, and `server_capabilities`
+    /// then omits them.
     fn list_resources(&self) -> Vec<turbomcp::Resource> {
-        vec![]
+        let audience = self.audience();
+        self.inner
+            .list_resources()
+            .into_iter()
+            .filter(|r| audience.offers_resource(&r.uri))
+            .collect()
     }
     fn list_prompts(&self) -> Vec<turbomcp::Prompt> {
-        vec![]
+        let audience = self.audience();
+        self.inner
+            .list_prompts()
+            .into_iter()
+            .filter(|p| audience.offers_prompt(&p.name))
+            .collect()
     }
     async fn call_tool<'a>(
         &'a self,
@@ -427,20 +444,42 @@ impl McpHandler for AuthorizedServer {
     async fn read_resource<'a>(
         &'a self,
         uri: &'a str,
-        _ctx: &'a RequestContext,
+        ctx: &'a RequestContext,
     ) -> McpResult<ResourceResult> {
-        Err(McpError::resource_not_found(uri))
+        if !self.audience().offers_resource(uri) {
+            return Err(McpError::resource_not_found(uri));
+        }
+        self.inner.read_resource(uri, ctx).await
     }
+    /// The workflow is rendered for this principal's tools and switches,
+    /// and only for an account it holds: a prompt that named another
+    /// account would send the model to tools that refuse it.
     async fn get_prompt<'a>(
         &'a self,
         name: &'a str,
-        _args: Option<Value>,
+        args: Option<Value>,
         _ctx: &'a RequestContext,
     ) -> McpResult<PromptResult> {
-        Err(McpError::prompt_not_found(name))
+        if !self.audience().offers_prompt(name) {
+            return Err(McpError::prompt_not_found(name));
+        }
+        let proposal = guidance::Proposal::parse(args)?;
+        if !self.principal.grants_account(&proposal.account_hash) {
+            return Err(McpError::permission_denied(
+                "Account not authorized for this principal",
+            ));
+        }
+        Ok(guidance::propose_trade(&self.audience(), &proposal))
     }
 }
 impl AuthorizedServer {
+    fn audience(&self) -> guidance::Audience<'_> {
+        guidance::Audience::new(
+            Some(&self.principal.tools),
+            self.inner.switches(),
+            self.inner.backend().mode(),
+        )
+    }
     /// Authorize, audit and dispatch one call. A `ToolFailure` here is a
     /// denial or an audit fault the model must see; the inner result is
     /// whatever the tool itself produced.
@@ -865,6 +904,9 @@ mod tests {
         result.err().map(|f| f.code)
     }
     fn authorized() -> AuthorizedServer {
+        authorized_as(Switches::default(), policy())
+    }
+    fn authorized_as(switches: Switches, policy: PrincipalPolicy) -> AuthorizedServer {
         let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
             oauth: schwab_rs::OAuthConfig {
                 app_key: "k".repeat(32),
@@ -877,11 +919,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        AuthorizedServer::new(
-            Backend::Live(Arc::new(client)),
-            Switches::default(),
-            policy(),
-        )
+        AuthorizedServer::new(Backend::Live(Arc::new(client)), switches, policy)
     }
     /// Denials reach the model as `isError` results it can read, never as
     /// JSON-RPC errors, and carry the code and intent digest it needs next.
@@ -1080,5 +1118,86 @@ mod tests {
             assert!(exposure(&under(uncovered), &none).is_err());
         }
         assert!(exposure(&OrderRequest::market(entry()).triggers(stop()), &none).is_err());
+    }
+    /// Prompts and resources follow the principal's tools and accounts: a
+    /// principal with `check_order` is offered both, rendered for the tools
+    /// and switches it has; one without sees neither, and the capabilities
+    /// it is told at initialize agree.
+    #[tokio::test]
+    async fn guidance_is_gated_by_the_principal() {
+        let ctx = RequestContext::stdio();
+        let uri = guidance::ORDER_SPEC_URI;
+        let prompt = guidance::PROPOSE_TRADE;
+        let args = |account: &str| Some(serde_json::json!({"account_hash": account}));
+
+        let desk = authorized();
+        assert_eq!(desk.list_resources().len(), 1);
+        assert_eq!(desk.list_prompts().len(), 1);
+        assert!(desk.server_capabilities().resources.is_some());
+        assert!(desk.server_capabilities().prompts.is_some());
+        assert!(
+            desk.read_resource(uri, &ctx)
+                .await
+                .unwrap()
+                .first_text()
+                .unwrap()
+                .starts_with("# OrderSpec")
+        );
+        assert!(desk.read_resource("schwab://other", &ctx).await.is_err());
+        // Held `place_order`, but the trading switch is off.
+        let text = desk
+            .get_prompt(prompt, args("A"), &ctx)
+            .await
+            .unwrap()
+            .messages[0]
+            .content
+            .as_text()
+            .unwrap()
+            .to_owned();
+        assert!(text.contains("Call `get_account`"), "{text}");
+        assert!(!text.contains("`get_quotes`"), "{text}");
+        assert!(
+            text.contains("does not submit orders (the operator's trading switch is off)"),
+            "{text}"
+        );
+        // Another account, or a missing one, is refused before rendering.
+        let denied = desk.get_prompt(prompt, args("B"), &ctx).await.unwrap_err();
+        assert!(
+            denied.to_string().contains("Account not authorized"),
+            "{denied}"
+        );
+        assert!(desk.get_prompt(prompt, None, &ctx).await.is_err());
+        assert!(desk.get_prompt("other", args("A"), &ctx).await.is_err());
+
+        // With the switch on, the same principal is walked through placing it.
+        let trading = authorized_as(
+            Switches {
+                trading: true,
+                cancel: true,
+            },
+            policy(),
+        );
+        let text = trading
+            .get_prompt(prompt, args("A"), &ctx)
+            .await
+            .unwrap()
+            .messages[0]
+            .content
+            .as_text()
+            .unwrap()
+            .to_owned();
+        assert!(text.contains("call `place_order`"), "{text}");
+        assert!(!text.contains("does not submit"), "{text}");
+
+        // A reader holds no order tool: nothing is listed or served.
+        let mut reader = policy();
+        reader.tools = ["get_account", "get_quotes"].map(String::from).into();
+        let reader = authorized_as(Switches::default(), reader);
+        assert!(reader.list_resources().is_empty());
+        assert!(reader.list_prompts().is_empty());
+        assert!(reader.server_capabilities().resources.is_none());
+        assert!(reader.server_capabilities().prompts.is_none());
+        assert!(reader.read_resource(uri, &ctx).await.is_err());
+        assert!(reader.get_prompt(prompt, args("A"), &ctx).await.is_err());
     }
 }

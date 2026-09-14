@@ -419,3 +419,86 @@ async fn server_status_is_complete_without_a_session() {
     assert_eq!(warnings[0]["disposition"], "ask_operator");
     assert!(status.get("source").is_none());
 }
+
+/// The stdio server offers the `OrderSpec` grammar as one markdown
+/// resource and the propose-a-trade workflow as one prompt, and its
+/// capabilities say so.
+#[tokio::test]
+async fn guidance_is_one_resource_and_one_prompt() {
+    let server = server();
+    let ctx = turbomcp::RequestContext::stdio();
+
+    let resources = server.list_resources();
+    assert_eq!(resources.len(), 1, "{resources:?}");
+    assert_eq!(resources[0].uri, schwab_mcp::guidance::ORDER_SPEC_URI);
+    assert_eq!(resources[0].name, "order_spec");
+    assert_eq!(resources[0].mime_type.as_deref(), Some("text/markdown"));
+    assert!(
+        resources[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("build_order")
+    );
+    let read = server
+        .read_resource(schwab_mcp::guidance::ORDER_SPEC_URI, &ctx)
+        .await
+        .unwrap();
+    let grammar = read.first_text().unwrap();
+    assert!(grammar.starts_with("# OrderSpec"), "{grammar}");
+    assert!(grammar.contains("`bracket`"));
+    assert!(
+        server
+            .read_resource("schwab://elsewhere", &ctx)
+            .await
+            .is_err()
+    );
+
+    let prompts = server.list_prompts();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0].name, schwab_mcp::guidance::PROPOSE_TRADE);
+    let arguments = prompts[0].arguments.as_deref().unwrap();
+    let required: Vec<(&str, bool)> = arguments
+        .iter()
+        .map(|a| (a.name.as_str(), a.required == Some(true)))
+        .collect();
+    assert_eq!(
+        required,
+        [("account_hash", true), ("symbol", false), ("thesis", false)]
+    );
+    assert!(arguments.iter().all(|a| a.description.is_some()));
+
+    // The stdio server has every tool but, with the trading switch off,
+    // cannot submit: the workflow says so and ends at the operator.
+    let rendered = server
+        .get_prompt(
+            schwab_mcp::guidance::PROPOSE_TRADE,
+            Some(serde_json::json!({"account_hash": "ABC123", "symbol": "AAPL"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    let text = rendered.messages[0].content.as_text().unwrap();
+    assert!(
+        text.starts_with("Propose a trade for account `ABC123` in `AAPL`."),
+        "{text}"
+    );
+    assert!(text.contains("live mode"), "{text}");
+    assert!(text.contains("Call `check_order`"), "{text}");
+    assert!(text.contains("Call `preview_order`"), "{text}");
+    assert!(
+        text.contains("does not submit orders (the operator's trading switch is off)"),
+        "{text}"
+    );
+    assert!(!text.contains("`place_order`"), "{text}");
+    assert!(
+        server
+            .get_prompt(schwab_mcp::guidance::PROPOSE_TRADE, None, &ctx)
+            .await
+            .is_err()
+    );
+
+    let capabilities = server.server_capabilities();
+    assert!(capabilities.resources.is_some());
+    assert!(capabilities.prompts.is_some());
+}

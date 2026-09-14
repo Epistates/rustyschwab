@@ -25,7 +25,7 @@ Three published crates plus example packages, all on the workspace version
                  │ server.rs (39 tools)  policy.rs  network.rs  identity.rs  redact.rs │
                  │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
                  │ projection.rs  portfolio.rs  order_status.rs  journal.rs             │
-                 │ authority.rs (gateway)                                               │
+                 │ guidance.rs (1 resource, 1 prompt)  authority.rs (gateway)           │
                  │ bins: admin/authority/remote/paper/paper-verify                      │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend / PaperBroker
@@ -333,6 +333,12 @@ future and stack frame stay small however many tools there are.
   dispatching or auditing. `AuthorizedServer` evaluates it under the principal with durable
   approvals merged in; the unauthorized stdio path evaluates it without a
   policy.
+- `guidance.rs` — the `schwab://order-spec` resource (the `OrderSpec`
+  grammar, `guidance/order_spec.md`) and the `propose_trade` prompt,
+  rendered for an `Audience`: the tools the session holds, less the write
+  tools the switches keep off, and the mode. `AuthorizedServer` lists and
+  serves them only to principals holding the tools they are about, and the
+  prompt only for the principal's accounts.
 - `network.rs` — the axum router authenticates every request first
   (constant-time comparison of a bearer token's SHA-256 against the policy,
   or `identity::JwtVerifier` for short-lived RS256 tokens from

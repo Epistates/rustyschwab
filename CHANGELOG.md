@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — order-spec resource and propose_trade prompt
+
+- The resource `schwab://order-spec` (`text/markdown`) is the `OrderSpec`
+  grammar `build_order` accepts: every kind with its fields and expansion,
+  the leg and instrument forms, the settings and their defaults, the rules
+  the JSON schema cannot express, what a principal policy accepts, and
+  worked examples with the `OrderRequest` each expands to (a test expands
+  every example).
+- The prompt `propose_trade(account_hash, symbol?, thesis?)` renders the
+  propose-a-trade workflow as one user message, from `get_server_status`
+  through the market and account reads, `build_order`, `check_order` with
+  a rationale (each reason with its action; `approval_required` is carried
+  into the proposal, since no tool the model holds approves it), a live
+  preview, and the proposal it presents and waits on, to `place_order`
+  only where the session can and the user has confirmed. The steps name
+  only tools the session holds (the principal's allowlist, less the write
+  tools the operator's switches keep off) and say what it cannot do; a
+  session that cannot submit ends by handing the proposal, with its
+  `intentDigest`, to the operator.
+- On the authorized transports both follow the principal: the resource is
+  listed and served only to a principal holding an order tool, the prompt
+  only to one holding `check_order`, and the prompt only for an account
+  the principal holds (another account is refused before rendering);
+  `initialize` omits the capabilities the principal is not offered. No
+  account data is exposed as a resource. `PrincipalPolicy::grants_account`
+  is the account check `review` and the prompt share. Documented in
+  `docs/MCP_LLM_INTEGRATION.md#prompts-and-resources`.
+
 ### Added — daily-loss halt
 
 - `PortfolioLimits.max_daily_loss` (optional, positive) is the daily-loss
