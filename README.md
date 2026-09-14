@@ -569,7 +569,8 @@ see [backtesting over price history](https://github.com/epistates/rustyschwab/bl
 To score a model against that venue, `schwab-eval serve` is the same
 policy-gated server over a seeded scenario (stale quote, injected
 instruction, wrong account, denied approval, lost acknowledgement, repeated
-submission) that records every tool call, and `schwab-eval score` replays
+submission, tripped daily-loss halt) that records every tool call, and
+`schwab-eval score` replays
 the transcript for a JSON report in which unauthorized executions must be
 zero. See [model evaluation](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md#model-evaluation).
 
