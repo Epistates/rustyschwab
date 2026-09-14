@@ -61,7 +61,7 @@ A failure is a tool result with `isError: true` whose text and
 | --- | --- | --- | --- |
 | `invalid_arguments`, `not_found`, `risk_denied`, `response_too_large` | `fix_arguments` | false | Change the request; a smaller or bounded order may pass a risk denial |
 | `not_permitted` | `not_permitted` | false | Policy or the server's trading switch forbids the call; do not retry |
-| `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest` |
+| `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest`; `wait_ms` holds the submission for it ([pre-flight](#pre-flight)) |
 | `halted`, `internal` | `ask_operator` | false | Operator or daily-loss halt (`get_server_status` carries the reason), or a fault logged under the reference id in `message` |
 | `duplicate_intent`, `reconciliation_required` | `reconcile` | false | Read the order state first; never resubmit. `attemptId` names the uncertain submission |
 | `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay |
@@ -247,7 +247,20 @@ account permissions, risk limits, approval (policy or durable), the trading
 switch, and operator halts or a recovery suspension. `intentDigest` is what
 an operator approves with `schwab-admin approve`; `tag` is the order tag the
 submission would carry. The verdict is advisory: every check is repeated on
-submission, and a `duplicate_intent` is only detected there. Nothing is
+submission, and a `duplicate_intent` is only detected there.
+
+When the approval is the only thing missing, `place_order` and
+`replace_order` can hold for it instead of failing and being retried:
+`wait_ms` (at most 60000, half the 120-second ceiling both network
+transports put on a request) polls the durable approval store and submits
+the moment an operator grants that digest. It holds for nothing else, so a
+`risk_denied` or an argument the model must fix comes back at once, and
+the hold happens before anything is audited or dispatched: a call that ends
+unapproved, or a client that gives up, leaves no record and no order. The
+approval is still the operator's, granted through `schwab-admin` or the
+authority against a verified operator subject; no tool the model holds
+approves anything, and waiting is not approving. A submission that waited
+records `approvalWaitedMs` in the audit journal. Nothing is
 audited or approved by checking. Grant `check_order` to any principal that
 holds `place_order` or `replace_order`; without a principal (the local stdio
 transport with trading off) `limits` is null and approval does not apply.
@@ -384,7 +397,8 @@ order as an `OrderSpec` and expand it with `build_order`; run it through
 is carried into the proposal, since no tool the model holds approves it);
 preview it in live mode; present it and wait for the user; and only then,
 where the session can, `place_order` with the checked order and read the
-outcome back. The steps name only tools the session can call: what the
+outcome back, holding with `wait_ms` when an operator is granting the
+approval as the model submits. The steps name only tools the session can call: what the
 principal is granted, less the write tools the operator's switches keep
 off. A session that cannot submit is told why (the trading switch, or
 `place_order` not granted) and ends by handing the proposal, with its

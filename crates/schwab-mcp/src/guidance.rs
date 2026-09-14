@@ -358,7 +358,11 @@ pub fn propose_trade(audience: &Audience<'_>, proposal: &Proposal) -> PromptResu
             format!(
                 "Once the user has confirmed and `check_order` answers `allowed: true`, call \
                  `place_order` with the same account, the same `order` and the `rationale`. \
-                 Then {outcome} and report the outcome. On `duplicate_intent` or \
+                 If `check_order` answered `approval_required` and an operator is granting \
+                 it now, add `wait_ms` to hold the submission for it rather than failing and \
+                 retrying; the order goes the moment the approval lands, and nothing is \
+                 submitted if none does. Then {outcome} and report the outcome. On \
+                 `duplicate_intent` or \
                  `reconciliation_required`, read what the account holds{state} and never \
                  resubmit; on a `retryable` failure, repeat the same call once after a short \
                  wait; on anything else, stop and report."

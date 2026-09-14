@@ -664,3 +664,67 @@ async fn the_trade_journal_records_why_and_what_the_venue_did() {
     .await;
     assert_eq!(other["error"]["code"], "not_permitted", "{other}");
 }
+
+/// A desk that requires approval can hold the submission while the
+/// operator grants it out of band, instead of failing and being retried.
+/// A hold that ends unapproved dispatches nothing and audits nothing.
+#[tokio::test]
+async fn a_submission_can_hold_for_an_approval_that_lands_out_of_band() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut policy = policy();
+    policy.require_approval = true;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy);
+    let intent = json!({
+        "account_hash": ACCOUNT,
+        "order": order("BUY", "1", "11"),
+        "rationale": "Breakout above 10.90 on volume.",
+    });
+    let digest = call(&server, "check_order", intent.clone()).await["intentDigest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Held, but never approved: denied as it would have been immediately,
+    // with nothing audited and nothing on the venue.
+    let mut holding = intent.clone();
+    holding["wait_ms"] = json!(1500);
+    let started = std::time::Instant::now();
+    let unapproved = call(&server, "place_order", holding.clone()).await;
+    assert_eq!(unapproved["error"]["code"], "approval_required");
+    assert_eq!(unapproved["error"]["intentDigest"], digest);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
+    assert!(server.audit.records().await.unwrap().is_empty());
+    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+
+    // The same call holds while an operator approves the digest it was
+    // told, and submits the moment the approval lands.
+    let approving = server.audit.clone();
+    let landing = digest.clone();
+    tokio::spawn(async move {
+        approving
+            .approve(
+                "paper-desk",
+                &landing,
+                "operator",
+                chrono::Utc::now().timestamp() + 60,
+            )
+            .await
+            .unwrap();
+    });
+    holding["wait_ms"] = json!(10_000);
+    let placed = call(&server, "place_order", holding).await;
+    assert_eq!(placed["source"], "paper", "{placed}");
+    assert!(placed["data"]["orderId"].is_string());
+    assert_eq!(broker.orders(ACCOUNT, 0, 10).await.unwrap().len(), 1);
+
+    // The journal records that the trade waited on a human.
+    let records = server.audit.records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0].request["approvalWaitedMs"].as_u64().is_some(),
+        "{}",
+        records[0].request
+    );
+    assert_eq!(records[0].request["intentDigest"], digest);
+}

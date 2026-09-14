@@ -63,7 +63,7 @@ schwab-admin --state <principal-audit> approve desk <digest> --operator supervis
 schwab-admin --state <principal-audit> revoke <digest> --operator supervisor
 ```
 
-Approvals last at most one hour, bind a principal and exact tool arguments, require a distinct operator identity string, and are consumed transactionally with dispatch intent. The local CLI trusts filesystem access and the supplied operator attribution; deployments requiring verified two-person approval must wrap it with enterprise identity and audit controls. Durable revocation tombstones also override approval digests supplied in legacy static policy.
+Approvals last at most one hour, bind a principal and exact tool arguments, require a distinct operator identity string, and are consumed transactionally with dispatch intent. A desk may be holding a submission open while you approve: `place_order` and `replace_order` accept `wait_ms` (at most 60 seconds), which polls this store and submits the moment the digest is granted, so approving promptly completes a trade rather than only unblocking the next retry. Waiting grants nothing — the approval is still yours — and a hold that ends unapproved dispatches nothing. The local CLI trusts filesystem access and the supplied operator attribution; deployments requiring verified two-person approval must wrap it with enterprise identity and audit controls. Durable revocation tombstones also override approval digests supplied in legacy static policy.
 
 ## Risk boundary
 

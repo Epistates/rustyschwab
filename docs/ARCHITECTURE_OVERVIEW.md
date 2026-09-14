@@ -332,6 +332,11 @@ future and stack frame stay small however many tools there are.
   it). `authorize` is the first denial of `review`, which keeps them all.
   `AuthorizedServer` wraps `SchwabMcp` as an `McpHandler`, writes the
   principal's audit journal and hands write tools to a `TradingBackend`.
+  When that single denial is the approval and the submission asked for
+  `wait_ms`, `await_approval` polls the same durable store for up to
+  `MAX_APPROVAL_WAIT_MS` and judges again; it holds for no other denial,
+  grants nothing itself, and runs before `begin_once`, so a hold that ends
+  unapproved or is cancelled leaves no audit record and no order.
 - `preflight.rs` — `check_order`: the same `review`, plus the trading switch
   and `Backend::submission_admission` (operator halt, recovery suspension
   or the paper venue draining), reported together as a `Verdict` without

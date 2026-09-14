@@ -29,6 +29,7 @@ use crate::contract::{self, Source, ToolFailure};
 use crate::guidance;
 use crate::journal;
 use crate::order_status;
+use crate::policy;
 use crate::portfolio;
 use crate::preflight;
 use crate::projection;
@@ -941,7 +942,12 @@ impl SchwabMcp {
     /// `rationale` (at most 2000 characters) is why you are placing this
     /// order, kept in the trade journal for `get_trade_journal` and the
     /// operator's audit; it is never sent to the venue and does not
-    /// change the intent digest.
+    /// change the intent digest. `wait_ms` (at most 60000) holds the call
+    /// for that long when the only thing missing is the operator's
+    /// approval of this intent, instead of failing `approval_required`
+    /// straight away; the order is submitted the moment the approval
+    /// lands, and nothing is submitted if it never does. Like `rationale`
+    /// it does not change the intent digest.
     #[tool(
         read_only = false,
         destructive = true,
@@ -953,10 +959,12 @@ impl SchwabMcp {
         account_hash: String,
         order: OrderRequest,
         rationale: Option<String>,
+        wait_ms: Option<u64>,
     ) -> McpResult<ToolResult> {
         contract::run("place_order", async {
             self.switches.require("place_order")?;
             journal::check_rationale(rationale.as_deref())?;
+            policy::approval_wait(&json!({ "wait_ms": wait_ms }))?;
             let resp = self.backend.place_order(&account_hash, &order).await?;
             Ok(contract::envelope(self.backend.source(), resp))
         })
@@ -997,7 +1005,8 @@ impl SchwabMcp {
     /// Replace a working order with a new order spec (the venue atomically
     /// cancels the old one and places the new one). **Requires**
     /// `SCHWAB_MCP_ALLOW_TRADING=1`. An omitted `tag` defaults to this exact
-    /// intent's digest, and `rationale` is journaled, as for `place_order`.
+    /// intent's digest, and `rationale` and `wait_ms` behave as for
+    /// `place_order`.
     #[tool(
         read_only = false,
         destructive = true,
@@ -1010,10 +1019,12 @@ impl SchwabMcp {
         order_id: String,
         order: OrderRequest,
         rationale: Option<String>,
+        wait_ms: Option<u64>,
     ) -> McpResult<ToolResult> {
         contract::run("replace_order", async {
             self.switches.require("replace_order")?;
             journal::check_rationale(rationale.as_deref())?;
+            policy::approval_wait(&json!({ "wait_ms": wait_ms }))?;
             let resp = self
                 .backend
                 .replace_order(&account_hash, &order_id, &order)

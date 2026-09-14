@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — a submission can hold for the operator's approval
+
+- `place_order` and `replace_order` take `wait_ms` (at most 60000, half the
+  120-second ceiling both network transports put on a request). When the
+  only thing missing is the operator's approval of this intent, the call
+  polls the durable approval store instead of failing `approval_required`,
+  and submits the moment an operator grants that digest. It holds for
+  nothing else: an argument to fix or a risk denial comes back at once.
+- The hold runs before anything is audited or dispatched, so a call that
+  ends unapproved, or a client that gives up, leaves no audit record and no
+  order. A submission that waited records `approvalWaitedMs` in the journal.
+- Waiting is not approving. The approval is still written out of band by
+  `schwab-admin` or by the authority against a verified operator subject,
+  and no tool the model holds grants one.
+- `intent_digest` excludes `wait_ms` as it excludes `rationale`, so the
+  digest `check_order` reports is the one a holding submission carries.
+- The `approval_required` message, the `propose_trade` prompt and the
+  operator's approval runbook say the hold is available.
+
 ### Added — a daily-loss scenario for `schwab-eval`
 
 - `daily_loss` seeds a position, sells it off past the account's

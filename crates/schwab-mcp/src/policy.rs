@@ -13,7 +13,11 @@ use crate::server::Switches;
 use schwab_rs::execution::OrderJournal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use turbomcp::prelude::*;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -147,7 +151,12 @@ impl PrincipalPolicy {
                 review.denials.push(
                     ToolFailure::new(
                         FailureCode::ApprovalRequired,
-                        format!("Order requires operator approval of intent {digest}"),
+                        format!(
+                            "Order requires operator approval of intent {digest}. \
+                             `wait_ms` holds the submission for up to \
+                             {MAX_APPROVAL_WAIT_MS} ms while an operator grants it; \
+                             nothing is submitted if none arrives."
+                        ),
                     )
                     .with_intent(digest),
                 );
@@ -330,10 +339,14 @@ pub fn digest(bytes: &[u8]) -> String {
 /// is digested as written and fails validation later). A `rationale` is
 /// journaled, not digested: an approval binds the order, not the words,
 /// and re-wording an identical order must still be a duplicate intent.
+/// `wait_ms` is not digested either: it says how long the caller will hold
+/// for the operator, not what the operator is approving, so the digest
+/// `check_order` reports is the one a waiting `place_order` submits.
 pub fn intent_digest(name: &str, args: &Value) -> String {
     let mut args = args.clone();
     if let Some(args) = args.as_object_mut() {
         args.remove("rationale");
+        args.remove("wait_ms");
     }
     if let Some(order) = args.get("order")
         && let Ok(order) =
@@ -347,6 +360,30 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
             .unwrap()
             .as_slice(),
     )
+}
+
+/// The longest a submission may hold for an operator's approval.
+///
+/// Half the 120-second ceiling both network transports put on a request,
+/// so the submission the wait was for still has room to reach the venue
+/// and be retried inside the same call.
+pub const MAX_APPROVAL_WAIT_MS: u64 = 60_000;
+
+/// How often a holding submission re-reads the approval store.
+const APPROVAL_POLL: Duration = Duration::from_secs(1);
+
+/// The bounded hold `args` asks for, if any.
+pub(crate) fn approval_wait(args: &Value) -> Result<Option<Duration>, ToolFailure> {
+    match args.get("wait_ms") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(0) => Ok(None),
+            Some(ms) if ms <= MAX_APPROVAL_WAIT_MS => Ok(Some(Duration::from_millis(ms))),
+            _ => Err(ToolFailure::invalid_arguments(format!(
+                "wait_ms is at most {MAX_APPROVAL_WAIT_MS}; call again to keep waiting"
+            ))),
+        },
+    }
 }
 
 /// Prefix of the order tag derived from an intent digest.
@@ -501,8 +538,21 @@ impl AuthorizedServer {
         }
         let submission = matches!(name, "place_order" | "replace_order");
         let digest = intent_digest(name, &args);
+        let wait = approval_wait(&args)?;
         let effective = self.effective_policy(name, &digest).await?;
-        effective.authorize(name, &args)?;
+        let waited = match effective.authorize(name, &args) {
+            Ok(()) => None,
+            Err(failure) => {
+                let waitable =
+                    submission && wait.is_some() && failure.code == FailureCode::ApprovalRequired;
+                if !waitable {
+                    return Err(failure);
+                }
+                let (effective, waited) = self.await_approval(name, &digest, wait.unwrap()).await?;
+                effective.authorize(name, &args)?;
+                Some(waited)
+            }
+        };
         let args = if submission {
             tag_intent(args, &digest)
         } else {
@@ -521,12 +571,15 @@ impl AuthorizedServer {
             } else {
                 self.principal.name.clone()
             };
-            let request = serde_json::json!({
+            let mut request = serde_json::json!({
                 "principal": self.principal.name,
                 "intentDigest": digest,
                 "requestId": ctx.request_id(),
                 "arguments": args,
             });
+            if let Some(ms) = waited {
+                request["approvalWaitedMs"] = ms.into();
+            }
             let id = self
                 .audit
                 .begin_once(&audit_scope, name, request, dedup)
@@ -615,6 +668,34 @@ impl AuthorizedServer {
         .await)
     }
 
+    /// Hold, bounded, for the operator's approval of `digest`, then answer
+    /// with the policy as it stands and how long the hold took.
+    ///
+    /// The approval is still the operator's: this polls the same durable
+    /// store [`effective_policy`](Self::effective_policy) reads, written by
+    /// `schwab-admin` or by the authority against a verified operator
+    /// subject. Nothing here grants anything, so a session cannot approve
+    /// its own intent by waiting for it. The caller has judged that the
+    /// approval is the only thing missing; a denial that appears while
+    /// waiting is caught when the caller judges again.
+    async fn await_approval(
+        &self,
+        name: &str,
+        digest: &str,
+        wait: Duration,
+    ) -> Result<(PrincipalPolicy, u64), ToolFailure> {
+        let started = Instant::now();
+        loop {
+            let remaining = wait.saturating_sub(started.elapsed());
+            let effective = self.effective_policy(name, digest).await?;
+            if remaining.is_zero() || effective.approved_intents.contains(digest) {
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return Ok((effective, ms));
+            }
+            tokio::time::sleep(remaining.min(APPROVAL_POLL)).await;
+        }
+    }
+
     /// `get_server_status` under this principal: the server's status,
     /// scoped to what this principal may see, with the policy it runs
     /// under.
@@ -680,6 +761,93 @@ mod tests {
             intent_digest("place_order", &reasoned),
             intent_digest("place_order", &quoted)
         );
+        // Nor is how long the caller will hold for the operator: the digest
+        // `check_order` reports is the one a waiting submission carries.
+        let mut holding = quoted.clone();
+        holding["wait_ms"] = 30_000.into();
+        assert_eq!(
+            intent_digest("place_order", &holding),
+            intent_digest("place_order", &quoted)
+        );
+    }
+    /// A hold is bounded, opt-in, and only ever for the approval.
+    #[tokio::test]
+    async fn a_submission_holds_for_the_operator_and_for_nothing_else() {
+        let wait = |value: Value| approval_wait(&serde_json::json!({"wait_ms": value}));
+        assert!(approval_wait(&serde_json::json!({})).unwrap().is_none());
+        assert!(wait(Value::Null).unwrap().is_none());
+        assert!(wait(0.into()).unwrap().is_none());
+        assert_eq!(
+            wait(MAX_APPROVAL_WAIT_MS.into()).unwrap(),
+            Some(Duration::from_millis(MAX_APPROVAL_WAIT_MS))
+        );
+        for over in [
+            (MAX_APPROVAL_WAIT_MS + 1).into(),
+            (-1).into(),
+            "soon".into(),
+        ] {
+            assert_eq!(
+                wait(over).unwrap_err().code,
+                FailureCode::InvalidArguments,
+                "wait_ms must be a bounded number of milliseconds"
+            );
+        }
+
+        let server = authorized_as(
+            Switches {
+                trading: true,
+                cancel: true,
+            },
+            policy(),
+        );
+        let ctx = RequestContext::stdio();
+        let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
+        let digest = intent_digest("place_order", &args);
+
+        // An unapproved intent is still denied when the hold runs out, and
+        // the hold is what was asked for, not what the operator takes.
+        let (unapproved, ms) = server
+            .await_approval("place_order", &digest, Duration::from_millis(0))
+            .await
+            .unwrap();
+        assert!(!unapproved.approved_intents.contains(&digest));
+        assert!(ms < 1_000, "{ms}");
+
+        // A denial only the caller can fix never holds, however long it asked.
+        let mut oversized = args.clone();
+        oversized["order"]["orderLegCollection"][0]["quantity"] = "3".into();
+        oversized["wait_ms"] = MAX_APPROVAL_WAIT_MS.into();
+        let started = Instant::now();
+        let denied = server
+            .dispatch("place_order", oversized, &ctx)
+            .await
+            .unwrap_err();
+        assert_eq!(denied.code, FailureCode::RiskDenied);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "held on a denial"
+        );
+        assert!(server.audit.records().await.unwrap().is_empty());
+
+        // An approval that lands while the call holds is picked up.
+        let approving = server.audit.clone();
+        let landing = digest.clone();
+        tokio::spawn(async move {
+            approving
+                .approve(
+                    "desk",
+                    &landing,
+                    "operator",
+                    chrono::Utc::now().timestamp() + 60,
+                )
+                .await
+                .unwrap();
+        });
+        let (approved, _) = server
+            .await_approval("place_order", &digest, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(approved.approved_intents.contains(&digest));
     }
     /// A rationale is judged before anything is audited or consumed, on
     /// every write tool, and a valid one changes nothing else.

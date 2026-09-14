@@ -635,7 +635,11 @@ until an operator clears it, and trips it again while the loss persists. See
   submission would fail (validity, policy limits, approval, trading switch,
   halts) with the intent digest to approve, also without contacting Schwab;
   `preview_order`, `place_order`, `cancel_order`, `replace_order` *(last
-  three gated)*. The write tools and `check_order` accept an optional
+  three gated)*. `place_order` and `replace_order` take `wait_ms` (at most
+  60 s) to hold the submission while an operator grants the approval it is
+  waiting on, instead of failing and being retried; they hold for nothing
+  else, and a hold that ends unapproved dispatches nothing. The write tools
+  and `check_order` accept an optional
   `rationale` (at most 2000 characters): the model's reason, kept in the
   audit journal, never sent to Schwab, and excluded from the intent digest
 - **Transactions** — `get_transactions`, `get_transaction`
