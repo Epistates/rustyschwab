@@ -558,6 +558,13 @@ describing the venue), `/readyz`, and as `source: "paper"` on every read
 and mutation the venue served. Policy, approval, the trading switches and
 the operator halt gate paper orders exactly as they gate live ones.
 
+To score a model against that venue, `schwab-eval serve` is the same
+policy-gated server over a seeded scenario (stale quote, injected
+instruction, wrong account, denied approval, lost acknowledgement, repeated
+submission) that records every tool call, and `schwab-eval score` replays
+the transcript for a JSON report in which unauthorized executions must be
+zero. See [model evaluation](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md#model-evaluation).
+
 Network transports require `SCHWAB_MCP_POLICY_FILE` and a bearer token on
 every request. Principals have explicit account/tool permissions and isolated
 sessions. Remote access also requires a TLS proxy and

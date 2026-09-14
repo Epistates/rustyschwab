@@ -22,7 +22,7 @@
 
 use std::future::Future;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use turbomcp::prelude::*;
 
@@ -40,7 +40,7 @@ pub enum Source {
 }
 
 /// Closed failure vocabulary. Add a variant rather than overloading one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
     /// The arguments are malformed or violate a static rule; change them.

@@ -342,6 +342,14 @@ future and stack frame stay small however many tools there are.
 - `bin/schwab-paper.rs` and `bin/schwab-paper-verify.rs` — deterministic
   replay and transcript verification for the paper engine
   (`paper_replay.rs` is the shared command decoder).
+- `eval.rs` and `bin/schwab-eval.rs` — model evaluation over the paper
+  venue. `Scenario` fixes a seeded venue, a principal policy and a task;
+  `Fixture::open` builds them under a private directory behind an
+  `AuthorizedServer`; `Recording` is the `McpHandler` that appends each
+  call to a JSONL transcript before dispatching it; `score` replays a
+  `Transcript` through a fresh fixture and reduces the contract codes and
+  venue orders to named checks plus the harness invariant
+  (`unauthorized_executions`). No model is embedded.
 
 ## Request flows
 
@@ -407,3 +415,4 @@ harness's own request → decode → diff → record cycle is still covered by a
 | Durable state, migrations, backup | `crates/schwab-rs/src/storage.rs`, `execution.rs` |
 | Metrics or alerts | `crates/schwab-rs/src/metrics.rs`, `crates/schwab-mcp/src/metrics.rs`, `ops/` dashboards and rules |
 | Paper engine behaviour | `crates/schwab-rs/src/paper/`, `docs/PAPER_TRADING.md`, `docs/PAPER_LIMITATIONS.md` |
+| Add a model-evaluation scenario or check | `crates/schwab-mcp/src/eval.rs` (`Scenario`, `Fixture::open`, `checks`), then `tests/eval_harness.rs`; `docs/MCP_LLM_INTEGRATION.md#model-evaluation` |

@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — model evaluation harness
+
+- `schwab-eval` scores a model's tool use against the paper venue without
+  embedding a model. Six scenarios (`stale_data`, `injected_instruction`,
+  `account_confusion`, `denied_approval`, `submission_unknown`,
+  `repeated_submission`) each fix a seeded venue, a principal policy and a
+  verbatim task; `list` prints them, `serve` is the policy-gated stdio
+  server over a scenario that appends every tool call to a JSONL transcript
+  before dispatching it (with a `meta` line recording model, system prompt
+  and config), and `score` replays a transcript through `AuthorizedServer`
+  over a fresh venue and prints a JSON report: each step's result-contract
+  code and venue order id, named checks with details, the venue's orders,
+  whether `check_order` was used, and the prompt's SHA-256. The exit
+  status is non-zero on failure.
+- Every report verifies the harness invariant `unauthorized_executions`,
+  the count of venue orders no authorized, accepted dispatch explains; it
+  must be zero and is reported as a server defect, not a model score.
+- `schwab_mcp::eval` is the library form (`Scenario`, `Fixture`,
+  `Recording`, `Transcript`, `score`); `contract::FailureCode` now
+  implements `Deserialize` so a report can parse the code a model saw.
+  Documented in `docs/MCP_LLM_INTEGRATION.md#model-evaluation`.
+
 ### Added — paper mode for the MCP server
 
 - `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` run `schwab-mcp`

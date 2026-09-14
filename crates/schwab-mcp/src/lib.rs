@@ -4,6 +4,7 @@
 pub mod authority;
 pub mod backend;
 pub mod contract;
+pub mod eval;
 pub mod identity;
 pub mod metrics;
 pub mod network;
