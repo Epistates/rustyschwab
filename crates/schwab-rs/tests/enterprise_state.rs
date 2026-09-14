@@ -1,6 +1,6 @@
 use schwab_rs::{
     coordination::Coordinator,
-    execution::{OrderJournal, SubmissionOutcome},
+    execution::{ExecutionStore, OrderJournal, SubmissionOutcome},
     risk::{PortfolioLimits, PortfolioRisk, RiskProvider},
     storage::StateDatabase,
 };
@@ -160,6 +160,7 @@ async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidenc
         max_open_notional: "100".parse().unwrap(),
         max_position_quantity: "2".parse().unwrap(),
         max_snapshot_age_ms: 5000,
+        max_daily_loss: None,
     };
     let risk = PortfolioRisk {
         database: db,
@@ -170,6 +171,94 @@ async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidenc
     assert!(risk.reserve("A", "second", &order).await.is_err());
     risk.release("first").await.unwrap();
     risk.reserve("A", "second", &order).await.unwrap();
+}
+
+#[tokio::test]
+async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let db = journal.database().clone();
+    let baseline = |start: &str, current: &str| {
+        json!({"securitiesAccount":{
+            "initialBalances":{"liquidationValue":start},
+            "currentBalances":{"availableFunds":"100","liquidationValue":current},
+            "positions":[]}})
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    db.invalidate_account("A", 1).await.unwrap();
+    db.reconcile_snapshot("A", 1, now, baseline("10000", "9990"), vec![])
+        .await
+        .unwrap();
+    let risk = PortfolioRisk {
+        database: db.clone(),
+        accounts: HashMap::from([(
+            "A".into(),
+            PortfolioLimits {
+                max_open_quantity: 2.into(),
+                max_open_notional: 100.into(),
+                max_position_quantity: 2.into(),
+                max_snapshot_age_ms: 5000,
+                max_daily_loss: Some(50.into()),
+            },
+        )]),
+    };
+    let order=serde_json::from_value(json!({"orderStrategyType":"SINGLE","session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"60","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})).unwrap();
+    // Ten down against a cap of fifty: reserved, and nothing to observe.
+    risk.reserve("A", "first", &order).await.unwrap();
+    risk.observe_baseline("A").await.unwrap();
+    assert!(journal.operator_halt().await.unwrap().is_none());
+    // Sixty down: the next reservation trips the halt and fails closed, and
+    // so does the revalidation of the one already held.
+    db.reconcile_snapshot("A", 1, now + 1, baseline("10000", "9940"), vec![])
+        .await
+        .unwrap();
+    let denied = risk.reserve("A", "second", &order).await.unwrap_err();
+    let schwab_rs::Error::Halted(reason) = &denied else {
+        panic!("{denied:?}");
+    };
+    assert!(
+        reason.starts_with("Daily loss 60 exceeds the 50 limit for account A: liquidation value"),
+        "{reason}"
+    );
+    assert_eq!(
+        journal.operator_halt().await.unwrap().as_deref(),
+        Some(reason.as_str())
+    );
+    assert!(matches!(
+        risk.revalidate("A", "first", &order).await,
+        Err(schwab_rs::Error::Halted(_))
+    ));
+    let trips: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.kind == "operator_halt_changed")
+        .collect();
+    assert_eq!(trips.len(), 1);
+    assert_eq!(trips[0].subject, "daily-loss-control");
+    // Clearing the halt does not reset the day: reconciliation trips it again.
+    journal.set_operator_halt(None, "operator").await.unwrap();
+    risk.observe_baseline("A").await.unwrap();
+    assert!(journal.operator_halt().await.unwrap().is_some());
+    // A baseline without liquidation values cannot be measured: observation
+    // leaves the halt alone and the reservation fails closed as stale.
+    journal.set_operator_halt(None, "operator").await.unwrap();
+    db.reconcile_snapshot(
+        "A",
+        1,
+        now + 2,
+        json!({"securitiesAccount":{"currentBalances":{"availableFunds":"100"},"positions":[]}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    risk.observe_baseline("A").await.unwrap();
+    assert!(journal.operator_halt().await.unwrap().is_none());
+    assert!(matches!(
+        risk.reserve("A", "third", &order).await,
+        Err(schwab_rs::Error::BaselineStale { .. })
+    ));
 }
 
 #[tokio::test]
@@ -466,6 +555,7 @@ async fn external_partial_orders_count_toward_risk_and_dispatch_rechecks_freshne
                 max_open_notional: 100.into(),
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
+                max_daily_loss: None,
             },
         )]),
     };
@@ -515,6 +605,7 @@ async fn fenced_risk_revalidation_rejects_released_ownership_and_operator_halt()
                 max_open_notional: 100.into(),
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
+                max_daily_loss: None,
             },
         )]),
     };

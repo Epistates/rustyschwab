@@ -161,7 +161,11 @@ Around the journal:
   file, so several processes on one host share limits and fences.
 - `risk::RiskProvider` — pre-trade checks with durable reservations;
   `PortfolioRisk` enforces per-account open-quantity/notional/position caps
-  from a JSON policy and counts external open orders.
+  from a JSON policy and counts external open orders. Its optional
+  `max_daily_loss` trips the durable operator halt (`execution::trip_halt`)
+  once the reconciled baseline's day loss exceeds it, at the next
+  reservation and, through `observe_baseline`, at each reconciliation; the
+  paper engine applies the same cap to its bid-marked equity at every event.
 - `reconciliation` — matches broker orders and activity to journal intents
   by unique tag, records generation-stamped account snapshots, and treats
   absence as inconclusive (never as rejection).

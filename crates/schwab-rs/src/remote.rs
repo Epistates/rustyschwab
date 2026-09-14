@@ -102,6 +102,9 @@ pub enum BackendRequest {
     ReleaseRisk {
         attempt_id: String,
     },
+    ObserveBaseline {
+        account: String,
+    },
 }
 impl BackendRequest {
     /// Low-level state mutation requires a trusted backend-service identity.
@@ -196,6 +199,9 @@ impl BackendRequest {
             } => serde_json::to_value(risk.revalidate(&account, &attempt_id, &order).await?)?,
             Self::ReleaseRisk { attempt_id } => {
                 serde_json::to_value(risk.release(&attempt_id).await?)?
+            }
+            Self::ObserveBaseline { account } => {
+                serde_json::to_value(risk.observe_baseline(&account).await?)?
             }
         };
         Ok(value)
@@ -511,6 +517,12 @@ impl RiskProvider for RemoteBackend {
     async fn release(&self, attempt_id: &str) -> Result<()> {
         self.call(&BackendRequest::ReleaseRisk {
             attempt_id: attempt_id.to_owned(),
+        })
+        .await
+    }
+    async fn observe_baseline(&self, account: &str) -> Result<()> {
+        self.call(&BackendRequest::ObserveBaseline {
+            account: account.to_owned(),
         })
         .await
     }

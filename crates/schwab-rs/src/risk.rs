@@ -2,7 +2,7 @@
 use crate::{
     coordination::{Lease, lease_held},
     error::{Error, Result},
-    execution::ensure_not_halted,
+    execution::{ensure_not_halted, trip_halt},
     storage::{StateDatabase, sql},
     types::{
         common::AssetType,
@@ -28,11 +28,19 @@ const SELECT_UNRESERVED_BROKER_ORDERS: &str = "SELECT o.payload FROM orders o \
        WHERE r.state='held' AND s.account=o.account \
          AND json_extract(s.outcome,'$.order_id')=o.order_id)";
 const INSERT_HELD_RESERVATION: &str = "INSERT INTO reservations VALUES(?1,?2,?3,?4,'held')";
+/// Audit subject of a halt the daily-loss control trips, live or paper.
+pub const DAILY_LOSS_CONTROL: &str = "daily-loss-control";
 
 #[async_trait]
 pub trait RiskProvider: Send + Sync {
     /// Atomically reserve exposure. Implementations must retain it on unknown outcomes.
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()>;
+    /// The account's baseline was just reconciled. Providers with a
+    /// daily-loss control judge it here, so a breach halts submissions before
+    /// the next order rather than at it; the default observes nothing.
+    async fn observe_baseline(&self, _account: &str) -> Result<()> {
+        Ok(())
+    }
     /// Recheck the held reservation and current risk baseline after all admission
     /// waits, immediately before transmission. Fail closed if unsupported.
     async fn revalidate(
@@ -69,6 +77,12 @@ pub struct PortfolioLimits {
     pub max_position_quantity: Decimal,
     #[serde(default = "max_age")]
     pub max_snapshot_age_ms: i64,
+    /// The most the account may lose in a day before submissions halt:
+    /// Schwab's start-of-day liquidation value less the current one, so
+    /// realized and unrealized alike. Absent, the account has no daily-loss
+    /// control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_daily_loss: Option<Decimal>,
 }
 fn max_age() -> i64 {
     5000
@@ -85,6 +99,38 @@ fn decimal(value: Option<&serde_json::Value>) -> Option<Decimal> {
                 .or_else(|| v.is_number().then(|| v.to_string()))
         })
         .and_then(|v| v.parse().ok())
+}
+/// The account's loss for the day, read from the reconciled `securitiesAccount`:
+/// its start-of-day liquidation value less the current one. `None` when the
+/// venue omitted either value.
+fn daily_loss(account: &serde_json::Value) -> Option<DailyLoss> {
+    let start = decimal(account.pointer("/initialBalances/liquidationValue"))?;
+    let current = decimal(account.pointer("/currentBalances/liquidationValue"))?;
+    Some(DailyLoss {
+        start,
+        current,
+        loss: start.checked_sub(current)?,
+    })
+}
+struct DailyLoss {
+    start: Decimal,
+    current: Decimal,
+    loss: Decimal,
+}
+/// The halt reason the daily-loss control records: `measure` names what was
+/// compared (the venue's liquidation value, or paper equity).
+pub(crate) fn daily_loss_reason(
+    account: &str,
+    measure: &str,
+    start: Decimal,
+    current: Decimal,
+    loss: Decimal,
+    cap: Decimal,
+) -> String {
+    format!(
+        "Daily loss {loss} exceeds the {cap} limit for account {account}: \
+         {measure} {start} at the open, {current} now"
+    )
 }
 impl PortfolioRisk {
     async fn validate_and_reserve(
@@ -105,6 +151,9 @@ impl PortfolioRisk {
             || limits.max_open_notional <= Decimal::ZERO
             || limits.max_position_quantity <= Decimal::ZERO
             || !(1..=60000).contains(&limits.max_snapshot_age_ms)
+            || limits
+                .max_daily_loss
+                .is_some_and(|cap| cap <= Decimal::ZERO)
         {
             return Err(Error::Config("Invalid portfolio risk limits".into()));
         }
@@ -178,6 +227,24 @@ impl PortfolioRisk {
                 }
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
                 let account_value = &snapshot["securitiesAccount"];
+                if let Some(cap) = limits.max_daily_loss {
+                    let day = daily_loss(account_value)
+                        .ok_or_else(|| stale("Liquidation values missing from risk baseline"))?;
+                    if day.loss > cap {
+                        // The halt outlives this denial: commit it, then fail closed.
+                        let reason = daily_loss_reason(
+                            &account,
+                            "liquidation value",
+                            day.start,
+                            day.current,
+                            day.loss,
+                            cap,
+                        );
+                        trip_halt(&tx, &reason, DAILY_LOSS_CONTROL)?;
+                        tx.commit().map_err(sql)?;
+                        return Err(Error::Halted(reason));
+                    }
+                }
                 let funds = decimal(account_value.pointer("/currentBalances/availableFunds"))
                     .ok_or_else(|| stale("Available funds missing from risk baseline"))?;
                 let position = account_value
@@ -299,6 +366,51 @@ impl PortfolioRisk {
 impl RiskProvider for PortfolioRisk {
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()> {
         self.validate_and_reserve(account, attempt_id, order, false, None)
+            .await
+    }
+    /// Trips the halt as soon as a reconciled baseline shows the day's loss
+    /// past the cap. A baseline that cannot be measured is left to the next
+    /// reservation, which fails closed on it.
+    async fn observe_baseline(&self, account: &str) -> Result<()> {
+        let Some(cap) = self
+            .accounts
+            .get(account)
+            .and_then(|limits| limits.max_daily_loss)
+        else {
+            return Ok(());
+        };
+        let account = account.to_owned();
+        self.database
+            .run(move |c| {
+                use rusqlite::OptionalExtension;
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let state: Option<(i64, bool, String)> = tx
+                    .query_row(SELECT_ACCOUNT_BASELINE, [&account], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
+                    .optional()
+                    .map_err(sql)?;
+                let Some((_, true, body)) = state else {
+                    return Ok(());
+                };
+                let snapshot: serde_json::Value = serde_json::from_str(&body)?;
+                if let Some(day) = daily_loss(&snapshot["securitiesAccount"])
+                    && day.loss > cap
+                {
+                    let reason = daily_loss_reason(
+                        &account,
+                        "liquidation value",
+                        day.start,
+                        day.current,
+                        day.loss,
+                        cap,
+                    );
+                    trip_halt(&tx, &reason, DAILY_LOSS_CONTROL)?;
+                }
+                tx.commit().map_err(sql)
+            })
             .await
     }
     async fn revalidate(

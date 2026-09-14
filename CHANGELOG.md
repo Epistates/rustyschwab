@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — daily-loss halt
+
+- `PortfolioLimits.max_daily_loss` (optional, positive) is the daily-loss
+  control for an account, live or paper. Live, the loss is Schwab's
+  start-of-day liquidation value less the current one in the reconciled
+  baseline, so realized and unrealized alike, and it resets with Schwab's
+  day; paper, it is the session's first complete bid mark of equity (cash,
+  pending credits and holdings at fresh bids) less the current one, and it
+  resets with the session. Past the cap, the control records the durable
+  operator halt (audited as `operator_halt_changed` by
+  `daily-loss-control`, the reason carrying the loss, the cap and the
+  values compared) and every submission answers `Halted`: live at the
+  reservation and revalidation of the next order, and proactively at every
+  reconciliation through the new `RiskProvider::observe_baseline` (default
+  no-op; `RemoteBackend` forwards it as `BackendRequest::ObserveBaseline`);
+  paper inside the event that crossed it. Clearing the halt does not reset
+  the day: the control trips again while the loss still exceeds the cap. A
+  live baseline without liquidation values fails reservations closed as
+  `BaselineStale` when a cap is configured.
+- Paper snapshots carry `ledger.session_mark` and `daily_loss`; the
+  recorded transcript `ops/paper/replay-expected.jsonl` is regenerated for
+  the new field. The paper configuration validates the cap like the other
+  limits; it is part of the pinned run. A standing operator halt keeps its
+  own reason when the control trips behind it.
+
 ### Added — trade journal
 
 - `place_order`, `replace_order`, `cancel_order` and `check_order` accept

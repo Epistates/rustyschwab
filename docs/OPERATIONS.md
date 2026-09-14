@@ -72,10 +72,12 @@ The SDK accepts any implementation of `RiskProvider`. The bundled `PortfolioRisk
 Network MCP trading requires `SCHWAB_RISK_POLICY_FILE` and `SCHWAB_RECOVERY_ACCOUNTS`, in addition to principal permissions and `SCHWAB_MCP_ALLOW_TRADING=1`. Example risk file:
 
 ```json
-{"ACCOUNT_HASH":{"max_open_quantity":"10","max_open_notional":"1000","max_position_quantity":"20","max_snapshot_age_ms":5000}}
+{"ACCOUNT_HASH":{"max_open_quantity":"10","max_open_notional":"1000","max_position_quantity":"20","max_snapshot_age_ms":5000,"max_daily_loss":"500"}}
 ```
 
 Limits are conservative account-level caps on held reservations plus externally placed open orders in the broker baseline. Positive local order links prevent double counting; partial external orders use validated remaining quantity. Unsupported or unbounded external orders fail closed under the built-in provider. It is not a complete portfolio margin model, nor can it observe activity beyond its history horizon or make separate REST reads atomic. Risk is revalidated after auth/quota waits, immediately before transmission. External providers must implement dispatch revalidation; fenced gateway dispatch also requires atomic fence/halt validation.
+
+`max_daily_loss` is the optional daily-loss control. The loss is Schwab's start-of-day liquidation value less the current one, both read from the reconciled baseline, so it counts realized and unrealized losses alike and resets with Schwab's trading day. Once it exceeds the cap, the provider records the operator halt (audited as `operator_halt_changed` by `daily-loss-control`, with the figures in the reason) and fails the reservation closed with `Halted`; each reconciliation also judges the baseline, so the halt normally trips within one recovery interval of the breach rather than at the next order. Clearing the halt does not reset the day: the next reconciliation or reservation trips it again while the loss still exceeds the cap. To trade on regardless, raise or remove the cap and restart. A baseline that carries no liquidation values cannot be measured; with a cap configured, reservations then fail closed as `BaselineStale`.
 
 ## Health, alerts and shutdown
 

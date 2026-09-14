@@ -25,12 +25,14 @@ Configure the existing Schwab OAuth environment variables on the authority host 
 ```
 
 ```json
-{"ACCOUNT_HASH":{"max_open_quantity":"10","max_open_notional":"1000","max_position_quantity":"20","max_snapshot_age_ms":5000}}
+{"ACCOUNT_HASH":{"max_open_quantity":"10","max_open_notional":"1000","max_position_quantity":"20","max_snapshot_age_ms":5000,"max_daily_loss":"500"}}
 ```
 
 ```sh
 schwab-authority --identity identity.json --policy authority-policy.json --risk risk.json
 ```
+
+The risk file is the same shape as the local `SCHWAB_RISK_POLICY_FILE` ([operations](OPERATIONS.md#risk-boundary)); the optional `max_daily_loss` trips the authority's durable halt for every worker, and privileged backend workers report each reconciled baseline to it (`observe_baseline`) so the trip does not wait for the next order.
 
 The listener binds loopback, default `127.0.0.1:8766`. Put an HTTPS reverse proxy in the same host/pod for cross-host access. Preserve the Authorization header and restrict infrastructure access to the service. The SDK adapter rejects plaintext remote endpoints, redirects, URL credentials, query strings and fragments. Do not put credentials in URLs. `/livez` and `/readyz` provide aggregate operations probes; trading readiness checks the configured risk accounts and durable operator halt.
 

@@ -2,7 +2,8 @@ use super::model::*;
 use crate::{
     Error, Result,
     coordination::{Lease, lease_held},
-    execution::{OrderJournal, SubmissionOutcome, ensure_not_halted},
+    execution::{OrderJournal, SubmissionOutcome, ensure_not_halted, trip_halt},
+    risk::{DAILY_LOSS_CONTROL, daily_loss_reason},
     storage::{audit, meta, sql},
     types::{
         common::AssetType,
@@ -266,6 +267,93 @@ fn fresh_quote(
 ) -> Result<Option<Quote>> {
     Ok(load_quote(c, symbol)?.filter(|quote| is_fresh(quote, clock, config)))
 }
+/// Conservative marks of the account's holdings: their value at fresh bids
+/// (`None` while any held position lacks one) and their remaining cost basis.
+fn mark_positions(
+    c: &Connection,
+    ledger: &PaperAccount,
+    clock: &Clock,
+    config: &PaperConfig,
+) -> Result<(Option<Decimal>, Decimal)> {
+    let mut market = Some(Decimal::ZERO);
+    let mut basis = Decimal::ZERO;
+    for (symbol, position) in &ledger.positions {
+        basis = add(basis, position.cost_basis)?;
+        if position.quantity.is_zero() {
+            continue;
+        }
+        let quote = fresh_quote(c, symbol, clock, config)?;
+        market = match (market, quote) {
+            (Some(value), Some(q)) => Some(add(value, mul(position.quantity, q.bid)?)?),
+            _ => None,
+        };
+    }
+    Ok((market, basis))
+}
+fn unsettled_cash(ledger: &PaperAccount) -> Result<Decimal> {
+    ledger
+        .pending_cash
+        .iter()
+        .try_fold(Decimal::ZERO, |sum, p| add(sum, p.amount))
+}
+/// Cash, unsettled proceeds and the marked holdings.
+fn equity(ledger: &PaperAccount, market: Option<Decimal>) -> Result<Option<Decimal>> {
+    market
+        .map(|v| add(add(ledger.cash, unsettled_cash(ledger)?)?, v))
+        .transpose()
+}
+/// How far `equity` has fallen from this session's mark; `None` without both.
+fn session_loss(
+    ledger: &PaperAccount,
+    clock: &Clock,
+    equity: Option<Decimal>,
+) -> Result<Option<Decimal>> {
+    ledger
+        .session_mark
+        .as_ref()
+        .filter(|mark| mark.session_id == clock.session_id)
+        .zip(equity)
+        .map(|(mark, equity)| sub(mark.equity, equity))
+        .transpose()
+}
+/// The daily-loss control. Each capped account is marked at every event: the
+/// session's first complete mark is kept, and once equity has fallen further
+/// below it than the cap the halt trips, in this transaction. Clearing the
+/// halt does not reset the day; the next event trips it again until a new
+/// session sets a new mark.
+fn enforce_daily_loss(tx: &Connection, config: &PaperConfig, clock: &Clock) -> Result<()> {
+    for (name, settings) in &config.accounts {
+        let Some(cap) = settings.limits.max_daily_loss else {
+            continue;
+        };
+        let mut ledger = configured_ledger(tx, name)?;
+        let (market, _) = mark_positions(tx, &ledger, clock, config)?;
+        let Some(equity) = equity(&ledger, market)? else {
+            continue;
+        };
+        match ledger
+            .session_mark
+            .as_ref()
+            .filter(|mark| mark.session_id == clock.session_id)
+        {
+            Some(mark) => {
+                let loss = sub(mark.equity, equity)?;
+                if loss > cap {
+                    let reason = daily_loss_reason(name, "equity", mark.equity, equity, loss, cap);
+                    trip_halt(tx, &reason, DAILY_LOSS_CONTROL)?;
+                }
+            }
+            None => {
+                ledger.session_mark = Some(SessionMark {
+                    session_id: clock.session_id.clone(),
+                    equity,
+                });
+                save_ledger(tx, name, &ledger)?;
+            }
+        }
+    }
+    Ok(())
+}
 fn symbol_valid(symbol: &str) -> bool {
     !symbol.is_empty()
         && symbol.len() <= 32
@@ -310,6 +398,10 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
             || !(1..=60000).contains(&account.limits.max_snapshot_age_ms)
             || !positive_bounded(account.limits.max_open_notional)
             || !positive_bounded(account.limits.max_position_quantity)
+            || account
+                .limits
+                .max_daily_loss
+                .is_some_and(|cap| !positive_bounded(cap))
         {
             return Err(Error::Config(
                 "Paper account names must start paper- and limits must be positive and bounded"
@@ -954,25 +1046,10 @@ impl PaperBroker {
                 let reserved_cash = working_orders
                     .iter()
                     .try_fold(Decimal::ZERO, |sum, o| add(sum, o.reserved_cash))?;
-                let mut market = Some(Decimal::ZERO);
-                let mut basis = Decimal::ZERO;
-                for (symbol, position) in &ledger.positions {
-                    basis = add(basis, position.cost_basis)?;
-                    if position.quantity.is_zero() {
-                        continue;
-                    }
-                    let quote = fresh_quote(&tx, symbol, &clock, &config)?;
-                    market = match (market, quote) {
-                        (Some(value), Some(q)) => Some(add(value, mul(position.quantity, q.bid)?)?),
-                        _ => None,
-                    };
-                }
-                let unsettled_cash = ledger
-                    .pending_cash
-                    .iter()
-                    .try_fold(Decimal::ZERO, |sum, p| add(sum, p.amount))?;
+                let (market, basis) = mark_positions(&tx, &ledger, &clock, &config)?;
+                let equity = equity(&ledger, market)?;
                 let snapshot = PaperSnapshot {
-                    unsettled_cash,
+                    unsettled_cash: unsettled_cash(&ledger)?,
                     clock: config.clock,
                     mode: "paper".into(),
                     model_version: MODEL_VERSION.into(),
@@ -981,10 +1058,9 @@ impl PaperBroker {
                     event_sequence: clock.sequence,
                     reserved_cash,
                     available_cash: sub(ledger.cash, reserved_cash)?,
-                    equity: market
-                        .map(|v| add(add(ledger.cash, unsettled_cash)?, v))
-                        .transpose()?,
+                    equity,
                     unrealized_pnl: market.map(|v| sub(v, basis)).transpose()?,
+                    daily_loss: session_loss(&ledger, &clock, equity)?,
                     ledger,
                     working_orders,
                 };
@@ -1380,6 +1456,7 @@ fn apply_event(
             fills.push(fill);
         }
     }
+    enforce_daily_loss(&tx, config, &clock)?;
     put(&tx, "paper_clock", &clock)?;
     let result = PaperEventResult {
         mode: "paper".into(),
@@ -1509,6 +1586,7 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
                 fees: Decimal::ZERO,
                 positions: BTreeMap::new(),
                 pending_cash: Vec::new(),
+                session_mark: None,
             };
             tx.execute(
                 "INSERT INTO paper_accounts VALUES(?1,?2)",

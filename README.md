@@ -580,6 +580,12 @@ and principal policy approval. Cancellation can be enabled independently with
 `SCHWAB_MCP_ALLOW_CANCEL=1`. All policy-bound tools, including preview,
 require an explicit tool permission.
 
+An account's risk limits (`SCHWAB_RISK_POLICY_FILE`, or the paper
+configuration) may set `max_daily_loss`: once the day's loss exceeds it, the
+venue trips the durable operator halt and every submission answers `halted`
+until an operator clears it, and trips it again while the loss persists. See
+[the risk boundary](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md#risk-boundary).
+
 ### Tool surface
 
 - **Market data** — `get_quotes`, `get_quote`, `get_price_history`,

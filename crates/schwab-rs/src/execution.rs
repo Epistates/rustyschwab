@@ -69,6 +69,36 @@ pub(crate) fn ensure_not_halted(c: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Records the halt (`Some`) or clears it (`None`) inside `tx` and audits the
+/// change under `operator`: the person who asked for it, or the automatic
+/// control that tripped it.
+pub(crate) fn record_operator_halt(
+    tx: &rusqlite::Connection,
+    reason: Option<&str>,
+    operator: &str,
+) -> Result<()> {
+    match reason {
+        Some(reason) => meta::put(tx, OPERATOR_HALT_KEY, reason)?,
+        None => meta::delete(tx, OPERATOR_HALT_KEY)?,
+    }
+    audit(
+        tx,
+        "operator_halt_changed",
+        operator,
+        &serde_json::json!({"reason":reason}),
+    )
+}
+
+/// Trips the halt for an automatic control unless one is already recorded,
+/// so a standing operator halt keeps its reason; either way the caller must
+/// fail closed with `reason`.
+pub(crate) fn trip_halt(tx: &rusqlite::Connection, reason: &str, control: &str) -> Result<()> {
+    if meta::exists(tx, OPERATOR_HALT_KEY)? {
+        return Ok(());
+    }
+    record_operator_halt(tx, Some(reason), control)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmissionRecord {
     pub attempt_id: String,
@@ -535,16 +565,7 @@ impl ExecutionStore for OrderJournal {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                match &reason {
-                    Some(reason) => meta::put(&tx, OPERATOR_HALT_KEY, reason)?,
-                    None => meta::delete(&tx, OPERATOR_HALT_KEY)?,
-                }
-                audit(
-                    &tx,
-                    "operator_halt_changed",
-                    &operator,
-                    &serde_json::json!({"reason":reason}),
-                )?;
+                record_operator_halt(&tx, reason.as_deref(), &operator)?;
                 tx.commit().map_err(sql)
             })
             .await

@@ -60,7 +60,7 @@ A failure is a tool result with `isError: true` whose text and
 | `invalid_arguments`, `not_found`, `risk_denied`, `response_too_large` | `fix_arguments` | false | Change the request; a smaller or bounded order may pass a risk denial |
 | `not_permitted` | `not_permitted` | false | Policy or the server's trading switch forbids the call; do not retry |
 | `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest` |
-| `halted`, `internal` | `ask_operator` | false | Operator halt, or a fault logged under the reference id in `message` |
+| `halted`, `internal` | `ask_operator` | false | Operator or daily-loss halt (`get_server_status` carries the reason), or a fault logged under the reference id in `message` |
 | `duplicate_intent`, `reconciliation_required` | `reconcile` | false | Read the order state first; never resubmit. `attemptId` names the uncertain submission |
 | `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay |
 
@@ -328,7 +328,12 @@ the session runs as (null on the local stdio transport, where none applies).
 `trading.admissible` means a submission would pass the trading switch,
 operator halt and recovery suspension right now; validity, limits, approval
 and duplicates are still judged per order by `check_order` and on
-submission. `readiness` is the body of the `/readyz` probe, evaluated for
+submission. `trading.operatorHalt` is the halt's reason: an operator's
+words, or, when the venue's daily-loss control tripped it (the optional
+`max_daily_loss` in the account's risk limits, live or paper), the loss, the
+cap and the values compared. A model that meets `halted` should read it,
+stop submitting, and tell the operator; clearing the halt does not reset the
+day, so the control trips again while the loss still exceeds the cap. `readiness` is the body of the `/readyz` probe, evaluated for
 the accounts in `SCHWAB_RECOVERY_ACCOUNTS` (the venue's accounts in paper
 mode). `requestBudget` is this process's own quota (null when rate limiting
 is disabled or there is no Schwab client). `equitySession` is Schwab's

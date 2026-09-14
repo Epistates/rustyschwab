@@ -109,8 +109,12 @@ fn order(side: &str, quantity: &str, price: &str) -> Value {
 /// windows of the read tools cover what the test places; its session is
 /// open and `ABC` has a fresh quote.
 async fn venue(dir: &Path) -> (Arc<PaperBroker>, i64) {
+    venue_with(dir, config()).await
+}
+
+async fn venue_with(dir: &Path, config: PaperConfig) -> (Arc<PaperBroker>, i64) {
     let now = chrono::Utc::now().timestamp_millis();
-    let broker = PaperBroker::open(dir.join("state/paper.sqlite3"), config())
+    let broker = PaperBroker::open(dir.join("state/paper.sqlite3"), config)
         .await
         .unwrap();
     broker
@@ -408,6 +412,56 @@ async fn the_operator_halt_and_the_write_switches_gate_paper_orders() {
     let placed = call(&server, "place_order", intent).await;
     assert_eq!(placed["source"], "paper", "{placed}");
     assert!(placed["data"]["orderId"].is_string());
+}
+
+/// The venue's daily-loss control halts the desk the moment its marked
+/// equity has fallen past the cap, and the status says why.
+#[tokio::test]
+async fn the_daily_loss_control_halts_paper_orders_and_the_status_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config
+        .accounts
+        .get_mut(ACCOUNT)
+        .unwrap()
+        .limits
+        .max_daily_loss = Some(d("5"));
+    let (broker, now) = venue_with(dir.path(), config).await;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy());
+    let placed = call(
+        &server,
+        "place_order",
+        json!({"account_hash": ACCOUNT, "order": order("BUY", "10", "11")}),
+    )
+    .await;
+    assert_eq!(placed["source"], "paper", "{placed}");
+    // Filled at 10.01 plus fees and marked at the 10 bid: 0.20 down, admissible.
+    broker
+        .apply(quote(3, now + 100, "10", "10.01", "10"))
+        .await
+        .unwrap();
+    let status = call(&server, "get_server_status", json!({})).await;
+    assert_eq!(status["trading"]["operatorHalt"], Value::Null);
+    assert_eq!(status["trading"]["admissible"], true);
+    // The bid falls to 9.40: 6.20 down, past the cap.
+    broker
+        .apply(quote(4, now + 200, "9.40", "9.41", "10"))
+        .await
+        .unwrap();
+    let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
+    let halted = call(&server, "place_order", intent.clone()).await;
+    assert_eq!(halted["error"]["code"], "halted", "{halted}");
+    let verdict = call(&server, "check_order", intent).await;
+    assert_eq!(verdict["allowed"], false);
+    assert_eq!(verdict["reasons"][0]["code"], "halted", "{verdict}");
+    let status = call(&server, "get_server_status", json!({})).await;
+    let reason = status["trading"]["operatorHalt"].as_str().unwrap();
+    assert!(
+        reason.starts_with("Daily loss 6.20 exceeds the 5 limit for account paper-test: equity"),
+        "{reason}"
+    );
+    assert_eq!(status["trading"]["admissible"], false);
+    assert_eq!(status["readiness"]["tradingReady"], false);
 }
 
 /// The journal keeps every dispatch this principal made for the account,

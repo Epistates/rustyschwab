@@ -455,6 +455,7 @@ impl SchwabClient {
                 for id in &report.terminal_attempts {
                     risk.release(id).await?;
                 }
+                risk.observe_baseline(account).await?;
             }
             Ok(report)
         };

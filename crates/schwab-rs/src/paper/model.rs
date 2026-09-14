@@ -170,6 +170,18 @@ pub struct PaperAccount {
     pub positions: BTreeMap<String, PaperPosition>,
     #[serde(default)]
     pub pending_cash: Vec<PendingCash>,
+    /// Where the daily-loss control measures the session from; absent until
+    /// the account's holdings could first be marked in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_mark: Option<SessionMark>,
+}
+
+/// The account's equity at the first event of a session at which every held
+/// position had a fresh quote.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMark {
+    pub session_id: String,
+    pub equity: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +222,9 @@ pub struct PaperSnapshot {
     /// Conservative bid marking; absent if any position lacks a fresh quote.
     pub equity: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
+    /// The session mark less `equity`, the figure the daily-loss control
+    /// judges against `max_daily_loss`; absent while either is.
+    pub daily_loss: Option<Decimal>,
     pub working_orders: Vec<PaperOrder>,
 }
 

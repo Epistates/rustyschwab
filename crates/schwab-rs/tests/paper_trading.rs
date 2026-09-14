@@ -888,6 +888,96 @@ async fn settlement_proceeds_are_unavailable_until_explicit_calendar_time() {
         .unwrap();
 }
 #[tokio::test]
+async fn daily_loss_past_the_cap_trips_the_halt_until_a_new_session() {
+    let mut cfg = config();
+    cfg.accounts
+        .get_mut("paper-test")
+        .unwrap()
+        .limits
+        .max_daily_loss = Some(d("5"));
+    let (_dir, b) = configured_setup(cfg).await;
+    // Nothing held at the session open, so the open itself is the mark.
+    let start = b.snapshot("paper-test").await.unwrap();
+    assert_eq!(
+        start.ledger.session_mark,
+        Some(SessionMark {
+            session_id: "session-1".into(),
+            equity: d("1000"),
+        })
+    );
+    assert_eq!(start.daily_loss, Some(Decimal::ZERO));
+    // Ten shares at 10.01 plus fees, marked at the 10 bid: 0.20 down.
+    b.place_order("paper-test", &order("buy", "BUY", "10", "11"))
+        .await
+        .unwrap();
+    b.apply(quote(3, 200, "10", "10.01", "10")).await.unwrap();
+    assert_eq!(
+        b.snapshot("paper-test").await.unwrap().daily_loss,
+        Some(d("0.20"))
+    );
+    assert!(b.operator_halt().await.unwrap().is_none());
+    // The bid falls to 9.40: 6.20 down, past the 5 cap.
+    b.apply(quote(4, 300, "9.40", "9.41", "10")).await.unwrap();
+    let reason = b.operator_halt().await.unwrap().expect("halt tripped");
+    assert!(
+        reason.starts_with("Daily loss 6.20 exceeds the 5 limit for account paper-test"),
+        "{reason}"
+    );
+    assert!(matches!(
+        b.place_order("paper-test", &order("more", "BUY", "1", "11"))
+            .await,
+        Err(Error::Halted(_))
+    ));
+    let audit = b.order_journal().audit_page(0, 100).await.unwrap();
+    let trips: Vec<_> = audit
+        .iter()
+        .filter(|entry| entry.kind == "operator_halt_changed")
+        .collect();
+    assert_eq!(trips.len(), 1);
+    assert_eq!(trips[0].subject, "daily-loss-control");
+    assert_eq!(trips[0].payload["reason"], reason);
+    // Clearing the halt does not reset the day: the next event trips it again,
+    // and a standing operator halt keeps its own reason.
+    b.clear_operator_halt("operator").await.unwrap();
+    b.apply(quote(5, 400, "9.40", "9.41", "10")).await.unwrap();
+    assert_eq!(b.operator_halt().await.unwrap().as_deref(), Some(&*reason));
+    b.clear_operator_halt("operator").await.unwrap();
+    b.halt_submissions("desk review", "operator").await.unwrap();
+    b.apply(quote(6, 500, "9.40", "9.41", "10")).await.unwrap();
+    assert_eq!(
+        b.operator_halt().await.unwrap().as_deref(),
+        Some("desk review")
+    );
+    // A new session marks afresh at its first complete mark; the halt stays
+    // until an operator clears it.
+    b.apply(PaperEvent {
+        sequence: 7,
+        at_ms: 600,
+        kind: PaperEventKind::Session {
+            session_id: "session-2".into(),
+            open: true,
+        },
+    })
+    .await
+    .unwrap();
+    assert_eq!(b.snapshot("paper-test").await.unwrap().daily_loss, None);
+    b.apply(quote(8, 700, "9.40", "9.41", "10")).await.unwrap();
+    let next = b.snapshot("paper-test").await.unwrap();
+    assert_eq!(
+        next.ledger.session_mark,
+        Some(SessionMark {
+            session_id: "session-2".into(),
+            equity: d("993.80"),
+        })
+    );
+    assert_eq!(next.daily_loss, Some(Decimal::ZERO));
+    assert!(b.operator_halt().await.unwrap().is_some());
+    b.clear_operator_halt("operator").await.unwrap();
+    b.place_order("paper-test", &order("again", "BUY", "1", "11"))
+        .await
+        .unwrap();
+}
+#[tokio::test]
 async fn dividend_entitlement_survives_sale_and_pays_exactly_once() {
     let (_dir, b) = setup().await;
     b.place_order("paper-test", &order("buy", "BUY", "2", "11"))

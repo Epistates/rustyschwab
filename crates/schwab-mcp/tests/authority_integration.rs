@@ -112,6 +112,7 @@ async fn setup() -> Setup {
                 max_open_notional: 100.into(),
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
+                max_daily_loss: None,
             },
         )]),
     });
