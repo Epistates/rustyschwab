@@ -1,6 +1,9 @@
 //! Unit tests for configuration module
 //!
 //! Tests domain validation, URL parsing, config loading from env/file
+// `std::env::set_var` is `unsafe` in edition 2024; every call here holds
+// ENV_MUTEX, so no two tests touch the environment at once.
+#![allow(unsafe_code)]
 
 use once_cell::sync::Lazy;
 use schwab_rs::config::SchwabConfig;

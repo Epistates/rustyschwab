@@ -29,6 +29,7 @@ pub mod retry;
 pub mod risk;
 pub mod security;
 #[cfg(windows)]
+#[allow(unsafe_code)] // Win32 security FFI; each call carries a SAFETY note.
 mod security_windows;
 pub mod storage;
 pub mod streaming;

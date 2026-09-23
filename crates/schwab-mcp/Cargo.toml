@@ -9,6 +9,9 @@ repository = { workspace = true }
 homepage = { workspace = true }
 description = "MCP server exposing the Schwab Trading + Market Data SDK as tools"
 
+[lints]
+workspace = true
+
 [lib]
 name = "schwab_mcp"
 path = "src/lib.rs"

@@ -23,11 +23,13 @@ use tracing::debug;
 /// - Status codes that are retryable (500, 502, 503, etc.)
 ///
 /// # Example
-/// ```ignore
-/// use schwab_rs::retry::RetryPolicy;
+/// ```no_run
+/// use schwab_rs::Error;
 /// use schwab_rs::config::RetryConfig;
+/// use schwab_rs::retry::RetryPolicy;
 /// use std::time::Duration;
 ///
+/// # async fn run() {
 /// let config = RetryConfig {
 ///     max_retries: 3,
 ///     initial_backoff: Duration::from_secs(1),
@@ -37,10 +39,14 @@ use tracing::debug;
 /// };
 ///
 /// let policy = RetryPolicy::new(&config);
-/// let result = policy.execute(|| async {
-///     // Operation that might fail
-///     Ok::<_, Error>(42)
-/// }).await;
+/// let result = policy
+///     .execute(|| async {
+///         // Operation that might fail
+///         Ok::<_, Error>(42)
+///     })
+///     .await;
+/// # let _ = result;
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct RetryPolicy {

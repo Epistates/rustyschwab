@@ -42,26 +42,29 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use schwab_rs::Result;
+//! ```no_run
+//! use schwab_rs::{Error, Result};
+//! use std::{future::Future, time::Duration};
 //!
-//! async fn call_api() -> Result<String> {
-//!     match make_request().await {
-//!         Ok(result) => Ok(result),
-//!         Err(e) => match e {
-//!             // Rate limit: wait and retry
-//!             Error::RateLimit { retry_after } => {
-//!                 tokio::time::sleep(Duration::from_secs(retry_after)).await;
-//!                 make_request().await
-//!             }
-//!             // Configuration error: fix config and retry
-//!             Error::Config(msg) => {
-//!                 eprintln!("Config error: {}", msg);
-//!                 Err(e)
-//!             }
-//!             // Other errors: propagate
-//!             _ => Err(e),
+//! /// Honour one server-directed wait, then give up.
+//! async fn with_rate_limit_retry<T, F, Fut>(mut call: F) -> Result<T>
+//! where
+//!     F: FnMut() -> Fut,
+//!     Fut: Future<Output = Result<T>>,
+//! {
+//!     match call().await {
+//!         // Rate limit: wait as told and try once more
+//!         Err(Error::RateLimit { retry_after }) => {
+//!             tokio::time::sleep(Duration::from_secs(retry_after)).await;
+//!             call().await
 //!         }
+//!         // Configuration errors are the caller's to fix
+//!         Err(Error::Config(msg)) => {
+//!             eprintln!("Config error: {msg}");
+//!             Err(Error::Config(msg))
+//!         }
+//!         // Everything else propagates
+//!         other => other,
 //!     }
 //! }
 //! ```

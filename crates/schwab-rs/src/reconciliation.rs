@@ -54,6 +54,7 @@ pub struct AccountState {
     pub snapshot: Value,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReconciliationReport {
     pub account: String,
     pub generation: u64,

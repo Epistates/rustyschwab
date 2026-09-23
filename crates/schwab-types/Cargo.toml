@@ -10,6 +10,9 @@ homepage = { workspace = true }
 documentation = "https://docs.rs/schwab-types"
 description = "Type definitions for Schwab Trading and Market Data APIs"
 
+[lints]
+workspace = true
+
 [dependencies]
 rust_decimal = { version = "1.43", features = ["serde"] }
 serde = { workspace = true }

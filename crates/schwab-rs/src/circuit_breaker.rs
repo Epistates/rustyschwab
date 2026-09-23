@@ -28,17 +28,24 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use schwab_rs::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+//! ```no_run
+//! use schwab_rs::Error;
+//! use schwab_rs::circuit_breaker::CircuitBreaker;
+//! use schwab_rs::config::CircuitBreakerConfig;
 //!
+//! # async fn run() {
 //! let config = CircuitBreakerConfig::default();
 //! let breaker = CircuitBreaker::new(config);
 //!
 //! // Execute with circuit breaker protection
-//! let result = breaker.call(|| async {
-//!     // Your fallible operation here
-//!     Ok::<_, Error>(response)
-//! }).await;
+//! let result = breaker
+//!     .call(|| async {
+//!         // Your fallible operation here
+//!         Ok::<_, Error>(42)
+//!     })
+//!     .await;
+//! # let _ = result;
+//! # }
 //! ```
 
 use crate::config::CircuitBreakerConfig;
@@ -51,6 +58,7 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum CircuitState {
     Closed,
     Open,
@@ -208,8 +216,6 @@ impl CircuitBreaker {
     }
 }
 
-/// Emit the transition counter + state gauge. Split out so the
-/// transition_to_* methods don't each duplicate the metric glue.
 /// The service answered: a success, or a permanent client error. A 429 is
 /// an answer too: the broker is up and pacing this credential, which the
 /// request budget and `Retry-After` handle, and tripping the one shared
@@ -231,6 +237,8 @@ fn unhealthy<T>(result: &Result<T>) -> bool {
         .is_some_and(|e| e.is_retryable() && !matches!(e, Error::RateLimit { .. }))
 }
 
+/// Emit the transition counter + state gauge. Split out so the
+/// transition_to_* methods don't each duplicate the metric glue.
 fn record_transition(from: CircuitState, to: CircuitState) {
     metrics::counter!(
         crate::metrics::CIRCUIT_TRANSITIONS_TOTAL,

@@ -13,6 +13,9 @@ keywords = { workspace = true }
 categories = { workspace = true }
 description = "Production-grade Rust SDK for Charles Schwab Trading and Market Data APIs"
 
+[lints]
+workspace = true
+
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 rust_decimal = { version = "1.43", features = ["serde"] }

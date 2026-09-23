@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 /// endpoint and of the MCP `get_server_status` tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Readiness {
     pub reads_ready: bool,
     pub trading_ready: bool,

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — code quality and release evidence
+
+- Workspace lint policy (`[workspace.lints]`): `unsafe_code` is denied
+  outside the Windows file-security FFI module; `dbg!`, `todo!` and
+  `unimplemented!` are denied; the 2018 idiom lints warn.
+- `Readiness`, `RecoveryStatus`, `ReconciliationReport`,
+  `RequestBudgetUsage` and `CircuitState` are `#[non_exhaustive]`. Input
+  configuration structs stay constructible with `..Default::default()`.
+- Every SDK doc example compiles (none are `ignore`); two were wrong
+  (a missing function, a config imported from the wrong module).
+- Property tests cover OSI symbol round trips and canonical parsing,
+  `OrderSpec` → request → JSON round trips, unknown enum values on orders
+  and transactions, and stream field naming.
+- Account and market-data response types derive `PartialEq`.
+  `SELL_SHORT_EXEMPT` closes with `BUY_TO_COVER` (brackets accept it).
+- The SBOM covers what `schwab-mcp` ships (normal and build dependencies,
+  not dev-only crates or examples) and names it as the subject. Release
+  binaries are built with `cargo auditable` and checked with
+  `cargo audit bin`. `SECURITY.md` states the reporting policy.
+
 ### Security — secrets at rest and in memory
 
 - Every token store serialized the token set into plain `String`s and

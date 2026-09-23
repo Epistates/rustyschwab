@@ -14,7 +14,9 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 /// The complete header value ready to use with `Authorization` header
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use schwab_rs::auth::create_bearer_header;
+///
 /// let header = create_bearer_header("my_token");
 /// assert_eq!(header, "Bearer my_token");
 /// ```
@@ -35,7 +37,9 @@ pub fn create_bearer_header(access_token: &str) -> String {
 /// The complete header value ready to use with `Authorization` header
 ///
 /// # Example
-/// ```ignore
+/// ```
+/// use schwab_rs::auth::create_basic_header;
+///
 /// let header = create_basic_header("my_app_key", "my_secret");
 /// assert_eq!(header, "Basic bXlfYXBwX2tleTpteV9zZWNyZXQ=");
 /// ```

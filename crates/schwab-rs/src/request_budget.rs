@@ -28,6 +28,7 @@ type Limiter = RateLimiter<
 /// first when other processes use the same credential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct RequestBudgetUsage {
     pub per_minute: usize,
     pub used_last_minute: usize,

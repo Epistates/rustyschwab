@@ -186,13 +186,13 @@ impl From<&OptionSymbol> for String {
 
 impl OrderInstruction {
     /// The instruction that flattens a position this one opens: `BUY` →
-    /// `SELL`, `SELL_SHORT` → `BUY_TO_COVER`, `BUY_TO_OPEN` →
-    /// `SELL_TO_CLOSE`, `SELL_TO_OPEN` → `BUY_TO_CLOSE`. Closing
-    /// instructions and `EXCHANGE` have no counterpart.
+    /// `SELL`, `SELL_SHORT` and `SELL_SHORT_EXEMPT` → `BUY_TO_COVER`,
+    /// `BUY_TO_OPEN` → `SELL_TO_CLOSE`, `SELL_TO_OPEN` → `BUY_TO_CLOSE`.
+    /// Closing instructions and `EXCHANGE` have no counterpart.
     pub fn closing(self) -> Option<Self> {
         match self {
             Self::Buy => Some(Self::Sell),
-            Self::SellShort => Some(Self::BuyToCover),
+            Self::SellShort | Self::SellShortExempt => Some(Self::BuyToCover),
             Self::BuyToOpen => Some(Self::SellToClose),
             Self::SellToOpen => Some(Self::BuyToClose),
             Self::Sell
@@ -200,7 +200,6 @@ impl OrderInstruction {
             | Self::BuyToClose
             | Self::SellToClose
             | Self::Exchange
-            | Self::SellShortExempt
             | Self::Unknown => None,
         }
     }
@@ -211,7 +210,7 @@ impl OrderInstruction {
     pub fn opens_long(self) -> Option<bool> {
         match self {
             Self::Buy | Self::BuyToOpen => Some(true),
-            Self::SellShort | Self::SellToOpen => Some(false),
+            Self::SellShort | Self::SellShortExempt | Self::SellToOpen => Some(false),
             _ => None,
         }
     }
@@ -787,14 +786,9 @@ mod tests {
         assert_eq!(SellShort.closing(), Some(BuyToCover));
         assert_eq!(BuyToOpen.closing(), Some(SellToClose));
         assert_eq!(SellToOpen.closing(), Some(BuyToClose));
-        for closing in [
-            Sell,
-            BuyToCover,
-            BuyToClose,
-            SellToClose,
-            Exchange,
-            SellShortExempt,
-        ] {
+        assert_eq!(SellShortExempt.closing(), Some(BuyToCover));
+        assert_eq!(SellShortExempt.opens_long(), Some(false));
+        for closing in [Sell, BuyToCover, BuyToClose, SellToClose, Exchange] {
             assert_eq!(closing.closing(), None);
         }
     }

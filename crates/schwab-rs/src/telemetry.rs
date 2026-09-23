@@ -9,7 +9,7 @@
 //!
 //! # Basic Usage
 //!
-//! ```ignore
+//! ```no_run
 //! use schwab_rs::telemetry;
 //!
 //! // Initialize with default settings (respects RUST_LOG env var)
@@ -44,7 +44,7 @@ static INIT: Once = Once::new();
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// schwab_rs::telemetry::init_tracing();
 /// ```
 pub fn init_tracing() {
@@ -73,7 +73,7 @@ pub fn init_tracing() {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// schwab_rs::telemetry::init_tracing_with_level("debug");
 /// ```
 pub fn init_tracing_with_level(default_level: &str) {
@@ -98,7 +98,7 @@ pub fn init_tracing_with_level(default_level: &str) {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// schwab_rs::telemetry::init_tracing_json();
 /// ```
 pub fn init_tracing_json() {

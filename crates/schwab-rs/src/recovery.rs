@@ -9,6 +9,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 pub const FULL_RESCAN_EVERY: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RecoveryStatus {
     pub generation: u64,
     pub ready: bool,

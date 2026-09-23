@@ -26,7 +26,7 @@ Three published crates plus example packages, all on the workspace version
                  │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
                  │ projection.rs  portfolio.rs  order_status.rs  journal.rs             │
                  │ guidance.rs (1 resource, 1 prompt)  authority.rs (gateway)           │
-                 │ bins: admin/authority/remote/paper/paper-verify                      │
+                 │ bins: admin/authority/remote/paper/paper-verify/eval                 │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend / PaperBroker
 ┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐

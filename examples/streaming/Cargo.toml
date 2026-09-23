@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 schwab-rs = { path = "../../crates/schwab-rs", features = ["full"] }
 tokio = { workspace = true }

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
+
+[lints]
+workspace = true
+
 [dependencies]
 schwab-rs = { path = "../../crates/schwab-rs" }
 serde_json.workspace = true

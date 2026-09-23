@@ -262,7 +262,7 @@ export SCHWAB_APP_SECRET="your_app_secret"
 
 ### Vulnerability Reporting
 
-If you discover a security vulnerability, please email `security@epistates.com` or open a confidential GitHub Security Advisory. Do not open public issues for security vulnerabilities.
+See [SECURITY.md](SECURITY.md): email `security@epistates.com` or open a private GitHub security advisory. Do not open public issues for security vulnerabilities.
 
 ### Security Dependencies
 

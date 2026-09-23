@@ -121,6 +121,17 @@ turbomcp = { version = "3.3", default-features = false }
 # JSON-Schema for MCP tool parameter schemas (must match turbomcp's schemars version)
 schemars = { version = "1.0", features = ["chrono04"] }
 
+# Shared lint policy; each crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+# The one FFI module (Windows file security) allows it locally.
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [profile.release]
 opt-level = 3
 lto = true
