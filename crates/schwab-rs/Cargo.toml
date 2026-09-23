@@ -17,7 +17,6 @@ description = "Production-grade Rust SDK for Charles Schwab Trading and Market D
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 schwab-types = { path = "../schwab-types", version = "0.2.0" }
-schemars = { workspace = true, optional = true }
 
 # Random number generation (for jitter in backoff)
 rand = { workspace = true }
@@ -67,7 +66,8 @@ uuid = { workspace = true }
 
 # Security
 ring = { workspace = true }
-rustls = { workspace = true }
+rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true }
 keyring = { workspace = true }
 secrecy = { workspace = true }
@@ -87,12 +87,22 @@ dotenvy = { workspace = true }
 
 [features]
 default = ["rustls"]
-rustls = ["reqwest/rustls", "tokio-tungstenite/rustls"]
+# The streamer's WebSocket gets an explicit rustls configuration (ring
+# provider, platform verifier): both ring and aws-lc-rs are in the tree, so
+# rustls cannot pick a process-level provider on its own. The tungstenite
+# roots feature only compiles in its rustls connector; its roots go unused.
+rustls = [
+    "reqwest/rustls",
+    "tokio-tungstenite/rustls-tls-native-roots",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+]
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
-callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen"]
-# JSON-Schema derives on SchwabClient param structs (PriceHistoryParams, OptionChainParams)
-# so the schwab-mcp crate can expose them as strongly-typed MCP tool arguments.
-schemars = ["dep:schemars", "schwab-types/schemars"]
+callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls"]
+# JSON-Schema derives on the schwab-types request structs (PriceHistoryParams,
+# OptionChainParams, OrderRequest, ...) so the schwab-mcp crate can expose them
+# as strongly-typed MCP tool arguments.
+schemars = ["schwab-types/schemars"]
 full = ["rustls", "callback-server", "schemars"]
 
 [target.'cfg(windows)'.dependencies]

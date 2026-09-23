@@ -23,11 +23,11 @@ async-trait = { workspace = true }
 secrecy = { workspace = true }
 clap = { workspace = true }
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["rustls"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 turbomcp = { workspace = true, features = ["stdio", "http", "websocket"] }
-schwab-rs = { path = "../schwab-rs", features = ["schemars"] }
-schwab-types = { path = "../schwab-types", features = ["schemars"] }
+schwab-rs = { path = "../schwab-rs", version = "0.2.0", features = ["schemars"] }
+schwab-types = { path = "../schwab-types", version = "0.2.0", features = ["schemars"] }
 
 tokio = { workspace = true }
 tracing = { workspace = true }

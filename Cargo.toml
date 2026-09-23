@@ -26,12 +26,15 @@ rand = "0.10"
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls"] }
+# TLS backends are chosen per crate (schwab-rs `rustls` / `native-tls`
+# features), never here: a backend listed at the workspace level is on for
+# every consumer and makes the other feature meaningless.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
 # HTTP and networking
-reqwest = { version = "0.13", features = ["json", "rustls", "cookies", "stream", "form", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "cookies", "stream", "form", "query", "charset", "http2", "system-proxy"] }
 hyper = "1.9"
 url = "2.5"
 headers = "0.4"
@@ -89,7 +92,9 @@ ring = "0.17"
 # explicitly — both ring and aws-lc-rs end up in the dependency tree, so
 # rustls cannot auto-select a process-level provider.
 rustls = { version = "0.23", features = ["ring"] }
-webpki-roots = "1.0"
+# The operating system's trust store for the streamer's WebSocket, the same
+# verifier reqwest's rustls backend uses for HTTPS.
+rustls-platform-verifier = "0.7"
 # Encryption at rest (ChaCha20Poly1305 AEAD - audited by NCC Group)
 chacha20poly1305 = "0.10"
 # Cross-platform secure credential storage

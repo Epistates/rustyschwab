@@ -2,7 +2,9 @@
 
 use crate::error::{Error, Result, StreamError};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 use tracing::{debug, info};
 use url::Url;
 
@@ -30,12 +32,42 @@ impl WebSocketTransport {
     pub async fn connect(&self) -> Result<WsStream> {
         debug!("Connecting to WebSocket at {}", self.url);
 
-        let (ws_stream, response) = connect_async(self.url.as_str())
-            .await
-            .map_err(|e| Error::Stream(StreamError::ConnectionFailed(e.to_string())))?;
+        let connector = if self.url.scheme() == "wss" {
+            tls_connector()?
+        } else {
+            Some(Connector::Plain)
+        };
+        let (ws_stream, response) =
+            connect_async_tls_with_config(self.url.as_str(), None, true, connector)
+                .await
+                .map_err(|e| Error::Stream(StreamError::ConnectionFailed(e.to_string())))?;
 
         info!("WebSocket connected with status: {}", response.status());
 
         Ok(ws_stream)
     }
+}
+
+/// The TLS connector for `wss://`, matching the HTTP client's backend.
+///
+/// With rustls, the configuration is built here: ring and aws-lc-rs are both
+/// in the dependency tree, so rustls cannot choose a process-level crypto
+/// provider, and the certificate verifier is the operating system's, as for
+/// reqwest's rustls backend. With native-tls (which wins when both features
+/// are on, as in reqwest), tungstenite builds the platform connector itself.
+#[cfg(all(feature = "rustls", not(feature = "native-tls")))]
+fn tls_connector() -> Result<Option<Connector>> {
+    use rustls_platform_verifier::BuilderVerifierExt;
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .and_then(|builder| builder.with_platform_verifier())
+        .map_err(|e| Error::Config(format!("WebSocket TLS configuration: {e}")))?
+        .with_no_client_auth();
+    Ok(Some(Connector::Rustls(std::sync::Arc::new(config))))
+}
+
+#[cfg(not(all(feature = "rustls", not(feature = "native-tls"))))]
+fn tls_connector() -> Result<Option<Connector>> {
+    Ok(None)
 }
