@@ -124,6 +124,10 @@ impl fmt::Display for OptionSymbol {
 impl FromStr for OptionSymbol {
     type Err = String;
 
+    /// Parses exactly the canonical form [`Display`](fmt::Display) writes:
+    /// an upper-case root padded on the right to six characters, so a symbol
+    /// round-trips unchanged. The two-digit year is 20YY: listed options do
+    /// not expire in the last century, and `%y` would read 70–99 as 19YY.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let invalid = || format!("Expected a 21-character OSI option symbol, got {s:?}");
         if s.len() != 21 || !s.is_ascii() {
@@ -132,7 +136,16 @@ impl FromStr for OptionSymbol {
         let (underlying, rest) = s.split_at(6);
         let (date, rest) = rest.split_at(6);
         let (right, strike) = rest.split_at(1);
-        let expiration = NaiveDate::parse_from_str(date, "%y%m%d").map_err(|_| invalid())?;
+        let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+        if !digits(date) {
+            return Err(invalid());
+        }
+        let field = |range: std::ops::Range<usize>| date[range].parse::<u32>().ok();
+        let expiration = field(0..2)
+            .zip(field(2..4))
+            .zip(field(4..6))
+            .and_then(|((y, m), d)| NaiveDate::from_ymd_opt(2000 + y as i32, m, d))
+            .ok_or_else(invalid)?;
         let put_call = match right {
             "C" => PutCall::Call,
             "P" => PutCall::Put,
@@ -141,14 +154,21 @@ impl FromStr for OptionSymbol {
         let thousandths: i64 = strike
             .parse()
             .ok()
-            .filter(|_| strike.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|_| digits(strike))
             .ok_or_else(invalid)?;
-        Self::new(
+        let symbol = Self::new(
             underlying,
             expiration,
             put_call,
             Decimal::new(thousandths, 3),
-        )
+        )?;
+        if symbol.to_string() != s {
+            return Err(format!(
+                "{s:?} is not in canonical OSI form; expected {:?}",
+                symbol.to_string()
+            ));
+        }
+        Ok(symbol)
     }
 }
 
@@ -180,7 +200,8 @@ impl OrderInstruction {
             | Self::BuyToClose
             | Self::SellToClose
             | Self::Exchange
-            | Self::SellShortExempt => None,
+            | Self::SellShortExempt
+            | Self::Unknown => None,
         }
     }
 
@@ -225,6 +246,9 @@ impl OrderRequestLeg {
             quantity: quantity.into(),
             instrument,
             position_effect: None,
+            quantity_type: None,
+            div_cap_gains: None,
+            to_symbol: None,
         }
     }
 
@@ -407,8 +431,13 @@ impl OrderRequest {
     /// of the entry leg.
     ///
     /// Fails if the entry is not a single-leg `SINGLE` order, if its
-    /// instruction does not open a position, or if the exit prices are on the
-    /// wrong sides of each other for the position's direction.
+    /// instruction does not open a position, or if the exits are on the
+    /// wrong sides for the position's direction: of each other always, and
+    /// of the entry's limit price when it has one (`LIMIT`, `STOP_LIMIT`).
+    /// A long entry at 150 needs its stop below 150 and its target above;
+    /// otherwise an exit is marketable the moment the entry fills. Market
+    /// and stop entries have no price to compare, so only the ordering of
+    /// the exits is checked.
     pub fn bracket(self, take_profit: Decimal, stop_loss: Decimal) -> Result<Self, String> {
         if self.order_strategy_type != OrderStrategyType::Single
             || !self.child_order_strategies.is_empty()
@@ -432,11 +461,23 @@ impl OrderRequest {
                  take profit {take_profit}, stop loss {stop_loss}"
             ));
         }
+        if let Some(entry) = self.price {
+            let (below, above) = if long {
+                (stop_loss, take_profit)
+            } else {
+                (take_profit, stop_loss)
+            };
+            if !(below < entry && entry < above) {
+                let side = if long { "long" } else { "short" };
+                return Err(format!(
+                    "Bracket exits must straddle a {side} entry at {entry}: \
+                     take profit {take_profit}, stop loss {stop_loss}"
+                ));
+            }
+        }
         let exit = || OrderRequestLeg {
-            instruction: closing,
-            quantity: leg.quantity,
-            instrument: leg.instrument.clone(),
             position_effect: leg.position_effect.map(|_| PositionEffect::Closing),
+            ..OrderRequestLeg::new(closing, leg.instrument.clone(), leg.quantity)
         };
         let exits = Self::one_cancels_other(
             Self::limit(exit(), take_profit).with_duration(OrderDuration::Gtc),
@@ -572,7 +613,6 @@ mod tests {
                 .with_position_effect(PositionEffect::Closing),
             d("9"),
         )
-        .with_session(OrderSession::Seamless)
         .with_duration(OrderDuration::Gtc)
         .with_tag("t")
         .with_special_instruction(SpecialInstruction::AllOrNone)
@@ -581,8 +621,26 @@ mod tests {
         .with_stop_type(StopType::Mark);
         order.validate().unwrap();
         let value = serde_json::to_value(&order).unwrap();
-        assert_eq!(value["session"], "SEAMLESS");
+        assert_eq!(value["session"], "NORMAL");
         assert_eq!(value["duration"], "GOOD_TILL_CANCEL");
+        // Extended hours take limit orders only.
+        assert!(
+            order
+                .clone()
+                .with_session(OrderSession::Seamless)
+                .validate()
+                .is_err()
+        );
+        let seamless = OrderRequest::limit(
+            OrderRequestLeg::equity(OrderInstruction::Sell, "XYZ", 1),
+            d("9"),
+        )
+        .with_session(OrderSession::Seamless);
+        seamless.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(&seamless).unwrap()["session"],
+            "SEAMLESS"
+        );
         assert_eq!(value["tag"], "t");
         assert_eq!(value["specialInstruction"], "ALL_OR_NONE");
         assert_eq!(value["requestedDestination"], "AUTO");

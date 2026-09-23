@@ -71,9 +71,16 @@ only to place the same order twice on purpose.
 - `trigger` needs at least one child.
 - `bracket` needs a single-leg `entry` whose instruction opens a position
   (`BUY`, `BUY_TO_OPEN`, `SELL_SHORT`, `SELL_TO_OPEN`). For a long entry
-  `take_profit` must be above `stop_loss`; for a short entry, below. The
-  exits use the closing instruction and the entry's full quantity, and
-  are `GOOD_TILL_CANCEL` regardless of the entry's duration.
+  `take_profit` must be above `stop_loss`; for a short entry, below. When
+  the entry is a `limit` or `stop_limit`, the exits must also straddle its
+  price. The exits use the closing instruction and the entry's full
+  quantity, and are `GOOD_TILL_CANCEL` regardless of the entry's duration.
+- Equity legs trade whole shares with `BUY`, `SELL`, `SELL_SHORT`,
+  `SELL_SHORT_EXEMPT` or `BUY_TO_COVER`; option legs trade whole contracts
+  with `BUY_TO_OPEN`, `BUY_TO_CLOSE`, `SELL_TO_OPEN` or `SELL_TO_CLOSE`.
+  Symbols are upper case.
+- A `session` other than `NORMAL` takes `limit` orders only.
+- Trailing stops cannot trail `MANUAL`, and a `PERCENT` offset is below 100.
 - Strategies nest at most eight levels.
 
 ## What policy accepts

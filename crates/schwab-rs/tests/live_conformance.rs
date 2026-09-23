@@ -811,11 +811,11 @@ async fn harness_records_then_checks_against_a_mock_server() {
             decode_as::<MoversResponse>,
         )
     };
-    // `marketShare` is not a typed field, so a type change there is exactly
-    // the drift the typed decode alone would swallow.
+    // `rank` stands in for a field the SDK does not type, so a type change
+    // there is exactly the drift the typed decode alone would swallow.
     let v1 = serde_json::json!({"screeners": [{
-        "symbol": "AAPL", "direction": "up", "change": 1.5,
-        "last": 200.0, "totalVolume": 1000, "marketShare": 0.2
+        "symbol": "AAPL", "lastPrice": 200.0, "netChange": 1.5,
+        "totalVolume": 1000, "rank": 0.2
     }]});
 
     // Check with no fixture: warns and includes the live shape for review.
@@ -855,7 +855,7 @@ async fn harness_records_then_checks_against_a_mock_server() {
     // binding still decodes (the field lands in `extra`).
     let mut v2 = v1.clone();
     v2["screeners"][0]["volume"] = serde_json::json!(5);
-    v2["screeners"][0]["marketShare"] = serde_json::json!("0.2");
+    v2["screeners"][0]["rank"] = serde_json::json!("0.2");
     respond(&server, v2).await;
     let (report, _) = check.run(&movers()).await;
     assert_eq!(report.status, "fail");
@@ -865,7 +865,7 @@ async fn harness_records_then_checks_against_a_mock_server() {
         .map(|f| (f.path.as_str(), &f.kind))
         .collect();
     assert_eq!(kinds["/screeners[]/volume"], &Kind::Added);
-    assert_eq!(kinds["/screeners[]/marketShare"], &Kind::TypeChanged);
+    assert_eq!(kinds["/screeners[]/rank"], &Kind::TypeChanged);
     assert!(
         !kinds.values().any(|k| **k == Kind::DecodeError),
         "{:?}",

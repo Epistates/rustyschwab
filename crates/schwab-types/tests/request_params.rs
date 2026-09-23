@@ -454,12 +454,19 @@ fn transactions_params_join_types_and_read_either_form_back() {
     .unwrap();
     assert_eq!(from_list, params);
 
+    // The type is shared with responses, so an unknown name decodes (as
+    // `Unknown`); validation, which runs before every request, refuses it.
     let bad = serde_json::from_value::<TransactionsParams>(serde_json::json!({
         "startDate": "2025-01-01T00:00:00Z",
         "endDate": "2025-01-31T23:59:59Z",
         "types": "TRADE,BOGUS",
-    }));
-    assert!(bad.is_err(), "unknown transaction types must not be sent");
+    }))
+    .unwrap();
+    assert_eq!(bad.types[1], TransactionType::Unknown);
+    assert!(
+        bad.validate().is_err(),
+        "unknown transaction types must not be sent"
+    );
 }
 
 #[test]

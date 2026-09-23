@@ -40,6 +40,16 @@ use serde_with::skip_serializing_none;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+// The rustdoc example above is for Rust readers; the schema gets prose.
+#[cfg_attr(
+    feature = "schemars",
+    schemars(
+        description = "One order, keyed by `kind`. Single orders take a `leg` (or `legs` \
+                            for the net-priced multi-leg kinds) and optional `settings`; `oco`, \
+                            `trigger` and `bracket` nest other specs. Quantities and prices are \
+                            decimal strings."
+    )
+)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OrderSpec {
     /// Fill at the market.
@@ -51,7 +61,8 @@ pub enum OrderSpec {
     /// Fill at `price` or better.
     Limit {
         leg: LegSpec,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         price: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -59,7 +70,8 @@ pub enum OrderSpec {
     /// Become a market order once `stop_price` trades.
     Stop {
         leg: LegSpec,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         stop_price: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -67,9 +79,11 @@ pub enum OrderSpec {
     /// Become a limit order at `price` once `stop_price` trades.
     StopLimit {
         leg: LegSpec,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         stop_price: Decimal,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         price: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -79,7 +93,8 @@ pub enum OrderSpec {
         leg: LegSpec,
         basis: PriceLinkBasis,
         link: PriceLinkType,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         offset: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -87,7 +102,8 @@ pub enum OrderSpec {
     /// Multi-leg order paying at most `price` net.
     NetDebit {
         legs: Vec<LegSpec>,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         price: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -95,7 +111,8 @@ pub enum OrderSpec {
     /// Multi-leg order collecting at least `price` net.
     NetCredit {
         legs: Vec<LegSpec>,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         price: Decimal,
         #[serde(default)]
         settings: OrderSettings,
@@ -120,9 +137,11 @@ pub enum OrderSpec {
     /// pair that close the entry leg; see [`OrderRequest::bracket`].
     Bracket {
         entry: Box<OrderSpec>,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         take_profit: Decimal,
-        #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+        #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+        #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
         stop_loss: Decimal,
     },
 }
@@ -135,7 +154,8 @@ pub enum OrderSpec {
 pub struct LegSpec {
     pub instruction: OrderInstruction,
     /// Shares, or contracts for options.
-    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+    #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
     pub quantity: Decimal,
     pub instrument: InstrumentSpec,
     #[serde(default)]
@@ -167,8 +187,14 @@ pub enum InstrumentSpec {
         expiration: Option<NaiveDate>,
         #[serde(default)]
         right: Option<PutCall>,
-        #[serde(default)]
-        #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+        #[serde(
+            default,
+            deserialize_with = "crate::common::exact_decimal::option::deserialize"
+        )]
+        #[cfg_attr(
+            feature = "schemars",
+            schemars(with = "Option<crate::common::DecimalString>")
+        )]
         strike: Option<Decimal>,
     },
 }

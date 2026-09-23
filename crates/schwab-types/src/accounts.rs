@@ -6,9 +6,18 @@
 //! - Position information
 //! - User preferences and streamer info
 
+//!
+//! Response types keep fields this crate does not model in `extra` (Schwab
+//! adds them, for example `aggregatedBalance`), except
+//! [`StreamerInfo`](crate::accounts::StreamerInfo),
+//! whose unmodelled fields could be credentials.
+
 use crate::common::AccountsInstrument;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use std::collections::HashMap;
+
+type Extra = HashMap<String, serde_json::Value>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -24,6 +33,8 @@ pub struct AccountNumberHash {
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub securities_account: SecuritiesAccount,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[skip_serializing_none]
@@ -41,6 +52,8 @@ pub struct SecuritiesAccount {
     pub initial_balances: Option<Balance>,
     pub current_balances: Option<Balance>,
     pub projected_balances: Option<Balance>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[skip_serializing_none]
@@ -68,6 +81,8 @@ pub struct Position {
     pub previous_session_long_quantity: Option<f64>,
     pub previous_session_short_quantity: Option<f64>,
     pub current_cost: Option<f64>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 /// One of an account's three balance blocks. Margin and cash accounts
@@ -133,6 +148,8 @@ pub struct Balance {
     pub total_cash: Option<f64>,
     /// Cash accounts.
     pub unsettled_cash: Option<f64>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +166,8 @@ pub struct UserPreferences {
     pub accounts: Option<Vec<AccountPreferences>>,
     pub streamer_info: Option<Vec<StreamerInfo>>,
     pub offers: Option<Vec<Offer>>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[skip_serializing_none]
@@ -164,6 +183,8 @@ pub struct AccountPreferences {
     pub account_color: Option<String>,
     pub display_acct_id: Option<String>,
     pub auto_position_effect: Option<bool>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,4 +205,6 @@ pub struct StreamerInfo {
 pub struct Offer {
     pub level2_permissions: Option<bool>,
     pub mkt_data_permission: Option<String>,
+    #[serde(flatten)]
+    pub extra: Extra,
 }

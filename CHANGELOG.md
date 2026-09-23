@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — wire types match what Schwab sends and refuse what it rejects
+
+- `get_movers` failed on every live response: `MoverItem.direction` was
+  required, and the live payload has no such field. Movers now decode the
+  live shape (`lastPrice`, `netChange`, `netPercentChange`, `volume`,
+  `marketShare`, `trades`) as well as the portal example's.
+- One unrecognised enum value on one order failed a whole order list (and
+  reconciliation with it). Every enum shared by requests and responses now
+  decodes an unknown value as `Unknown`, as `OrderStatus` already did.
+- `Order.session`, `duration` and `order_type` defaulted to NORMAL, DAY and
+  MARKET when absent, so an OCO parent appeared as a working market order.
+  They are now `Option` and stay `None`.
+- `bracket()` checks the exits straddle a priced entry, not just each other.
+- `OrderRequest::validate` refuses what Schwab would reject or misread: a
+  field the order type does not take, a top-level quantity that disagrees
+  with the legs, option instructions on equities (and the reverse),
+  fractional shares or contracts, lower-case or padded symbols, non-OSI
+  option symbols, stops in extended hours, on-close orders outside
+  NORMAL/DAY, single-leg net orders, trailing stops on `MANUAL` or 100%+
+  offsets, executable fields on an OCO parent, non-submittable order types,
+  and any `Unknown` value. Nesting is capped at eight levels, as documented
+  (nine were allowed). `validate_price_increment` covers value trailing offsets.
+- Request decimals parse exactly: digit separators, padding, exponents and
+  excess digits are errors instead of being read as other numbers.
+- `OptionSymbol` reads years 70–99 as 2070–2099 and parses only its
+  canonical form.
+- Unknown transaction types are `Unknown`, not dropped to `None`; account,
+  balance, position, preference and order-leg responses keep unmodelled
+  fields in `extra`.
+- Tool schemas: decimals carry a pattern, `UNKNOWN` is never offered, and
+  the `OrderSpec` description no longer embeds a Rust code block.
+
+**Migration.** Response enums and the enums they share with requests are
+`#[non_exhaustive]` with an `Unknown` variant: add a wildcard arm to
+exhaustive matches. Read `Order.session` / `duration` / `order_type` as
+options. `OrderType` no longer implements `Default`. `OrderRequestLeg` has
+three new optional mutual-fund fields (`quantity_type`, `div_cap_gains`,
+`to_symbol`); construct legs with `OrderRequestLeg::new` or the
+`equity` / `option` helpers. An unknown enum spelling in a request now
+decodes and is refused by `validate()` rather than by deserialization;
+the SDK validates before every request.
+
 ### Fixed — the streamer WebSocket speaks TLS
 
 - `StreamClient` could not connect to any `wss://` URL, Schwab's streamer

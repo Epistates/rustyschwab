@@ -33,10 +33,11 @@ pub struct ResponseHeaders {
 ///
 /// This is the spec's complete `assetType` enumeration; the per-instrument
 /// base schemas list only the first eight, and the remaining three appear
-/// in transaction instruments.
+/// in transaction instruments. See [`Wire`] for `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum AssetType {
     #[default]
     Equity,
@@ -50,6 +51,44 @@ pub enum AssetType {
     Future,
     Forex,
     Product,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
+}
+
+/// An enum that appears on both requests and broker responses.
+///
+/// Responses decode a value this release does not know as `Unknown`, so one
+/// new spelling from Schwab cannot fail a whole order list or account. A
+/// request can never carry `Unknown`: the variant is absent from the JSON
+/// schemas, and [`OrderRequest::validate`](crate::trading::OrderRequest::validate)
+/// and the other request validators reject it.
+pub trait Wire {
+    /// Whether this is the `Unknown` catch-all rather than a value Schwab
+    /// documents.
+    fn is_unknown(&self) -> bool;
+}
+
+/// Implements [`Wire`] for enums whose catch-all variant is `Unknown`.
+macro_rules! wire_enum {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl $crate::common::Wire for $ty {
+            fn is_unknown(&self) -> bool {
+                matches!(self, Self::Unknown)
+            }
+        }
+    )+};
+}
+pub(crate) use wire_enum;
+
+wire_enum!(AssetType);
+
+/// Reject `Unknown` in a request field, naming the field.
+pub(crate) fn known<T: Wire>(field: &str, value: Option<&T>) -> Result<(), String> {
+    match value {
+        Some(v) if v.is_unknown() => Err(format!("{field} is not a value Schwab accepts")),
+        _ => Ok(()),
+    }
 }
 
 /// Instrument class as Market Data spells `assetMainType` on quotes and
@@ -183,6 +222,100 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(de)?;
     Ok(value.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// Deserialize a request decimal exactly.
+///
+/// Accepts a plain decimal string (`"150.25"`) or a JSON integer. A JSON
+/// fraction is accepted as its shortest round-trip spelling, but it may
+/// already have lost precision in the parser, so callers should send
+/// strings. Rejected rather than reinterpreted: digit separators (`"1_000"`,
+/// which `rust_decimal` would read as 1000), surrounding whitespace, exponent
+/// notation, and more digits than a `Decimal` holds (which it would round).
+pub mod exact_decimal {
+    use rust_decimal::Decimal;
+    use serde::de::{self, Deserializer, Visitor};
+    use std::fmt;
+
+    pub fn parse(s: &str) -> Result<Decimal, String> {
+        let plain = !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+');
+        if !plain {
+            return Err(format!("{s:?} is not a plain decimal number"));
+        }
+        Decimal::from_str_exact(s).map_err(|e| format!("{s:?} is not an exact decimal: {e}"))
+    }
+
+    struct Exact;
+
+    impl Visitor<'_> for Exact {
+        type Value = Decimal;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a decimal number as a string, such as \"150.25\"")
+        }
+
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<Decimal, E> {
+            parse(s).map_err(E::custom)
+        }
+
+        fn visit_i64<E: de::Error>(self, n: i64) -> Result<Decimal, E> {
+            Ok(Decimal::from(n))
+        }
+
+        fn visit_u64<E: de::Error>(self, n: u64) -> Result<Decimal, E> {
+            Ok(Decimal::from(n))
+        }
+
+        fn visit_f64<E: de::Error>(self, n: f64) -> Result<Decimal, E> {
+            if !n.is_finite() {
+                return Err(E::custom("decimal must be finite"));
+            }
+            // `{}` on f64 is the shortest round-trip spelling, never exponent form.
+            parse(&n.to_string()).map_err(E::custom)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Decimal, D::Error> {
+        de.deserialize_any(Exact)
+    }
+
+    /// The same rules for an optional field; pair with `#[serde(default)]`.
+    pub mod option {
+        use rust_decimal::Decimal;
+        use serde::{Deserialize, Deserializer};
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Decimal>, D::Error> {
+            #[derive(Deserialize)]
+            struct Wrap(#[serde(deserialize_with = "super::deserialize")] Decimal);
+            Ok(Option::<Wrap>::deserialize(de)?.map(|Wrap(d)| d))
+        }
+    }
+}
+
+/// JSON schema for a request decimal: a string of digits with an optional
+/// fraction, the only spelling [`exact_decimal`] guarantees is exact.
+#[cfg(feature = "schemars")]
+pub struct DecimalString;
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for DecimalString {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DecimalString".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Exact decimal as a string, e.g. \"150.25\"; never a JSON number."
+        })
+    }
 }
 
 /// Format a timestamp for the Trader API's time-window query parameters

@@ -334,8 +334,41 @@ fn market_hours_classify_the_session_phase() {
     );
 }
 
+/// The live `/movers` shape (Schwabdev `docs/pages-raw/api.md`, movers
+/// return example): no `direction`, prices as `lastPrice`/`netChange`.
 #[test]
-fn movers_response_uses_screeners_key() {
+fn movers_decode_the_live_shape() {
+    let json = r#"{
+        "screeners": [
+            {
+                "description": "APPLE INC",
+                "volume": 46430830,
+                "lastPrice": 235.0,
+                "netChange": 235.0,
+                "marketShare": 15.28,
+                "totalVolume": 303821282,
+                "trades": 562489,
+                "netPercentChange": 1.0,
+                "symbol": "AAPL"
+            }
+        ]
+    }"#;
+
+    let parsed: MoversResponse = serde_json::from_str(json).unwrap();
+    let mover = &parsed.screeners[0];
+    assert_eq!(mover.symbol, "AAPL");
+    assert_eq!(mover.last_price, Some(235.0));
+    assert_eq!(mover.net_percent_change, Some(1.0));
+    assert_eq!(mover.volume, Some(46430830));
+    assert_eq!(mover.market_share, Some(15.28));
+    assert_eq!(mover.trades, Some(562489));
+    assert_eq!(mover.direction, None);
+    assert!(mover.extra.is_empty(), "{:?}", mover.extra);
+}
+
+/// The developer portal's example spelling still decodes.
+#[test]
+fn movers_decode_the_portal_example() {
     let json = r#"{
         "screeners": [
             {
@@ -350,7 +383,91 @@ fn movers_response_uses_screeners_key() {
     }"#;
 
     let parsed: MoversResponse = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.screeners[0].symbol, "NVDA");
+    let mover = &parsed.screeners[0];
+    assert_eq!(mover.symbol, "NVDA");
+    assert_eq!(
+        mover.direction,
+        Some(schwab_types::market_data::Direction::Up)
+    );
+    assert_eq!(mover.last, Some(140.11));
+}
+
+/// One new enum spelling on one order must not fail the whole list: every
+/// order enum decodes unknown values as `Unknown`.
+#[test]
+fn orders_tolerate_unknown_enum_values() {
+    use schwab_types::common::AssetType;
+    use schwab_types::trading::{
+        Order, OrderDuration, OrderInstruction, OrderLegType, OrderSession, OrderType,
+        PositionEffect, RequestedDestination,
+    };
+    let orders: Vec<Order> = serde_json::from_value(serde_json::json!([{
+        "orderId": 1, "session": "EXTO", "duration": "UNKNOWN", "orderType": "UNKNOWN",
+        "requestedDestination": "MEMX", "orderStrategyType": "SINGLE", "status": "WORKING",
+        "orderLegCollection": [{
+            "orderLegType": "FUTURE", "instruction": "SELL_SHORT_PLUS",
+            "positionEffect": "UNKNOWN", "quantity": 1,
+            "instrument": {"assetType": "CRYPTO", "symbol": "XYZ"}
+        }]
+    }, {
+        "orderId": 2, "session": "NORMAL", "duration": "DAY", "orderType": "LIMIT",
+        "orderStrategyType": "SINGLE", "status": "FILLED", "orderLegCollection": []
+    }]))
+    .unwrap();
+    let odd = &orders[0];
+    assert_eq!(odd.session, Some(OrderSession::Unknown));
+    assert_eq!(odd.duration, Some(OrderDuration::Unknown));
+    assert_eq!(odd.order_type, Some(OrderType::Unknown));
+    assert_eq!(
+        odd.requested_destination,
+        Some(RequestedDestination::Unknown)
+    );
+    let leg = &odd.order_leg_collection[0];
+    assert_eq!(leg.order_leg_type, OrderLegType::Unknown);
+    assert_eq!(leg.instruction, OrderInstruction::Unknown);
+    assert_eq!(leg.position_effect, Some(PositionEffect::Unknown));
+    assert_eq!(leg.instrument.asset_type, AssetType::Unknown);
+    assert_eq!(orders[1].order_type, Some(OrderType::Limit));
+}
+
+/// Schwab omits type, session and duration on an OCO parent; nothing is
+/// invented in their place.
+#[test]
+fn oco_parents_carry_no_invented_order_type() {
+    let order: schwab_types::trading::Order = serde_json::from_value(serde_json::json!({
+        "orderId": 7, "orderStrategyType": "OCO", "status": "WORKING",
+        "childOrderStrategies": []
+    }))
+    .unwrap();
+    assert_eq!(order.order_type, None);
+    assert_eq!(order.session, None);
+    assert_eq!(order.duration, None);
+    let back = serde_json::to_value(&order).unwrap();
+    assert!(back.get("orderType").is_none(), "{back}");
+}
+
+#[test]
+fn unknown_transaction_types_are_kept_as_unknown() {
+    use schwab_types::trading::{Transaction, TransactionType};
+    let t: Transaction =
+        serde_json::from_value(serde_json::json!({"activityId": 1, "type": "NEW_TYPE"})).unwrap();
+    assert_eq!(t.type_, Some(TransactionType::Unknown));
+}
+
+#[test]
+fn accounts_keep_fields_the_crate_does_not_model() {
+    let account: schwab_types::accounts::Account = serde_json::from_value(serde_json::json!({
+        "securitiesAccount": {
+            "accountNumber": "123", "type": "MARGIN", "pfcbFlag": false,
+            "currentBalances": {"cashBalance": 1.0, "newBalanceField": 2.0}
+        },
+        "aggregatedBalance": {"currentLiquidationValue": 10.0}
+    }))
+    .unwrap();
+    assert!(account.extra.contains_key("aggregatedBalance"));
+    assert_eq!(account.securities_account.extra["pfcbFlag"], false);
+    let balances = account.securities_account.current_balances.unwrap();
+    assert_eq!(balances.extra["newBalanceField"], 2.0);
 }
 
 #[test]
@@ -470,11 +587,17 @@ fn transactions_decode_transfer_items_with_typed_fees_and_instruments() {
             "instrument": {"assetType": "PRODUCT", "symbol": "?", "putCall": "UNKNOWN"}}]
     }))
     .unwrap();
-    assert_eq!(odd.type_, None);
+    assert_eq!(
+        odd.type_,
+        Some(schwab_types::trading::TransactionType::Unknown)
+    );
     assert_eq!(odd.status, Some(TransactionStatus::Unknown));
     assert_eq!(odd.sub_account, Some(SubAccount::Unknown));
     assert_eq!(odd.transfer_items[0].fee_type, Some(FeeType::Unknown));
-    assert_eq!(odd.transfer_items[0].position_effect, None);
+    assert_eq!(
+        odd.transfer_items[0].position_effect,
+        Some(schwab_types::trading::PositionEffect::Unknown)
+    );
     let instrument = odd.transfer_items[0].instrument.as_ref().unwrap();
     assert_eq!(instrument.asset_type, AssetType::Product);
     assert_eq!(instrument.put_call, None);
@@ -636,25 +759,24 @@ fn order_enums_use_the_trader_api_spellings() {
     }))
     .unwrap();
     assert!(request.validate().is_err());
-    // Request-only fields are typed; a misspelled destination is rejected
-    // before it reaches the broker.
-    assert!(
-        serde_json::from_value::<OrderRequest>(serde_json::json!({
-            "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
-            "requestedDestination":"NYSE_ARCA",
-            "orderLegCollection":[leg]
-        }))
-        .is_err()
-    );
+    // Request enums are shared with responses, so a misspelled destination
+    // decodes as `Unknown`, and validation (which runs before every send)
+    // rejects it before it reaches the broker.
+    let misspelled: OrderRequest = serde_json::from_value(serde_json::json!({
+        "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
+        "requestedDestination":"NYSE_ARCA",
+        "orderLegCollection":[leg]
+    }))
+    .unwrap();
+    assert!(misspelled.validate().is_err());
     // A misspelled asset type is rejected the same way.
-    assert!(
-        serde_json::from_value::<OrderRequest>(serde_json::json!({
-            "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
-            "orderLegCollection":[{"instruction":"BUY","quantity":"1",
-                "instrument":{"assetType":"STOCK","symbol":"AAPL"}}]
-        }))
-        .is_err()
-    );
+    let misspelled: OrderRequest = serde_json::from_value(serde_json::json!({
+        "session":"NORMAL","duration":"DAY","orderType":"MARKET","orderStrategyType":"SINGLE",
+        "orderLegCollection":[{"instruction":"BUY","quantity":"1",
+            "instrument":{"assetType":"STOCK","symbol":"AAPL"}}]
+    }))
+    .unwrap();
+    assert!(misspelled.validate().is_err());
 }
 
 #[test]

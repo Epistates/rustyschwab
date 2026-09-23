@@ -55,9 +55,13 @@ mod spec;
 pub use builder::OptionSymbol;
 pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 
-/// An order as Schwab reports it. Tolerant: enums that only appear on
-/// responses carry an `Unknown` catch-all, and undocumented fields land in
-/// `extra`. Times are the broker's ISO-8601 strings, kept verbatim.
+/// An order as Schwab reports it. Tolerant: every enum decodes a value this
+/// release does not know as `Unknown` (see [`Wire`](crate::common::Wire)),
+/// and undocumented fields land in `extra`. Times are the broker's ISO-8601
+/// strings, kept verbatim.
+///
+/// `session`, `duration` and `order_type` are `None` when Schwab omits
+/// them, as it does on an `OCO` parent: nothing is inferred.
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
@@ -65,12 +69,9 @@ pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 pub struct Order {
     #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub order_id: Option<String>,
-    #[serde(default)]
-    pub session: OrderSession,
-    #[serde(default)]
-    pub duration: OrderDuration,
-    #[serde(default)]
-    pub order_type: OrderType,
+    pub session: Option<OrderSession>,
+    pub duration: Option<OrderDuration>,
+    pub order_type: Option<OrderType>,
     pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
     pub quantity: Option<f64>,
     pub filled_quantity: Option<f64>,
@@ -124,6 +125,8 @@ pub struct OrderLeg {
     pub position_effect: Option<PositionEffect>,
     pub quantity: f64,
     pub quantity_type: Option<QuantityType>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// One entry of `orderActivityCollection`: an execution (partial or full
@@ -149,10 +152,12 @@ pub struct OrderActivity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderActivityType {
     Execution,
     OrderAction,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
@@ -176,26 +181,35 @@ pub struct ExecutionLeg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum QuantityType {
     AllShares,
     Dollars,
     Shares,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderSession {
     #[default]
     Normal,
     Am,
     Pm,
     Seamless,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderDuration {
     #[default]
     Day,
@@ -206,13 +220,16 @@ pub enum OrderDuration {
     EndOfWeek,
     EndOfMonth,
     NextEndOfMonth,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderType {
-    #[default]
     Market,
     Limit,
     Stop,
@@ -227,11 +244,15 @@ pub enum OrderType {
     NetCredit,
     NetZero,
     LimitOnClose,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum ComplexOrderStrategyType {
     None,
     Covered,
@@ -254,6 +275,9 @@ pub enum ComplexOrderStrategyType {
     UnbalancedVerticalRoll,
     MutualFundSwap,
     Custom,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// Only [`Single`](Self::Single), [`Oco`](Self::Oco), and
@@ -262,6 +286,7 @@ pub enum ComplexOrderStrategyType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderStrategyType {
     #[default]
     Single,
@@ -273,11 +298,15 @@ pub enum OrderStrategyType {
     BlastAll,
     Oco,
     Trigger,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderStatus {
     AwaitingParentOrder,
     AwaitingCondition,
@@ -300,6 +329,7 @@ pub enum OrderStatus {
     PendingAcknowledgement,
     PendingRecall,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
@@ -318,6 +348,7 @@ impl OrderStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderLegType {
     #[default]
     Equity,
@@ -328,11 +359,15 @@ pub enum OrderLegType {
     FixedIncome,
     Currency,
     CollectiveInvestment,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OrderInstruction {
     #[default]
     Buy,
@@ -345,16 +380,23 @@ pub enum OrderInstruction {
     SellToClose,
     Exchange,
     SellShortExempt,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum PositionEffect {
     Opening,
     Closing,
     #[default]
     Automatic,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// What a linked (trailing) price follows: `priceLinkBasis` and
@@ -362,6 +404,7 @@ pub enum PositionEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum PriceLinkBasis {
     Manual,
     Base,
@@ -372,6 +415,9 @@ pub enum PriceLinkBasis {
     AskBid,
     Mark,
     Average,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// How a linked price's offset is expressed: `priceLinkType` and
@@ -379,27 +425,36 @@ pub enum PriceLinkBasis {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum PriceLinkType {
     Value,
     Percent,
     Tick,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// Which price a stop order triggers on (`stopType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum StopType {
     Standard,
     Bid,
     Ask,
     Last,
     Mark,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum TaxLotMethod {
     Fifo,
     Lifo,
@@ -408,21 +463,29 @@ pub enum TaxLotMethod {
     AverageCost,
     SpecificLot,
     LossHarvester,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum SpecialInstruction {
     AllOrNone,
     DoNotReduce,
     AllOrNoneDoNotReduce,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// Routing venue for `requestedDestination`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum RequestedDestination {
     Inet,
     EcnArca,
@@ -436,6 +499,9 @@ pub enum RequestedDestination {
     Bats,
     C2,
     Auto,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 /// Result of submitting an order via `POST .../orders` or `PUT .../orders/{id}`.
@@ -498,7 +564,7 @@ impl OrdersParams {
         if self.max_results == Some(0) {
             return Err("maxResults must be at least 1".into());
         }
-        Ok(())
+        crate::common::known("status", self.status.as_ref())
     }
 }
 
@@ -518,9 +584,8 @@ pub struct Transaction {
     pub description: Option<String>,
     #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub account_number: Option<String>,
-    /// `None` for a value outside [`TransactionType`], which is also the
-    /// request-side filter and therefore has no catch-all.
-    #[serde(rename = "type", default, deserialize_with = "crate::common::lenient")]
+    /// `Unknown` for a category this release does not know.
+    #[serde(rename = "type")]
     pub type_: Option<TransactionType>,
     pub status: Option<TransactionStatus>,
     pub sub_account: Option<SubAccount>,
@@ -542,6 +607,7 @@ pub struct Transaction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum TransactionType {
     Trade,
     ReceiveAndDeliver,
@@ -558,6 +624,9 @@ pub enum TransactionType {
     MarginCall,
     MoneyMarket,
     SmaAdjustment,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
 }
 
 impl TransactionType {
@@ -579,6 +648,7 @@ impl TransactionType {
             Self::MarginCall => "MARGIN_CALL",
             Self::MoneyMarket => "MONEY_MARKET",
             Self::SmaAdjustment => "SMA_ADJUSTMENT",
+            Self::Unknown => "UNKNOWN",
         }
     }
 }
@@ -592,11 +662,13 @@ impl std::fmt::Display for TransactionType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum TransactionStatus {
     Valid,
     Invalid,
     Pending,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
@@ -604,6 +676,7 @@ pub enum TransactionStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum SubAccount {
     Cash,
     Margin,
@@ -611,18 +684,21 @@ pub enum SubAccount {
     Div,
     Income,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum TransactionActivityType {
     ActivityCorrection,
     Execution,
     OrderAction,
     Transfer,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
@@ -639,8 +715,7 @@ pub struct TransferItem {
     pub price: Option<f64>,
     /// Set on fee items only.
     pub fee_type: Option<FeeType>,
-    /// `None` when Schwab reports `UNKNOWN`.
-    #[serde(default, deserialize_with = "crate::common::lenient")]
+    /// `Unknown` when Schwab reports `UNKNOWN`.
     pub position_effect: Option<PositionEffect>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -649,6 +724,7 @@ pub struct TransferItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum FeeType {
     Commission,
     SecFee,
@@ -675,6 +751,7 @@ pub enum FeeType {
     TefraTax,
     StateTax,
     #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Unknown,
 }
 
@@ -795,6 +872,9 @@ impl TransactionsParams {
         if self.types.is_empty() {
             return Err("types must name at least one transaction type".into());
         }
+        for t in &self.types {
+            crate::common::known("types", Some(t))?;
+        }
         if self.symbol.as_deref().is_some_and(|s| s.trim().is_empty()) {
             return Err("symbol must not be blank".into());
         }
@@ -838,9 +918,10 @@ fn deserialize_transaction_types<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Outgoing orders have a strict schema, separate from tolerant broker responses.
-/// Unsupported fields fail deserialization rather than silently altering a trade.
+/// Unsupported fields fail deserialization rather than silently altering a trade,
+/// and decimals parse exactly (see [`exact_decimal`](crate::common::exact_decimal)).
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderRequest {
@@ -848,15 +929,44 @@ pub struct OrderRequest {
     pub duration: Option<OrderDuration>,
     pub order_type: Option<OrderType>,
     pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    /// When present, must equal every leg's quantity.
+    #[serde(
+        default,
+        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Option<crate::common::DecimalString>")
+    )]
     pub quantity: Option<rust_decimal::Decimal>,
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[serde(
+        default,
+        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Option<crate::common::DecimalString>")
+    )]
     pub price: Option<rust_decimal::Decimal>,
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[serde(
+        default,
+        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Option<crate::common::DecimalString>")
+    )]
     pub stop_price: Option<rust_decimal::Decimal>,
     pub stop_price_link_basis: Option<PriceLinkBasis>,
     pub stop_price_link_type: Option<PriceLinkType>,
-    #[cfg_attr(feature = "schemars", schemars(with = "Option<String>"))]
+    #[serde(
+        default,
+        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Option<crate::common::DecimalString>")
+    )]
     pub stop_price_offset: Option<rust_decimal::Decimal>,
     pub stop_type: Option<StopType>,
     pub price_link_basis: Option<PriceLinkBasis>,
@@ -873,17 +983,44 @@ pub struct OrderRequest {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderRequestLeg {
     pub instruction: OrderInstruction,
-    #[cfg_attr(feature = "schemars", schemars(with = "String"))]
+    /// Shares or contracts; whole numbers for equities and options. For a
+    /// mutual fund, denominated as `quantity_type` says.
+    #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
+    #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
     pub quantity: rust_decimal::Decimal,
     pub instrument: OrderRequestInstrument,
     pub position_effect: Option<PositionEffect>,
+    /// Mutual funds only: whether `quantity` is shares, dollars or the whole
+    /// position.
+    #[serde(default)]
+    pub quantity_type: Option<QuantityType>,
+    /// Mutual funds only: what happens to dividends and capital gains.
+    #[serde(default)]
+    pub div_cap_gains: Option<DivCapGains>,
+    /// Mutual funds only: the fund an `EXCHANGE` moves into.
+    #[serde(default)]
+    pub to_symbol: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+/// Dividend and capital-gain handling on a mutual-fund leg (`divCapGains`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
+pub enum DivCapGains {
+    Reinvest,
+    Payout,
+    #[serde(other)]
+    #[cfg_attr(feature = "schemars", schemars(skip))]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OrderRequestInstrument {
@@ -891,16 +1028,134 @@ pub struct OrderRequestInstrument {
     pub asset_type: AssetType,
 }
 
-impl OrderRequest {
-    /// Validates structural safety without silently rounding prices. Broker
-    /// eligibility, buying power, and asset-specific increments require preview.
-    pub fn validate(&self) -> Result<(), String> {
-        self.validate_depth(0)
+crate::common::wire_enum!(
+    QuantityType,
+    OrderSession,
+    OrderDuration,
+    OrderType,
+    ComplexOrderStrategyType,
+    OrderStrategyType,
+    OrderStatus,
+    OrderLegType,
+    OrderInstruction,
+    PositionEffect,
+    PriceLinkBasis,
+    PriceLinkType,
+    StopType,
+    TaxLotMethod,
+    SpecialInstruction,
+    RequestedDestination,
+    OrderActivityType,
+    TransactionType,
+    TransactionStatus,
+    SubAccount,
+    TransactionActivityType,
+    FeeType,
+    DivCapGains,
+);
+
+/// Strategies nest at most this many levels, the root counting as one.
+const MAX_STRATEGY_DEPTH: usize = 8;
+
+/// What an executable order type takes. `true` means required, `false`
+/// forbidden; the trailing link fields are required together.
+struct TypeRules {
+    price: bool,
+    stop_price: bool,
+    trailing: bool,
+    /// `priceLinkBasis`/`priceLinkType` (a linked limit) are allowed.
+    price_link: bool,
+    /// `stopType` is meaningful.
+    stop_type: bool,
+    /// Net-priced: needs two or more legs.
+    net: bool,
+}
+
+impl OrderType {
+    /// Submission rules for this type; `None` for types Schwab reports but
+    /// does not accept on a new order.
+    fn rules(self) -> Option<TypeRules> {
+        let base = TypeRules {
+            price: false,
+            stop_price: false,
+            trailing: false,
+            price_link: false,
+            stop_type: false,
+            net: false,
+        };
+        Some(match self {
+            Self::Market | Self::MarketOnClose => base,
+            Self::Limit | Self::LimitOnClose => TypeRules {
+                price: true,
+                ..base
+            },
+            Self::Stop => TypeRules {
+                stop_price: true,
+                stop_type: true,
+                ..base
+            },
+            Self::StopLimit => TypeRules {
+                price: true,
+                stop_price: true,
+                stop_type: true,
+                ..base
+            },
+            Self::TrailingStop => TypeRules {
+                trailing: true,
+                stop_type: true,
+                ..base
+            },
+            Self::TrailingStopLimit => TypeRules {
+                price: true,
+                trailing: true,
+                price_link: true,
+                stop_type: true,
+                ..base
+            },
+            Self::NetDebit | Self::NetCredit => TypeRules {
+                price: true,
+                net: true,
+                ..base
+            },
+            Self::NetZero => TypeRules { net: true, ..base },
+            Self::Cabinet | Self::NonMarketable | Self::Exercise | Self::Unknown => return None,
+        })
     }
+}
+
+impl OrderRequest {
+    /// Validates structure without silently rounding prices: every field
+    /// the order type takes and none it does not, instructions that fit the
+    /// asset, whole shares and contracts, canonical symbols, extended hours
+    /// only for limit orders. Broker eligibility, buying power and
+    /// asset-specific increments still require a preview.
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_depth(1)
+    }
+
     fn validate_depth(&self, depth: usize) -> Result<(), String> {
-        if depth > 8 {
-            return Err("Order strategy nesting exceeds eight levels".into());
+        use crate::common::known;
+        if depth > MAX_STRATEGY_DEPTH {
+            return Err(format!(
+                "Order strategies nest at most {MAX_STRATEGY_DEPTH} levels"
+            ));
         }
+        known("session", self.session.as_ref())?;
+        known("duration", self.duration.as_ref())?;
+        known("orderType", self.order_type.as_ref())?;
+        known(
+            "complexOrderStrategyType",
+            self.complex_order_strategy_type.as_ref(),
+        )?;
+        known("stopPriceLinkBasis", self.stop_price_link_basis.as_ref())?;
+        known("stopPriceLinkType", self.stop_price_link_type.as_ref())?;
+        known("stopType", self.stop_type.as_ref())?;
+        known("priceLinkBasis", self.price_link_basis.as_ref())?;
+        known("priceLinkType", self.price_link_type.as_ref())?;
+        known("taxLotMethod", self.tax_lot_method.as_ref())?;
+        known("specialInstruction", self.special_instruction.as_ref())?;
+        known("requestedDestination", self.requested_destination.as_ref())?;
+        known("orderStrategyType", Some(&self.order_strategy_type))?;
         for (name, value) in [
             ("quantity", self.quantity),
             ("price", self.price),
@@ -908,79 +1163,13 @@ impl OrderRequest {
             ("stopPriceOffset", self.stop_price_offset),
         ] {
             if value.is_some_and(|v| v <= rust_decimal::Decimal::ZERO) {
-                return Err(format!("{name} must be finite and positive"));
+                return Err(format!("{name} must be positive"));
             }
         }
-        if self.order_strategy_type == OrderStrategyType::Oco {
-            if self.child_order_strategies.len() != 2
-                || !self.order_leg_collection.is_empty()
-                || self.order_type.is_some()
-                || self.price.is_some()
-                || self.stop_price.is_some()
-            {
-                return Err(
-                    "OCO must contain exactly two children and no executable parent".into(),
-                );
-            }
-        } else {
-            if !matches!(
-                self.order_strategy_type,
-                OrderStrategyType::Single | OrderStrategyType::Trigger
-            ) {
-                return Err("Only SINGLE, OCO, and TRIGGER strategies can be submitted".into());
-            }
-            let (Some(kind), Some(_), Some(_), false) = (
-                self.order_type,
-                self.session,
-                self.duration,
-                self.order_leg_collection.is_empty(),
-            ) else {
-                return Err(
-                    "Executable orders require legs, session, duration, and orderType".into(),
-                );
-            };
-            if matches!(
-                kind,
-                OrderType::Limit
-                    | OrderType::StopLimit
-                    | OrderType::TrailingStopLimit
-                    | OrderType::NetDebit
-                    | OrderType::NetCredit
-                    | OrderType::LimitOnClose
-            ) && self.price.is_none()
-            {
-                return Err("This order type requires price".into());
-            }
-            if matches!(kind, OrderType::Stop | OrderType::StopLimit) && self.stop_price.is_none() {
-                return Err("Stop orders require stopPrice".into());
-            }
-            if matches!(kind, OrderType::TrailingStop | OrderType::TrailingStopLimit)
-                && (self.stop_price_offset.is_none()
-                    || self.stop_price_link_basis.is_none()
-                    || self.stop_price_link_type.is_none())
-            {
-                return Err("Trailing stops require offset, basis, and link type".into());
-            }
-            for leg in &self.order_leg_collection {
-                if leg.quantity <= rust_decimal::Decimal::ZERO
-                    || leg.instrument.symbol.trim().is_empty()
-                {
-                    return Err(
-                        "Leg quantity must be finite/positive and instrument must be specified"
-                            .into(),
-                    );
-                }
-            }
-            if self.order_strategy_type == OrderStrategyType::Single
-                && !self.child_order_strategies.is_empty()
-            {
-                return Err("SINGLE cannot contain child strategies".into());
-            }
-            if self.order_strategy_type == OrderStrategyType::Trigger
-                && self.child_order_strategies.is_empty()
-            {
-                return Err("TRIGGER requires child strategies".into());
-            }
+        match self.order_strategy_type {
+            OrderStrategyType::Oco => self.validate_oco_parent()?,
+            OrderStrategyType::Single | OrderStrategyType::Trigger => self.validate_executable()?,
+            _ => return Err("Only SINGLE, OCO, and TRIGGER strategies can be submitted".into()),
         }
         for child in &self.child_order_strategies {
             child.validate_depth(depth + 1)?;
@@ -988,19 +1177,212 @@ impl OrderRequest {
         Ok(())
     }
 
-    /// Enforce a caller-supplied broker/asset tick size; never round implicitly.
+    /// An OCO parent only groups its two children; anything executable on
+    /// it would be ignored or misread.
+    fn validate_oco_parent(&self) -> Result<(), String> {
+        let executable = self.session.is_some()
+            || self.duration.is_some()
+            || self.order_type.is_some()
+            || self.complex_order_strategy_type.is_some()
+            || self.quantity.is_some()
+            || self.price.is_some()
+            || self.stop_price.is_some()
+            || self.stop_price_link_basis.is_some()
+            || self.stop_price_link_type.is_some()
+            || self.stop_price_offset.is_some()
+            || self.stop_type.is_some()
+            || self.price_link_basis.is_some()
+            || self.price_link_type.is_some()
+            || self.tax_lot_method.is_some()
+            || self.special_instruction.is_some()
+            || self.requested_destination.is_some()
+            || !self.order_leg_collection.is_empty();
+        if self.child_order_strategies.len() != 2 || executable {
+            return Err("OCO must contain exactly two children and no executable parent".into());
+        }
+        Ok(())
+    }
+
+    fn validate_executable(&self) -> Result<(), String> {
+        let (Some(kind), Some(session), Some(duration), false) = (
+            self.order_type,
+            self.session,
+            self.duration,
+            self.order_leg_collection.is_empty(),
+        ) else {
+            return Err("Executable orders require legs, session, duration, and orderType".into());
+        };
+        let name = serde_json::to_value(kind).unwrap_or_default();
+        let name = name.as_str().unwrap_or("this order type");
+        let rules = kind
+            .rules()
+            .ok_or_else(|| format!("{name} orders cannot be submitted"))?;
+        let field = |present: bool, required: bool, field: &str| -> Result<(), String> {
+            match (present, required) {
+                (false, true) => Err(format!("{name} requires {field}")),
+                (true, false) => Err(format!("{name} does not take {field}")),
+                _ => Ok(()),
+            }
+        };
+        field(self.price.is_some(), rules.price, "price")?;
+        field(self.stop_price.is_some(), rules.stop_price, "stopPrice")?;
+        for (present, f) in [
+            (self.stop_price_offset.is_some(), "stopPriceOffset"),
+            (self.stop_price_link_basis.is_some(), "stopPriceLinkBasis"),
+            (self.stop_price_link_type.is_some(), "stopPriceLinkType"),
+        ] {
+            field(present, rules.trailing, f)?;
+        }
+        if self.price_link_basis.is_some() != self.price_link_type.is_some() {
+            return Err("priceLinkBasis and priceLinkType go together".into());
+        }
+        if self.price_link_basis.is_some() && !rules.price_link {
+            return Err(format!("{name} does not take priceLinkBasis"));
+        }
+        if self.stop_type.is_some() && !rules.stop_type {
+            return Err(format!("{name} does not take stopType"));
+        }
+        if rules.trailing {
+            if self.stop_price_link_basis == Some(PriceLinkBasis::Manual) {
+                return Err("A trailing stop cannot trail a MANUAL basis".into());
+            }
+            if self.stop_price_link_type == Some(PriceLinkType::Percent)
+                && self
+                    .stop_price_offset
+                    .is_some_and(|o| o >= rust_decimal::Decimal::ONE_HUNDRED)
+            {
+                return Err("A percentage trailing offset must be below 100".into());
+            }
+        }
+        if rules.net && self.order_leg_collection.len() < 2 {
+            return Err(format!("{name} needs two or more legs"));
+        }
+        if session != OrderSession::Normal && kind != OrderType::Limit {
+            return Err("Extended-hours sessions accept only LIMIT orders".into());
+        }
+        if matches!(kind, OrderType::MarketOnClose | OrderType::LimitOnClose)
+            && (session != OrderSession::Normal || duration != OrderDuration::Day)
+        {
+            return Err(format!(
+                "{name} requires the NORMAL session and DAY duration"
+            ));
+        }
+        for leg in &self.order_leg_collection {
+            leg.validate()?;
+            if self.quantity.is_some_and(|q| q != leg.quantity) {
+                return Err(
+                    "quantity must equal every leg's quantity; size orders on the legs".into(),
+                );
+            }
+        }
+        match (
+            self.order_strategy_type,
+            self.child_order_strategies.is_empty(),
+        ) {
+            (OrderStrategyType::Single, false) => {
+                Err("SINGLE cannot contain child strategies".into())
+            }
+            (OrderStrategyType::Trigger, true) => Err("TRIGGER requires child strategies".into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// Enforce a caller-supplied broker/asset tick size on every price and
+    /// on a trailing offset expressed as a value; never round implicitly.
     pub fn validate_price_increment(&self, tick: rust_decimal::Decimal) -> Result<(), String> {
         self.validate()?;
+        self.validate_ticks(tick)
+    }
+
+    fn validate_ticks(&self, tick: rust_decimal::Decimal) -> Result<(), String> {
         if tick <= rust_decimal::Decimal::ZERO {
             return Err("Tick size must be finite and positive".into());
         }
-        for price in [self.price, self.stop_price].into_iter().flatten() {
+        let value_offset = self
+            .stop_price_offset
+            .filter(|_| self.stop_price_link_type == Some(PriceLinkType::Value));
+        for price in [self.price, self.stop_price, value_offset]
+            .into_iter()
+            .flatten()
+        {
             if price % tick != rust_decimal::Decimal::ZERO {
                 return Err("Price does not match the supplied tick size".into());
             }
         }
         for child in &self.child_order_strategies {
-            child.validate_price_increment(tick)?;
+            child.validate_ticks(tick)?;
+        }
+        Ok(())
+    }
+}
+
+impl OrderRequestLeg {
+    /// The leg-level rules [`OrderRequest::validate`] applies to each leg.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::common::known;
+        use OrderInstruction as I;
+        known("instruction", Some(&self.instruction))?;
+        known("positionEffect", self.position_effect.as_ref())?;
+        known("assetType", Some(&self.instrument.asset_type))?;
+        known("quantityType", self.quantity_type.as_ref())?;
+        known("divCapGains", self.div_cap_gains.as_ref())?;
+        let symbol = &self.instrument.symbol;
+        if symbol.trim().is_empty()
+            || symbol.trim() != symbol
+            || symbol.bytes().any(|b| b.is_ascii_lowercase())
+        {
+            return Err(format!(
+                "Instrument symbol {symbol:?} must be non-empty, upper case and unpadded"
+            ));
+        }
+        if self.quantity <= rust_decimal::Decimal::ZERO {
+            return Err("Leg quantity must be positive".into());
+        }
+        let whole = self.quantity.fract().is_zero();
+        match self.instrument.asset_type {
+            AssetType::Equity => {
+                if !matches!(
+                    self.instruction,
+                    I::Buy | I::Sell | I::SellShort | I::BuyToCover | I::SellShortExempt
+                ) {
+                    return Err(format!(
+                        "{:?} is an option instruction; equities take BUY, SELL, \
+                         SELL_SHORT, SELL_SHORT_EXEMPT or BUY_TO_COVER",
+                        self.instruction
+                    ));
+                }
+                if !whole {
+                    return Err("Equity orders are for whole shares".into());
+                }
+            }
+            AssetType::Option => {
+                if !matches!(
+                    self.instruction,
+                    I::BuyToOpen | I::BuyToClose | I::SellToOpen | I::SellToClose
+                ) {
+                    return Err(format!(
+                        "{:?} is not an option instruction; options take BUY_TO_OPEN, \
+                         BUY_TO_CLOSE, SELL_TO_OPEN or SELL_TO_CLOSE",
+                        self.instruction
+                    ));
+                }
+                symbol.parse::<OptionSymbol>()?;
+                if !whole {
+                    return Err("Option orders are for whole contracts".into());
+                }
+            }
+            _ => {}
+        }
+        let fund = self.instrument.asset_type == AssetType::MutualFund;
+        if !fund
+            && (self.quantity_type.is_some()
+                || self.div_cap_gains.is_some()
+                || self.to_symbol.is_some())
+        {
+            return Err("quantityType, divCapGains and toSymbol apply to mutual funds only".into());
+        }
+        if (self.instruction == I::Exchange) != self.to_symbol.is_some() {
+            return Err("EXCHANGE takes a toSymbol, and only EXCHANGE does".into());
         }
         Ok(())
     }

@@ -371,22 +371,43 @@ pub struct MoversResponse {
 }
 
 /// A single market mover item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// The live `/movers` payload carries `lastPrice`, `netChange`,
+/// `netPercentChange`, `volume`, `marketShare` and `trades` and no
+/// `direction`; the developer portal's example instead shows `last`,
+/// `change` and `direction`. Both spellings decode, every field but
+/// `symbol` is optional, and anything else lands in `extra`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct MoverItem {
     pub symbol: String,
     pub description: Option<String>,
-    pub direction: Direction,
-    pub change: Option<f64>,
-    pub last: Option<f64>,
+    pub last_price: Option<f64>,
+    pub net_change: Option<f64>,
+    /// Net change as a fraction of the previous close.
+    pub net_percent_change: Option<f64>,
+    /// Shares traded in the mover's own listing.
+    pub volume: Option<i64>,
+    /// Volume across the index or universe the movers were drawn from.
     pub total_volume: Option<i64>,
+    /// This mover's share of `total_volume`, in percent.
+    pub market_share: Option<f64>,
+    pub trades: Option<i64>,
+    /// Portal-example spelling of `last_price`.
+    pub last: Option<f64>,
+    /// Portal-example spelling of `net_change`.
+    pub change: Option<f64>,
+    /// Portal-example only; `None` otherwise or for an unknown value.
+    #[serde(default, deserialize_with = "crate::common::lenient")]
+    pub direction: Option<Direction>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Direction of price movement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {

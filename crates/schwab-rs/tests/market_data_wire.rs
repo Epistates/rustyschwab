@@ -228,8 +228,9 @@ async fn movers_encode_the_index_in_the_path_and_frequency_as_minutes() {
         .and(query_param("frequency", "5"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "screeners": [{
-                "symbol": "AAPL", "direction": "up", "change": 1.5,
-                "last": 200.0, "totalVolume": 1000
+                "symbol": "AAPL", "description": "APPLE INC", "volume": 400,
+                "lastPrice": 200.0, "netChange": 1.5, "marketShare": 40.0,
+                "totalVolume": 1000, "trades": 12, "netPercentChange": 0.0075
             }]
         })))
         .expect(1)
@@ -245,6 +246,8 @@ async fn movers_encode_the_index_in_the_path_and_frequency_as_minutes() {
         .await
         .unwrap();
     assert_eq!(movers.screeners[0].symbol, "AAPL");
+    assert_eq!(movers.screeners[0].last_price, Some(200.0));
+    assert_eq!(movers.screeners[0].market_share, Some(40.0));
 }
 
 /// `/instruments/{cusip}` answers with the same `{"instruments":[…]}` envelope

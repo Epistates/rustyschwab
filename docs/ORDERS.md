@@ -23,10 +23,30 @@ type Schwab reports back and is never sent.
 | `client.cancel_order(account_hash, order_id)` | Cancels a working order. |
 
 Every constructor produces a `NORMAL`-session, `DAY` order; change either
-with `with_session` / `with_duration`. `order.validate()` checks structure
-(required prices, leg shape, strategy nesting) before the request leaves the
-process; it never rounds a price. `validate_price_increment(tick)` enforces a
-tick you supply.
+with `with_session` / `with_duration`. `order.validate()` runs before every
+submission and preview and never rounds a price. It checks:
+
+- each order type carries exactly its fields (a `MARKET` order has no
+  `price`, a `LIMIT` no `stopPrice` or trailing fields, a net-priced order
+  two or more legs), and `CABINET`, `EXERCISE` and `NON_MARKETABLE` are refused;
+- extended-hours sessions (`AM`, `PM`, `SEAMLESS`) take `LIMIT` orders only,
+  and on-close orders need `NORMAL` / `DAY`;
+- equity legs use `BUY` / `SELL` / `SELL_SHORT` / `SELL_SHORT_EXEMPT` /
+  `BUY_TO_COVER` in whole shares, option legs the `*_TO_OPEN` / `*_TO_CLOSE`
+  instructions on a canonical OSI symbol in whole contracts; symbols are
+  upper case and unpadded;
+- a top-level `quantity`, if present, equals every leg's quantity;
+- trailing stops trail a real basis (not `MANUAL`), by less than 100%;
+- an `OCO` parent carries nothing executable, and strategies nest at most
+  eight levels;
+- no field holds a value Schwab does not document. Request and response
+  enums are shared, and responses decode unknown values as `Unknown`; a
+  request carrying one is refused.
+
+`validate_price_increment(tick)` enforces a tick you supply on prices, stop
+prices and value trailing offsets. Decimals parse exactly: `"1_000"`,
+exponent notation, padding and more digits than a decimal holds are errors,
+not reinterpretations.
 
 ## Single-leg orders
 
@@ -151,7 +171,10 @@ let bracket = OrderRequest::limit(
 `bracket` requires a single-leg `SINGLE` entry whose instruction opens a
 position (`BUY`, `SELL_SHORT`, `BUY_TO_OPEN`, `SELL_TO_OPEN`) and rejects
 exit prices on the wrong side for the direction: long entries need
-`take_profit > stop_loss`, short entries the reverse. The MCP risk policy
+`take_profit > stop_loss`, short entries the reverse. When the entry has a
+limit price the exits must also straddle it (a long entry at 150 needs its
+stop below 150 and its target above), since otherwise an exit is
+marketable the moment the entry fills. The MCP risk policy
 sums entry, take-profit and stop-loss as gross exposure and prices the
 stop-loss at the entry's limit (a child that only flattens what its bounded
 parent opens cannot fill for more), so size `max_quantity` / `max_notional`
