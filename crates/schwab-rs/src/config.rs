@@ -42,12 +42,13 @@ pub struct ClientConfig {
 #[serde(rename_all = "lowercase")]
 pub enum ChannelKind {
     /// Legacy configuration, capped at 65,536 messages by StreamClient.
-    /// Overflow invalidates the session and emits a loss notification.
+    /// Overflow behaves as for `Bounded`.
     Unbounded,
 
-    /// Bounded channel with specified buffer size
-    /// Use when: Need backpressure, want to limit memory usage
-    /// Behavior: Overflow invalidates the session and emits a loss notification.
+    /// Bounded channel with specified buffer size.
+    /// Overflow drops frames, emits a loss notification (`ready: false`) and,
+    /// once the consumer drains half the queue, resumes delivery under a new
+    /// generation on the same connection.
     Bounded(usize),
 }
 
@@ -85,6 +86,15 @@ pub struct ReconnectConfig {
     #[serde(with = "humantime_serde")]
     pub max_backoff: Duration,
     pub backoff_multiplier: f64,
+    /// Each reconnect delay is drawn uniformly from ±this fraction of the
+    /// backoff (0 to 1), so clients dropped together by one streamer
+    /// restart do not all log in again at the same instant.
+    #[serde(default = "default_reconnect_jitter")]
+    pub jitter: f64,
+}
+
+fn default_reconnect_jitter() -> f64 {
+    0.25
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +192,7 @@ impl Default for ReconnectConfig {
             initial_backoff: Duration::from_secs(2), // Initial reconnection delay
             max_backoff: Duration::from_secs(128),   // Maximum reconnection delay
             backoff_multiplier: 2.0,
+            jitter: default_reconnect_jitter(),
         }
     }
 }

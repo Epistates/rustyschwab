@@ -26,30 +26,90 @@ use uuid::Uuid;
 
 /// Generation-tagged sender feeding the subscriber queue.
 ///
-/// Every message carries the connection generation it was produced under so
-/// the receiver can discard data that predates a reconnect. Queue overflow is
-/// never silent: it flips the shared [`StreamStatus`] to not-ready and bumps
-/// `lost_messages`.
+/// Every message carries the generation it was produced under so the
+/// receiver can discard data that predates a reconnect or a gap. Queue
+/// overflow is never silent: it flips the shared [`StreamStatus`] to
+/// not-ready and bumps `lost_messages`. The connection stays up: frames are
+/// dropped (and counted) until the consumer has drained half the queue, then
+/// delivery resumes under a new generation, so the consumer re-baselines as
+/// after a reconnect without a new LOGIN or resubscription.
 #[derive(Debug)]
 pub(crate) struct MessageSender {
     tx: mpsc::Sender<(u64, StreamMessage)>,
     state: tokio::sync::watch::Sender<StreamStatus>,
+    overflow: std::sync::atomic::AtomicU8,
 }
 
+/// [`MessageSender::overflow`] states.
+const FLOWING: u8 = 0;
+const OVERFLOWED_WHILE_READY: u8 = 1;
+const OVERFLOWED_WHILE_UNREADY: u8 = 2;
+
 impl MessageSender {
-    /// Send a message tagged with the current generation.
+    pub(crate) fn new(
+        tx: mpsc::Sender<(u64, StreamMessage)>,
+        state: tokio::sync::watch::Sender<StreamStatus>,
+    ) -> Self {
+        Self {
+            tx,
+            state,
+            overflow: std::sync::atomic::AtomicU8::new(FLOWING),
+        }
+    }
+
+    /// Send a message tagged with the current generation. A full queue
+    /// drops it and invalidates the stream until the consumer catches up.
     ///
-    /// Returns `Err` if the receiver has been dropped or the queue is full.
+    /// Returns `Err` only if the receiver has been dropped.
     pub(crate) fn send(&self, msg: StreamMessage) -> std::result::Result<(), String> {
-        let generation = self.state.borrow().generation;
-        self.tx.try_send((generation, msg)).map_err(|_| {
+        let overflow = self.overflow.load(Ordering::Acquire);
+        if overflow != FLOWING {
+            if self.tx.capacity() * 2 < self.tx.max_capacity() {
+                self.record_loss();
+                return Ok(());
+            }
+            // Drained: what follows starts a new generation, and it is ready
+            // only if the stream was ready when the gap began.
+            self.overflow.store(FLOWING, Ordering::Release);
             self.state.send_modify(|s| {
-                s.lost_messages += 1;
-                s.ready = false;
+                s.generation += 1;
+                s.ready = overflow == OVERFLOWED_WHILE_READY;
             });
-            metrics::counter!(crate::metrics::STREAM_DROPPED_MESSAGES_TOTAL).increment(1);
-            "Stream queue overflow or receiver closed; reconciliation required".into()
-        })
+        }
+        let generation = self.state.borrow().generation;
+        match self.tx.try_send((generation, msg)) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let was_ready = self.state.borrow().ready;
+                self.overflow.store(
+                    if was_ready {
+                        OVERFLOWED_WHILE_READY
+                    } else {
+                        OVERFLOWED_WHILE_UNREADY
+                    },
+                    Ordering::Release,
+                );
+                self.record_loss();
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.record_loss();
+                Err("Stream receiver closed".into())
+            }
+        }
+    }
+
+    /// A new connection starts clean: any gap belongs to the old generation.
+    pub(crate) fn reset_overflow(&self) {
+        self.overflow.store(FLOWING, Ordering::Release);
+    }
+
+    fn record_loss(&self) {
+        self.state.send_modify(|s| {
+            s.lost_messages += 1;
+            s.ready = false;
+        });
+        metrics::counter!(crate::metrics::STREAM_DROPPED_MESSAGES_TOTAL).increment(1);
     }
 }
 
@@ -313,10 +373,7 @@ impl StreamClient {
         };
         let (health, status_rx) = tokio::sync::watch::channel(StreamStatus::default());
         let (tx, rx) = mpsc::channel(capacity);
-        let message_tx = MessageSender {
-            tx,
-            state: health.clone(),
-        };
+        let message_tx = MessageSender::new(tx, health.clone());
         let message_rx = MessageReceiver::new(rx, status_rx);
 
         let coordinator = crate::storage::StateDatabase::new(
@@ -521,11 +578,58 @@ impl StreamClient {
         StreamClientBuilder::new()
     }
 
-    /// Set service-specific field IDs (comma-separated) to be used on subscriptions
+    /// Set service-specific field IDs (comma-separated) for *later*
+    /// subscriptions and reconnects. Keys already streaming keep their
+    /// fields; use [`StreamClient::view`] to change those.
     pub fn set_service_fields(&self, service: StreamService, fields_csv: String) {
         self.inner
             .subscriptions
             .set_service_fields(service.as_str().to_string(), fields_csv);
+    }
+
+    /// Change the fields streamed for every subscribed key of `service` now
+    /// (Schwab's `VIEW` command), and for later subscriptions and
+    /// reconnects. With nothing subscribed on the service this only records
+    /// the fields, like [`StreamClient::set_service_fields`].
+    pub async fn view(&self, service: StreamService, fields_csv: String) -> Result<()> {
+        let _subscription = self.inner.subscription_lock.lock().await;
+        let valid = !fields_csv.is_empty()
+            && fields_csv
+                .split(',')
+                .all(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()));
+        if !valid {
+            return Err(Error::InvalidParameter(
+                "Fields must be comma-separated field numbers".into(),
+            ));
+        }
+        let live = self
+            .inner
+            .subscriptions
+            .get_subscription(service.as_str())
+            .is_some_and(|s| !s.symbols.is_empty());
+        if live {
+            if !self.is_authenticated() {
+                return Err(Error::Stream(StreamError::ConnectionFailed(
+                    "Not authenticated".to_string(),
+                )));
+            }
+            let request = self.inner.build_request(
+                StreamCommand::View,
+                &service,
+                StreamParameters {
+                    keys: None,
+                    fields: Some(fields_csv.clone()),
+                    authorization: None,
+                    schwab_client_channel: None,
+                    schwab_client_function_id: None,
+                },
+            );
+            self.send_request(request).await?;
+        }
+        self.inner
+            .subscriptions
+            .set_service_fields(service.as_str().to_string(), fields_csv);
+        Ok(())
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -826,6 +930,17 @@ impl StreamClient {
 /// inbound frame. Response/Notify frames have no per-service payload,
 /// so they get `service="_control"` rather than inflating real
 /// service labels.
+/// `delay` scaled by a uniform factor in `1 ± jitter` (clamped to 0..=1).
+fn jittered(delay: Duration, jitter: f64) -> Duration {
+    let jitter = if jitter.is_finite() {
+        jitter.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let factor = 1.0 + jitter * (2.0 * rand::random::<f64>() - 1.0);
+    delay.mul_f64(factor.max(0.0))
+}
+
 fn record_stream_frame(msg: &StreamMessage) {
     match msg {
         StreamMessage::State(_) => {}
@@ -910,8 +1025,11 @@ impl StreamClientInner {
             .await;
             let result = match ownership {
                 Ok(mut lease) => {
+                    // Never backwards: an overflow recovery may already have
+                    // advanced the generation past this lease's epoch.
+                    let base = lease.lease().epoch.saturating_sub(1);
                     self.health
-                        .send_modify(|s| s.generation = lease.lease().epoch.saturating_sub(1));
+                        .send_modify(|s| s.generation = s.generation.max(base));
                     lease.run(self.connect_and_run()).await
                 }
                 Err(error) => Err(error),
@@ -963,7 +1081,8 @@ impl StreamClientInner {
                         )));
                     }
 
-                    let backoff = *self.backoff_delay.read();
+                    let backoff =
+                        jittered(*self.backoff_delay.read(), self.config.reconnect.jitter);
                     warn!(
                         "Stream connection lost, reconnecting in {:?} (attempt {})",
                         backoff,
@@ -990,6 +1109,7 @@ impl StreamClientInner {
             s.generation += 1;
             s.ready = false;
         });
+        self.message_tx.reset_overflow();
 
         let ws_stream = tokio::time::timeout(Duration::from_secs(5), self.transport.connect())
             .await
@@ -1309,9 +1429,11 @@ impl StreamClientInner {
                             // payloads; Response/Notify are control-plane.
                             record_stream_frame(&stream_msg);
 
-                            if let Err(e) = self.message_tx.send(stream_msg) {
-                                warn!("Stream delivery failed; session invalidated");
-                                let _ = e;
+                            // A full queue is handled inside `send` (the
+                            // stream stays up and resumes under a new
+                            // generation); only a dropped receiver ends it.
+                            if self.message_tx.send(stream_msg).is_err() {
+                                warn!("Stream receiver dropped; closing the session");
                                 return Err(Error::ConnectionClosed);
                             }
                         }
@@ -1510,6 +1632,58 @@ mod tests {
             ..Default::default()
         };
         AuthManager::new(oauth_config).unwrap()
+    }
+
+    #[test]
+    fn reconnect_delays_are_jittered_within_bounds() {
+        let base = Duration::from_secs(8);
+        let delays: Vec<_> = (0..200).map(|_| jittered(base, 0.25)).collect();
+        assert!(
+            delays
+                .iter()
+                .all(|d| *d >= base.mul_f64(0.75) && *d <= base.mul_f64(1.25))
+        );
+        assert!(delays.iter().any(|d| *d != delays[0]), "no spread");
+        assert_eq!(jittered(base, 0.0), base);
+        assert!(jittered(base, f64::NAN) == base);
+        assert!(jittered(base, 5.0) <= base * 2);
+    }
+
+    /// Overflow drops frames (counted) while the queue is full, then, once
+    /// half of it has drained, resumes delivery under a new generation
+    /// without tearing the connection down.
+    #[test]
+    fn overflow_recovers_under_a_new_generation_once_drained() {
+        let (health, _status) = tokio::sync::watch::channel(StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        });
+        let (tx, mut rx) = mpsc::channel(2);
+        let sender = MessageSender::new(tx, health.clone());
+        let beat =
+            || StreamMessage::Notify(crate::types::streaming::StreamNotify { notify: vec![] });
+        sender.send(beat()).unwrap();
+        sender.send(beat()).unwrap();
+        // Full: dropped, counted, not ready; the socket is not closed.
+        sender.send(beat()).unwrap();
+        let status = health.borrow().clone();
+        assert!(!status.ready);
+        assert_eq!((status.generation, status.lost_messages), (1, 1));
+        // Still full: dropped again.
+        sender.send(beat()).unwrap();
+        assert_eq!(health.borrow().lost_messages, 2);
+        // The consumer drains; the next frame opens generation 2, ready.
+        assert_eq!(rx.try_recv().unwrap().0, 1);
+        assert_eq!(rx.try_recv().unwrap().0, 1);
+        sender.send(beat()).unwrap();
+        let status = health.borrow().clone();
+        assert!(status.ready);
+        assert_eq!(status.generation, 2);
+        assert_eq!(rx.try_recv().unwrap().0, 2);
+        // A dropped receiver is the only error.
+        drop(rx);
+        assert!(sender.send(beat()).is_err());
     }
 
     #[test]

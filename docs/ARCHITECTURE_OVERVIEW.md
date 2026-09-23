@@ -206,12 +206,17 @@ tracked bounded queue (`ChannelKind::Bounded(4096)` by default):
   lost_messages })` whenever that changes, so consumers re-baseline instead
   of consuming stale data.
 - Overflow is never silent: it bumps `lost_messages`, flips `ready` to
-  false and increments `schwab_stream_dropped_messages_total`.
+  false and increments `schwab_stream_dropped_messages_total`. The socket
+  stays up: frames are dropped until the consumer drains half the queue,
+  then delivery resumes under a new generation, so consumers re-baseline as
+  after a reconnect without another LOGIN.
 - Heartbeat: ping every 20 s, reconnect if no pong within 30 s. Reconnect
-  backoff 2 s → 128 s, unlimited by default. Subscriptions are restored on
-  reconnect and only confirmed once Schwab acknowledges them.
-- Field selection per service via `set_service_fields`; incoming frames
-  decode to `StreamPayload` through the field tables in `schwab-types`.
+  backoff 2 s → 128 s with ±25% jitter, unlimited by default. Subscriptions
+  are restored on reconnect and only confirmed once Schwab acknowledges them.
+- Field selection per service: `set_service_fields` for later
+  subscriptions, `view` (Schwab's `VIEW`) for live ones. Frames are capped
+  at 16 MiB and decode to `StreamPayload` through the field tables in
+  `schwab-types`.
 
 ### Observability
 

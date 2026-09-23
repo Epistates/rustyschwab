@@ -38,7 +38,7 @@ impl WebSocketTransport {
             Some(Connector::Plain)
         };
         let (ws_stream, response) =
-            connect_async_tls_with_config(self.url.as_str(), None, true, connector)
+            connect_async_tls_with_config(self.url.as_str(), Some(limits()), true, connector)
                 .await
                 .map_err(|e| Error::Stream(StreamError::ConnectionFailed(e.to_string())))?;
 
@@ -46,6 +46,17 @@ impl WebSocketTransport {
 
         Ok(ws_stream)
     }
+}
+
+/// Largest streamer message or frame accepted. Schwab's frames (books
+/// included) are kilobytes; the bound is set here rather than inherited from
+/// tungstenite's defaults so a corrupt or hostile peer cannot grow it.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+fn limits() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
 }
 
 /// The TLS connector for `wss://`, matching the HTTP client's backend.

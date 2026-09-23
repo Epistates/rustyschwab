@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — streaming
+
+- A full subscriber queue no longer tears down the WebSocket. Frames are
+  dropped and counted, the stream reports `ready: false`, and once the
+  consumer has drained half the queue delivery resumes under a new
+  generation on the same connection. A persistently slow consumer used to
+  cycle through reconnects (new LOGIN, resubscribe) with growing backoff.
+  The generation never moves backwards across a later reconnect.
+- Reconnect delays carry ±25% jitter (`ReconnectConfig::jitter`), so
+  clients dropped together do not log in again in lockstep.
+- `StreamClient::view` sends Schwab's `VIEW` command, changing the fields of
+  live subscriptions; `set_service_fields` still only affects later ones.
+  The MCP `stream_set_service_fields` tool now uses `view`.
+- WebSocket message and frame sizes are capped at 16 MiB explicitly.
+- Stream decoding builds the named object in one pass
+  (`DataContent::into_named_value` avoids the copy for owned items), and the
+  MCP cache evicts a tenth of its keys at its cap instead of scanning every
+  key for each new one.
+
 ### Fixed — MCP projections and the paper venue
 
 - `get_option_contracts` could permanently skip a contract: the page key

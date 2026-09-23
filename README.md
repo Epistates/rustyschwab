@@ -759,7 +759,8 @@ let mut config = StreamConfig::default();
 // Legacy compatibility setting (now capped at 65,536 messages)
 config.channel_kind = ChannelKind::Unbounded;
 
-// Bounded (default capacity: 4,096; overflow invalidates stream health)
+// Bounded (default capacity: 4,096; overflow marks the stream unready until
+// the consumer drains, then resumes under a new generation)
 config.channel_kind = ChannelKind::Bounded(10000); // 10k message buffer
 
 let stream = StreamClient::builder()

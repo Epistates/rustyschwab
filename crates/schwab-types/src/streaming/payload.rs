@@ -79,43 +79,48 @@ pub(super) fn csv(numbers: impl Iterator<Item = u32>) -> String {
         .join(",")
 }
 
+/// The table entry for wire key `key`, if it is a field number the table
+/// lists. Tables are in field order and mostly contiguous from 0, so the
+/// index is tried before a scan.
+fn lookup<'t>(key: &str, table: &'t [Field]) -> Option<&'t Field> {
+    let number = key.parse::<u32>().ok()?;
+    table
+        .get(number as usize)
+        .filter(|field| field.number == number)
+        .or_else(|| table.iter().find(|field| field.number == number))
+}
+
 /// Renames the numeric keys of `entries` per `table`; keys the table does
 /// not list, and non-numeric keys, pass through unchanged.
-fn rename<'a>(
-    entries: impl IntoIterator<Item = (&'a String, &'a Value)>,
+fn rename(
+    entries: impl IntoIterator<Item = (String, Value)>,
     table: &[Field],
 ) -> Map<String, Value> {
     entries
         .into_iter()
-        .map(|(key, value)| {
-            let field = key
-                .parse::<u32>()
-                .ok()
-                .and_then(|number| table.iter().find(|field| field.number == number));
-            match field {
-                Some(field) => {
-                    let value = match field.nested {
-                        Some(nested) => rename_nested(value, nested),
-                        None => value.clone(),
-                    };
-                    (field.name.to_owned(), value)
-                }
-                None => (key.clone(), value.clone()),
+        .map(|(key, value)| match lookup(&key, table) {
+            Some(field) => {
+                let value = match field.nested {
+                    Some(nested) => rename_nested(value, nested),
+                    None => value,
+                };
+                (field.name.to_owned(), value)
             }
+            None => (key, value),
         })
         .collect()
 }
 
-fn rename_nested(value: &Value, table: &[Field]) -> Value {
+fn rename_nested(value: Value, table: &[Field]) -> Value {
     match value {
         Value::Array(items) => Value::Array(
             items
-                .iter()
+                .into_iter()
                 .map(|item| rename_nested(item, table))
                 .collect(),
         ),
         Value::Object(map) => Value::Object(rename(map, table)),
-        other => other.clone(),
+        other => other,
     }
 }
 
@@ -124,17 +129,37 @@ impl DataContent {
     /// Numbers the table does not list, and non-numeric keys such as `seq`,
     /// pass through unchanged.
     pub fn named_fields(&self, table: &[Field]) -> Map<String, Value> {
-        rename(&self.fields, table)
+        rename(
+            self.fields.iter().map(|(k, v)| (k.clone(), v.clone())),
+            table,
+        )
     }
 
     /// The whole item as one JSON object: the envelope (`key`, `delayed`,
     /// `assetMainType`, …) plus [`named_fields`](Self::named_fields). This is
     /// the shape the typed payloads deserialize from.
     pub fn to_named_value(&self, table: &[Field]) -> Value {
-        match serde_json::to_value(self) {
-            Ok(Value::Object(map)) => Value::Object(rename(&map, table)),
-            _ => Value::Null,
+        self.clone().into_named_value(table)
+    }
+
+    /// [`to_named_value`](Self::to_named_value) without copying: for
+    /// consumers that own the item and do not need it afterwards.
+    pub fn into_named_value(self, table: &[Field]) -> Value {
+        let mut map = rename(self.fields, table);
+        map.insert("key".into(), Value::String(self.key));
+        if let Some(delayed) = self.delayed {
+            map.insert("delayed".into(), Value::Bool(delayed));
         }
+        if let Some(Ok(asset)) = self.asset_main_type.map(serde_json::to_value) {
+            map.insert("assetMainType".into(), asset);
+        }
+        if let Some(Ok(asset)) = self.asset_sub_type.map(serde_json::to_value) {
+            map.insert("assetSubType".into(), asset);
+        }
+        if let Some(cusip) = self.cusip {
+            map.insert("cusip".into(), Value::String(cusip));
+        }
+        Value::Object(map)
     }
 }
 

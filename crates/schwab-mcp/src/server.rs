@@ -1207,8 +1207,9 @@ impl SchwabMcp {
         .await
     }
 
-    /// Override the field list (comma-separated field numbers) sent on the
-    /// *next* subscription for `service`. Field 0 is always the key; the
+    /// Set the field list (comma-separated field numbers) streamed for
+    /// `service`: applied at once to its current subscriptions and kept
+    /// for later ones and reconnects. Field 0 is always the key; the
     /// numbering per service is the `*Fields` table in
     /// `schwab_types::streaming` (for example `LevelOneEquityFields`),
     /// which is also what `stream_snapshot` names the fields by.
@@ -1226,7 +1227,7 @@ impl SchwabMcp {
         contract::run("stream_set_service_fields", async {
             let guard = self.stream.read().await;
             let client = guard.as_ref().ok_or_else(not_connected)?;
-            client.set_service_fields(service, fields_csv.clone());
+            client.view(service, fields_csv.clone()).await?;
             Ok(contract::local(json!({
                 "status": "updated",
                 "service": service.as_str(),

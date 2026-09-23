@@ -69,6 +69,9 @@ impl CacheState {
         }
     }
 }
+/// Keys kept across all non-activity services before the oldest are evicted.
+const MAX_SNAPSHOTS: usize = 10_000;
+
 #[derive(Clone, Default)]
 pub struct StreamCache {
     inner: Arc<RwLock<CacheState>>,
@@ -103,17 +106,24 @@ impl StreamCache {
             }));
             return;
         }
-        if cache.snapshots.len() >= 10000
+        if cache.snapshots.len() >= MAX_SNAPSHOTS
             && !cache
                 .snapshots
                 .contains_key(&(service.clone(), key.clone()))
-            && let Some(oldest) = cache
+        {
+            // Evict the least recently updated tenth in one pass, so a
+            // churning key set costs one scan per thousand new keys rather
+            // than one per key.
+            let mut by_age: Vec<_> = cache
                 .snapshots
                 .iter()
-                .min_by_key(|(_, e)| e.received)
-                .map(|(k, _)| k.clone())
-        {
-            cache.snapshots.remove(&oldest);
+                .map(|(k, e)| (e.received, k.clone()))
+                .collect();
+            let evict = MAX_SNAPSHOTS / 10;
+            by_age.select_nth_unstable_by_key(evict - 1, |(received, _)| *received);
+            for (_, stale) in by_age.into_iter().take(evict) {
+                cache.snapshots.remove(&stale);
+            }
         }
         let merge = service.starts_with("LEVELONE_");
         let entry = cache
@@ -171,6 +181,10 @@ impl StreamCache {
             })
             .collect()
     }
+    /// The bounded account-activity log. `reconciliationRequired` is false
+    /// only once REST reconciliation has vouched for the current stream
+    /// generation; with account activity never subscribed nothing vouches
+    /// for an empty log, so it stays true.
     pub fn events(&self) -> Value {
         let cache = self.inner.read();
         json!({
@@ -421,12 +435,10 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                         // An unknown service keeps its numbered fields.
                         let table = item.service().map_or(&[][..], StreamService::fields);
                         for content in item.content {
-                            let mut value = content.to_named_value(table);
-                            if !value.is_object() {
-                                continue;
-                            }
+                            let key = content.key.clone();
+                            let mut value = content.into_named_value(table);
                             redact::apply_stream_content(&item.service, &mut value);
-                            cache.put(item.service.clone(), content.key, value, item.timestamp);
+                            cache.put(item.service.clone(), key, value, item.timestamp);
                         }
                     }
                 }
@@ -441,6 +453,25 @@ pub fn spawn_recovering_cache_feeder_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_full_cache_evicts_a_tenth_and_keeps_the_newest_key() {
+        let cache = StreamCache::new();
+        cache.update_status(StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        for i in 0..MAX_SNAPSHOTS {
+            cache.put("LEVELONE_EQUITIES".into(), format!("K{i}"), json!({}), now);
+        }
+        assert_eq!(cache.inner.read().snapshots.len(), MAX_SNAPSHOTS);
+        cache.put("LEVELONE_EQUITIES".into(), "NEW".into(), json!({}), now);
+        let snapshots = &cache.inner.read().snapshots;
+        assert_eq!(snapshots.len(), MAX_SNAPSHOTS - MAX_SNAPSHOTS / 10 + 1);
+        assert!(snapshots.contains_key(&("LEVELONE_EQUITIES".into(), "NEW".into())));
+    }
+
     #[test]
     fn recent_delivery_does_not_make_old_broker_data_fresh() {
         let cache = StreamCache::new();

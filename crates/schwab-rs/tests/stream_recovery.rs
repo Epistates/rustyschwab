@@ -241,3 +241,49 @@ async fn reconnect_is_not_ready_until_subscription_replay_is_acknowledged() {
     client.disconnect().await;
     server.await.unwrap();
 }
+
+/// `view` re-fields a live subscription with Schwab's VIEW command.
+#[tokio::test]
+async fn view_changes_fields_of_live_subscriptions() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let server = tokio::spawn(async move {
+        let mut ws = login(&listener).await;
+        let subscribe = request(&mut ws).await;
+        ws.send(Message::Text(
+            json!({"response":[ack(&subscribe,0)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let view = request(&mut ws).await;
+        ws.send(Message::Text(
+            json!({"response":[ack(&view,29)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+        view
+    });
+    client.connect().await.unwrap();
+    client
+        .subscribe(StreamService::LeveloneEquities, vec!["AAPL".into()])
+        .await
+        .unwrap();
+    assert!(
+        client
+            .view(StreamService::LeveloneEquities, "0,1,x".into())
+            .await
+            .is_err()
+    );
+    client
+        .view(StreamService::LeveloneEquities, "0,1,2".into())
+        .await
+        .unwrap();
+    client.disconnect().await;
+    let view = server.await.unwrap();
+    let sent = &view["requests"][0];
+    assert_eq!(sent["command"], "VIEW");
+    assert_eq!(sent["service"], "LEVELONE_EQUITIES");
+    assert_eq!(sent["parameters"]["fields"], "0,1,2");
+    assert!(sent["parameters"].get("keys").is_none());
+}
