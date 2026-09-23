@@ -5,6 +5,11 @@ on:
     tags: ['v*']
 permissions:
   contents: read
+env:
+  # Every binary the schwab-mcp package ships.
+  BINARIES: >-
+    schwab-mcp schwab-admin schwab-authority schwab-remote
+    schwab-paper schwab-paper-verify schwab-eval
 jobs:
   artifacts:
     runs-on: ubuntu-latest
@@ -13,32 +18,27 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --workspace --all-targets --all-features --locked
       - run: cargo build -p schwab-mcp --bins --release --locked
-      - run: python3 tools/sbom.py target/sbom.cdx.json
-      - run: sha256sum target/release/schwab-mcp target/release/schwab-admin target/release/schwab-authority target/release/schwab-remote target/release/schwab-paper target/release/schwab-paper-verify target/sbom.cdx.json > target/SHA256SUMS
-      - uses: actions/attest-build-provenance@v3
+      - name: Stage binaries and SBOM
+        run: |
+          mkdir -p dist
+          for bin in $BINARIES; do cp "target/release/$bin" dist/; done
+          # Fail if the package gained a binary this list does not ship.
+          built=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "schwab-mcp") | .targets[] | select(.kind[] == "bin") | .name' | sort)
+          listed=$(printf '%s\n' $BINARIES | sort)
+          [ "$built" = "$listed" ] || { echo "::error::binaries differ: $built vs $listed"; exit 1; }
+          python3 tools/sbom.py dist/sbom.cdx.json
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: |
-            target/release/schwab-mcp
-            target/release/schwab-admin
-            target/release/schwab-authority
-            target/release/schwab-remote
-            target/release/schwab-paper
-            target/release/schwab-paper-verify
-            target/sbom.cdx.json
-      - uses: actions/upload-artifact@v4
+          subject-path: dist/*
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-release-evidence
-          path: |
-            target/release/schwab-mcp
-            target/release/schwab-admin
-            target/release/schwab-authority
-            target/release/schwab-remote
-            target/release/schwab-paper
-            target/release/schwab-paper-verify
-            target/sbom.cdx.json
-            target/SHA256SUMS
+          path: dist/

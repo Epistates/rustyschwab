@@ -3,6 +3,7 @@ name = "streaming-examples"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]
@@ -12,6 +13,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+dotenvy = { workspace = true }
 
 [features]
 default = ["callback-server"]
