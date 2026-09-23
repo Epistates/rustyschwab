@@ -113,7 +113,10 @@ async fn option_contracts_are_ordered_and_spreads_are_refused() {
     assert_eq!(data["rows"][1][0], "AAPL  250117P00150000");
     assert_eq!(data["rows"][1][10], -0.5);
     assert_eq!(data["total"], 3);
-    assert_eq!(data["nextCursor"], "2025-01-17|150.000|P");
+    assert_eq!(
+        data["nextCursor"],
+        "2025-01-17|150.000|P|AAPL  250117P00150000"
+    );
 
     let rest_of = call(
         &server,

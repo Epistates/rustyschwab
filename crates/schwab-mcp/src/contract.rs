@@ -219,7 +219,10 @@ impl From<schwab_rs::Error> for ToolFailure {
                 let mut message = format!("Schwab rejected the request (HTTP {status})");
                 if !reasons.is_empty() {
                     message.push_str(": ");
-                    message.push_str(&truncate(&reasons.join("; "), 1024));
+                    // Schwab's prose is not redacted like its structured
+                    // payloads; mask anything shaped like an account number.
+                    let reasons = crate::redact::mask_accounts_in_text(&reasons.join("; "));
+                    message.push_str(&truncate(&reasons, 1024));
                 }
                 return Self::new(code, message);
             }

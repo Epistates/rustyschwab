@@ -282,6 +282,7 @@ fn exposure_under(
             Some(
                 OrderType::Limit
                     | OrderType::StopLimit
+                    | OrderType::LimitOnClose
                     | OrderType::NetDebit
                     | OrderType::NetCredit
             )
@@ -732,6 +733,15 @@ mod tests {
     }
     fn order(quantity: Value) -> Value {
         serde_json::json!({"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":quantity,"instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})
+    }
+    /// A limit-on-close order has a firm price, so it is bounded exposure.
+    #[test]
+    fn limit_on_close_orders_are_bounded() {
+        let mut close = order("2".into());
+        close["orderType"] = "LIMIT_ON_CLOSE".into();
+        let close: schwab_types::trading::OrderRequest = serde_json::from_value(close).unwrap();
+        let (quantity, notional) = exposure(&close, &Default::default()).unwrap();
+        assert_eq!((quantity, notional), (2.into(), 100.into()));
     }
     /// An approval binds the order Schwab would receive, not one JSON
     /// spelling of it; an order that is not a strict `OrderRequest` is

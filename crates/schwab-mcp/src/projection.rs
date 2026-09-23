@@ -138,15 +138,54 @@ pub fn page<K: Ord + Display + FromStr>(
 
 pub const CANDLE_COLUMNS: &[&str] = &["t", "o", "h", "l", "c", "v"];
 
+/// Orders candles by time, then by position among candles sharing a
+/// timestamp, so a page boundary between two such candles skips neither.
+/// The cursor text is the epoch milliseconds, suffixed `#n` for the n-th
+/// repeat of a timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CandleKey {
+    datetime: i64,
+    repeat: u32,
+}
+
+impl Display for CandleKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.repeat {
+            0 => write!(f, "{}", self.datetime),
+            n => write!(f, "{}#{n}", self.datetime),
+        }
+    }
+}
+
+impl FromStr for CandleKey {
+    type Err = ();
+    fn from_str(text: &str) -> Result<Self, ()> {
+        let (datetime, repeat) = text.split_once('#').unwrap_or((text, "0"));
+        Ok(Self {
+            datetime: datetime.parse().map_err(|_| ())?,
+            repeat: repeat.parse().map_err(|_| ())?,
+        })
+    }
+}
+
 /// `[t, o, h, l, c, v]` rows in time order, with `t` in epoch
 /// milliseconds as Schwab sends it.
-pub fn candles(history: PriceHistoryResponse) -> (Map<String, Value>, Vec<Row<i64>>) {
+pub fn candles(history: PriceHistoryResponse) -> (Map<String, Value>, Vec<Row<CandleKey>>) {
+    let mut seen: std::collections::HashMap<i64, u32> = std::collections::HashMap::new();
     let rows = history
         .candles
         .into_iter()
-        .map(|c| Row {
-            key: c.datetime,
-            value: json!([c.datetime, c.open, c.high, c.low, c.close, c.volume]),
+        .map(|c| {
+            let repeat = seen.entry(c.datetime).or_insert(0);
+            let key = CandleKey {
+                datetime: c.datetime,
+                repeat: *repeat,
+            };
+            *repeat += 1;
+            Row {
+                key,
+                value: json!([c.datetime, c.open, c.high, c.low, c.close, c.volume]),
+            }
         })
         .collect();
     let mut header = Map::new();
@@ -183,14 +222,19 @@ pub const CONTRACT_COLUMNS: &[&str] = &[
     "dte",
 ];
 
-/// Orders contracts by expiration, strike, then calls before puts, and
-/// survives a round trip through the cursor text `2025-01-17|150.000|C`.
+/// Orders contracts by expiration, strike, calls before puts, then contract
+/// symbol, and survives a round trip through the cursor text
+/// `2025-01-17|150.000|C|AAPL  250117C00150000`. The symbol breaks ties:
+/// after a corporate action a chain can list an adjusted contract beside
+/// the standard one at the same expiration, strike and side, and without it
+/// a page boundary between the two would skip the second.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContractKey {
     expiration: String,
     /// Strike in thousandths, so ordering is numeric.
     strike_milli: i64,
     put_call: u8,
+    symbol: String,
 }
 
 impl ContractKey {
@@ -199,6 +243,7 @@ impl ContractKey {
             expiration: expiration.to_owned(),
             strike_milli: (contract.strike_price * 1000.0).round() as i64,
             put_call: u8::from(!contract.put_call.eq_ignore_ascii_case("CALL")),
+            symbol: contract.symbol.clone(),
         }
     }
 }
@@ -207,11 +252,12 @@ impl Display for ContractKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}|{}.{:03}|{}",
+            "{}|{}.{:03}|{}|{}",
             self.expiration,
             self.strike_milli / 1000,
             self.strike_milli % 1000,
-            if self.put_call == 0 { 'C' } else { 'P' }
+            if self.put_call == 0 { 'C' } else { 'P' },
+            self.symbol
         )
     }
 }
@@ -219,7 +265,7 @@ impl Display for ContractKey {
 impl FromStr for ContractKey {
     type Err = ();
     fn from_str(text: &str) -> Result<Self, ()> {
-        let mut parts = text.split('|');
+        let mut parts = text.splitn(4, '|');
         let expiration = parts.next().filter(|e| !e.is_empty()).ok_or(())?;
         let strike: f64 = parts.next().and_then(|s| s.parse().ok()).ok_or(())?;
         let put_call = match parts.next() {
@@ -227,13 +273,12 @@ impl FromStr for ContractKey {
             Some("P") => 1,
             _ => return Err(()),
         };
-        if parts.next().is_some() {
-            return Err(());
-        }
+        let symbol = parts.next().ok_or(())?;
         Ok(Self {
             expiration: expiration.to_owned(),
             strike_milli: (strike * 1000.0).round() as i64,
             put_call,
+            symbol: symbol.to_owned(),
         })
     }
 }
@@ -483,6 +528,78 @@ mod tests {
         assert!(zero.is_err());
     }
 
+    /// An adjusted contract shares expiration, strike and side with the
+    /// standard one; paging one row at a time must still return both.
+    #[test]
+    fn contracts_sharing_a_strike_survive_page_boundaries() {
+        let chain: OptionChainResponse = serde_json::from_value(json!({
+            "symbol": "AAPL",
+            "callExpDateMap": {"2025-01-17:3": {"150.0": [
+                {"putCall": "CALL", "symbol": "AAPL  250117C00150000", "strikePrice": 150.0,
+                 "expirationDate": "2025-01-17T00:00:00.000+00:00"},
+                {"putCall": "CALL", "symbol": "AAPL1 250117C00150000", "strikePrice": 150.0,
+                 "expirationDate": "2025-01-17T00:00:00.000+00:00"}
+            ]}}
+        }))
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (header, rows) = option_contracts(chain.clone());
+            let page = page(
+                rows,
+                CONTRACT_COLUMNS,
+                header,
+                cursor.as_deref(),
+                Some(1),
+                1 << 20,
+            )
+            .unwrap();
+            assert_eq!(page.total, 2);
+            seen.extend(page.rows.iter().map(|r| r[0].as_str().unwrap().to_owned()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(seen, ["AAPL  250117C00150000", "AAPL1 250117C00150000"]);
+    }
+
+    /// Two candles at one timestamp are both returned across a boundary.
+    #[test]
+    fn candles_sharing_a_timestamp_survive_page_boundaries() {
+        let history: PriceHistoryResponse = serde_json::from_value(json!({
+            "symbol": "AAPL", "empty": false, "candles": [
+                {"datetime": 1, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1},
+                {"datetime": 2, "open": 2.0, "high": 2.0, "low": 2.0, "close": 2.0, "volume": 2},
+                {"datetime": 2, "open": 3.0, "high": 3.0, "low": 3.0, "close": 3.0, "volume": 3}
+            ]
+        }))
+        .unwrap();
+        let mut opens = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (header, rows) = candles(history.clone());
+            let page = page(
+                rows,
+                CANDLE_COLUMNS,
+                header,
+                cursor.as_deref(),
+                Some(1),
+                1 << 20,
+            )
+            .unwrap();
+            opens.extend(page.rows.iter().map(|r| r[1].as_f64().unwrap()));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(opens, [1.0, 2.0, 3.0]);
+        assert_eq!(CandleKey::from_str("2#1").unwrap().to_string(), "2#1");
+        assert_eq!(CandleKey::from_str("2").unwrap().to_string(), "2");
+    }
+
     #[test]
     fn contract_keys_order_and_round_trip() {
         let chain: OptionChainResponse = serde_json::from_value(json!({
@@ -523,17 +640,22 @@ mod tests {
         assert_eq!(page.rows[1][15], false);
         assert_eq!(page.columns.len(), page.rows[0].as_array().unwrap().len());
 
-        let key = ContractKey::from_str("2025-01-17|150.000|P").unwrap();
-        assert_eq!(key.to_string(), "2025-01-17|150.000|P");
+        let key = ContractKey::from_str("2025-01-17|150.000|P|AAPL  250117P00150000").unwrap();
         assert_eq!(
-            ContractKey::from_str("2025-01-17|152.5|C")
+            key.to_string(),
+            "2025-01-17|150.000|P|AAPL  250117P00150000"
+        );
+        assert_eq!(
+            ContractKey::from_str("2025-01-17|152.5|C|X")
                 .unwrap()
                 .to_string(),
-            "2025-01-17|152.500|C"
+            "2025-01-17|152.500|C|X"
         );
-        assert!(ContractKey::from_str("2025-01-17|abc|C").is_err());
-        assert!(ContractKey::from_str("2025-01-17|150|X").is_err());
-        assert!(ContractKey::from_str("|150|C").is_err());
+        assert!(ContractKey::from_str("2025-01-17|abc|C|X").is_err());
+        assert!(ContractKey::from_str("2025-01-17|150|X|X").is_err());
+        assert!(ContractKey::from_str("|150|C|X").is_err());
+        // The symbol is part of the key: a cursor without one was not issued here.
+        assert!(ContractKey::from_str("2025-01-17|150|C").is_err());
 
         let spread = OptionChainParams {
             strategy: Some(OptionStrategy::Vertical),

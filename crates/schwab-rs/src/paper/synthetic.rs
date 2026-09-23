@@ -197,7 +197,11 @@ impl SyntheticBbo {
 
     fn check(&self, symbol: &str, candle: &Candle, previous_open: Option<i64>) -> Result<()> {
         let prices = [candle.open, candle.high, candle.low, candle.close];
-        if prices.iter().any(|p| !p.is_finite() || *p <= 0.0)
+        // The venue's own price bound (`positive_bounded`): anything above it
+        // could never be quoted, and keeps the spread arithmetic in range.
+        if prices
+            .iter()
+            .any(|p| !p.is_finite() || *p <= 0.0 || *p > 1e12)
             || candle.low > candle.open.min(candle.close)
             || candle.high < candle.open.max(candle.close)
         {
@@ -238,9 +242,20 @@ impl SyntheticBbo {
             .to_string()
             .parse()
             .map_err(|_| self.reject(symbol, candle, "has a price the venue cannot represent"))?;
-        let half = mid * self.spread_bps / Decimal::from(20_000);
-        let bid = (mid - half).round_dp_with_strategy(2, RoundingStrategy::ToNegativeInfinity);
-        let ask = (mid + half).round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
+        let unrepresentable =
+            || self.reject(symbol, candle, "has a price the venue cannot represent");
+        let half = mid
+            .checked_mul(self.spread_bps)
+            .and_then(|v| v.checked_div(Decimal::from(20_000)))
+            .ok_or_else(unrepresentable)?;
+        let bid = mid
+            .checked_sub(half)
+            .ok_or_else(unrepresentable)?
+            .round_dp_with_strategy(2, RoundingStrategy::ToNegativeInfinity);
+        let ask = mid
+            .checked_add(half)
+            .ok_or_else(unrepresentable)?
+            .round_dp_with_strategy(2, RoundingStrategy::ToPositiveInfinity);
         if bid < Decimal::ONE {
             return Err(self.reject(
                 symbol,
@@ -560,6 +575,18 @@ mod tests {
         assert!(err(&one(candle(-1, 100.0, 100.0, 100.0, 100.0, 1))).contains("clock"));
         assert!(err(&one(candle(OPEN, 0.5, 0.5, 0.5, 0.5, 1))).contains("one-unit"));
         assert!(err(&one(candle(OPEN, 100.0, 100.0, 100.0, 100.0, i64::MAX))).contains("bound"));
+        // Representable but absurd prices are refused, not an arithmetic panic.
+        let wide = SyntheticBbo {
+            spread_bps: d("1000"),
+            ..model.clone()
+        };
+        let huge = candle(OPEN, 8e25, 8e25, 8e25, 8e25, 1);
+        assert!(
+            wide.events(&[history("ABC", vec![huge])], 1)
+                .unwrap_err()
+                .to_string()
+                .contains("well-formed")
+        );
         assert!(
             err(&[history(
                 "ABC",

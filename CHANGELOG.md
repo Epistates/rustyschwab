@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — MCP projections and the paper venue
+
+- `get_option_contracts` could permanently skip a contract: the page key
+  was expiration, strike and side, which an adjusted contract shares with
+  the standard one, so a page boundary between them dropped the second.
+  The contract symbol now breaks the tie, and candles sharing a timestamp
+  get an ordinal. Contract cursors gain a fourth part (the symbol); a cursor
+  from before this release is refused as not issued here.
+- The synthetic quote model refuses candle prices above the venue's price
+  bound instead of panicking on decimal overflow.
+- The paper REST feed names the trading day by New York's date, not UTC's,
+  which rolled over at 8 pm Eastern and opened the next session early.
+- Schwab's rejection text in tool errors has account-number-shaped digit
+  runs masked, like structured payloads (`SCHWAB_MCP_REDACT_PII`).
+- The policy treats `LIMIT_ON_CLOSE` as bounded exposure at its limit.
+
 ### Fixed — execution and resilience
 
 - Rate limiting (429) no longer opens the circuit breaker. It shows the

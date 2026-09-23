@@ -17,6 +17,14 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 /// the clock indefinitely.
 const FEED_DEADLINE: Duration = Duration::from_secs(10);
 
+/// The US equity trading day `now` falls in: New York's calendar date. The
+/// UTC date turns over at 8 pm Eastern (7 pm in winter), which would open
+/// the next day's session hours early.
+fn trading_date(now: DateTime<Utc>) -> chrono::NaiveDate {
+    now.with_timezone(&chrono_tz::America::New_York)
+        .date_naive()
+}
+
 fn deadline_exceeded() -> Error {
     Error::Timeout {
         duration: FEED_DEADLINE.as_secs(),
@@ -155,14 +163,13 @@ impl SchwabPaperFeed {
             .await
     }
     async fn poll(&self) -> Result<()> {
-        let now = Utc::now();
-        let date = now.format("%Y-%m-%d").to_string();
+        let today = trading_date(Utc::now());
+        let date = today.format("%Y-%m-%d").to_string();
         // Do not cancel database mutations: blocking SQLite work may outlive a
         // dropped future and otherwise commit after the disconnect event.
         let hours = tokio::time::timeout(
             FEED_DEADLINE,
-            self.market_data
-                .get_market(Market::Equity, Some(now.date_naive())),
+            self.market_data.get_market(Market::Equity, Some(today)),
         )
         .await
         .map_err(|_| deadline_exceeded())??;
@@ -214,5 +221,24 @@ impl SchwabPaperFeed {
             self.publish(event).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trading_date;
+    use chrono::{NaiveDate, TimeZone, Utc};
+
+    #[test]
+    fn the_trading_day_is_new_yorks_date() {
+        let day = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+        // 21:30 EDT on the 16th is already the 17th in UTC.
+        let evening = Utc.with_ymd_and_hms(2024, 5, 17, 1, 30, 0).unwrap();
+        assert_eq!(trading_date(evening), day(2024, 5, 16));
+        // 19:30 EST on the 16th, winter offset.
+        let winter = Utc.with_ymd_and_hms(2024, 1, 17, 0, 30, 0).unwrap();
+        assert_eq!(trading_date(winter), day(2024, 1, 16));
+        let open = Utc.with_ymd_and_hms(2024, 5, 17, 13, 30, 0).unwrap();
+        assert_eq!(trading_date(open), day(2024, 5, 17));
     }
 }

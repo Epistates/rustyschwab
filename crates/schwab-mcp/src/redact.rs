@@ -176,6 +176,40 @@ fn redact_stream_content_with(service: &str, value: &mut Value, mask_accounts: b
     }
 }
 
+/// Mask what may be an account number inside free text (Schwab's error
+/// prose): a standalone run of 8 or 9 digits keeps its last four. Longer
+/// runs are order or activity IDs and stay readable; shorter ones are
+/// quantities and prices. Only when masking is enabled.
+pub fn mask_accounts_in_text(text: &str) -> String {
+    if !account_masking_enabled() {
+        return text.to_owned();
+    }
+    mask_digit_runs(text)
+}
+
+fn mask_digit_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    let flush = |run: &mut String, out: &mut String| {
+        if (8..=9).contains(&run.len()) {
+            out.push_str(&mask_account(run));
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut run, &mut out);
+            out.push(c);
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 fn mask_account(num: &str) -> String {
     let chars: Vec<char> = num.chars().collect();
     let n = chars.len();
@@ -198,6 +232,16 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_numbers_in_prose_are_masked_but_order_ids_are_not() {
+        assert_eq!(
+            mask_digit_runs("Account 12345678 cannot trade AAPL; order 1004055538123 stands"),
+            "Account ***5678 cannot trade AAPL; order 1004055538123 stands"
+        );
+        assert_eq!(mask_digit_runs("qty 100 at 150.25"), "qty 100 at 150.25");
+        assert_eq!(mask_digit_runs("123456789"), "***6789");
+    }
 
     #[test]
     fn mask_account_keeps_last_four() {
