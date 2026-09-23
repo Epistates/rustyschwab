@@ -15,6 +15,15 @@ pub fn mock_client(
     server: &MockServer,
     expired: bool,
 ) -> (SchwabClient, tempfile::TempDir, TokenSet) {
+    mock_client_with(server, expired, |_| {})
+}
+
+/// [`mock_client`] with a final adjustment to the configuration.
+pub fn mock_client_with(
+    server: &MockServer,
+    expired: bool,
+    adjust: impl FnOnce(&mut SchwabConfig),
+) -> (SchwabClient, tempfile::TempDir, TokenSet) {
     let dir = tempfile::tempdir().unwrap();
     let mut config = SchwabConfig::default();
     config.oauth.app_key = "12345678901234567890123456789012".into();
@@ -47,5 +56,6 @@ pub fn mock_client(
     FileTokenStore::new(config.oauth.tokens_file.clone())
         .save(&tokens)
         .unwrap();
+    adjust(&mut config);
     (SchwabClient::new(config).unwrap(), dir, tokens)
 }

@@ -241,9 +241,10 @@ impl From<schwab_rs::Error> for ToolFailure {
             ErrorKind::RiskDenied => Self::new(FailureCode::RiskDenied, e.to_string()),
             ErrorKind::ApprovalInvalid => Self::new(FailureCode::ApprovalRequired, e.to_string()),
             ErrorKind::Halted => Self::new(FailureCode::Halted, e.to_string()),
-            ErrorKind::BaselineStale | ErrorKind::CircuitOpen | ErrorKind::OwnershipLost => {
-                Self::new(FailureCode::Unavailable, e.to_string())
-            }
+            ErrorKind::BaselineStale
+            | ErrorKind::CircuitOpen
+            | ErrorKind::OwnershipLost
+            | ErrorKind::LeaseBusy => Self::new(FailureCode::Unavailable, e.to_string()),
             ErrorKind::RateLimit => Self::new(FailureCode::RateLimited, e.to_string()),
             ErrorKind::Timeout => Self::new(FailureCode::Timeout, e.to_string()),
             _ if e.is_retryable() => {

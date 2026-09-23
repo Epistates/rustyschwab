@@ -863,3 +863,63 @@ async fn concurrent_first_use_initializes_once() {
         .unwrap();
     assert_eq!(migrations, 2);
 }
+
+/// A partial fill shrinks the order's held reservation to what can still
+/// fill; the filled part is already out of the broker's available funds.
+#[tokio::test]
+async fn partial_fills_shrink_held_reservations() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("partial.json"));
+    let db = journal.database().clone();
+    let baseline =
+        json!({"securitiesAccount":{"currentBalances":{"availableFunds":1000},"positions":[]}});
+    let now = || chrono::Utc::now().timestamp_millis();
+    db.reconcile_snapshot("A", 1, now(), baseline.clone(), vec![])
+        .await
+        .unwrap();
+    let risk = PortfolioRisk {
+        database: db.clone(),
+        accounts: HashMap::from([(
+            "A".into(),
+            PortfolioLimits {
+                max_open_quantity: 10.into(),
+                max_open_notional: 100.into(),
+                max_position_quantity: 100.into(),
+                max_snapshot_age_ms: 5000,
+                max_daily_loss: None,
+            },
+        )]),
+    };
+    let order = |quantity: u32| -> schwab_rs::types::trading::OrderRequest {
+        serde_json::from_value(json!({"orderStrategyType":"SINGLE","orderType":"LIMIT",
+            "price":"10","session":"NORMAL","duration":"DAY","orderLegCollection":[
+            {"quantity":quantity.to_string(),"instruction":"BUY",
+             "instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}))
+        .unwrap()
+    };
+    let id = journal
+        .begin_once("A", "place_order", json!({}), None)
+        .await
+        .unwrap();
+    risk.reserve("A", &id, &order(10)).await.unwrap();
+    journal
+        .finish(
+            &id,
+            SubmissionOutcome::Accepted {
+                order_id: Some("9".into()),
+            },
+        )
+        .await
+        .unwrap();
+    // The full reservation leaves no room.
+    assert!(risk.reserve("A", "next", &order(6)).await.is_err());
+    let working = json!({"orderId":9,"status":"WORKING","orderStrategyType":"SINGLE",
+        "orderType":"LIMIT","quantity":10,"filledQuantity":6,"remainingQuantity":4,"price":10,
+        "orderLegCollection":[{"instruction":"BUY","quantity":10,
+            "instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]});
+    db.reconcile_snapshot("A", 1, now(), baseline, vec![working])
+        .await
+        .unwrap();
+    // Four remain held, so six more fit the ten-share cap.
+    risk.reserve("A", "next", &order(6)).await.unwrap();
+}

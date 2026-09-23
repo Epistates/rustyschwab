@@ -717,3 +717,123 @@ async fn reconciliation_deadline_and_missing_target_leave_account_unready() {
             .reconciled
     );
 }
+
+/// Submissions for different accounts on one credential take turns on the
+/// execution lease; the second waits for the first instead of failing
+/// (and being journaled as refused) without reaching the broker.
+#[tokio::test]
+async fn concurrent_submissions_share_the_execution_lease() {
+    let server = MockServer::start().await;
+    for (account, delay) in [("a", 300), ("b", 0)] {
+        Mock::given(method("POST"))
+            .and(path(format!("/trader/v1/accounts/{account}/orders")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(
+                        "Location",
+                        format!("https://api.schwabapi.com/trader/v1/accounts/{account}/orders/7"),
+                    )
+                    .set_delay(Duration::from_millis(delay)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let (client, _dir, _) = client(&server, false);
+    let order = limit_order();
+    let slow = client.place_order("a", &order);
+    let fast = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.place_order("b", &order).await
+    };
+    let (slow, fast) = tokio::join!(slow, fast);
+    assert_eq!(slow.unwrap().order_id.as_deref(), Some("7"));
+    assert_eq!(fast.unwrap().order_id.as_deref(), Some("7"));
+    server.verify().await;
+}
+
+/// One account's unresolved intent blocks that account, not its neighbours.
+#[tokio::test]
+async fn pending_submissions_are_counted_per_account() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    let store = client.execution_store();
+    store
+        .begin_once("a", "place_order", serde_json::json!({"tag": "x"}), None)
+        .await
+        .unwrap();
+    assert_eq!(store.pending_count().await.unwrap(), 1);
+    assert_eq!(store.pending_count_for(&["a".into()]).await.unwrap(), 1);
+    assert_eq!(store.pending_count_for(&["b".into()]).await.unwrap(), 0);
+    let readiness = client.readiness(&["b".into()], 5000).await.unwrap();
+    assert_eq!(readiness.pending_submissions, 0);
+}
+
+/// After a complete pass, the order list covers only the time since it (less
+/// the overlap), and a working order the list returned is not fetched again.
+#[tokio::test]
+async fn incremental_reconciliation_narrows_the_window_and_skips_listed_targets() {
+    use schwab_rs::reconciliation::{ReconciliationOptions, SINCE_OVERLAP};
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    // Order 5 is working and already tracked; the list will return it.
+    client
+        .execution_store()
+        .track_order("hash", "5")
+        .await
+        .unwrap();
+    Mock::given(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"orderId": 5, "status": "WORKING", "orderStrategyType": "SINGLE"}
+        ])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/trader/v1/accounts/hash/orders/5"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(path("/trader/v1/accounts/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "securitiesAccount": {"positions": [], "currentBalances": {"availableFunds": 100}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let since = chrono::Utc::now() - chrono::Duration::hours(1);
+    let report = client
+        .reconcile_account_with_options(
+            "hash",
+            1,
+            ReconciliationOptions {
+                since: Some(since),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(report.reconciled);
+    assert!(report.started_at >= since.timestamp_millis());
+    let list = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/trader/v1/accounts/hash/orders")
+        .unwrap();
+    let from = list
+        .url
+        .query_pairs()
+        .find(|(k, _)| k == "fromEnteredTime")
+        .unwrap()
+        .1
+        .into_owned();
+    let from = chrono::DateTime::parse_from_rfc3339(&from).unwrap();
+    let expected = since - SINCE_OVERLAP;
+    assert!(
+        (from.timestamp_millis() - expected.timestamp_millis()).abs() < 1000,
+        "window starts {from}, expected {expected}"
+    );
+    server.verify().await;
+}

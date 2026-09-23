@@ -113,10 +113,13 @@ and calls `execute_resilient`, which runs one logical call as:
    run (`meta.execution_mode`).
 2. Fetch the access token from `AuthManager`.
 3. `CircuitBreaker::call` (default: opens after 5 failures, half-open after
-   30 s). Reads run inside `RetryPolicy::execute` (default 3 retries,
-   100 ms → 10 s backoff with jitter, `Retry-After` honoured); **writes are
-   never retried** — an ambiguous outcome becomes `Error::SubmissionUnknown`
-   carrying the attempt ID.
+   30 s; 429s show the broker is answering and never count). Reads and
+   cancellations run inside `RetryPolicy::execute` (default 3 retries,
+   100 ms → 10 s backoff with jitter, `Retry-After` honoured up to 5
+   minutes); **placements and replacements are never retried** — an
+   ambiguous outcome becomes `Error::SubmissionUnknown` carrying the
+   attempt ID. They also take the credential's execution lease, waiting
+   for another in-flight submission rather than failing.
 4. Each attempt: `RequestBudget::admit` (in-process `governor` limiter +
    rolling per-minute window + shared quota through the `Coordinator`,
    keyed by app key and API origin; default 2 req/s, burst 10), then for

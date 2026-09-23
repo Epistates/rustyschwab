@@ -164,14 +164,7 @@ impl CircuitBreaker {
             }
         };
         let result = f().await;
-        // A permanent HTTP rejection is evidence that the service responded.
-        // Local validation/auth failures are neutral; the permit still releases.
-        let success = result.is_ok()
-            || result.as_ref().err().is_some_and(|e| {
-                e.http_status().is_some_and(|s| s.is_client_error()) && !e.is_retryable()
-            });
-        let failure = result.as_ref().err().is_some_and(Error::is_retryable);
-        self.record(permit.generation, success, failure);
+        self.record(permit.generation, responded(&result), unhealthy(&result));
         result
     }
     fn record(&self, generation: u64, success: bool, failure: bool) {
@@ -217,6 +210,27 @@ impl CircuitBreaker {
 
 /// Emit the transition counter + state gauge. Split out so the
 /// transition_to_* methods don't each duplicate the metric glue.
+/// The service answered: a success, or a permanent client error. A 429 is
+/// an answer too: the broker is up and pacing this credential, which the
+/// request budget and `Retry-After` handle, and tripping the one shared
+/// breaker on it would refuse orders because of read traffic.
+fn responded<T>(result: &Result<T>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(Error::RateLimit { .. }) => true,
+        Err(e) => e.http_status().is_some_and(|s| s.is_client_error()) && !e.is_retryable(),
+    }
+}
+
+/// The service may be unhealthy: a transport failure, timeout or 5xx.
+/// Local validation and auth failures are neither; the permit still releases.
+fn unhealthy<T>(result: &Result<T>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.is_retryable() && !matches!(e, Error::RateLimit { .. }))
+}
+
 fn record_transition(from: CircuitState, to: CircuitState) {
     metrics::counter!(
         crate::metrics::CIRCUIT_TRANSITIONS_TOTAL,
@@ -278,6 +292,28 @@ mod tests {
         breaker.record_success();
         assert_eq!(breaker.failure_count(), 0);
         assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    /// Rate limiting proves the broker is answering: however many 429s,
+    /// the breaker stays closed, so reads cannot lock out order submission.
+    #[tokio::test]
+    async fn rate_limits_never_open_the_breaker() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            ..Default::default()
+        });
+        for _ in 0..10 {
+            let _ = breaker
+                .call(|| async { Err::<(), _>(Error::RateLimit { retry_after: 1 }) })
+                .await;
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
+        for _ in 0..2 {
+            let _ = breaker
+                .call(|| async { Err::<(), _>(Error::ConnectionClosed) })
+                .await;
+        }
+        assert_eq!(breaker.state(), CircuitState::Open);
     }
 
     #[test]

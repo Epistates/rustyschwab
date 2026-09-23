@@ -19,8 +19,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Readiness treats an account baseline older than this as stale, as the
-/// `/readyz` endpoint does.
+/// `/readyz` endpoint does, unless [`BASELINE_MAX_AGE_ENV`] says otherwise.
 pub const BASELINE_MAX_AGE_MS: i64 = 5_000;
+
+/// Oldest account baseline readiness accepts, in milliseconds (1–60000).
+/// Set it to the risk policy's `max_snapshot_age_ms`, and keep
+/// `SCHWAB_RECOVERY_INTERVAL_MS` comfortably below it.
+pub const BASELINE_MAX_AGE_ENV: &str = "SCHWAB_BASELINE_MAX_AGE_MS";
+
+/// The configured baseline age limit; startup rejects an invalid value, so
+/// here it falls back to the default.
+pub fn baseline_max_age_ms() -> i64 {
+    parse_baseline_max_age(std::env::var(BASELINE_MAX_AGE_ENV).ok().as_deref())
+        .unwrap_or(BASELINE_MAX_AGE_MS)
+}
+
+/// Parse [`BASELINE_MAX_AGE_ENV`]; unset is the default.
+pub fn parse_baseline_max_age(raw: Option<&str>) -> Result<i64, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(BASELINE_MAX_AGE_MS),
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|ms| (1..=60_000).contains(ms))
+            .ok_or_else(|| format!("{BASELINE_MAX_AGE_ENV} must be 1-60000 ms, got {raw:?}")),
+    }
+}
 
 /// Bound on the readiness probe and on each calendar request, so a status
 /// call answers promptly even when a dependency does not.
@@ -249,18 +273,22 @@ pub async fn collect(
         submissions_suspended,
         circuit: backend.circuit_state(),
     };
-    let readiness =
-        match tokio::time::timeout(PROBE_DEADLINE, backend.readiness(BASELINE_MAX_AGE_MS)).await {
-            Ok(Ok(readiness)) => Some(readiness),
-            Ok(Err(e)) => {
-                warnings.push(e);
-                None
-            }
-            Err(_) => {
-                warnings.push(timeout("Readiness probe"));
-                None
-            }
-        };
+    let readiness = match tokio::time::timeout(
+        PROBE_DEADLINE,
+        backend.readiness(baseline_max_age_ms()),
+    )
+    .await
+    {
+        Ok(Ok(readiness)) => Some(readiness),
+        Ok(Err(e)) => {
+            warnings.push(e);
+            None
+        }
+        Err(_) => {
+            warnings.push(timeout("Readiness probe"));
+            None
+        }
+    };
     let equity_session = match backend.market_data("The equity calendar") {
         Ok(schwab) if schwab.auth_manager().has_valid_tokens() => {
             match calendar.session(schwab, now).await {
@@ -462,6 +490,24 @@ async fn equity_hours(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn freshness_settings_parse_within_their_bounds() {
+        assert_eq!(parse_baseline_max_age(None), Ok(BASELINE_MAX_AGE_MS));
+        assert_eq!(parse_baseline_max_age(Some(" 15000 ")), Ok(15_000));
+        for bad in ["0", "60001", "5s", "-1"] {
+            assert!(parse_baseline_max_age(Some(bad)).is_err(), "{bad}");
+        }
+        use crate::server::parse_recovery_interval;
+        assert_eq!(parse_recovery_interval(None), Ok(Duration::from_secs(2)));
+        assert_eq!(
+            parse_recovery_interval(Some("30000")),
+            Ok(Duration::from_secs(30))
+        );
+        for bad in ["999", "60001", "2s"] {
+            assert!(parse_recovery_interval(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     fn hours(value: Value) -> MarketHours {
         serde_json::from_value(value).unwrap()

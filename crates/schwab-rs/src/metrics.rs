@@ -25,6 +25,7 @@
 //! | `schwab_circuit_transitions_total` | counter | `from`, `to` | Every state change. |
 //! | `schwab_token_refresh_total` | counter | `outcome`, `grant` | One per `/oauth/token` request after internal retries: `success` / `failure` × `authorization_code` / `refresh_token`. |
 //! | `schwab_reconciliation_total` | counter | `outcome` | Account reconciliation runs: `ready` when the baseline is usable, `unresolved` otherwise. |
+//! | `schwab_reconciliation_untagged_matches_total` | counter | — | Unresolved submissions for which the broker lists an order matching the request but without its tag. Reconciliation never resolves these on a guess; an operator reconciles them with evidence. |
 //! | `schwab_pending_submissions` | gauge | — | Submissions awaiting reconciliation, as of the last readiness probe. |
 //! | `schwab_unreconciled_accounts` | gauge | — | Required accounts without a fresh baseline, as of the last readiness probe. |
 //! | `schwab_baseline_age_seconds` | gauge | — | Age of the oldest required-account baseline, as of the last readiness probe. |
@@ -58,6 +59,7 @@ pub const TOKEN_REFRESH_TOTAL: &str = "schwab_token_refresh_total";
 
 /// Reconciliation and readiness.
 pub const RECONCILIATION_TOTAL: &str = "schwab_reconciliation_total";
+pub const UNTAGGED_MATCHES_TOTAL: &str = "schwab_reconciliation_untagged_matches_total";
 pub const PENDING_SUBMISSIONS: &str = "schwab_pending_submissions";
 pub const UNRECONCILED_ACCOUNTS: &str = "schwab_unreconciled_accounts";
 pub const BASELINE_AGE_SECONDS: &str = "schwab_baseline_age_seconds";
@@ -154,6 +156,10 @@ pub const CATALOG: &[Metric] = &[
     Metric::counter(
         RECONCILIATION_TOTAL,
         "Account reconciliation runs, by outcome",
+    ),
+    Metric::counter(
+        UNTAGGED_MATCHES_TOTAL,
+        "Unresolved submissions with a matching broker order that lacks their tag",
     ),
     Metric::gauge(
         PENDING_SUBMISSIONS,

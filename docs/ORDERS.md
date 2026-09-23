@@ -191,6 +191,13 @@ for three legs; short brackets are refused like any other opening short.
 | `with_stop_type(StopType)` | `stopType` (`STANDARD`, `BID`, `ASK`, `LAST`, `MARK`) |
 | `with_complex_strategy(ComplexOrderStrategyType)` | `complexOrderStrategyType` |
 
+A tag identifies one intent. The SDK assigns a random one when you leave it
+out, and reconciliation matches broker orders to intents by it. Once an
+intent is accepted (or reconciled) its tag is spent for that account: any
+later `place_order` or `replace_order` carrying it, the replacement of the
+same order included, fails with `Error::Duplicate`. A rejected intent frees
+its tag. Give each replacement its own tag, for example `swing-1-r1`.
+
 Every field is also a public member of `OrderRequest`, so anything without a
 constructor (`TRAILING_STOP_LIMIT`, `LIMIT_ON_CLOSE`, `priceLinkBasis`, …)
 can be set directly or deserialized from JSON. The paper engine and the MCP

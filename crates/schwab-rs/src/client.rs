@@ -48,6 +48,8 @@ struct ClientInner {
     rate_limiter: Option<Arc<RequestBudget>>,
     retry_policy: RetryPolicy,
     circuit_breaker: Arc<CircuitBreaker>,
+    /// Wakes a [`RecoveryWorker`](crate::recovery::RecoveryWorker) early.
+    reconciliation_wanted: Arc<tokio::sync::Notify>,
 }
 
 impl SchwabClient {
@@ -97,6 +99,7 @@ impl SchwabClient {
                 rate_limiter,
                 retry_policy,
                 circuit_breaker,
+                reconciliation_wanted: Arc::new(tokio::sync::Notify::new()),
             }),
         })
     }
@@ -128,6 +131,15 @@ impl SchwabClient {
     /// Trusted application recovery must establish readiness before clearing this gate.
     pub fn resume_submissions(&self) {
         *self.inner.submission_gate.write() = None;
+    }
+    /// Ask the recovery worker for a reconciliation pass now rather than at
+    /// its next interval: account activity arrived, so orders or balances
+    /// changed. Requests made during a pass start another one after it.
+    pub fn request_reconciliation(&self) {
+        self.inner.reconciliation_wanted.notify_one();
+    }
+    pub(crate) async fn reconciliation_requested(&self) {
+        self.inner.reconciliation_wanted.notified().await
     }
     /// Permanently close submission admission on this client and all its clones.
     /// Reconciliation and cancellation remain available during process drain.
@@ -540,9 +552,12 @@ impl SchwabClient {
         };
         let guarded = async {
             if submission {
-                let mut ownership = crate::coordination::LeaseSession::acquire(
+                // Submissions sharing the credential take turns; the overall
+                // deadline below bounds the wait.
+                let mut ownership = crate::coordination::LeaseSession::acquire_waiting(
                     self.inner.coordinator.clone(),
                     &format!("execution:{}", self.inner.quota_key),
+                    self.inner.config.timeout,
                 )
                 .await?;
                 ownership.run(operation).await
@@ -981,7 +996,13 @@ impl SchwabClient {
         .await
     }
 
-    /// Cancel an order
+    /// Cancel an order.
+    ///
+    /// Unlike placement, a cancellation creates no exposure and asking twice
+    /// is harmless, so it is retried like a read, is allowed while
+    /// submissions are halted, and opens no intent in the execution journal.
+    /// Record who cancelled what in the calling layer: the MCP server and the
+    /// authority audit every cancellation per principal.
     pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {
         self.request(
             "cancel_order",

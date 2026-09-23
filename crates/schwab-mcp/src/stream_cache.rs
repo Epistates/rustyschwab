@@ -411,6 +411,12 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                     }
                 }
                 StreamMessage::Data(data) => {
+                    // Activity means orders or balances moved: have the
+                    // recovery worker, if any, re-read the account now
+                    // rather than at its next interval.
+                    if data.data.iter().any(|item| item.service == "ACCT_ACTIVITY") {
+                        client.request_reconciliation();
+                    }
                     for item in data.data {
                         // An unknown service keeps its numbered fields.
                         let table = item.service().map_or(&[][..], StreamService::fields);

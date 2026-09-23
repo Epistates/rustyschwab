@@ -30,6 +30,8 @@
 //! - [`Error::ReconciliationRequired`] / [`Error::SubmissionUnknown`] -
 //!   Reconcile the pending attempt before submitting again
 //! - [`Error::OwnershipLost`] - Another writer holds the execution lease
+//! - [`Error::LeaseBusy`] - Another operation held the lease for the whole
+//!   wait; nothing was sent, so the same intent can be submitted again
 //!
 //! # Portability
 //!
@@ -88,6 +90,10 @@ pub enum Error {
     Storage(String),
     #[error("Ownership lease lost; reconcile in-flight operations")]
     OwnershipLost,
+    /// Another operation holds the lease right now; nothing was attempted.
+    /// The resource is not named: lease names embed the app key.
+    #[error("Another operation holds the lease; nothing was sent")]
+    LeaseBusy,
     #[error("Circuit breaker is open")]
     CircuitOpen,
     #[error("Reconciliation is required for pending submission {attempt_id}")]
@@ -149,11 +155,15 @@ pub enum Error {
     /// - 4xx: Fix the request (invalid parameters, unauthorized, etc.)
     /// - 5xx: Retry with exponential backoff (SDK handles automatically)
     /// - 429: Rate limited - wait and retry (SDK handles automatically)
-    #[error("HTTP request failed with status {status}: {message}")]
+    ///
+    /// Like [`Error::Broker`]'s details, the body is kept in `message` for
+    /// trusted callers and left out of `Display`: an unrecognised error body
+    /// (a proxy page, a new error shape) can echo request data into logs.
+    #[error("HTTP request failed with status {status}")]
     Http {
         /// HTTP status code (e.g., 401, 404, 500)
         status: reqwest::StatusCode,
-        /// Response body or error message
+        /// Response body (at most 16 KiB) or error message
         message: String,
     },
 
@@ -385,6 +395,7 @@ impl Error {
         match self {
             Self::Storage(_) => ErrorKind::Storage,
             Self::OwnershipLost => ErrorKind::OwnershipLost,
+            Self::LeaseBusy => ErrorKind::LeaseBusy,
             Self::CircuitOpen => ErrorKind::CircuitOpen,
             Self::ReconciliationRequired { .. } => ErrorKind::ReconciliationRequired,
             Self::Halted(_) => ErrorKind::Halted,
@@ -490,6 +501,7 @@ struct ApiErrorResponse {
 pub enum ErrorKind {
     Storage,
     OwnershipLost,
+    LeaseBusy,
     CircuitOpen,
     ReconciliationRequired,
     Halted,
@@ -515,6 +527,9 @@ pub enum ErrorKind {
     Subscription,
     Stream,
     Io,
+    /// Also any kind a newer peer sends that this release does not know, so
+    /// an envelope from a newer authority still decodes.
+    #[serde(other)]
     Unknown,
 }
 
@@ -524,6 +539,7 @@ impl ErrorKind {
         match self {
             Self::Storage => "storage",
             Self::OwnershipLost => "ownership_lost",
+            Self::LeaseBusy => "lease_busy",
             Self::CircuitOpen => "circuit_open",
             Self::ReconciliationRequired => "reconciliation_required",
             Self::Halted => "halted",
@@ -643,6 +659,7 @@ impl From<&Error> for ErrorEnvelope {
             Error::Serialization(inner) => envelope.message = inner.to_string(),
             Error::Io(inner) => envelope.message = inner.to_string(),
             Error::OwnershipLost
+            | Error::LeaseBusy
             | Error::CircuitOpen
             | Error::ConnectionClosed
             | Error::Auth(_)
@@ -669,6 +686,7 @@ impl From<ErrorEnvelope> for Error {
         match envelope.kind {
             ErrorKind::Storage => Error::Storage(envelope.message),
             ErrorKind::OwnershipLost => Error::OwnershipLost,
+            ErrorKind::LeaseBusy => Error::LeaseBusy,
             ErrorKind::CircuitOpen => Error::CircuitOpen,
             ErrorKind::ReconciliationRequired => match envelope.attempt_id.clone() {
                 Some(attempt_id) => Error::ReconciliationRequired { attempt_id },
@@ -838,6 +856,7 @@ mod tests {
             Error::OwnershipLost
         ));
         assert!(matches!(round_trip(Error::CircuitOpen), Error::CircuitOpen));
+        assert!(matches!(round_trip(Error::LeaseBusy), Error::LeaseBusy));
         assert!(matches!(
             round_trip(Error::Broker {
                 status: reqwest::StatusCode::BAD_REQUEST,
@@ -896,8 +915,14 @@ mod tests {
             matches!(Error::from(envelope), Error::Unknown(m) if m.contains("reconciliation_required"))
         );
 
-        // Unknown future kinds fail to deserialize instead of being misread
-        assert!(serde_json::from_str::<ErrorEnvelope>(r#"{"kind":"later","message":""}"#).is_err());
+        // A kind from a newer peer decodes as Unknown: never misread as a
+        // known kind, never retryable, and the envelope itself still decodes.
+        let later: ErrorEnvelope =
+            serde_json::from_str(r#"{"kind":"later","message":"new"}"#).unwrap();
+        assert_eq!(later.kind, ErrorKind::Unknown);
+        let later = Error::from(later);
+        assert!(matches!(&later, Error::Unknown(m) if m == "new"));
+        assert!(!later.is_retryable());
 
         // Wire names are stable
         assert_eq!(

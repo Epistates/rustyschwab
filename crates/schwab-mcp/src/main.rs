@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
                     async move {
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(2),
-                            backend.readiness(5000),
+                            backend.readiness(schwab_mcp::status::baseline_max_age_ms()),
                         )
                         .await
                         {
@@ -237,6 +237,23 @@ async fn live_backend(
         "failed to load SchwabConfig from environment \
          (set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, etc.; or SCHWAB_MCP_PAPER_CONFIG for paper mode)",
     )?;
+    let requests_per_second = config
+        .client
+        .rate_limit
+        .enabled
+        .then_some(config.client.rate_limit.requests_per_second);
+    let recovery_interval = schwab_mcp::server::parse_recovery_interval(
+        std::env::var(schwab_mcp::server::RECOVERY_INTERVAL_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    schwab_mcp::status::parse_baseline_max_age(
+        std::env::var(schwab_mcp::status::BASELINE_MAX_AGE_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
 
     let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
     match std::env::var("SCHWAB_RISK_POLICY_FILE") {
@@ -268,11 +285,25 @@ async fn live_backend(
     let recovery = if recovery_accounts.is_empty() {
         None
     } else {
+        if let Some(rps) = requests_per_second {
+            let share =
+                schwab_rs::recovery::budget_share(recovery_accounts.len(), recovery_interval, rps);
+            if share > 0.5 {
+                tracing::warn!(
+                    accounts = recovery_accounts.len(),
+                    interval_ms = recovery_interval.as_millis() as u64,
+                    share = format!("{:.0}%", share * 100.0),
+                    "Reconciliation alone uses over half the request budget; raise \
+                     SCHWAB_RECOVERY_INTERVAL_MS (and the risk policy's \
+                     max_snapshot_age_ms with SCHWAB_BASELINE_MAX_AGE_MS) or reconcile fewer accounts"
+                );
+            }
+        }
         Some(schwab_rs::recovery::RecoveryWorker::start(
             client.clone(),
             recovery_accounts,
             0,
-            std::time::Duration::from_secs(2),
+            recovery_interval,
         ))
     };
     Ok((Backend::Live(client), recovery))

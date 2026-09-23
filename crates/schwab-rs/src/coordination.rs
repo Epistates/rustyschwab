@@ -150,7 +150,7 @@ impl Coordinator for StateDatabase {
                 .optional()
                 .map_err(sql)?;
             if old.as_ref().is_some_and(|(_, _, until)| *until > now) {
-                return Err(Error::Storage("Resource already has a live owner".into()));
+                return Err(Error::LeaseBusy);
             }
             let epoch = old.map_or(1, |(_, epoch, _)| epoch + 1);
             tx.execute(UPSERT_LEASE, params![resource, owner, epoch, expires_at])
@@ -208,6 +208,12 @@ impl Coordinator for StateDatabase {
     }
 }
 
+const LEASE_TTL: Duration = Duration::from_secs(30);
+const RENEW_EVERY: Duration = Duration::from_secs(5);
+/// Longer than SQLite's five-second busy timeout, so lock contention at that
+/// boundary is not mistaken for a store that stopped answering.
+const RENEW_WITHIN: Duration = Duration::from_secs(8);
+
 /// Holds and renews ownership while an operation is running. Lease loss cancels
 /// the operation; a broker write already in flight still requires reconciliation.
 pub struct LeaseSession {
@@ -217,11 +223,43 @@ pub struct LeaseSession {
     closed: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 impl LeaseSession {
+    /// Take the lease now or fail with [`Error::LeaseBusy`]: for a standby
+    /// that should not wait on a live owner (the stream).
     pub async fn acquire(backend: std::sync::Arc<dyn Coordinator>, resource: &str) -> Result<Self> {
-        let ttl = Duration::from_secs(30);
         let lease = backend
-            .acquire(resource, &uuid::Uuid::new_v4().to_string(), ttl)
+            .acquire(resource, &uuid::Uuid::new_v4().to_string(), LEASE_TTL)
             .await?;
+        Ok(Self::hold(backend, lease))
+    }
+
+    /// Take the lease, waiting while another operation holds it (in this
+    /// process or another sharing the state file) for at most `wait`.
+    /// Submissions serialize on the credential's lease this way instead of
+    /// failing because a concurrent one, possibly for another account, was
+    /// mid-flight. Only [`Error::LeaseBusy`] is waited out.
+    pub async fn acquire_waiting(
+        backend: std::sync::Arc<dyn Coordinator>,
+        resource: &str,
+        wait: Duration,
+    ) -> Result<Self> {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match backend.acquire(resource, &owner, LEASE_TTL).await {
+                Ok(lease) => return Ok(Self::hold(backend, lease)),
+                Err(Error::LeaseBusy) if tokio::time::Instant::now() < deadline => {
+                    // Jitter keeps waiters from retrying in lockstep.
+                    let pause = Duration::from_millis(20 + rand::random::<u64>() % 30);
+                    tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + pause))
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn hold(backend: std::sync::Arc<dyn Coordinator>, lease: Lease) -> Self {
+        let ttl = LEASE_TTL;
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let (lost_tx, lost) = tokio::sync::watch::channel(false);
         let (closed_tx, closed) = tokio::sync::oneshot::channel();
@@ -230,13 +268,30 @@ impl LeaseSession {
             loop {
                 tokio::select! {
                     _ = &mut stopped => break,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                        let renewal =
-                            tokio::time::timeout(Duration::from_secs(5), backend.renew(&held, ttl))
-                                .await;
-                        if !matches!(renewal, Ok(Ok(_))) {
-                            let _ = lost_tx.send(true);
-                            break;
+                    _ = tokio::time::sleep(RENEW_EVERY) => {
+                        let renewal = tokio::time::timeout(RENEW_WITHIN, backend.renew(&held, ttl))
+                            .await;
+                        match renewal {
+                            Ok(Ok(_)) => {}
+                            // The store answered: the lease is gone.
+                            Ok(Err(_)) => {
+                                let _ = lost_tx.send(true);
+                                break;
+                            }
+                            // The store did not answer in time. The renewal may
+                            // still commit (blocking SQLite work outlives a
+                            // dropped future), so ask before giving up: an
+                            // unconfirmed lease is treated as lost, and never
+                            // released, since it may belong to a successor.
+                            Err(_) => {
+                                let held_now = tokio::time::timeout(RENEW_WITHIN, backend.valid(&held))
+                                    .await;
+                                if !matches!(held_now, Ok(Ok(true))) {
+                                    let _ = lost_tx.send(true);
+                                    let _ = closed_tx.send(());
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
@@ -244,12 +299,12 @@ impl LeaseSession {
             let _ = backend.release(&held).await;
             let _ = closed_tx.send(());
         });
-        Ok(Self {
+        Self {
             lease,
             lost,
             stop: Some(stop),
             closed: Some(closed),
-        })
+        }
     }
     pub fn lease(&self) -> &Lease {
         &self.lease

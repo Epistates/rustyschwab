@@ -7,6 +7,15 @@ use std::time::Duration;
 use tracing::debug;
 use url::Url;
 
+/// Largest successful response body read. Full option chains run to tens of
+/// megabytes; anything past this is not a Schwab response.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+/// Largest error body kept; the rest is discarded unread.
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+/// Longest `Retry-After` honoured. The request deadline bounds the wait as
+/// well; this keeps a nonsensical header out of errors and metrics.
+const MAX_RETRY_AFTER_SECS: u64 = 300;
+
 #[derive(Clone)]
 pub struct HttpTransport {
     client: Client,
@@ -24,6 +33,9 @@ impl HttpTransport {
 
         let client = Client::builder()
             .timeout(timeout)
+            // A dead route fails fast instead of spending the whole deadline.
+            .connect_timeout(timeout.min(Duration::from_secs(10)))
+            .tcp_keepalive(Duration::from_secs(30))
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(user_agent.into())
@@ -121,7 +133,14 @@ impl HttpTransport {
             if status == StatusCode::NO_CONTENT {
                 return serde_json::from_str("null").map_err(Error::from);
             }
-            let bytes = response.bytes().await.map_err(Error::from)?;
+            let bytes = read_capped(response, MAX_RESPONSE_BYTES)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidParameter(format!(
+                        "Response body exceeds {} MiB",
+                        MAX_RESPONSE_BYTES / (1024 * 1024)
+                    ))
+                })?;
             if bytes.is_empty() {
                 return serde_json::from_str("null").map_err(Error::from);
             }
@@ -146,7 +165,8 @@ async fn error_from_response(response: Response) -> Error {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after)
-            .unwrap_or(60);
+            .unwrap_or(60)
+            .min(MAX_RETRY_AFTER_SECS);
         return Error::RateLimit { retry_after };
     }
 
@@ -156,15 +176,34 @@ async fn error_from_response(response: Response) -> Error {
         .or_else(|| response.headers().get("x-request-id"))
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "Unknown error".to_string());
+    // An oversize error body is not a Schwab error document; keep none of it.
+    let body = match read_capped(response, MAX_ERROR_BODY_BYTES).await {
+        Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(None) => "Error body too large".to_string(),
+        Err(_) => "Unknown error".to_string(),
+    };
     let mut error = crate::error::parse_api_error(status, &body);
     if let Error::Broker { request_id: id, .. } = &mut error {
         *id = request_id;
     }
     error
+}
+
+/// Read a body of at most `limit` bytes; `None` if it is longer. Checks the
+/// declared length first so an oversize body is refused unread, and counts
+/// while streaming because the declaration may be absent or wrong.
+async fn read_capped(mut response: Response, limit: usize) -> Result<Option<Vec<u8>>> {
+    if response.content_length().is_some_and(|n| n > limit as u64) {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(Error::from)? {
+        if body.len() + chunk.len() > limit {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 fn parse_retry_after(value: &str) -> Option<u64> {

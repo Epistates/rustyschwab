@@ -36,6 +36,14 @@ const SELECT_TERMINAL_SUBMISSIONS: &str = "SELECT s.id FROM submissions s \
      IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')";
 const RELEASE_HELD_RESERVATION: &str =
     "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'";
+/// Held reservations whose submission is linked to a broker order this store
+/// has observed, with that order's latest payload.
+const SELECT_LINKED_HELD_RESERVATIONS: &str = "SELECT r.id,r.quantity,r.notional,o.payload \
+     FROM reservations r JOIN submissions s ON s.id=r.id \
+     JOIN orders o ON o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') \
+     WHERE r.state='held' AND s.account=?1";
+const SHRINK_HELD_RESERVATION: &str =
+    "UPDATE reservations SET quantity=?1,notional=?2 WHERE id=?3 AND state='held'";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -49,6 +57,10 @@ pub struct AccountState {
 pub struct ReconciliationReport {
     pub account: String,
     pub generation: u64,
+    /// When this pass began (ms since the epoch): the `since` for the next
+    /// incremental pass once this one is reconciled.
+    #[serde(default)]
+    pub started_at: i64,
     pub orders_observed: usize,
     pub newly_observed_activities: usize,
     pub resolved_attempts: Vec<String>,
@@ -116,6 +128,7 @@ impl StateDatabase {
             let mut report = ReconciliationReport {
                 account: account.clone(),
                 generation,
+                started_at,
                 orders_observed: orders.len(),
                 newly_observed_activities: 0,
                 resolved_attempts: vec![],
@@ -182,6 +195,26 @@ impl StateDatabase {
                     )?;
                     report.resolved_attempts.push(id);
                 } else {
+                    // Matching by tag is the only safe resolution; an order
+                    // that fits the request but has no tag might be this
+                    // intent or an identical manual one. Count it, so the
+                    // operator knows evidence exists, and leave it pending.
+                    let mut untagged = request.clone();
+                    if let Some(fields) = untagged.as_object_mut() {
+                        fields.remove("tag");
+                    }
+                    if candidates.is_empty()
+                        && orders.iter().any(|o| {
+                            o.get("tag").is_none_or(Value::is_null) && matches_request(&untagged, o)
+                        })
+                    {
+                        metrics::counter!(crate::metrics::UNTAGGED_MATCHES_TOTAL).increment(1);
+                        tracing::warn!(
+                            attempt = %id,
+                            "Broker lists an untagged order matching an unresolved submission; \
+                             reconcile it with evidence (schwab-admin)"
+                        );
+                    }
                     report.unresolved_attempts.push(id);
                 }
             }
@@ -195,6 +228,7 @@ impl StateDatabase {
             for id in &report.terminal_attempts {
                 tx.execute(RELEASE_HELD_RESERVATION, [id]).map_err(sql)?;
             }
+            shrink_filled_reservations(&tx, &account)?;
             report.reconciled = report.unresolved_attempts.is_empty();
             tx.execute(
                 UPSERT_ACCOUNT_SNAPSHOT,
@@ -225,6 +259,74 @@ impl StateDatabase {
         })
         .await
     }
+}
+/// Cut each held reservation down to what its working order can still fill.
+/// A partial fill is already out of the broker's available funds, so a
+/// reservation for the full size would count the filled part twice. The
+/// reservation's price is its notional over its quantity, so the remainder is
+/// valued at the same limit. Unreadable or non-shrinking payloads are left
+/// alone: holding too much is the safe error.
+fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> Result<()> {
+    use rust_decimal::Decimal;
+    let rows = {
+        let mut stmt = tx.prepare(SELECT_LINKED_HELD_RESERVATIONS).map_err(sql)?;
+        stmt.query_map([account], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sql)?
+    };
+    let decimal = |v: Option<&Value>| {
+        v.and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.is_number().then(|| v.to_string()))
+        })
+        .and_then(|s| s.parse::<Decimal>().ok())
+    };
+    for (id, quantity, notional, payload) in rows {
+        let (Ok(quantity), Ok(notional), Ok(order)) = (
+            quantity.parse::<Decimal>(),
+            notional.parse::<Decimal>(),
+            serde_json::from_str::<Value>(&payload),
+        ) else {
+            continue;
+        };
+        let remaining = decimal(order.get("remainingQuantity")).or_else(|| {
+            let total = decimal(order.get("quantity"))?;
+            total.checked_sub(decimal(order.get("filledQuantity"))?)
+        });
+        let Some(remaining) = remaining.filter(|r| *r >= Decimal::ZERO && *r < quantity) else {
+            continue;
+        };
+        let Some(price) = notional.checked_div(quantity) else {
+            continue;
+        };
+        let Some(left) = remaining.checked_mul(price) else {
+            continue;
+        };
+        tx.execute(
+            SHRINK_HELD_RESERVATION,
+            params![remaining.to_string(), left.to_string(), id],
+        )
+        .map_err(sql)?;
+        audit(
+            tx,
+            "risk_reservation_filled",
+            &id,
+            &serde_json::json!({
+                "quantity": remaining.to_string(),
+                "notional": left.to_string(),
+            }),
+        )?;
+    }
+    Ok(())
 }
 fn broker_id(value: Option<&Value>) -> Option<String> {
     value.and_then(|v| match v {
@@ -302,7 +404,17 @@ pub struct ReconciliationOptions {
     pub max_pages: usize,
     pub max_targeted_orders: usize,
     pub timeout_ms: u64,
+    /// When the last complete pass for this account began. The order list
+    /// then covers only orders entered since (less [`SINCE_OVERLAP`]),
+    /// not the whole lookback: older working orders are still fetched one
+    /// by one as targets, and an older unresolved intent still widens the
+    /// window. `None` scans the full lookback.
+    #[serde(default)]
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
 }
+/// Margin on an incremental window, for clock skew between this host and
+/// Schwab's `enteredTime`.
+pub const SINCE_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
 impl Default for ReconciliationOptions {
     fn default() -> Self {
         Self {
@@ -310,6 +422,7 @@ impl Default for ReconciliationOptions {
             max_pages: 128,
             max_targeted_orders: 1000,
             timeout_ms: 60000,
+            since: None,
         }
     }
 }
@@ -349,7 +462,10 @@ impl SchwabClient {
         }
         let started = chrono::Utc::now();
         let run = async {
-            let mut from = started - chrono::Duration::days(i64::from(options.lookback_days));
+            let lookback = started - chrono::Duration::days(i64::from(options.lookback_days));
+            let mut from = options
+                .since
+                .map_or(lookback, |since| (since - SINCE_OVERLAP).max(lookback));
             // An ambiguous older intent extends the history scan. Limits still
             // apply; we never silently drop an old unresolved submission.
             for record in database.records().await? {
@@ -413,7 +529,14 @@ impl SchwabClient {
                     orders.insert(id, order);
                 }
             }
-            let targets = database.reconciliation_targets(account).await?;
+            // A target the list just returned is already current; fetching it
+            // again would cost one request per working order per pass.
+            let targets: Vec<String> = database
+                .reconciliation_targets(account)
+                .await?
+                .into_iter()
+                .filter(|id| !orders.contains_key(id))
+                .collect();
             if targets.len() > options.max_targeted_orders {
                 return Err(Error::Storage(
                     "Reconciliation targeted-order budget exhausted".into(),

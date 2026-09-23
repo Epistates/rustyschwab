@@ -411,16 +411,36 @@ impl TokenStore for KeychainTokenStore {
     }
 }
 
+/// How long to wait for another process's refresh. A holder needs at most
+/// three 30-second token requests plus backoff; one still holding the lock
+/// after this is wedged (stopped, or stuck in I/O), and waiting longer would
+/// hang every caller that needs a token.
+const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The guard is held through reload, grant exchange, and persistence. OS locks
 /// release on crash; lock files contain no credentials and are never unlinked.
 pub(crate) async fn refresh_lock(path: &std::path::Path) -> AuthResult<std::fs::File> {
+    refresh_lock_within(path, REFRESH_LOCK_WAIT).await
+}
+
+async fn refresh_lock_within(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+) -> AuthResult<std::fs::File> {
     let lock_path = path.with_extension("refresh.lock");
     let file = open_lock_file(&lock_path)?;
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(file),
-            Err(std::fs::TryLockError::WouldBlock) => {
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(AuthError::RefreshFailed(format!(
+                    "another process has held the token refresh lock for over {}s",
+                    wait.as_secs()
+                )));
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(AuthError::TokenStorage(e)),
         }
@@ -442,6 +462,25 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// A holder that never lets go makes waiters fail, not hang.
+    #[tokio::test]
+    async fn refresh_lock_wait_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let tokens = dir.path().join("tokens.json");
+        let held = refresh_lock_within(&tokens, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let waited = refresh_lock_within(&tokens, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(waited, Err(AuthError::RefreshFailed(_))),
+            "{waited:?}"
+        );
+        drop(held);
+        refresh_lock_within(&tokens, std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+    }
 
     fn create_test_tokens() -> TokenSet {
         TokenSet::new(

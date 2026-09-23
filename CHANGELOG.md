@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — execution and resilience
+
+- Rate limiting (429) no longer opens the circuit breaker. It shows the
+  broker is answering, and tripping the one shared breaker on read traffic
+  refused order submissions, protective ones included, for 30 seconds.
+- Submissions sharing a credential wait for the execution lease instead of
+  failing: a second account's order no longer came back refused, without
+  reaching the broker, because the first was mid-flight.
+  `LeaseSession::acquire_waiting` and `Error::LeaseBusy` are new;
+  `ErrorKind` decodes kinds it does not know as `Unknown`.
+- A lease renewal that times out is checked before being treated as lost,
+  and is never released unconfirmed; the renewal timeout now exceeds
+  SQLite's busy timeout.
+- Readiness counts pending submissions for the accounts it is asked about,
+  not every account: one stuck account no longer made the others, or the
+  authority's `/readyz`, unready. `ExecutionStore::pending_count_for` is new,
+  with a conservative default.
+- A held risk reservation shrinks to its order's remaining quantity as it
+  partially fills, instead of counting the filled part twice.
+- Reconciliation costs less: after a complete pass the order list covers
+  only the time since (less five minutes), with a full scan every ten
+  minutes; working orders the list already returned are not fetched again.
+  `SCHWAB_RECOVERY_INTERVAL_MS` and `SCHWAB_BASELINE_MAX_AGE_MS` configure
+  the cadence and the readiness limit (previously fixed at 2 s and 5 s),
+  startup warns when reconciliation would take over half the request
+  budget, and stream account activity triggers an immediate pass
+  (`SchwabClient::request_reconciliation`).
+- `schwab_reconciliation_untagged_matches_total` (and an alert) counts
+  pending submissions for which the broker lists a matching order without
+  their tag; they are still never resolved on a guess.
+- The authority reserves capacity for `/v1/operator`, which used to take two
+  of the same sixteen slots as trading traffic and was the first call refused
+  under load. `/v1/orders` tags an untagged order with its intent digest, as
+  the MCP path does, so a resubmission under a new `request_id` is a
+  duplicate, not a second order.
+- The token refresh lock waits at most two minutes for another process.
+- `Error::Http` no longer prints the response body; bodies are capped (64
+  MiB, 16 KiB for errors); `Retry-After` is capped at five minutes; the HTTP
+  client has a connect timeout and TCP keepalive.
+
 ### Fixed — wire types match what Schwab sends and refuse what it rejects
 
 - `get_movers` failed on every live response: `MoverItem.direction` was

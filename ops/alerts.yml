@@ -8,6 +8,12 @@ groups:
         annotations:
           summary: Pending execution requires broker reconciliation
           runbook: docs/OPERATIONS.md
+      - alert: SchwabUntaggedBrokerMatch
+        expr: increase(schwab_reconciliation_untagged_matches_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: A pending submission has a matching broker order without its tag; reconcile it with evidence
+          runbook: docs/OPERATIONS.md
       - alert: SchwabStreamLoss
         expr: increase(schwab_stream_dropped_messages_total[5m]) > 0
         labels: {severity: warning}
@@ -15,6 +21,7 @@ groups:
           summary: Stream loss detected; verify reconciliation readiness
           runbook: docs/OPERATIONS.md
       - alert: SchwabAccountBaselineStale
+        # Match SCHWAB_BASELINE_MAX_AGE_MS / the risk policy's max_snapshot_age_ms.
         expr: schwab_baseline_age_seconds > 5
         for: 15s
         labels: {severity: critical}

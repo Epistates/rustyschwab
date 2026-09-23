@@ -57,6 +57,9 @@ pub enum BackendRequest {
     },
     Health,
     Pending,
+    PendingFor {
+        accounts: Vec<String>,
+    },
     Targets {
         account: String,
     },
@@ -162,6 +165,9 @@ impl BackendRequest {
             }
             Self::Health => serde_json::to_value(execution.healthcheck().await?)?,
             Self::Pending => serde_json::to_value(execution.pending_count().await?)?,
+            Self::PendingFor { accounts } => {
+                serde_json::to_value(execution.pending_count_for(&accounts).await?)?
+            }
             Self::Targets { account } => {
                 serde_json::to_value(execution.reconciliation_targets(&account).await?)?
             }
@@ -413,6 +419,17 @@ impl ExecutionStore for RemoteBackend {
     }
     async fn pending_count(&self) -> Result<usize> {
         self.call(&BackendRequest::Pending).await
+    }
+    async fn pending_count_for(&self, accounts: &[String]) -> Result<usize> {
+        let request = BackendRequest::PendingFor {
+            accounts: accounts.to_vec(),
+        };
+        match self.call(&request).await {
+            Ok(count) => Ok(count),
+            // An authority older than this operation refuses it; the
+            // all-account count can only over-report, which is safe.
+            Err(_) => self.pending_count().await,
+        }
     }
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>> {
         self.call(&BackendRequest::Targets {

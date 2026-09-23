@@ -97,6 +97,24 @@ impl Switches {
 /// maintains and readiness requires (comma-separated).
 pub const RECOVERY_ACCOUNTS_ENV: &str = "SCHWAB_RECOVERY_ACCOUNTS";
 
+/// How often the recovery worker reconciles each trading account, in
+/// milliseconds (1000–60000, default 2000). Each pass costs about two
+/// requests per account; see [`schwab_rs::recovery::RecoveryWorker::start`].
+pub const RECOVERY_INTERVAL_ENV: &str = "SCHWAB_RECOVERY_INTERVAL_MS";
+
+/// Parse [`RECOVERY_INTERVAL_ENV`]; unset is two seconds.
+pub fn parse_recovery_interval(raw: Option<&str>) -> Result<std::time::Duration, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(std::time::Duration::from_secs(2)),
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|ms| (1_000..=60_000).contains(ms))
+            .map(std::time::Duration::from_millis)
+            .ok_or_else(|| format!("{RECOVERY_INTERVAL_ENV} must be 1000-60000 ms, got {raw:?}")),
+    }
+}
+
 /// The accounts readiness is judged against; empty when trading is off and
 /// no recovery worker runs.
 pub fn recovery_accounts() -> Vec<String> {

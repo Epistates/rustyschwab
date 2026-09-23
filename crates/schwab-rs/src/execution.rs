@@ -116,6 +116,9 @@ pub enum SubmissionOutcome {
     Accepted {
         order_id: Option<String>,
     },
+    /// The broker holds no order for this intent: Schwab refused it, or it
+    /// was refused locally (risk, halt, deadline) before anything was sent.
+    /// The caller's error says which; either way the tag is free again.
     Rejected,
     /// Explicit reconciliation by a trusted caller, after querying the broker.
     Reconciled {
@@ -508,6 +511,13 @@ pub trait ExecutionStore: Send + Sync {
     async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>>;
     async fn healthcheck(&self) -> Result<()>;
     async fn pending_count(&self) -> Result<usize>;
+    /// Unresolved submissions on these accounts: what blocks their next
+    /// submission. The default counts every account, which can only
+    /// over-report; stores that can filter should.
+    async fn pending_count_for(&self, accounts: &[String]) -> Result<usize> {
+        let _ = accounts;
+        self.pending_count().await
+    }
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>>;
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
     async fn operator_halt(&self) -> Result<Option<String>>;
@@ -615,6 +625,21 @@ impl ExecutionStore for OrderJournal {
                 c.query_row(
                     "SELECT COUNT(*) FROM submissions WHERE outcome IS NULL",
                     [],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map(|n| n as usize)
+                .map_err(sql)
+            })
+            .await
+    }
+    async fn pending_count_for(&self, accounts: &[String]) -> Result<usize> {
+        let accounts = serde_json::to_string(accounts)?;
+        self.database
+            .run(move |c| {
+                c.query_row(
+                    "SELECT COUNT(*) FROM submissions WHERE outcome IS NULL \
+                     AND account IN (SELECT value FROM json_each(?1))",
+                    [accounts],
                     |r| r.get::<_, i64>(0),
                 )
                 .map(|n| n as usize)

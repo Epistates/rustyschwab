@@ -58,6 +58,18 @@ async fn main() -> anyhow::Result<()> {
         _recovery = None;
     } else {
         let config = SchwabConfig::from_env()?;
+        let interval = schwab_mcp::server::parse_recovery_interval(
+            std::env::var(schwab_mcp::server::RECOVERY_INTERVAL_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        schwab_mcp::status::parse_baseline_max_age(
+            std::env::var(schwab_mcp::status::BASELINE_MAX_AGE_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .map_err(anyhow::Error::msg)?;
         let live = SchwabClient::new(config)?;
         let limits: HashMap<String, PortfolioLimits> = serde_json::from_slice(&std::fs::read(
             args.risk
@@ -82,12 +94,7 @@ async fn main() -> anyhow::Result<()> {
         ));
         authority.validate()?;
         live.init().await?;
-        _recovery = Some(RecoveryWorker::start(
-            live.clone(),
-            accounts,
-            0,
-            Duration::from_secs(2),
-        ));
+        _recovery = Some(RecoveryWorker::start(live.clone(), accounts, 0, interval));
         client = live;
     }
     authority.validate()?;

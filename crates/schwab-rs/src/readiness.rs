@@ -22,7 +22,9 @@ impl SchwabClient {
         let has_accounts = !accounts.is_empty();
         let store = self.execution_store();
         store.healthcheck().await?;
-        let pending = store.pending_count().await?;
+        // Only these accounts' unresolved intents block their trading; one
+        // stuck account must not report the others unready.
+        let pending = store.pending_count_for(accounts).await?;
         let now = chrono::Utc::now().timestamp_millis();
         let mut unreconciled = 0;
         let mut oldest = None;

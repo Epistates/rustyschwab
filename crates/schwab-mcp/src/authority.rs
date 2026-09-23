@@ -70,6 +70,9 @@ pub struct Authority {
     pub identity: Arc<dyn IdentityVerifier>,
     pub policy_file: PathBuf,
     capacity: Arc<tokio::sync::Semaphore>,
+    /// Reserved for `/v1/operator`, so a halt still gets through when trading
+    /// traffic (or unauthenticated noise) holds every general slot.
+    operator_capacity: Arc<tokio::sync::Semaphore>,
     pub required_accounts: Vec<String>,
 }
 impl Authority {
@@ -87,6 +90,7 @@ impl Authority {
             policy_file,
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
+            operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
     /// Paper execution uses the same verified identity, policy, approval and lease routes.
@@ -103,6 +107,7 @@ impl Authority {
             policy_file,
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
+            operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -194,7 +199,12 @@ async fn admit(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Ok(_permit) = state.capacity.clone().try_acquire_owned() else {
+    let lane = if request.uri().path() == "/v1/operator" {
+        &state.operator_capacity
+    } else {
+        &state.capacity
+    };
+    let Ok(_permit) = lane.clone().try_acquire_owned() else {
         return response(Err(StatusCode::SERVICE_UNAVAILABLE.into()));
     };
     tokio::time::timeout(Duration::from_secs(35), next.run(request))
@@ -204,7 +214,10 @@ async fn admit(
 async fn ready(State(state): State<Arc<Authority>>) -> Response {
     match tokio::time::timeout(
         Duration::from_secs(2),
-        state.client.readiness(&state.required_accounts, 5000),
+        state.client.readiness(
+            &state.required_accounts,
+            crate::status::baseline_max_age_ms(),
+        ),
     )
     .await
     {
@@ -386,11 +399,6 @@ async fn operator(
 ) -> Response {
     response(
         async {
-            let _permit = state
-                .capacity
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
             let (identity, grants) = state.authenticate(&headers, Role::Operator).await?;
             let operation = async {
                 // Operators may only act on principals they do not trade as.
@@ -532,7 +540,7 @@ pub enum GatewayAction {
 async fn order(
     State(state): State<Arc<Authority>>,
     headers: HeaderMap,
-    Json(request): Json<GatewayRequest>,
+    Json(mut request): Json<GatewayRequest>,
 ) -> Response {
     response(
         async {
@@ -593,6 +601,21 @@ async fn order(
             principal
                 .authorize(tool, &args)
                 .map_err(|_| StatusCode::FORBIDDEN)?;
+            // As on the MCP path: an untagged order is tagged with its intent
+            // digest, so resubmitting the identical order under a fresh
+            // request_id is a duplicate at the SDK's tag check, not a second
+            // order. The digest (what operators approve) is of the untagged form.
+            let args = if cancel {
+                args
+            } else {
+                crate::policy::tag_intent(args, &digest)
+            };
+            if let GatewayAction::Place { order } | GatewayAction::Replace { order, .. } =
+                &mut request.action
+                && order.tag.is_none()
+            {
+                order.tag = Some(crate::policy::intent_tag(&digest));
+            }
             let key = if !cancel && principal.require_approval {
                 digest
             } else {
