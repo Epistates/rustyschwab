@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — the streamer WebSocket speaks TLS
+
+- `StreamClient` could not connect to any `wss://` URL, Schwab's streamer
+  included: the `rustls` feature only pulled in the rustls crate, not
+  tokio-tungstenite's TLS connector, so every connection failed with "TLS
+  support not compiled in". Every streaming test used a plaintext mock.
+- The WebSocket now uses an explicit rustls configuration: the ring
+  provider (ring and aws-lc-rs are both in the tree, so rustls cannot pick
+  one) and the operating system's verifier, the trust store reqwest's
+  rustls backend uses. `tests/websocket_tls.rs` asserts a ClientHello.
+- `native-tls` now removes rustls from the SDK's dependency graph; the
+  workspace no longer hard-codes a TLS backend for reqwest or tungstenite.
+
+### Fixed — release hygiene
+
+- rustls 0.23.45 (RUSTSEC-2026-0285).
+- `schwab-rs` and `schwab-mcp` can be packaged: `schwab-rs` has its own
+  README (its examples are doctests, not `ignore` blocks), and `schwab-mcp`
+  gives its path dependencies versions. CI builds all three from their
+  tarballs. The unused optional `schemars` dependency of `schwab-rs` is gone.
+- `deny.toml`: advisories, licenses, bans and sources, checked in CI in
+  place of `cargo audit`. Actions are pinned to commit SHAs at their current
+  majors, and `ci.yml` runs with a read-only token. A feature job checks
+  `native-tls`, `callback-server` and no-default builds.
+- The release workflow ships `schwab-eval` and fails if the package gains a
+  binary it does not list.
+
+### Fixed — examples
+
+- Examples read `SCHWAB_OAUTH_CALLBACK_URL` (through `SchwabConfig::from_env`)
+  instead of an undocumented `SCHWAB_CALLBACK_URL`, and honour the
+  configured token store.
+- The streaming examples log in with the `streamerInfo` identity (channel
+  and function ID included) instead of a customer ID alone, share one
+  `AuthManager` with the REST client, and stop printing the app key and
+  customer ID.
+- `auth_test` no longer logs the authorization code or a token prefix, and
+  reads and writes tokens through `auth::open_token_store` (new): it used
+  to write RFC 3339 expiries into a file the SDK stores as Unix seconds,
+  corrupting it. `refresh` now refreshes unconditionally.
+- `comprehensive` previews against the account hash from
+  `get_account_numbers`, not the plain account number.
+- `TokenSet::refresh_expiry` (new) is the effective refresh-token expiry.
+
+### Changed — README
+
+- Security claims corrected: zeroization does not keep secrets out of swap
+  or core dumps, the encrypted store's key sits beside the file, the macOS
+  keychain is the login keychain. The static "no known vulnerabilities" line
+  is replaced by the CI policy that enforces it.
+- The Quick Start, whose uncompiled examples had drifted (version `0.1`, no
+  `StreamMessage::State` arm), points to the crate README instead.
+
 ### Added — a submission can hold for the operator's approval
 
 - `place_order` and `replace_order` take `wait_ms` (at most 60000, half the

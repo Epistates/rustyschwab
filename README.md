@@ -33,7 +33,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - **Three storage backends**: File (basic), EncryptedFile (ChaCha20Poly1305), Keychain (OS-native)
   - **Secure by default**: macOS uses Keychain, other platforms use EncryptedFile
   - **File permissions**: Unix 0600 enforcement on token files
-  - **Key derivation**: PBKDF2-HMAC-SHA256, 600k iterations (OWASP 2023 guidance)
+  - **Passphrase keys**: `security::derive_key_from_password` (PBKDF2-HMAC-SHA256, 600k iterations) for callers who manage their own encrypted files; the token stores use a random key
 
 - **Market Data APIs**
   - Real-time quotes and price history
@@ -95,10 +95,12 @@ pub struct TokenSet {
     refresh_token: Option<SecretString>,  // Never logged
 }
 ```
-- Prevents memory dumps from exposing tokens
-- Not visible in core dumps or swap files
+- Token buffers, including the serialized form written to a store, are
+  zeroized when dropped, which shortens how long a memory dump could find them
+- Pages are not locked, so this is not protection from swap or core dumps;
+  disable core dumps and use encrypted swap on hosts that hold credentials
 - Explicit `expose_secret()` required for access
-- Compiler prevents accidental logging
+- `Debug` output of configs and token sets redacts the secrets
 
 **Layer 2: Encryption at Rest**
 ```text
@@ -107,12 +109,18 @@ pub struct TokenSet {
 - Key: 256-bit random (OS CSPRNG)
 - Nonce: 96-bit random per encryption
 - Authentication: 128-bit tag prevents tampering
+- Key file: next to the token file, 0600 / owner-only ACL
 ```
+
+The key lives beside the ciphertext, so encryption protects a token file
+that leaves the machine on its own (a backup, a copied directory). It does
+not protect against a local account that can already read both files; use
+the keychain store for that.
 
 **Layer 3: OS-Native Credential Storage**
 ```text
 // Cross-platform secure storage
-- macOS: Keychain (secure enclave integration)
+- macOS: login Keychain
 - Windows: Credential Manager (DPAPI encryption)
 - Linux: Secret Service API (GNOME Keyring/KWallet)
 ```
@@ -174,9 +182,11 @@ token_store_kind: TokenStoreKind::Keychain,  // Default on macOS
 ```
 
 **Security Levels:**
-- **File:** Basic (0600 permissions) - Development/testing only
-- **EncryptedFile:** High (AES-equivalent encryption + tamper detection) - Production recommended
-- **Keychain:** Best (OS-level encryption + user authentication) - Production default on macOS
+- **File:** plaintext JSON, owner-only permissions. Development and testing only.
+- **EncryptedFile:** ChaCha20-Poly1305 with the key beside the file. Protects a
+  copied or backed-up token file; not a local account that can read both. The
+  default off macOS.
+- **Keychain:** the OS credential store. The default on macOS.
 
 **2. Enable Token Notifications**
 
@@ -210,11 +220,11 @@ echo "schwab_tokens.json.key" >> .gitignore
 echo ".env" >> .gitignore
 
 # Use environment variables
-export SCHWAB_APP_KEY="your_32_char_key"
-export SCHWAB_APP_SECRET="your_16_char_secret"
+export SCHWAB_APP_KEY="your_app_key"
+export SCHWAB_APP_SECRET="your_app_secret"
 
 # Or use a secret management service
-# - AWS শর্ Secrets Manager
+# - AWS Secrets Manager
 # - HashiCorp Vault
 # - Azure Key Vault
 ```
@@ -256,184 +266,38 @@ If you discover a security vulnerability, please email `security@epistates.com` 
 
 ### Security Dependencies
 
-All security-critical dependencies are industry-standard and regularly audited:
+| Crate | Purpose |
+|-------|---------|
+| `ring` | CSPRNG, SHA-256 (PKCE), TLS crypto provider |
+| `rustls` | TLS for HTTPS, the streamer WebSocket and the callback server |
+| `chacha20poly1305` | Token encryption at rest (RustCrypto; NCC Group audit, 2020) |
+| `keyring` | OS credential storage |
+| `secrecy`, `zeroize` | Secret wrappers and memory clearing |
 
-| Crate | Purpose | Security Track Record |
-|-------|---------|----------------------|
-| `ring` | Cryptography (CSPRNG, PKCE) | Used by Google, Chromium, Firefox |
-| `rustls` | TLS implementation | Memory-safe, no OpenSSL CVEs |
-| `chacha20poly1305` | Encryption | NCC Group audit (2020) |
-| `keyring` | OS credential storage | 1M+ downloads, cross-platform |
-| `secrecy` | Secret handling | De facto Rust standard |
-| `zeroize` | Memory clearing | Prevents secret leakage |
-
-**No known vulnerabilities** in any security-critical dependency.
+CI runs `cargo deny` (see `deny.toml`) on every change: any RustSec
+vulnerability, unmaintained or yanked crate, unapproved license or unknown
+source fails the build.
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-schwab-rs = { version = "0.1", features = ["callback-server"] }
-schwab-types = "0.1"
+schwab-rs = { version = "0.2", features = ["callback-server"] }
+tokio = { version = "1", features = ["full"] }
 ```
+
+`schwab-rs` re-exports the wire types as `schwab_rs::types`, so a separate
+`schwab-types` dependency is only needed by crates that use the types alone.
 
 ## Quick Start
 
-### 1. Set up OAuth Authentication
-
-```rust,ignore
-use schwab_rs::{SchwabClient, SchwabConfig, auth::{OAuthConfig, TokenNotification}};
-use std::sync::Arc;
-
-// Configure OAuth with notifications
-let oauth_config = OAuthConfig {
-    app_key: "YOUR_32_CHAR_APP_KEY".to_string(),
-    app_secret: "YOUR_16_CHAR_SECRET".to_string(),
-    callback_url: "https://127.0.0.1:8080".to_string(),
-    capture_callback: true,  // Auto-capture auth code
-    auto_refresh: true,      // Auto-refresh tokens
-    refresh_buffer_seconds: 61, // Refresh before expiry
-    on_token_notification: Some(Arc::new(|notification| {
-        if let TokenNotification::RefreshTokenExpiring { hours_remaining } = notification {
-            println!("Warning: Refresh token expires in {} hours", hours_remaining);
-        }
-    })),
-    ..Default::default()
-};
-
-// Create client
-let config = SchwabConfig { oauth: oauth_config, ..Default::default() };
-let client = SchwabClient::new(config)?;
-// Start background token management
-client.init().await?;
-```
-
-### 2. Authorize and Get Tokens
-
-```rust,ignore
-use schwab_rs::auth::AuthManager;
-
-// For initial OAuth, create an AuthManager and run the flow once
-let auth = AuthManager::new(client_config.oauth.clone())?;
-let (auth_url, _code) = auth.authorize().await?;
-println!("Open this URL in a browser: {}", auth_url);
-// After authorization, tokens are saved to the configured file and auto-refreshed by client.init()
-```
-
-### 3. Use the API
-
-```rust,ignore
-use chrono::{Duration, Utc};
-use schwab_rs::types::Decimal;
-use schwab_rs::types::market_data::{
-    FrequencyType, OptionChainParams, PeriodType, PriceHistoryParams, QuoteField,
-};
-use schwab_rs::types::trading::{
-    OrderInstruction, OrderRequest, OrderRequestLeg, OrderStatus, OrdersParams,
-    TransactionType, TransactionsParams,
-};
-
-// Get quotes
-let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
-
-// Advanced quotes: only request specific sections and enable indicative pricing
-let adv_quotes = client.get_quotes_with_options(
-    &["AAPL"],
-    &[QuoteField::Quote, QuoteField::Reference],
-    Some(true)
-).await?;
-
-// Price history — period/frequency combinations are validated against
-// Schwab's tables before the request is sent
-let history = client.get_price_history(&PriceHistoryParams {
-    period_type: Some(PeriodType::Day),
-    period: Some(10),
-    frequency_type: Some(FrequencyType::Minute),
-    frequency: Some(5),
-    ..PriceHistoryParams::new("AAPL")
-}).await?;
-
-// Get option chain
-let chain = client.get_option_chain(&OptionChainParams::new("SPY")).await?;
-
-// Build an order — buy 10 AAPL at 150.25, then take profit at 160 or
-// stop out at 145 (a TRIGGER → OCO tree; see docs/ORDERS.md)
-let order = OrderRequest::limit(
-    OrderRequestLeg::equity(OrderInstruction::Buy, "AAPL", 10),
-    "150.25".parse()?,
-)
-.bracket(Decimal::from(160), Decimal::from(145))?;
-
-// Preview an order (validate without executing)
-let preview = client.preview_order("account_hash", &order).await?;
-
-// Place an order — Schwab returns the new order's ID via the
-// `Location` header (no JSON body)
-let response = client.place_order("account_hash", &order).await?;
-println!("order id: {:?}", response.order_id);
-
-// List what filled this month, and the trades and dividends behind it.
-// Windows are `DateTime<Utc>`; the client emits Schwab's exact timestamp
-// spelling and rejects an inverted window before sending anything.
-let month_start = Utc::now() - Duration::days(30);
-let filled = client.get_account_orders("account_hash", &OrdersParams {
-    status: Some(OrderStatus::Filled),
-    ..OrdersParams::new(month_start, Utc::now())
-}).await?;
-let activity = client.get_transactions("account_hash", &TransactionsParams::new(
-    month_start,
-    Utc::now(),
-    [TransactionType::Trade, TransactionType::DividendOrInterest],
-)).await?;
-```
-
-### 4. Stream Market Data
-
-```rust,ignore
-use schwab_rs::streaming::{StreamClient, StreamMessage};
-use schwab_rs::types::streaming::{StreamPayload, StreamService};
-
-// Build streaming client
-// customer/correl IDs, channel, and function ID come from
-// `get_user_preferences()` → `streamerInfo`
-let stream_client = StreamClient::builder()
-    .config(stream_config)
-    .auth_manager(auth_manager.clone())
-    .streamer_info(&streamer_info)
-    .build()?;
-
-// Connect and (attempt to) subscribe
-stream_client.connect().await?;
-stream_client.subscribe(StreamService::LeveloneEquities, vec!["AAPL".into(), "MSFT".into()]).await?;
-
-// Handle messages. Frames arrive with numbered fields; `decode()` turns
-// them into typed payloads named like the REST quotes.
-if let Some(mut receiver) = stream_client.get_receiver() {
-    while let Some(msg) = receiver.recv().await {
-        match msg {
-            StreamMessage::Data(data) => {
-                for item in &data.data {
-                    for payload in item.decode()? {
-                        if let StreamPayload::LevelOneEquity(quote) = payload {
-                            println!("{} bid {:?} ask {:?}", quote.key, quote.bid_price, quote.ask_price);
-                        }
-                    }
-                }
-            }
-            StreamMessage::Response(resp) => println!("Response: {:?}", resp),
-            StreamMessage::Notify(hb) => println!("Heartbeat: {}", hb.heartbeat),
-        }
-    }
-}
-```
-
-Every data service has a field table (`LevelOneEquityFields`, `BookFields`, …)
-for building subscription field lists and a payload type (`LevelOneEquity`,
-`Book`, `ChartEquity`, `AccountActivity`, …) in `schwab_rs::types::streaming`.
-
-Note: Streaming authentication, reconnection, and subscription handling are fully implemented.
+[`crates/schwab-rs/README.md`](crates/schwab-rs/README.md) walks through
+configuration, authorization, market data and account reads, placing a
+bracket order and streaming quotes. Its examples are compiled as doctests,
+so they track the API; it is also the crate's page on docs.rs and
+crates.io. The runnable programs under [`examples/`](#examples) cover the
+same ground end to end, and [ORDERS.md](docs/ORDERS.md) and
+[STREAMING.md](docs/STREAMING.md) go deeper.
 
 ## OAuth Callback URL
 
