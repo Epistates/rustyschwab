@@ -6,19 +6,15 @@
 /// ## Usage
 ///
 /// ```bash
-/// export SCHWAB_APP_KEY="your_32_character_app_key"
-/// export SCHWAB_APP_SECRET="your_16_char_secret"
-/// export SCHWAB_CALLBACK_URL="https://localhost:8080"
-///
-/// cargo run --example streaming_processing --features callback-server
+/// # SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_OAUTH_CALLBACK_URL, ...
+/// # from the environment or .env (see .env.example)
+/// cargo run -p streaming-examples --bin streaming_processing
 /// ```
 use schwab_rs::{
-    StreamClient, StreamMessage,
-    auth::{AuthManager, OAuthConfig},
+    StreamMessage,
     config::{ChannelKind, StreamConfig},
     types::streaming::StreamService,
 };
-use std::env;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -35,50 +31,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Streaming Data Processing Pattern");
     println!("═══════════════════════════════════════════════════\n");
 
-    // Load configuration
-    let app_key = env::var("SCHWAB_APP_KEY").expect("SCHWAB_APP_KEY required");
-    let app_secret = env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET required");
-    let callback_url =
-        env::var("SCHWAB_CALLBACK_URL").unwrap_or_else(|_| "https://127.0.0.1:8080".to_string());
-
-    // Create OAuth config
-    let oauth_config = OAuthConfig {
-        app_key,
-        app_secret,
-        callback_url,
-        capture_callback: true,
-        auto_refresh: true,
-        ..Default::default()
-    };
-
-    // Authenticate and get customer ID
+    // A bounded channel for backpressure.
     println!("🔐 Authenticating...");
-    let auth_manager = AuthManager::new(oauth_config)?;
-    let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
-        oauth: auth_manager.config().clone(),
-        ..Default::default()
-    })?;
-    client.init().await?;
-
-    let prefs = client.get_user_preferences().await?;
-    let customer_id = prefs
-        .streamer_info
-        .and_then(|info| info.first().map(|i| i.schwab_client_customer_id.clone()))
-        .ok_or("Could not get customer ID")?;
-
-    println!("✅ Authenticated!\n");
-
-    // Create streaming client with BOUNDED channel for backpressure
     let stream_config = StreamConfig {
         channel_kind: ChannelKind::Bounded(1000),
         ..Default::default()
     };
-
-    let stream_client = StreamClient::builder()
-        .config(stream_config)
-        .auth_manager(auth_manager)
-        .customer_id(customer_id)
-        .build()?;
+    let (_client, stream_client) = streaming_examples::stream_client(stream_config).await?;
+    println!("✅ Authenticated!\n");
 
     // Connect and subscribe
     stream_client.connect().await?;

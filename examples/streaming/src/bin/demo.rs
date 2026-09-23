@@ -8,13 +8,9 @@
 /// ## Usage
 ///
 /// ```bash
-/// # Set environment variables
-/// export SCHWAB_APP_KEY="your_32_character_app_key"
-/// export SCHWAB_APP_SECRET="your_16_char_secret"
-/// export SCHWAB_CALLBACK_URL="https://localhost:8080"
-///
-/// # Run the example
-/// cargo run --example streaming_demo --features callback-server
+/// # SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_OAUTH_CALLBACK_URL, ...
+/// # from the environment or .env (see .env.example)
+/// cargo run -p streaming-examples --bin streaming_demo
 /// ```
 ///
 /// ## What This Demonstrates
@@ -24,13 +20,7 @@
 /// - ✅ Custom field selection for bandwidth optimization
 /// - ✅ Message handling (Data, Response, Notify)
 /// - ✅ Graceful shutdown after time limit
-use schwab_rs::{
-    StreamClient, StreamMessage,
-    auth::{AuthManager, OAuthConfig},
-    config::StreamConfig,
-    types::streaming::StreamService,
-};
-use std::env;
+use schwab_rs::{StreamMessage, config::StreamConfig, types::streaming::StreamService};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -47,65 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Based on Python reference: stream_demo.py");
     println!("═══════════════════════════════════════════════════\n");
 
-    // Load configuration from environment
-    let app_key = env::var("SCHWAB_APP_KEY").expect("SCHWAB_APP_KEY must be set (32 characters)");
-    let app_secret =
-        env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET must be set (16 characters)");
-    let callback_url =
-        env::var("SCHWAB_CALLBACK_URL").unwrap_or_else(|_| "https://localhost:8080".to_string());
-
-    // Validate key lengths
-    if app_key.len() != 32 {
-        eprintln!("❌ Error: SCHWAB_APP_KEY must be exactly 32 characters");
-        std::process::exit(1);
-    }
-    if app_secret.len() != 16 {
-        eprintln!("❌ Error: SCHWAB_APP_SECRET must be exactly 16 characters");
-        std::process::exit(1);
-    }
-
-    println!("📋 Configuration:");
-    println!("  • App Key: {}...", &app_key[..8]);
-    println!("  • Callback URL: {}", callback_url);
-    println!();
-
-    // Create OAuth config
-    let oauth_config = OAuthConfig {
-        app_key,
-        app_secret,
-        callback_url,
-        capture_callback: true,
-        auto_refresh: true,
-        ..Default::default()
-    };
-
-    // Create auth manager and get customer ID
     println!("🔐 Authenticating...");
-    let auth_manager = AuthManager::new(oauth_config)?;
-
-    // Get customer ID from user preferences
-    let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
-        oauth: auth_manager.config().clone(),
-        ..Default::default()
-    })?;
-    client.init().await?;
-
-    let prefs = client.get_user_preferences().await?;
-    let customer_id = prefs
-        .streamer_info
-        .and_then(|info| info.first().map(|i| i.schwab_client_customer_id.clone()))
-        .ok_or("Could not get customer ID from user preferences")?;
-
-    println!("✅ Authenticated! Customer ID: {}", customer_id);
-    println!();
-
-    // Create streaming client
-    let stream_config = StreamConfig::default();
-    let stream_client = StreamClient::builder()
-        .config(stream_config)
-        .auth_manager(auth_manager)
-        .customer_id(customer_id)
-        .build()?;
+    let (_client, stream_client) =
+        streaming_examples::stream_client(StreamConfig::default()).await?;
+    println!("✅ Authenticated!\n");
 
     // Connect to stream
     println!("🔌 Connecting to Schwab WebSocket...");

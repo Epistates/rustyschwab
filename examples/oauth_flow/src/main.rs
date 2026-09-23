@@ -26,9 +26,12 @@ async fn main() -> Result<()> {
             eprintln!("\nPlease set the following environment variables:");
             eprintln!("  SCHWAB_APP_KEY     - Your Schwab app key");
             eprintln!("  SCHWAB_APP_SECRET  - Your Schwab app secret");
-            eprintln!("  SCHWAB_CALLBACK_URL - Your callback URL (e.g., https://127.0.0.1:8080)");
-            eprintln!("\nOptional:");
+            eprintln!(
+                "  SCHWAB_OAUTH_CALLBACK_URL - Your callback URL (e.g., https://127.0.0.1:8080)"
+            );
+            eprintln!("\nOptional (see .env.example for the full list):");
             eprintln!("  SCHWAB_TOKENS_FILE - Path to store tokens (default: schwab_tokens.json)");
+            eprintln!("  SCHWAB_TOKEN_STORE - file, encrypted_file or keychain");
             std::process::exit(1);
         }
     };

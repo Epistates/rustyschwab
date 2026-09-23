@@ -351,6 +351,31 @@ async fn backoff(attempt: u32) {
     tokio::time::sleep(base + std::time::Duration::from_millis(jitter_ms)).await;
 }
 
+/// The token store `config` selects, the same one [`AuthManager`] reads and
+/// writes. Tools that inspect or edit saved tokens go through this rather
+/// than the file, whose format depends on the store kind.
+pub fn open_token_store(config: &OAuthConfig) -> Arc<dyn TokenStore + Send + Sync> {
+    match config.token_store_kind {
+        TokenStoreKind::File => {
+            tracing::info!("Using FileTokenStore (basic security: 0600 permissions only)");
+            Arc::new(FileTokenStore::new(config.tokens_file.clone()))
+        }
+        TokenStoreKind::EncryptedFile => {
+            tracing::info!(
+                "Using EncryptedFileTokenStore (ChaCha20Poly1305 encryption + 0600 permissions)"
+            );
+            Arc::new(EncryptedFileTokenStore::new(config.tokens_file.clone()))
+        }
+        TokenStoreKind::Keychain => {
+            tracing::info!("Using KeychainTokenStore (OS-native credential storage)");
+            Arc::new(KeychainTokenStore::new(
+                "schwab-rs".to_string(),
+                config.app_key.clone(),
+            ))
+        }
+    }
+}
+
 impl AuthManager {
     pub fn new(config: OAuthConfig) -> AuthResult<Self> {
         // Validate app key and secret lengths per Schwab requirements (matching Python reference)
@@ -407,26 +432,7 @@ impl AuthManager {
             pkce_verifier: Arc::new(RwLock::new(None)),
             oauth_state: Arc::new(RwLock::new(None)),
             last_notified_rt_hour: Arc::new(RwLock::new(None)),
-            token_store: match config.token_store_kind {
-                TokenStoreKind::File => {
-                    tracing::info!("Using FileTokenStore (basic security: 0600 permissions only)");
-                    Arc::new(FileTokenStore::new(config.tokens_file.clone()))
-                }
-                TokenStoreKind::EncryptedFile => {
-                    tracing::info!(
-                        "Using EncryptedFileTokenStore \
-                         (ChaCha20Poly1305 encryption + 0600 permissions)"
-                    );
-                    Arc::new(EncryptedFileTokenStore::new(config.tokens_file.clone()))
-                }
-                TokenStoreKind::Keychain => {
-                    tracing::info!("Using KeychainTokenStore (OS-native credential storage)");
-                    Arc::new(KeychainTokenStore::new(
-                        "schwab-rs".to_string(),
-                        config.app_key.clone(),
-                    ))
-                }
-            },
+            token_store: open_token_store(&config),
         };
 
         // Try to load existing tokens

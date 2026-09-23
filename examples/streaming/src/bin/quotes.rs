@@ -6,19 +6,15 @@
 /// ## Usage
 ///
 /// ```bash
-/// export SCHWAB_APP_KEY="your_32_character_app_key"
-/// export SCHWAB_APP_SECRET="your_16_char_secret"
-/// export SCHWAB_CALLBACK_URL="https://localhost:8080"
-///
-/// cargo run --example streaming_quotes --features callback-server
+/// # SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_OAUTH_CALLBACK_URL, ...
+/// # from the environment or .env (see .env.example)
+/// cargo run -p streaming-examples --bin streaming_quotes
 /// ```
 use schwab_rs::{
-    StreamClient, StreamMessage,
-    auth::{AuthManager, OAuthConfig},
+    StreamMessage,
     config::StreamConfig,
     types::streaming::{LevelOneEquity, LevelOneEquityFields, StreamService},
 };
-use std::env;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -34,39 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║   Real-Time Stock Quotes Streamer    ║");
     println!("╚═══════════════════════════════════════╝\n");
 
-    // Configuration
-    let oauth_config = OAuthConfig {
-        app_key: env::var("SCHWAB_APP_KEY").expect("SCHWAB_APP_KEY required"),
-        app_secret: env::var("SCHWAB_APP_SECRET").expect("SCHWAB_APP_SECRET required"),
-        callback_url: env::var("SCHWAB_CALLBACK_URL")
-            .unwrap_or_else(|_| "https://localhost:8080".to_string()),
-        capture_callback: true,
-        auto_refresh: true,
-        ..Default::default()
-    };
-
-    // Authenticate
     println!("🔐 Authenticating...");
-    let auth_manager = AuthManager::new(oauth_config)?;
-    let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
-        oauth: auth_manager.config().clone(),
-        ..Default::default()
-    })?;
-    client.init().await?;
-
-    // Get customer ID
-    let prefs = client.get_user_preferences().await?;
-    let customer_id = prefs
-        .streamer_info
-        .and_then(|info| info.first().map(|i| i.schwab_client_customer_id.clone()))
-        .ok_or("Could not get customer ID")?;
-
-    // Create stream
-    let stream_client = StreamClient::builder()
-        .config(StreamConfig::default())
-        .auth_manager(auth_manager)
-        .customer_id(customer_id)
-        .build()?;
+    let (_client, stream_client) =
+        streaming_examples::stream_client(StreamConfig::default()).await?;
 
     // Connect
     println!("🔌 Connecting to stream...");

@@ -184,12 +184,15 @@ impl TokenSet {
         Utc::now() >= refresh_time
     }
 
+    /// When the refresh token expires: the recorded time, or seven days after
+    /// issue for token sets written before it was recorded.
+    pub fn refresh_expiry(&self) -> DateTime<Utc> {
+        self.refresh_token_expires_at
+            .unwrap_or(self.issued_at + chrono::Duration::days(7))
+    }
+
     pub fn refresh_token_expired(&self) -> bool {
-        if let Some(refresh_expires) = self.refresh_token_expires_at {
-            Utc::now() >= refresh_expires
-        } else {
-            Utc::now() >= self.issued_at + chrono::Duration::days(7)
-        }
+        Utc::now() >= self.refresh_expiry()
     }
 }
 
