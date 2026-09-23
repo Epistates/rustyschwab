@@ -210,3 +210,21 @@ fn test_config_defaults() {
         env::remove_var("SCHWAB_CLIENT_BASE_URL");
     }
 }
+
+/// A saved config holds the app secret: it loads back only while it keeps
+/// owner-only permissions.
+#[cfg(unix)]
+#[test]
+fn config_files_round_trip_and_refuse_loose_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.json");
+    let mut config = SchwabConfig::default();
+    config.oauth.app_key = "12345678901234567890123456789012".into();
+    config.oauth.app_secret = "1234567890123456".into();
+    config.save(&path).unwrap();
+    let loaded = SchwabConfig::from_file(&path).unwrap();
+    assert_eq!(loaded.oauth.app_secret, config.oauth.app_secret);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(SchwabConfig::from_file(&path).is_err());
+}

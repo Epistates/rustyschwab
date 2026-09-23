@@ -361,11 +361,18 @@ impl SchwabConfig {
         Ok(config)
     }
 
+    /// Load a configuration written by [`SchwabConfig::save`]. It holds the
+    /// app secret, so it gets the same check as a token file: a regular
+    /// file (not a symlink) readable by its owner only.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?;
+        let path = path.as_ref();
+        crate::security::verify_file_permissions(path)?;
+        let contents = zeroize::Zeroizing::new(
+            std::fs::read(path)
+                .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?,
+        );
 
-        let config: Self = serde_json::from_str(&contents)
+        let config: Self = serde_json::from_slice(&contents)
             .map_err(|e| Error::Config(format!("Failed to parse config file: {}", e)))?;
 
         // Validate all URLs are from allowed domains (SSRF prevention)

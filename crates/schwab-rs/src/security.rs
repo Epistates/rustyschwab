@@ -58,7 +58,8 @@ impl EncryptedToken {
     ///
     /// # Arguments
     ///
-    /// * `plaintext` - Data to encrypt (will be zeroized after encryption)
+    /// * `plaintext` - Data to encrypt. It is only borrowed: keep secrets in a
+    ///   zeroizing buffer (`Zeroizing<Vec<u8>>`) on the caller's side.
     /// * `key` - 32-byte encryption key
     ///
     /// # Errors

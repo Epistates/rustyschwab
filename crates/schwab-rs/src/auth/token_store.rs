@@ -40,6 +40,20 @@ const CLOCK_SKEW_TOLERANCE_SECS: i64 = 5;
 /// Minimum recommended refresh buffer in seconds.
 const MIN_REFRESH_BUFFER_SECS: i64 = 30;
 
+/// Room for a serialized token set without reallocating: a reallocation
+/// would free the old buffer without wiping it. Schwab's tokens serialize to
+/// about 2 KiB.
+const TOKEN_JSON_CAPACITY: usize = 16 * 1024;
+
+/// Serialize `tokens` into a buffer that is wiped when dropped. Every store
+/// writes its plaintext through this, so the only plaintext copies of the
+/// secrets are this buffer and the `SecretString`s themselves.
+fn token_json(tokens: &TokenSet) -> serde_json::Result<Zeroizing<Vec<u8>>> {
+    let mut json = Zeroizing::new(Vec::with_capacity(TOKEN_JSON_CAPACITY));
+    serde_json::to_writer(&mut *json, tokens)?;
+    Ok(json)
+}
+
 fn serialize_secret<S>(secret: &Option<SecretString>, ser: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -223,14 +237,15 @@ impl FileTokenStore {
 
 impl TokenStore for FileTokenStore {
     fn save(&self, tokens: &TokenSet) -> AuthResult<()> {
-        let json = serde_json::to_string_pretty(tokens).map_err(|e| {
+        let json = token_json(tokens).map_err(|e| {
             AuthError::TokenStorage(std::io::Error::other(format!(
                 "Serialization failed: {}",
                 e
             )))
         })?;
 
-        to_auth_result(secure_file_write(&self.path, json.as_bytes()))?;
+        prepare_secret_directory(&self.path)?;
+        to_auth_result(secure_file_write(&self.path, &json))?;
 
         tracing::debug!("Tokens saved to file: {:?}", self.path);
         Ok(())
@@ -239,9 +254,10 @@ impl TokenStore for FileTokenStore {
     fn load(&self) -> AuthResult<TokenSet> {
         to_auth_result(verify_file_permissions(&self.path))?;
 
-        let json = std::fs::read_to_string(&self.path).map_err(AuthError::TokenStorage)?;
+        // `fs::read` sizes the buffer from the file, so it is never copied.
+        let json = Zeroizing::new(std::fs::read(&self.path).map_err(AuthError::TokenStorage)?);
 
-        let tokens: TokenSet = serde_json::from_str(&json).map_err(|e| {
+        let tokens: TokenSet = serde_json::from_slice(&json).map_err(|e| {
             AuthError::TokenStorage(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Deserialization failed: {}", e),
@@ -282,8 +298,10 @@ impl EncryptedFileTokenStore {
         key_lock.lock().map_err(AuthError::TokenStorage)?;
         if self.key_path.exists() {
             to_auth_result(verify_file_permissions(&self.key_path))?;
-            let key_bytes = std::fs::read(&self.key_path)
-                .map_err(|e| AuthError::TokenFileError(format!("Failed to read key: {}", e)))?;
+            let key_bytes =
+                Zeroizing::new(std::fs::read(&self.key_path).map_err(|e| {
+                    AuthError::TokenFileError(format!("Failed to read key: {}", e))
+                })?);
 
             if key_bytes.len() != 32 {
                 return Err(AuthError::TokenFileError(format!(
@@ -298,6 +316,7 @@ impl EncryptedFileTokenStore {
             Ok(key)
         } else {
             let key = to_auth_result(generate_random_key())?;
+            prepare_secret_directory(&self.key_path)?;
             to_auth_result(secure_file_write(&self.key_path, &*key))?;
             tracing::info!("Generated new encryption key: {:?}", self.key_path);
             Ok(key)
@@ -309,10 +328,10 @@ impl TokenStore for EncryptedFileTokenStore {
     fn save(&self, tokens: &TokenSet) -> AuthResult<()> {
         let key = self.load_or_generate_key()?;
 
-        let json = serde_json::to_string(tokens)
+        let json = token_json(tokens)
             .map_err(|e| AuthError::EncryptionFailed(format!("Serialization failed: {}", e)))?;
 
-        let encrypted = to_auth_result(EncryptedToken::encrypt(json.as_bytes(), &key))?;
+        let encrypted = to_auth_result(EncryptedToken::encrypt(&json, &key))?;
 
         let encrypted_json = serde_json::to_vec(&encrypted).map_err(|e| {
             AuthError::EncryptionFailed(format!("Failed to serialize encrypted data: {}", e))
@@ -336,12 +355,10 @@ impl TokenStore for EncryptedFileTokenStore {
             AuthError::DecryptionFailed(format!("Failed to parse encrypted data: {}", e))
         })?;
 
+        // Parse straight out of the zeroizing decryption buffer.
         let decrypted = to_auth_result(encrypted.decrypt(&key))?;
 
-        let json = String::from_utf8(decrypted.expose_secret().to_vec())
-            .map_err(|e| AuthError::DecryptionFailed(format!("Invalid UTF-8: {}", e)))?;
-
-        let tokens: TokenSet = serde_json::from_str(&json)
+        let tokens: TokenSet = serde_json::from_slice(decrypted.expose_secret())
             .map_err(|e| AuthError::DecryptionFailed(format!("Failed to parse JSON: {}", e)))?;
 
         tracing::debug!("Decrypted tokens loaded from: {:?}", self.path);
@@ -373,14 +390,16 @@ impl KeychainTokenStore {
 
 impl TokenStore for KeychainTokenStore {
     fn save(&self, tokens: &TokenSet) -> AuthResult<()> {
-        let json = serde_json::to_string(tokens)
+        let json = token_json(tokens)
+            .map_err(|e| AuthError::KeyringError(format!("Serialization failed: {}", e)))?;
+        let json = std::str::from_utf8(&json)
             .map_err(|e| AuthError::KeyringError(format!("Serialization failed: {}", e)))?;
 
         let entry = keyring::Entry::new(&self.service, &self.account)
             .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))?;
 
         entry
-            .set_password(&json)
+            .set_password(json)
             .map_err(|e| AuthError::KeyringError(format!("Failed to save: {}", e)))?;
 
         tracing::debug!(
@@ -395,9 +414,11 @@ impl TokenStore for KeychainTokenStore {
         let entry = keyring::Entry::new(&self.service, &self.account)
             .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))?;
 
-        let json = entry
-            .get_password()
-            .map_err(|e| AuthError::KeyringError(format!("Failed to load: {}", e)))?;
+        let json = Zeroizing::new(
+            entry
+                .get_password()
+                .map_err(|e| AuthError::KeyringError(format!("Failed to load: {}", e)))?,
+        );
 
         let tokens: TokenSet = serde_json::from_str(&json)
             .map_err(|e| AuthError::KeyringError(format!("Failed to parse: {}", e)))?;
@@ -447,7 +468,55 @@ async fn refresh_lock_within(
     }
 }
 
+/// Make sure the directory for a token, key or lock file exists, creating
+/// it owner-only if not, and warn when an existing one lets other accounts
+/// replace or delete files in it (group/world-writable without the sticky
+/// bit). An existing directory is never re-permissioned: it may be a home
+/// or project directory the caller chose.
+pub(crate) fn prepare_secret_directory(file: &std::path::Path) -> AuthResult<()> {
+    let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Ok(());
+    };
+    if !dir.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            return std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(AuthError::TokenStorage);
+        }
+        #[cfg(not(unix))]
+        return to_auth_result(crate::security::ensure_private_directory(dir));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(dir) {
+            let mode = meta.permissions().mode();
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        "The token directory is writable by other accounts; keep token, \
+                         key and lock files in a directory only this account can write"
+                    );
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File> {
+    prepare_secret_directory(path)?;
+    // Lock files hold no secret, but another account able to open one could
+    // hold it and stall refreshes: create it owner-only on Windows as well.
+    #[cfg(windows)]
+    if let Ok(file) = crate::security_windows::secure_create_new(path) {
+        return Ok(file);
+    }
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -462,6 +531,23 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// A missing token directory is created owner-only.
+    #[cfg(unix)]
+    #[test]
+    fn missing_token_directories_are_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("secrets").join("schwab");
+        let store = EncryptedFileTokenStore::new(nested.join("tokens.json"));
+        store.save(&create_test_tokens()).unwrap();
+        let mode = std::fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(
+            store.load().unwrap().access_token().unwrap(),
+            "access_token_12345"
+        );
+    }
 
     /// A holder that never lets go makes waiters fail, not hang.
     #[tokio::test]

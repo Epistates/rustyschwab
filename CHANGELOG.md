@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Security — secrets at rest and in memory
+
+- Every token store serialized the token set into plain `String`s and
+  parsed decrypted tokens through another, none of which were wiped.
+  Serialized and decrypted plaintext now lives only in zeroizing buffers
+  (pre-sized so no reallocation leaves a copy), and the encryption key read
+  from disk is wiped too. The encryption doc no longer claims `encrypt`
+  zeroizes its input.
+- Token-store I/O (files, locks, keychain) runs on the blocking pool
+  instead of an async worker.
+- `SchwabConfig::from_file` refuses a config file (which holds the app
+  secret) that is not a private regular file, like the token stores.
+- A missing directory for token, key and lock files is created owner-only;
+  an existing one writable by other accounts draws a warning. On Windows,
+  lock files are created with the owner/SYSTEM ACL.
+
 ### Changed — streaming
 
 - A full subscriber queue no longer tears down the WebSocket. Frames are

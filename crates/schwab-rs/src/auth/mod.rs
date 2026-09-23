@@ -460,7 +460,7 @@ impl AuthManager {
 
     pub async fn start(&self) -> AuthResult<()> {
         // Load tokens from file if they exist
-        if let Ok(tokens) = self.load_tokens() {
+        if let Ok(tokens) = self.store_load().await {
             *self.tokens.write() = Some(tokens);
         }
 
@@ -519,7 +519,7 @@ impl AuthManager {
         let _lock = self.refresh_lock.lock().await;
         let _process_lock = token_store::refresh_lock(&self.config.tokens_file).await?;
         // Another process may already have committed a newer token.
-        if let Ok(stored) = self.token_store.load() {
+        if let Ok(stored) = self.store_load().await {
             let mut current = self.tokens.write();
             if current
                 .as_ref()
@@ -560,7 +560,7 @@ impl AuthManager {
             old.refresh_token_expires_at
                 .unwrap_or(old.issued_at + Duration::days(7)),
         );
-        self.token_store.save(&new_tokens)?;
+        self.store_save(new_tokens.clone()).await?;
         *self.tokens.write() = Some(new_tokens);
         Ok(())
     }
@@ -594,8 +594,8 @@ impl AuthManager {
             // Start local server to capture callback
             let auth_code = self.capture_callback_code().await?;
             let tokens = self.exchange_code_for_tokens(&auth_code).await?;
-            *self.tokens.write() = Some(tokens);
-            self.save_tokens()?;
+            *self.tokens.write() = Some(tokens.clone());
+            self.store_save(tokens).await?;
             Ok((auth_url, auth_code))
         } else {
             Ok((auth_url, String::new()))
@@ -740,7 +740,7 @@ impl AuthManager {
         let tokens = token_response.into_token_set(Utc::now());
 
         let _file_lock = token_store::refresh_lock(&self.config.tokens_file).await?;
-        self.token_store.save(&tokens)?;
+        self.store_save(tokens.clone()).await?;
         *self.tokens.write() = Some(tokens.clone());
 
         Ok(tokens)
@@ -1007,14 +1007,26 @@ impl AuthManager {
         ))
     }
 
-    fn save_tokens(&self) -> AuthResult<()> {
-        if let Some(tokens) = self.tokens.read().as_ref() {
-            self.token_store.save(tokens)?;
-            debug!("Tokens saved");
-        }
+    /// Load through the store on the blocking pool: every store does file,
+    /// lock or keychain I/O that must not stall an async worker.
+    async fn store_load(&self) -> AuthResult<TokenSet> {
+        let store = self.token_store.clone();
+        tokio::task::spawn_blocking(move || store.load())
+            .await
+            .map_err(|e| AuthError::TokenStorage(std::io::Error::other(e)))?
+    }
+
+    /// Save through the store on the blocking pool; see [`Self::store_load`].
+    async fn store_save(&self, tokens: TokenSet) -> AuthResult<()> {
+        let store = self.token_store.clone();
+        tokio::task::spawn_blocking(move || store.save(&tokens))
+            .await
+            .map_err(|e| AuthError::TokenStorage(std::io::Error::other(e)))??;
+        debug!("Tokens saved");
         Ok(())
     }
 
+    /// Synchronous load, for the constructor only.
     fn load_tokens(&self) -> AuthResult<TokenSet> {
         let tokens = self.token_store.load()?;
         debug!("Tokens loaded");
