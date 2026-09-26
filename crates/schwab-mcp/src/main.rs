@@ -242,18 +242,8 @@ async fn live_backend(
         .rate_limit
         .enabled
         .then_some(config.client.rate_limit.requests_per_second);
-    let recovery_interval = schwab_mcp::server::parse_recovery_interval(
-        std::env::var(schwab_mcp::server::RECOVERY_INTERVAL_ENV)
-            .ok()
-            .as_deref(),
-    )
-    .map_err(anyhow::Error::msg)?;
-    schwab_mcp::status::parse_baseline_max_age(
-        std::env::var(schwab_mcp::status::BASELINE_MAX_AGE_ENV)
-            .ok()
-            .as_deref(),
-    )
-    .map_err(anyhow::Error::msg)?;
+    let (recovery_interval, _) =
+        schwab_mcp::status::freshness_from_env().map_err(anyhow::Error::msg)?;
 
     let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
     match std::env::var("SCHWAB_RISK_POLICY_FILE") {

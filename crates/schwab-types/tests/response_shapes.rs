@@ -656,7 +656,7 @@ fn user_preferences_carry_streamer_info() {
 #[test]
 fn protective_order_tree_survives_serialization_and_unknown_inputs_fail() {
     use schwab_types::trading::OrderRequest;
-    let leg = serde_json::json!({"instruction":"SELL","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}});
+    let leg = serde_json::json!({"instruction":"SELL","quantity":1,"instrument":{"assetType":"EQUITY","symbol":"AAPL"}});
     let stop = serde_json::json!({"session":"NORMAL","duration":"GOOD_TILL_CANCEL","orderType":"STOP_LIMIT","price":"9.99","stopPrice":"10.00","orderStrategyType":"SINGLE","orderLegCollection":[leg.clone()]});
     let limit = serde_json::json!({"session":"NORMAL","duration":"GOOD_TILL_CANCEL","orderType":"LIMIT","price":"12.34","orderStrategyType":"SINGLE","orderLegCollection":[leg]});
     let value = serde_json::json!({"orderStrategyType":"OCO","childOrderStrategies":[limit,stop]});
@@ -696,9 +696,9 @@ fn incomplete_stops_and_invalid_quantities_are_rejected_before_transport() {
 #[test]
 fn triggered_trailing_stop_and_partial_fill_activity_are_preserved() {
     use schwab_types::trading::{Order, OrderRequest};
-    let leg = serde_json::json!({"instruction":"SELL","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}});
+    let leg = serde_json::json!({"instruction":"SELL","quantity":1,"instrument":{"assetType":"EQUITY","symbol":"AAPL"}});
     let trailing = serde_json::json!({"session":"NORMAL","duration":"GOOD_TILL_CANCEL","orderType":"TRAILING_STOP","stopPriceLinkBasis":"BID","stopPriceLinkType":"VALUE","stopPriceOffset":"0.25","orderStrategyType":"SINGLE","orderLegCollection":[leg]});
-    let value = serde_json::json!({"session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"10.00","orderStrategyType":"TRIGGER","orderLegCollection":[{"instruction":"BUY","quantity":"1","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}],"childOrderStrategies":[trailing]});
+    let value = serde_json::json!({"session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"10.00","orderStrategyType":"TRIGGER","orderLegCollection":[{"instruction":"BUY","quantity":1,"instrument":{"assetType":"EQUITY","symbol":"AAPL"}}],"childOrderStrategies":[trailing]});
     let request: OrderRequest = serde_json::from_value(value.clone()).unwrap();
     request.validate().unwrap();
     assert_eq!(serde_json::to_value(request).unwrap(), value);
@@ -934,4 +934,29 @@ fn position_instruments_type_the_option_extension_and_tolerate_unknown() {
     // "no right" rather than failing the whole account.
     assert_eq!(sweep.put_call, None);
     assert_eq!(sweep.type_.as_deref(), Some("MONEY_MARKET_FUND"));
+}
+
+/// Only heartbeats are documented; any other notification keeps its fields.
+#[test]
+fn stream_notifications_keep_what_they_do_not_model() {
+    use schwab_types::streaming::StreamMessage;
+    let heartbeat: StreamMessage =
+        serde_json::from_str(r#"{"notify":[{"heartbeat":"1668715930582"}]}"#).unwrap();
+    let StreamMessage::Notify(heartbeat) = heartbeat else {
+        panic!("not a notification: {heartbeat:?}");
+    };
+    assert_eq!(
+        heartbeat.notify[0].heartbeat.as_deref(),
+        Some("1668715930582")
+    );
+    assert!(heartbeat.notify[0].extra.is_empty());
+    let admin: StreamMessage = serde_json::from_str(
+        r#"{"notify":[{"service":"ADMIN","timestamp":1,"content":{"code":30,"msg":"Stop streaming"}}]}"#,
+    )
+    .unwrap();
+    let StreamMessage::Notify(admin) = admin else {
+        panic!("not a notification: {admin:?}");
+    };
+    assert_eq!(admin.notify[0].heartbeat, None);
+    assert_eq!(admin.notify[0].extra["content"]["code"], 30);
 }

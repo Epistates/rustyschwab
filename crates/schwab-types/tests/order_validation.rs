@@ -258,6 +258,30 @@ fn request_decimals_parse_exactly_or_not_at_all() {
     }
 }
 
+/// Schwab's order examples always send `quantity` as a JSON number, and
+/// prices as strings or numbers: quantities go out as numbers, exactly.
+#[test]
+fn quantities_are_sent_as_exact_json_numbers() {
+    let mut order = OrderRequest::limit(buy(10), d("150.25"));
+    order.quantity = Some(d("10"));
+    let wire = serde_json::to_value(&order).unwrap();
+    assert_eq!(wire["quantity"], json!(10));
+    assert_eq!(wire["orderLegCollection"][0]["quantity"], json!(10));
+    assert_eq!(wire["price"], json!("150.25"));
+    // Fund dollar amounts are fractional; they survive the float spelling.
+    let mut fund = buy(1);
+    fund.quantity = d("1000.05");
+    assert_eq!(
+        serde_json::to_value(&fund).unwrap()["quantity"].to_string(),
+        "1000.05"
+    );
+    // More digits than a float carries is refused, never rounded.
+    fund.quantity = d("0.1234567890123456789");
+    assert!(serde_json::to_value(&fund).is_err());
+    // Either spelling reads back to the same order.
+    assert_eq!(parse(wire).unwrap(), order);
+}
+
 #[test]
 fn osi_symbols_parse_only_their_canonical_form() {
     // 2070 is 2070, not 1970.

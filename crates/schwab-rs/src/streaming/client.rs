@@ -921,8 +921,11 @@ impl StreamClient {
             .as_ref()
             .is_some_and(|h| !h.is_finished())
     }
+    /// Logged in to the streamer on a live socket. Unlike
+    /// [`StreamStatus::ready`], this holds while a slow consumer's queue has
+    /// overflowed, since the connection stays up and takes requests.
     pub fn is_authenticated(&self) -> bool {
-        self.inner.health.borrow().ready
+        *self.inner.connection_state.read() == ConnectionState::Authenticated
     }
 }
 
@@ -962,7 +965,12 @@ fn record_stream_frame(msg: &StreamMessage) {
             )
             .increment(1);
         }
-        StreamMessage::Notify(_) => {
+        StreamMessage::Notify(notify) => {
+            // Only heartbeats are documented; say so when something else
+            // arrives (the fields may name the account's session).
+            if notify.notify.iter().any(|item| item.heartbeat.is_none()) {
+                warn!("Streamer sent a notification other than a heartbeat");
+            }
             metrics::counter!(
                 crate::metrics::STREAM_MESSAGES_TOTAL,
                 "service" => "_control",
@@ -1925,6 +1933,7 @@ mod tests {
         StreamMessage::Notify(crate::types::streaming::StreamNotify {
             notify: vec![crate::types::streaming::NotifyItem {
                 heartbeat: Some(id.to_string()),
+                extra: Default::default(),
             }],
         })
     }

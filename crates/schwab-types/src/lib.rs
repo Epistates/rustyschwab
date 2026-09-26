@@ -42,7 +42,7 @@
 //!     "price": "150.25",
 //!     "orderLegCollection": [{
 //!         "instruction": "BUY",
-//!         "quantity": "10",
+//!         "quantity": 10,
 //!         "instrument": { "symbol": "AAPL", "assetType": "EQUITY" }
 //!     }]
 //! }))

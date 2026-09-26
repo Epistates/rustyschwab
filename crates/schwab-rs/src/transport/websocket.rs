@@ -2,9 +2,9 @@
 
 use crate::error::{Error, Result, StreamError};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
-};
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+use tokio_tungstenite::{Connector, connect_async_tls_with_config};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info};
 use url::Url;
 
@@ -32,20 +32,44 @@ impl WebSocketTransport {
     pub async fn connect(&self) -> Result<WsStream> {
         debug!("Connecting to WebSocket at {}", self.url);
 
-        let connector = if self.url.scheme() == "wss" {
-            tls_connector()?
-        } else {
-            Some(Connector::Plain)
-        };
-        let (ws_stream, response) =
-            connect_async_tls_with_config(self.url.as_str(), Some(limits()), true, connector)
-                .await
-                .map_err(|e| Error::Stream(StreamError::ConnectionFailed(e.to_string())))?;
+        let (ws_stream, response) = handshake(&self.url)
+            .await?
+            .map_err(|e| Error::Stream(StreamError::ConnectionFailed(e.to_string())))?;
 
         info!("WebSocket connected with status: {}", response.status());
 
         Ok(ws_stream)
     }
+}
+
+type Handshake = std::result::Result<
+    (
+        WsStream,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+>;
+
+#[cfg(any(feature = "rustls", feature = "native-tls"))]
+async fn handshake(url: &Url) -> Result<Handshake> {
+    let connector = if url.scheme() == "wss" {
+        tls_connector()?
+    } else {
+        Some(Connector::Plain)
+    };
+    Ok(connect_async_tls_with_config(url.as_str(), Some(limits()), true, connector).await)
+}
+
+/// Without a TLS feature only `ws://` can connect; Schwab's streamer is
+/// `wss://`, so say which features provide it.
+#[cfg(not(any(feature = "rustls", feature = "native-tls")))]
+async fn handshake(url: &Url) -> Result<Handshake> {
+    if url.scheme() == "wss" {
+        return Err(Error::Config(
+            "wss:// needs the `rustls` or `native-tls` feature of schwab-rs".into(),
+        ));
+    }
+    Ok(tokio_tungstenite::connect_async_with_config(url.as_str(), Some(limits()), true).await)
 }
 
 /// Largest streamer message or frame accepted. Schwab's frames (books
@@ -78,7 +102,7 @@ fn tls_connector() -> Result<Option<Connector>> {
     Ok(Some(Connector::Rustls(std::sync::Arc::new(config))))
 }
 
-#[cfg(not(all(feature = "rustls", not(feature = "native-tls"))))]
+#[cfg(feature = "native-tls")]
 fn tls_connector() -> Result<Option<Connector>> {
     Ok(None)
 }

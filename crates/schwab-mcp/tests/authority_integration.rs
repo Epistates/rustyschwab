@@ -151,7 +151,7 @@ async fn post(setup: &Setup, route: &str, token: char, body: Value) -> reqwest::
         .unwrap()
 }
 fn order(tag: &str) -> Value {
-    json!({"tag":tag,"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"10","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})
+    json!({"tag":tag,"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"10","orderLegCollection":[{"quantity":1,"instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})
 }
 async fn approve(s: &Setup, order: &Value) {
     let digest = schwab_mcp::policy::intent_digest(

@@ -27,8 +27,7 @@ const RELEASE_ORDER_TAG: &str = "DELETE FROM used_order_tags WHERE EXISTS(\
 const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)";
 const RESOLVE_SUBMISSION: &str =
     "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
-const SELECT_SUBMISSION_RESOLVED: &str =
-    "SELECT EXISTS(SELECT 1 FROM submissions WHERE id=?1 AND outcome IS NOT NULL)";
+const SELECT_SUBMISSION_OUTCOME: &str = "SELECT outcome FROM submissions WHERE id=?1";
 const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,dedup_key \
      FROM submissions ORDER BY created_at,id";
 const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
@@ -248,7 +247,9 @@ impl OrderJournal {
     }
     /// Resolve a pending submission. `Rejected` asserts the broker holds no
     /// order for it and releases its tag for a retry; `Accepted` and
-    /// `Reconciled` keep the tag consumed.
+    /// `Reconciled` keep the tag consumed. `Accepted` also succeeds when
+    /// reconciliation already accepted the submission under the same order
+    /// ID (or this call has none).
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
             && evidence.trim().is_empty()
@@ -270,14 +271,26 @@ impl OrderJournal {
                     )
                     .map_err(sql)?;
                 if changed != 1 {
-                    let resolved: bool = tx
-                        .query_row(SELECT_SUBMISSION_RESOLVED, [&id], |r| r.get(0))
-                        .map_err(sql)?;
-                    return Err(if resolved {
-                        Error::Duplicate("Submission is already resolved".into())
-                    } else {
-                        Error::InvalidParameter("Submission is unknown".into())
-                    });
+                    use rusqlite::OptionalExtension;
+                    let recorded: Option<String> = tx
+                        .query_row(SELECT_SUBMISSION_OUTCOME, [&id], |r| r.get(0))
+                        .optional()
+                        .map_err(sql)?
+                        .flatten();
+                    let Some(recorded) = recorded else {
+                        return Err(Error::InvalidParameter("Submission is unknown".into()));
+                    };
+                    // Reconciliation can match the order by its tag between
+                    // the broker's answer and this call; the same answer is
+                    // not a conflict.
+                    let recorded: SubmissionOutcome = serde_json::from_str(&recorded)?;
+                    return match (&recorded, &outcome) {
+                        (
+                            SubmissionOutcome::Accepted { order_id: Some(a) },
+                            SubmissionOutcome::Accepted { order_id: b },
+                        ) if b.as_ref().is_none_or(|b| b == a) => Ok(()),
+                        _ => Err(Error::Duplicate("Submission is already resolved".into())),
+                    };
                 }
                 if matches!(outcome, SubmissionOutcome::Rejected) {
                     tx.execute(RELEASE_ORDER_TAG, [&id]).map_err(sql)?;

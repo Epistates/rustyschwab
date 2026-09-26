@@ -46,6 +46,36 @@ pub fn parse_baseline_max_age(raw: Option<&str>) -> Result<i64, String> {
     }
 }
 
+/// The live recovery interval and baseline age limit from the environment,
+/// checked together: a baseline that ages out before the next pass could
+/// refresh it leaves readiness false and every submission refused.
+pub fn freshness_from_env() -> Result<(Duration, i64), String> {
+    use crate::server::{RECOVERY_INTERVAL_ENV, parse_recovery_interval};
+    let interval = parse_recovery_interval(std::env::var(RECOVERY_INTERVAL_ENV).ok().as_deref())?;
+    let max_age = parse_baseline_max_age(std::env::var(BASELINE_MAX_AGE_ENV).ok().as_deref())?;
+    check_freshness(interval, max_age)?;
+    Ok((interval, max_age))
+}
+
+fn check_freshness(interval: Duration, max_age_ms: i64) -> Result<(), String> {
+    let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
+    if interval_ms >= max_age_ms {
+        return Err(format!(
+            "SCHWAB_RECOVERY_INTERVAL_MS ({interval_ms}) must be below {BASELINE_MAX_AGE_ENV} \
+             ({max_age_ms}): baselines would go stale between reconciliation passes"
+        ));
+    }
+    if interval_ms * 2 > max_age_ms {
+        tracing::warn!(
+            interval_ms,
+            max_age_ms,
+            "A reconciliation pass that takes longer than the headroom between the recovery \
+             interval and the baseline age limit leaves baselines stale"
+        );
+    }
+    Ok(())
+}
+
 /// Bound on the readiness probe and on each calendar request, so a status
 /// call answers promptly even when a dependency does not.
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
@@ -92,12 +122,18 @@ impl ServerStatus {
     /// refused — but a principal scoped to particular accounts is not told
     /// its reason, which is operator text and, when a control wrote it,
     /// carries another account's equity, loss and cap. The full reason
-    /// stays in the audit journal and on the operator's own surfaces.
+    /// stays in the audit journal and on the operator's own surfaces. The
+    /// paper venue lists only the accounts the principal is granted.
     pub fn scope_to(&mut self, principal: &crate::policy::PrincipalPolicy) {
         if !principal.all_accounts
             && let Some(reason) = self.trading.operator_halt.as_mut()
         {
             *reason = HALT_WITHHELD.to_owned();
+        }
+        if let Some(paper) = self.paper.as_mut() {
+            paper
+                .accounts
+                .retain(|account| principal.grants_account(account));
         }
         self.principal = Some(Principal::from(principal));
     }
@@ -498,6 +534,10 @@ mod tests {
         for bad in ["0", "60001", "5s", "-1"] {
             assert!(parse_baseline_max_age(Some(bad)).is_err(), "{bad}");
         }
+        // The defaults fit; an interval at or past the age limit does not.
+        check_freshness(Duration::from_secs(2), BASELINE_MAX_AGE_MS).unwrap();
+        assert!(check_freshness(Duration::from_secs(5), 5_000).is_err());
+        assert!(check_freshness(Duration::from_secs(10), 5_000).is_err());
         use crate::server::parse_recovery_interval;
         assert_eq!(parse_recovery_interval(None), Ok(Duration::from_secs(2)));
         assert_eq!(

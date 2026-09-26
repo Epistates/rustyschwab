@@ -49,6 +49,17 @@ pub trait TradingBackend: Send + Sync {
     async fn operator_halt(&self) -> Result<Option<String>> {
         self.execution_store().operator_halt().await
     }
+    /// Local admission for a new submission, for a gateway to check before
+    /// it consumes a one-use approval. Advisory: each submission checks
+    /// again inside its own transaction.
+    async fn submission_admission(&self) -> Result<()> {
+        if self.operator_halt().await?.is_some() {
+            return Err(crate::Error::Halted(
+                "Operator trading halt is active".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[async_trait::async_trait]
 impl TradingBackend for SchwabClient {
@@ -93,6 +104,9 @@ impl TradingBackend for SchwabClient {
     }
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()> {
         self.cancel_order(account, id).await
+    }
+    async fn submission_admission(&self) -> Result<()> {
+        self.submission_admission().await
     }
 }
 #[async_trait::async_trait]

@@ -392,7 +392,7 @@ mod tests {
             json!({
                 "orderType": "MARKET", "session": "NORMAL", "duration": "DAY",
                 "orderStrategyType": "SINGLE",
-                "orderLegCollection": [{"instruction": "BUY", "quantity": "10",
+                "orderLegCollection": [{"instruction": "BUY", "quantity": 10,
                     "instrument": {"symbol": "AMD", "assetType": "EQUITY"}}]
             })
         );

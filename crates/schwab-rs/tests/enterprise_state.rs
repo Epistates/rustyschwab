@@ -74,8 +74,22 @@ async fn reconciliation_matches_tag_deduplicates_activity_and_rejects_old_genera
         .await
         .unwrap();
     assert!(first.reconciled);
-    assert_eq!(first.resolved_attempts, vec![id]);
+    assert_eq!(first.resolved_attempts, vec![id.clone()]);
     assert_eq!(first.newly_observed_activities, 1);
+    // The submitter's own answer arriving after reconciliation's agrees;
+    // a different order ID does not.
+    let accepted = |order_id: Option<&str>| SubmissionOutcome::Accepted {
+        order_id: order_id.map(str::to_owned),
+    };
+    journal.finish(&id, accepted(Some("123"))).await.unwrap();
+    journal.finish(&id, accepted(None)).await.unwrap();
+    assert!(journal.finish(&id, accepted(Some("124"))).await.is_err());
+    assert!(
+        journal
+            .finish(&id, SubmissionOutcome::Rejected)
+            .await
+            .is_err()
+    );
     assert_eq!(
         db.reconcile_snapshot("A", 1, 102, json!({}), vec![order])
             .await

@@ -8,7 +8,7 @@ use super::{
     StopType, TaxLotMethod,
 };
 use crate::common::{AssetType, PutCall};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use std::{fmt, str::FromStr};
 
@@ -37,8 +37,10 @@ pub struct OptionSymbol {
 
 impl OptionSymbol {
     /// Build a symbol, rejecting anything the OSI format cannot express: an
-    /// underlying longer than six ASCII letters or digits, a strike that is
-    /// not positive, above 99999.999, or finer than a tenth of a cent.
+    /// underlying longer than six ASCII letters or digits, an expiration
+    /// outside 2000–2099 (the symbol keeps two year digits, read as 20YY),
+    /// a strike that is not positive, above 99999.999, or finer than a
+    /// tenth of a cent.
     pub fn new(
         underlying: impl AsRef<str>,
         expiration: NaiveDate,
@@ -52,6 +54,11 @@ impl OptionSymbol {
         {
             return Err(format!(
                 "Option underlying must be one to six letters or digits, got {underlying:?}"
+            ));
+        }
+        if !(2000..=2099).contains(&expiration.year()) {
+            return Err(format!(
+                "Option expiration must be in 2000-2099, got {expiration}"
             ));
         }
         let strike = strike.normalize();
@@ -531,6 +538,11 @@ mod tests {
         assert!(OptionSymbol::call("AAPL", expiry(), d("-1")).is_err());
         assert!(OptionSymbol::call("AAPL", expiry(), d("100000")).is_err());
         assert!(OptionSymbol::call("AAPL", expiry(), d("1.0005")).is_err());
+        // Two year digits: 2125 and 1999 would print as 2025 and 2099.
+        for year in [1999, 2100, 2125] {
+            let date = NaiveDate::from_ymd_opt(year, 6, 20).unwrap();
+            assert!(OptionSymbol::call("SPY", date, d("550")).is_err(), "{year}");
+        }
         for bad in [
             "AAPL 240517P00190000",
             "AAPL  240517X00190000",
@@ -552,7 +564,7 @@ mod tests {
             json!({
                 "orderType": "MARKET", "session": "NORMAL", "duration": "DAY",
                 "orderStrategyType": "SINGLE",
-                "orderLegCollection": [{"instruction": "BUY", "quantity": "10",
+                "orderLegCollection": [{"instruction": "BUY", "quantity": 10,
                     "instrument": {"symbol": "AMD", "assetType": "EQUITY"}}]
             })
         );
@@ -570,7 +582,7 @@ mod tests {
                 "orderType": "LIMIT", "session": "NORMAL", "price": "1.0",
                 "duration": "GOOD_TILL_CANCEL", "orderStrategyType": "SINGLE",
                 "complexOrderStrategyType": "NONE",
-                "orderLegCollection": [{"instruction": "SELL_TO_OPEN", "quantity": "3",
+                "orderLegCollection": [{"instruction": "SELL_TO_OPEN", "quantity": 3,
                     "instrument": {"symbol": "AAPL  240517P00190000", "assetType": "OPTION"}}]
             })
         );
@@ -587,7 +599,7 @@ mod tests {
                 "orderType": "TRAILING_STOP", "session": "NORMAL", "stopPriceLinkBasis": "BID",
                 "stopPriceLinkType": "VALUE", "stopPriceOffset": "10", "duration": "DAY",
                 "orderStrategyType": "SINGLE",
-                "orderLegCollection": [{"instruction": "SELL", "quantity": "10",
+                "orderLegCollection": [{"instruction": "SELL", "quantity": 10,
                     "instrument": {"symbol": "XYZ", "assetType": "EQUITY"}}]
             })
         );
@@ -666,11 +678,11 @@ mod tests {
                 "childOrderStrategies": [
                     {"orderType": "LIMIT", "session": "NORMAL", "price": "45.97", "duration": "DAY",
                      "orderStrategyType": "SINGLE",
-                     "orderLegCollection": [{"instruction": "SELL", "quantity": "2",
+                     "orderLegCollection": [{"instruction": "SELL", "quantity": 2,
                          "instrument": {"symbol": "XYZ", "assetType": "EQUITY"}}]},
                     {"orderType": "STOP_LIMIT", "session": "NORMAL", "price": "37.00",
                      "stopPrice": "37.03", "duration": "DAY", "orderStrategyType": "SINGLE",
-                     "orderLegCollection": [{"instruction": "SELL", "quantity": "2",
+                     "orderLegCollection": [{"instruction": "SELL", "quantity": 2,
                          "instrument": {"symbol": "ABC", "assetType": "EQUITY"}}]}
                 ]
             })
@@ -723,7 +735,7 @@ mod tests {
         for exit in [profit, loss] {
             let leg = &exit["orderLegCollection"][0];
             assert_eq!(leg["instruction"], "SELL");
-            assert_eq!(leg["quantity"], "10");
+            assert_eq!(leg["quantity"], 10);
             assert_eq!(leg["instrument"]["symbol"], "AAPL");
             assert_eq!(leg["positionEffect"], "CLOSING");
         }

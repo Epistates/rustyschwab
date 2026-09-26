@@ -21,8 +21,9 @@ pub struct RecoveryWorker {
     task: tokio::task::JoinHandle<()>,
 }
 impl RecoveryWorker {
-    /// Reconcile `accounts` every `interval`, or sooner when
-    /// [`SchwabClient::request_reconciliation`] is called.
+    /// Reconcile `accounts` every `interval` (at least a second), or sooner
+    /// when [`SchwabClient::request_reconciliation`] is called, though never
+    /// less than half an interval apart.
     ///
     /// Each pass costs two requests per account (the order list and the
     /// account) plus one per working order entered before the pass's order
@@ -98,9 +99,16 @@ impl RecoveryWorker {
                     }
                 });
                 metrics::gauge!(crate::metrics::RECOVERY_READY).set(if ready { 1.0 } else { 0.0 });
+                // Activity comes in bursts (a fill, its order update, the
+                // balance change): it pulls the next pass forward, but never
+                // to less than half an interval after this one.
+                let finished = tokio::time::Instant::now();
+                let interval = interval.max(Duration::from_secs(1));
                 tokio::select! {
-                    _ = tokio::time::sleep(interval.max(Duration::from_secs(1))) => {}
-                    _ = client.reconciliation_requested() => {}
+                    _ = tokio::time::sleep_until(finished + interval) => {}
+                    _ = client.reconciliation_requested() => {
+                        tokio::time::sleep_until(finished + interval / 2).await;
+                    }
                 }
             }
         });
@@ -131,7 +139,8 @@ impl Drop for RecoveryWorker {
 /// Rough share of the request budget a worker reconciling `accounts` every
 /// `interval` consumes, counting two requests per account per pass (working
 /// orders older than the window add one each). Deployments should keep it
-/// well below one.
+/// well below one: sustained account activity can pull passes to half an
+/// interval apart, doubling it.
 pub fn budget_share(accounts: usize, interval: Duration, requests_per_second: u32) -> f64 {
     let per_second = (2 * accounts) as f64 / interval.as_secs_f64().max(1.0);
     per_second / f64::from(requests_per_second.max(1))

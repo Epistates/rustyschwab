@@ -562,6 +562,11 @@ impl AuthorizedServer {
         let write = submission || name == "cancel_order";
         let audit_id = if write {
             let dedup = if self.principal.require_approval && submission {
+                // The audit consumes this one-use approval, so refuse here
+                // what the tool would refuse before sending; a refusal
+                // after it would leave the operator to approve a new intent.
+                self.inner.switches().require(name)?;
+                self.inner.backend().submission_admission().await?;
                 Some(digest.clone())
             } else {
                 None
@@ -581,21 +586,14 @@ impl AuthorizedServer {
             if let Some(ms) = waited {
                 request["approvalWaitedMs"] = ms.into();
             }
+            // The refusal says which: a consumed approval or reused tag is a
+            // duplicate, an unresolved earlier submission needs
+            // reconciliation, and a lapsed approval needs a new one.
             let id = self
                 .audit
                 .begin_once(&audit_scope, name, request, dedup)
                 .await
-                .map_err(|e| {
-                    ToolFailure::new(
-                        FailureCode::ReconciliationRequired,
-                        format!(
-                            "Audit refused the dispatch ({e}): the approval was already \
-                             consumed or an earlier operation still requires reconciliation. \
-                             Read the order state; do not resubmit."
-                        ),
-                    )
-                    .with_intent(digest)
-                })?;
+                .map_err(|e| ToolFailure::from(e).with_intent(digest))?;
             Some(id)
         } else {
             None
@@ -969,6 +967,19 @@ mod tests {
         assert_eq!(approved["approved"], true);
         assert_eq!(codes(&approved), ["not_permitted"]);
         assert!(server.audit.records().await.unwrap().is_empty());
+
+        // A submission refused before sending leaves the one-use approval
+        // unspent, so it goes through once trading is switched on.
+        let refused = server
+            .call_tool("place_order", args.clone(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.structured_content.unwrap()["error"]["code"],
+            "not_permitted"
+        );
+        assert!(server.audit.records().await.unwrap().is_empty());
+        assert!(server.audit.is_approved("desk", &placement).await.unwrap());
 
         // An `order_id` makes it a replacement, which this principal lacks.
         let mut replacing = args.clone();

@@ -244,12 +244,17 @@ impl LeaseSession {
     ) -> Result<Self> {
         let owner = uuid::Uuid::new_v4().to_string();
         let deadline = tokio::time::Instant::now() + wait;
+        // A holder keeps the lease for a broker round trip, and each attempt
+        // is a write transaction on the state file the holder is also
+        // using: back off from 20–40 ms to 100–200 ms between attempts.
+        let mut base = 20u64;
         loop {
             match backend.acquire(resource, &owner, LEASE_TTL).await {
                 Ok(lease) => return Ok(Self::hold(backend, lease)),
                 Err(Error::LeaseBusy) if tokio::time::Instant::now() < deadline => {
                     // Jitter keeps waiters from retrying in lockstep.
-                    let pause = Duration::from_millis(20 + rand::random::<u64>() % 30);
+                    let pause = Duration::from_millis(base + rand::random::<u64>() % base);
+                    base = (base * 2).min(100);
                     tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + pause))
                         .await;
                 }

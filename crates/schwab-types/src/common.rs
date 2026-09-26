@@ -281,15 +281,48 @@ pub mod exact_decimal {
         de.deserialize_any(Exact)
     }
 
+    /// Serialize as a JSON number, the form Schwab's order examples always
+    /// use for `quantity` (prices appear as strings as well, so they stay
+    /// strings). Whole values go out as integers; a value the shortest
+    /// float spelling would not carry exactly is refused.
+    pub fn serialize_number<S: serde::Serializer>(
+        value: &Decimal,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        use rust_decimal::prelude::ToPrimitive;
+        use serde::ser::Error;
+        if value.fract().is_zero()
+            && let Some(n) = value.to_i64()
+        {
+            return s.serialize_i64(n);
+        }
+        match value.to_f64() {
+            Some(n) if parse(&n.to_string()).is_ok_and(|back| back == *value) => s.serialize_f64(n),
+            _ => Err(S::Error::custom(format!(
+                "{value} has more precision than a JSON number carries"
+            ))),
+        }
+    }
+
     /// The same rules for an optional field; pair with `#[serde(default)]`.
     pub mod option {
         use rust_decimal::Decimal;
-        use serde::{Deserialize, Deserializer};
+        use serde::{Deserialize, Deserializer, Serializer};
 
         pub fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Option<Decimal>, D::Error> {
             #[derive(Deserialize)]
             struct Wrap(#[serde(deserialize_with = "super::deserialize")] Decimal);
             Ok(Option::<Wrap>::deserialize(de)?.map(|Wrap(d)| d))
+        }
+
+        pub fn serialize_number<S: Serializer>(
+            value: &Option<Decimal>,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => super::serialize_number(value, s),
+                None => s.serialize_none(),
+            }
         }
     }
 }
@@ -314,6 +347,31 @@ impl schemars::JsonSchema for DecimalString {
             "type": "string",
             "pattern": "^[0-9]+(\\.[0-9]+)?$",
             "description": "Exact decimal as a string, e.g. \"150.25\"; never a JSON number."
+        })
+    }
+}
+
+/// JSON schema for an order quantity: Schwab's wire form is a JSON number
+/// ([`exact_decimal::serialize_number`]), and a decimal string reads the same.
+#[cfg(feature = "schemars")]
+pub struct QuantityNumber;
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for QuantityNumber {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "QuantityNumber".into()
+    }
+
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": ["number", "string"],
+            "pattern": "^[0-9]+(\\.[0-9]+)?$",
+            "description": "Shares, contracts or fund units: a JSON number such as 10, \
+                            or a decimal string such as \"10\"."
         })
     }
 }

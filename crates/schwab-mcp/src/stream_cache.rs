@@ -267,6 +267,36 @@ impl StreamCache {
             cache.reconciled_generation = Some(generation);
         }
     }
+    /// After `service`'s field list changes to `fields_csv`, drop the cached
+    /// fields it no longer streams: level-one entries merge deltas, so their
+    /// last values would ride along with fresh fields and read as current.
+    /// Fields outside the service's numbered table (`key`, `delayed`, …)
+    /// are kept.
+    pub fn retain_fields(&self, service: &str, fields_csv: &str) {
+        let Some(table) = StreamService::from_api_str(service).map(|s| s.fields()) else {
+            return;
+        };
+        let numbers: std::collections::HashSet<u32> = fields_csv
+            .split(',')
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        let dropped = |name: &str| {
+            table
+                .iter()
+                .any(|f| f.name == name && !numbers.contains(&f.number))
+        };
+        let mut cache = self.inner.write();
+        for ((_, _), entry) in cache
+            .snapshots
+            .iter_mut()
+            .filter(|((svc, _), _)| svc == service)
+        {
+            if let Some(fields) = entry.value.as_object_mut() {
+                fields.retain(|name, _| !dropped(name));
+            }
+            entry.field_times.retain(|name, _| !dropped(name));
+        }
+    }
     pub fn remove(&self, service: &str, keys: &[String]) {
         self.inner
             .write()
@@ -470,6 +500,38 @@ mod tests {
         let snapshots = &cache.inner.read().snapshots;
         assert_eq!(snapshots.len(), MAX_SNAPSHOTS - MAX_SNAPSHOTS / 10 + 1);
         assert!(snapshots.contains_key(&("LEVELONE_EQUITIES".into(), "NEW".into())));
+    }
+
+    /// A narrower field list drops the fields it no longer streams, so a
+    /// merged entry never pairs a fresh last price with an old bid.
+    #[test]
+    fn a_new_field_list_drops_the_fields_it_stops_streaming() {
+        let cache = StreamCache::new();
+        cache.update_status(StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        cache.put(
+            "LEVELONE_EQUITIES".into(),
+            "AAPL".into(),
+            json!({"key":"AAPL","delayed":false,"bidPrice":10,"askPrice":11,"lastPrice":10.5}),
+            now,
+        );
+        cache.retain_fields("LEVELONE_EQUITIES", "0,3");
+        let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+        assert_eq!(
+            snapshot["AAPL"]["content"],
+            json!({"key":"AAPL","delayed":false,"lastPrice":10.5})
+        );
+        let mut timed: Vec<_> = snapshot["AAPL"]["fieldUpdatedAt"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        timed.sort();
+        assert_eq!(timed, ["delayed", "key", "lastPrice"]);
     }
 
     #[test]

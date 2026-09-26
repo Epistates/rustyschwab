@@ -386,11 +386,10 @@ impl Display for PositionKey {
 
 impl FromStr for PositionKey {
     type Err = ();
+    /// The symbol may be empty: a position without an instrument sorts first
+    /// under `#0`.
     fn from_str(text: &str) -> Result<Self, ()> {
         let (symbol, ordinal) = text.rsplit_once('#').ok_or(())?;
-        if symbol.is_empty() {
-            return Err(());
-        }
         Ok(Self {
             symbol: symbol.to_owned(),
             ordinal: ordinal.parse().map_err(|_| ())?,
@@ -708,8 +707,26 @@ mod tests {
         assert_eq!(symbols, ["AAPL  250117C00150000", "MSFT"]);
         assert_eq!(rest.rows[1][1], "EQUITY");
         assert_eq!(rest.rows[1][6], 5.0);
-        assert!(PositionKey::from_str("#1").is_err());
         assert!(PositionKey::from_str("AAPL").is_err());
+
+        // A position without an instrument sorts first; paging goes past it.
+        let bare = || -> Account {
+            serde_json::from_value(json!({"securitiesAccount": {
+                "accountNumber": "123456789",
+                "positions": [
+                    {"longQuantity": 2.0, "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}},
+                    {"longQuantity": 1.0}
+                ]
+            }}))
+            .unwrap()
+        };
+        let (header, rows) = positions(bare());
+        let first = page(rows, POSITION_COLUMNS, header, None, Some(1), 1 << 20).unwrap();
+        assert_eq!(first.next_cursor.as_deref(), Some("#0"));
+        let (header, rows) = positions(bare());
+        let rest = page(rows, POSITION_COLUMNS, header, Some("#0"), None, 1 << 20).unwrap();
+        assert_eq!(rest.rows.len(), 1);
+        assert_eq!(rest.rows[0][0], "AAPL");
     }
 
     #[test]

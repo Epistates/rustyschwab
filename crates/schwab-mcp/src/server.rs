@@ -1228,6 +1228,7 @@ impl SchwabMcp {
             let guard = self.stream.read().await;
             let client = guard.as_ref().ok_or_else(not_connected)?;
             client.view(service, fields_csv.clone()).await?;
+            self.cache.retain_fields(service.as_str(), &fields_csv);
             Ok(contract::local(json!({
                 "status": "updated",
                 "service": service.as_str(),

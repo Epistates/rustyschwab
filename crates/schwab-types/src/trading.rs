@@ -225,6 +225,9 @@ pub enum OrderDuration {
     Unknown,
 }
 
+/// `CABINET`, `NON_MARKETABLE` and `EXERCISE` appear on orders Schwab
+/// reports back but cannot be submitted, so the request schema leaves them
+/// out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -235,9 +238,12 @@ pub enum OrderType {
     Stop,
     StopLimit,
     TrailingStop,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Cabinet,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     NonMarketable,
     MarketOnClose,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Exercise,
     TrailingStopLimit,
     NetDebit,
@@ -282,7 +288,7 @@ pub enum ComplexOrderStrategyType {
 
 /// Only [`Single`](Self::Single), [`Oco`](Self::Oco), and
 /// [`Trigger`](Self::Trigger) can be submitted; the rest appear on orders
-/// Schwab reports back.
+/// Schwab reports back, and are left out of the request schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -290,11 +296,17 @@ pub enum ComplexOrderStrategyType {
 pub enum OrderStrategyType {
     #[default]
     Single,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Cancel,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Recall,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Pair,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     Flatten,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     TwoDaySwap,
+    #[cfg_attr(feature = "schemars", schemars(skip))]
     BlastAll,
     Oco,
     Trigger,
@@ -929,14 +941,15 @@ pub struct OrderRequest {
     pub duration: Option<OrderDuration>,
     pub order_type: Option<OrderType>,
     pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
-    /// When present, must equal every leg's quantity.
+    /// When present, must equal every leg's quantity. Sent as a JSON number.
     #[serde(
         default,
-        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+        deserialize_with = "crate::common::exact_decimal::option::deserialize",
+        serialize_with = "crate::common::exact_decimal::option::serialize_number"
     )]
     #[cfg_attr(
         feature = "schemars",
-        schemars(with = "Option<crate::common::DecimalString>")
+        schemars(with = "Option<crate::common::QuantityNumber>")
     )]
     pub quantity: Option<rust_decimal::Decimal>,
     #[serde(
@@ -989,9 +1002,12 @@ pub struct OrderRequest {
 pub struct OrderRequestLeg {
     pub instruction: OrderInstruction,
     /// Shares or contracts; whole numbers for equities and options. For a
-    /// mutual fund, denominated as `quantity_type` says.
-    #[serde(deserialize_with = "crate::common::exact_decimal::deserialize")]
-    #[cfg_attr(feature = "schemars", schemars(with = "crate::common::DecimalString"))]
+    /// mutual fund, denominated as `quantity_type` says. Sent as a JSON number.
+    #[serde(
+        deserialize_with = "crate::common::exact_decimal::deserialize",
+        serialize_with = "crate::common::exact_decimal::serialize_number"
+    )]
+    #[cfg_attr(feature = "schemars", schemars(with = "crate::common::QuantityNumber"))]
     pub quantity: rust_decimal::Decimal,
     pub instrument: OrderRequestInstrument,
     pub position_effect: Option<PositionEffect>,

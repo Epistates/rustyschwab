@@ -167,11 +167,16 @@ pub struct StreamNotify {
     pub notify: Vec<NotifyItem>,
 }
 
+/// Schwab documents only the heartbeat notification. Anything else it sends
+/// here (an `ADMIN` notice with a `content.code`, say) is kept in `extra`
+/// rather than dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct NotifyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -317,6 +322,9 @@ impl StreamResponseCode {
 /// Local lifecycle notification, never accepted from the broker wire.
 /// `lost_messages` is cumulative; any increase requires REST reconciliation
 /// for account activity. A new session does not recover missed executions.
+/// It counts frames dropped at a full queue, not the frames still queued
+/// when the gap began: like those from before a reconnect, they are
+/// discarded unread, so treat the whole pre-gap view as stale.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamStatus {

@@ -52,10 +52,10 @@ impl FlexibleTime {
                         .and_hms_opt(0, 0, 0)
                         .expect("midnight exists")
                         .and_utc();
-                    return Ok(match bound {
-                        Bound::Start => start,
-                        Bound::End => start + Duration::days(1) - Duration::milliseconds(1),
-                    });
+                    return match bound {
+                        Bound::Start => Ok(start),
+                        Bound::End => shift(start, Duration::days(1) - Duration::milliseconds(1)),
+                    };
                 }
                 Err(format!(
                     "{text:?} is not a calendar date (YYYY-MM-DD), an RFC 3339 timestamp or \
@@ -74,10 +74,18 @@ fn window(
     now: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
     let end = end.map_or(Ok(now), |t| t.resolve(Bound::End))?;
-    let start = start.map_or(Ok(end - Duration::days(DEFAULT_WINDOW_DAYS)), |t| {
-        t.resolve(Bound::Start)
-    })?;
+    let start = start.map_or_else(
+        || shift(end, -Duration::days(DEFAULT_WINDOW_DAYS)),
+        |t| t.resolve(Bound::Start),
+    )?;
     Ok((start, end))
+}
+
+/// `at + by`, refused rather than panicking at the edge of chrono's range
+/// (`+262142-12-31` is a valid date to parse).
+fn shift(at: DateTime<Utc>, by: Duration) -> Result<DateTime<Utc>, String> {
+    at.checked_add_signed(by)
+        .ok_or_else(|| format!("{at} is too far from the present for a query window"))
 }
 
 /// Parameters of `get_account_orders` and `get_all_orders`.
@@ -260,6 +268,12 @@ mod tests {
         assert!(resolve(json!("2025-13-01"), Bound::Start).is_err());
         assert!(resolve(json!(i64::MAX), Bound::Start).is_err());
         assert!(serde_json::from_value::<FlexibleTime>(json!(true)).is_err());
+        // Chrono's last and first dates parse: the last day's end is its
+        // final millisecond, and a default window before the first is refused.
+        let last = resolve(json!(NaiveDate::MAX.to_string()), Bound::End).unwrap();
+        assert_eq!(last.date_naive(), NaiveDate::MAX);
+        let earliest = FlexibleTime::Text(NaiveDate::MIN.to_string());
+        assert!(window(None, Some(&earliest), Utc::now()).is_err());
     }
 
     #[test]

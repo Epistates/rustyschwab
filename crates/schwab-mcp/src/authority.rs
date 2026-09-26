@@ -114,35 +114,7 @@ impl Authority {
         self.grants().map(|_| ())
     }
     fn grants(&self) -> anyhow::Result<Vec<Grant>> {
-        let file = std::fs::File::open(&self.policy_file)?;
-        use std::io::Read;
-        let mut bytes = Vec::new();
-        file.take(1048577).read_to_end(&mut bytes)?;
-        anyhow::ensure!(bytes.len() <= 1048576, "Policy exceeds limit");
-        let grants: Vec<Grant> = serde_json::from_slice(&bytes)?;
-        let mut subjects = std::collections::HashSet::new();
-        let mut names = std::collections::HashSet::new();
-        for grant in &grants {
-            anyhow::ensure!(
-                !grant.subject.trim().is_empty() && subjects.insert(&grant.subject),
-                "Duplicate/empty subject"
-            );
-            if grant.role == Role::Trader {
-                let policy = grant
-                    .policy
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("Trader policy required"))?;
-                policy.validate()?;
-                anyhow::ensure!(
-                    policy.identity_subject.as_deref() == Some(&grant.subject)
-                        && names.insert(&policy.name),
-                    "Trader subject/name mismatch"
-                );
-            } else {
-                anyhow::ensure!(grant.policy.is_none(), "Only traders have trading policies");
-            }
-        }
-        Ok(grants)
+        load_grants(&self.policy_file)
     }
     async fn authenticate(
         &self,
@@ -164,7 +136,14 @@ impl Authority {
         if identity.expires_at <= now {
             return Err(StatusCode::UNAUTHORIZED);
         }
-        let grants = self.grants().map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        // Read per request, so a revoked grant takes effect at once; off
+        // the async workers, since the file may be up to a megabyte.
+        let path = self.policy_file.clone();
+        let grants = tokio::task::spawn_blocking(move || load_grants(&path))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
         if !grants
             .iter()
             .any(|g| g.subject == identity.subject && g.role == role)
@@ -179,6 +158,39 @@ impl Authority {
                 .principal_journal_path(&digest(principal.as_bytes())),
         )
     }
+}
+/// Read and check the grants file: bounded, one grant per subject, and a
+/// validated trading policy on every trader and on no one else.
+fn load_grants(path: &std::path::Path) -> anyhow::Result<Vec<Grant>> {
+    let file = std::fs::File::open(path)?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(1048577).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= 1048576, "Policy exceeds limit");
+    let grants: Vec<Grant> = serde_json::from_slice(&bytes)?;
+    let mut subjects = std::collections::HashSet::new();
+    let mut names = std::collections::HashSet::new();
+    for grant in &grants {
+        anyhow::ensure!(
+            !grant.subject.trim().is_empty() && subjects.insert(&grant.subject),
+            "Duplicate/empty subject"
+        );
+        if grant.role == Role::Trader {
+            let policy = grant
+                .policy
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Trader policy required"))?;
+            policy.validate()?;
+            anyhow::ensure!(
+                policy.identity_subject.as_deref() == Some(&grant.subject)
+                    && names.insert(&policy.name),
+                "Trader subject/name mismatch"
+            );
+        } else {
+            anyhow::ensure!(grant.policy.is_none(), "Only traders have trading policies");
+        }
+    }
+    Ok(grants)
 }
 pub fn router(state: Arc<Authority>) -> Router {
     Router::new()
@@ -200,6 +212,12 @@ async fn admit(
     next: axum::middleware::Next,
 ) -> Response {
     let lane = if request.uri().path() == "/v1/operator" {
+        // Only a verified operator may hold a reserved permit: anyone else
+        // could fill the lane with slow bodies and lock out a halt. The
+        // handler authenticates again, against the grants as they then are.
+        if let Err(code) = state.authenticate(request.headers(), Role::Operator).await {
+            return response(Err(code.into()));
+        }
         &state.operator_capacity
     } else {
         &state.capacity
@@ -280,7 +298,7 @@ fn status_for(envelope: &ErrorEnvelope) -> StatusCode {
         ErrorKind::RiskDenied | ErrorKind::BaselineStale => StatusCode::UNPROCESSABLE_ENTITY,
         ErrorKind::Halted => StatusCode::LOCKED,
         ErrorKind::RateLimit => StatusCode::TOO_MANY_REQUESTS,
-        ErrorKind::Storage | ErrorKind::Remote | ErrorKind::CircuitOpen => {
+        ErrorKind::Storage | ErrorKind::Remote | ErrorKind::CircuitOpen | ErrorKind::LeaseBusy => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
@@ -302,6 +320,7 @@ fn envelope(error: &schwab_rs::Error) -> ErrorEnvelope {
             | ErrorKind::ReconciliationRequired
             | ErrorKind::SubmissionUnknown
             | ErrorKind::OwnershipLost
+            | ErrorKind::LeaseBusy
             | ErrorKind::CircuitOpen
             | ErrorKind::RateLimit
             | ErrorKind::Timeout
@@ -617,6 +636,9 @@ async fn order(
                 order.tag = Some(crate::policy::intent_tag(&digest));
             }
             let key = if !cancel && principal.require_approval {
+                // As on the MCP path: refuse a halted or suspended submission
+                // before the audit consumes its one-use approval.
+                state.client.submission_admission().await?;
                 digest
             } else {
                 format!("gateway:{}:{}", principal.name, request.request_id)
@@ -740,7 +762,7 @@ async fn paper_account(
                 .find(|g| g.subject == identity.subject)
                 .and_then(|g| g.policy.as_ref())
                 .ok_or(StatusCode::FORBIDDEN)?;
-            if !policy.accounts.contains(&query.account) {
+            if !policy.grants_account(&query.account) {
                 return Err(StatusCode::FORBIDDEN.into());
             }
             let paper = state.client.paper().ok_or(StatusCode::NOT_FOUND)?;

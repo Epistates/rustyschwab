@@ -158,6 +158,9 @@ async fn queue_overflow_is_visible_to_a_slow_receiver() {
     })
     .await
     .unwrap();
+    // Data is stale, but the session is not: requests still go out.
+    assert!(!client.status().ready);
+    assert!(client.is_authenticated());
     let mut rx = client.get_receiver().unwrap();
     match rx.recv().await.unwrap() {
         StreamMessage::State(state) => {
