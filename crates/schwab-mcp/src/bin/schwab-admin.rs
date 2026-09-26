@@ -110,9 +110,7 @@ async fn main() -> anyhow::Result<()> {
             token_file,
             limit,
         } => {
-            schwab_rs::security::verify_file_permissions(&token_file)?;
-            let token =
-                secrecy::SecretString::from(std::fs::read_to_string(token_file)?.trim().to_owned());
+            let token = schwab_rs::security::read_secret_file(&token_file)?;
             println!(
                 "{}",
                 serde_json::to_string(

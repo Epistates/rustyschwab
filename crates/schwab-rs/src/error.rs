@@ -122,7 +122,11 @@ pub enum Error {
     ApprovalInvalid(String),
     /// The remote authority answered with a non-2xx status and no typed
     /// [`ErrorEnvelope`]. `status` is the authority's HTTP status, not Schwab's.
-    #[error("Remote authority rejected request (HTTP {status}): {message}")]
+    ///
+    /// As with [`Error::Http`], `message` is left out of `Display`: it can be
+    /// a relayed Schwab error body or an unrecognised reply, either of which
+    /// can echo request data into logs.
+    #[error("Remote authority rejected request (HTTP {status})")]
     Remote {
         status: reqwest::StatusCode,
         message: String,

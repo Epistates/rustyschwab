@@ -13,9 +13,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    schwab_rs::security::verify_file_permissions(&args.token_file)?;
-    let token =
-        secrecy::SecretString::from(std::fs::read_to_string(args.token_file)?.trim().to_owned());
+    let token = schwab_rs::security::read_secret_file(&args.token_file)?;
     let request: serde_json::Value = serde_json::from_slice(&std::fs::read(args.request)?)?;
     let remote = schwab_rs::remote::RemoteBackend::new(&args.endpoint, token)?;
     let reply: serde_json::Value = remote.post(&request).await?;

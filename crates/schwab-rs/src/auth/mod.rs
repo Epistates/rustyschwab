@@ -22,6 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use parking_lot::RwLock;
 use ring::rand::SecureRandom;
 use ring::{digest, rand as ring_rand};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -174,11 +175,13 @@ const OAUTH_TOKEN_RETRY_BASE: std::time::Duration = std::time::Duration::from_mi
 
 // TokenSet is now provided by token_store module and re-exported at the top
 
+/// Tokens decode straight into [`SecretString`]s (whose `Debug` is redacted)
+/// from a body buffer that is wiped on drop; see [`read_token_response`].
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    id_token: Option<String>,
+    access_token: SecretString,
+    refresh_token: Option<SecretString>,
+    id_token: Option<SecretString>,
     token_type: String,
     expires_in: u64,
     scope: Option<String>,
@@ -186,16 +189,39 @@ struct TokenResponse {
 
 impl TokenResponse {
     fn into_token_set(self, issued_at: DateTime<Utc>) -> TokenSet {
-        TokenSet::new(
+        TokenSet::from_secrets(
             self.access_token,
-            self.refresh_token.unwrap_or_default(),
-            self.id_token.unwrap_or_default(),
+            self.refresh_token.unwrap_or_else(|| SecretString::from("")),
+            self.id_token.unwrap_or_else(|| SecretString::from("")),
             self.token_type,
-            self.expires_in as i64,
+            i64::try_from(self.expires_in).unwrap_or(i64::MAX),
             self.scope.unwrap_or_default(),
             issued_at,
         )
     }
+}
+
+/// Read a token endpoint reply into a buffer sized up front, so it never
+/// reallocates and leaves an unwiped copy behind, and parse it without
+/// letting serde quote any of it: a type error message can include the
+/// offending value.
+async fn read_token_response(mut response: reqwest::Response) -> Result<TokenResponse, String> {
+    let limit = token_store::TOKEN_JSON_CAPACITY;
+    let mut body = zeroize::Zeroizing::new(Vec::with_capacity(limit));
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > limit {
+            return Err(format!("token response is over {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|e| {
+        format!(
+            "{:?} error at line {} column {}",
+            e.classify(),
+            e.line(),
+            e.column()
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -316,8 +342,7 @@ async fn post_oauth_token_with_retry(
 
         let status = response.status();
         if status.is_success() {
-            return response
-                .json::<TokenResponse>()
+            return read_token_response(response)
                 .await
                 .map_err(|e| grant.wrap(format!("failed to parse token response: {e}")));
         }
@@ -763,7 +788,7 @@ impl AuthManager {
 
         // Keep the same refresh token if not provided
         if token_response.refresh_token.is_none() {
-            token_response.refresh_token = Some(refresh_token.to_string());
+            token_response.refresh_token = Some(SecretString::from(refresh_token));
         }
 
         let tokens = token_response.into_token_set(Utc::now());

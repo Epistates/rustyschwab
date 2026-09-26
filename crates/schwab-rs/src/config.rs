@@ -385,12 +385,14 @@ impl SchwabConfig {
     ///
     /// Uses [`crate::security::secure_file_write`] (0600 permissions,
     /// atomic temp-file rename) because the serialized config contains
-    /// `app_secret` in plaintext.
+    /// `app_secret` in plaintext; the serialized copy is wiped after writing.
     pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)
+        // Sized so it never reallocates, which would leave an unwiped copy.
+        let mut json = zeroize::Zeroizing::new(Vec::with_capacity(64 * 1024));
+        serde_json::to_writer_pretty(&mut *json, self)
             .map_err(|e| Error::Config(format!("Failed to serialize config: {}", e)))?;
 
-        crate::security::secure_file_write(path.as_ref(), json.as_bytes())
+        crate::security::secure_file_write(path.as_ref(), &json)
             .map_err(|e| Error::Config(format!("Failed to write config file: {}", e)))?;
 
         Ok(())

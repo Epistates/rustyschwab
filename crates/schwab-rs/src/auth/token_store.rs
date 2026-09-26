@@ -43,7 +43,7 @@ const MIN_REFRESH_BUFFER_SECS: i64 = 30;
 /// Room for a serialized token set without reallocating: a reallocation
 /// would free the old buffer without wiping it. Schwab's tokens serialize to
 /// about 2 KiB.
-const TOKEN_JSON_CAPACITY: usize = 16 * 1024;
+pub(crate) const TOKEN_JSON_CAPACITY: usize = 16 * 1024;
 
 /// Serialize `tokens` into a buffer that is wiped when dropped. Every store
 /// writes its plaintext through this, so the only plaintext copies of the
@@ -127,10 +127,32 @@ impl TokenSet {
         scope: String,
         issued_at: DateTime<Utc>,
     ) -> Self {
+        Self::from_secrets(
+            SecretString::from(access_token),
+            SecretString::from(refresh_token),
+            SecretString::from(id_token),
+            token_type,
+            expires_in,
+            scope,
+            issued_at,
+        )
+    }
+
+    /// [`TokenSet::new`] for tokens that are already secret-wrapped, so a
+    /// fresh grant never passes through a plain `String`.
+    pub(crate) fn from_secrets(
+        access_token: SecretString,
+        refresh_token: SecretString,
+        id_token: SecretString,
+        token_type: String,
+        expires_in: i64,
+        scope: String,
+        issued_at: DateTime<Utc>,
+    ) -> Self {
         Self {
-            access_token: Some(SecretString::from(access_token)),
-            refresh_token: Some(SecretString::from(refresh_token)),
-            id_token: Some(SecretString::from(id_token)),
+            access_token: Some(access_token),
+            refresh_token: Some(refresh_token),
+            id_token: Some(id_token),
             token_type,
             expires_in,
             scope,
@@ -295,7 +317,24 @@ impl EncryptedFileTokenStore {
 
     fn load_or_generate_key(&self) -> AuthResult<Zeroizing<[u8; 32]>> {
         let key_lock = open_lock_file(&self.key_path.with_extension("key.lock"))?;
-        key_lock.lock().map_err(AuthError::TokenStorage)?;
+        // Holders only read or write one small file, so one still holding
+        // the lock after this is wedged; see REFRESH_LOCK_WAIT.
+        let deadline = std::time::Instant::now() + KEY_LOCK_WAIT;
+        loop {
+            match key_lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(AuthError::TokenFileError(format!(
+                        "another process has held the encryption key lock for over {}s",
+                        KEY_LOCK_WAIT.as_secs()
+                    )));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(AuthError::TokenStorage(e)),
+            }
+        }
         if self.key_path.exists() {
             to_auth_result(verify_file_permissions(&self.key_path))?;
             let key_bytes =
@@ -437,6 +476,10 @@ impl TokenStore for KeychainTokenStore {
 /// after this is wedged (stopped, or stuck in I/O), and waiting longer would
 /// hang every caller that needs a token.
 const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long to wait for another process's encryption key read or write. Runs
+/// on the blocking pool (see `AuthManager::store_load`).
+const KEY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The guard is held through reload, grant exchange, and persistence. OS locks
 /// release on crash; lock files contain no credentials and are never unlinked.

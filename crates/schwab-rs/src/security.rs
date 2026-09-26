@@ -282,8 +282,8 @@ pub fn secure_file_write(_path: &Path, _data: &[u8]) -> Result<()> {
 ///
 /// # Security
 ///
-/// - **Unix**: Checks that mode is exactly 0600
-/// - **Windows**: Warns that verification is not available
+/// - **Unix**: a regular file (not a symlink) with mode exactly 0600
+/// - **Windows**: not a reparse point, with an owner-only protected DACL
 ///
 /// # Arguments
 ///
@@ -350,6 +350,14 @@ pub fn verify_file_permissions(_path: &Path) -> Result<()> {
     Err(Error::Config(
         "Secure file storage is unsupported on this platform".into(),
     ))
+}
+
+/// Read a one-line secret (a bearer token, for example) from an owner-only
+/// file, trimming surrounding whitespace. The read buffer is wiped on drop.
+pub fn read_secret_file(path: &Path) -> Result<SecretString> {
+    verify_file_permissions(path)?;
+    let contents = Zeroizing::new(std::fs::read_to_string(path)?);
+    Ok(SecretString::from(contents.trim()))
 }
 
 #[cfg(test)]
