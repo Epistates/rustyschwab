@@ -39,19 +39,24 @@ Run what CI runs (`.github/workflows/ci.yml`):
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo doc --workspace --no-deps --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo doc --workspace --no-deps --all-features --locked
 cargo build --workspace --all-targets --locked
 cargo test --workspace --all-targets --all-features --locked
 cargo test --workspace --doc --all-features --locked
 cargo check -p schwab-rs --no-default-features --locked
+cargo check -p schwab-rs --no-default-features --features native-tls --locked
+cargo check -p schwab-rs --no-default-features --features callback-server --locked
+cargo check -p schwab-types --no-default-features --locked
+cargo package -p schwab-types -p schwab-rs -p schwab-mcp --locked
+cargo deny check advisories bans licenses sources
 ```
 
 The two `cargo test` lines are both needed: `--all-targets` skips doctests.
-CI additionally tests on the MSRV, runs `cargo audit`, compares the public
-API against the base branch with `cargo-semver-checks`, and runs the stream
-soak harness. Intentional public-API breaks need a CHANGELOG entry with
-migration notes.
+CI additionally tests on the MSRV, checks that a `native-tls` build carries
+no rustls, compares the public API against the base branch with
+`cargo-semver-checks`, and runs the stream soak harness. Intentional
+public-API breaks need a CHANGELOG entry with migration notes.
 
 Then:
 

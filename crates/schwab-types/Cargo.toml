@@ -8,6 +8,7 @@ license = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 documentation = "https://docs.rs/schwab-types"
+readme = "README.md"
 description = "Type definitions for Schwab Trading and Market Data APIs"
 
 [lints]

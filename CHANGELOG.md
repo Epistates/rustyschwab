@@ -7,6 +7,77 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — diligence pass
+
+- Order quantities go to Schwab as JSON numbers (`"quantity": 10`), the
+  form every Schwab order example uses; prices stay exact strings. Either
+  spelling is still accepted on input, and a quantity with more precision
+  than a JSON number carries is refused. Intent digests follow the wire
+  form, so an approval granted before upgrading must be granted again.
+- An approved `place_order`/`replace_order` refused by the trading switch,
+  an operator halt or a data-recovery suspension no longer consumes its
+  one-use approval: those checks now run before the audit does, on the MCP
+  path and the authority's `/v1/orders`. A refused retry reports its real
+  cause (`duplicate_intent`, `approval_required`, `reconciliation_required`)
+  instead of always `reconciliation_required`.
+- A submission that reconciliation matched by tag before the submitter
+  recorded the broker's answer no longer reports `SubmissionUnknown`:
+  `finish` accepts an `Accepted` outcome that agrees with the recorded one.
+- `StreamClient::is_authenticated` reads the login state, not delivery
+  readiness: during a slow consumer's queue overflow, `subscribe`,
+  `unsubscribe` and `view` work, `disconnect` sends LOGOUT, and
+  `stream_connect` no longer thinks the stream is down.
+- `stream_set_service_fields` drops cached fields the new list no longer
+  streams, so a snapshot never pairs a fresh last price with an old bid.
+- `OptionSymbol` refuses expirations outside 2000–2099; the two-digit year
+  made 2125 print as 2025, naming a different contract.
+- Account activity pulls the next reconciliation pass forward but never to
+  less than half an interval after the last, so a burst of fills cannot
+  run passes back to back and exhaust the request budget. Lease waiters
+  back off to 100–200 ms between attempts.
+- Agent-supplied dates at the edge of chrono's range return
+  `invalid_arguments` instead of panicking the tool call.
+- The authority verifies an operator's token before it takes a reserved
+  operator permit, so unauthenticated slow requests cannot lock out a halt;
+  reads its grants file on the blocking pool; answers `LeaseBusy` with 503
+  instead of an opaque 500; and honours `all_accounts` on
+  `/v1/paper/account`.
+- Startup refuses `SCHWAB_RECOVERY_INTERVAL_MS` at or above
+  `SCHWAB_BASELINE_MAX_AGE_MS` (baselines would go stale between passes),
+  and warns above half of it.
+- Positions whose instrument is missing no longer end paging with an
+  unreadable cursor. `get_server_status` lists only the paper accounts the
+  principal is granted.
+- `schwab-rs` builds again without a TLS feature (`--no-default-features`,
+  alone or with `callback-server`), which the CI feature job checks; such
+  a build connects to `ws://` only and refuses `wss://` with a
+  configuration error naming the features that provide it.
+- Streamer notifications other than heartbeats keep their fields
+  (`NotifyItem::extra`) and are logged instead of being dropped.
+- The request schema leaves out order types and strategies that cannot be
+  submitted (`CABINET`, `NON_MARKETABLE`, `EXERCISE`, `CANCEL`, `RECALL`,
+  `PAIR`, `FLATTEN`, `TWO_DAY_SWAP`, `BLAST_ALL`); the order-spec guidance
+  no longer lists `net_debit`/`net_credit` as accepted under policy.
+
+### Security — diligence pass
+
+- OAuth token responses decode straight into `SecretString`s from a wiped,
+  bounded (16 KiB) buffer, and a malformed one is reported without quoting
+  it. `SchwabConfig::save` serializes the app secret into a wiped buffer.
+  `security::read_secret_file` reads the operator tools' bearer tokens
+  the same way.
+- `Error::Remote` leaves its message out of `Display`, like `Error::Http`:
+  it can carry a relayed Schwab error body.
+- The encryption key's file lock waits at most 10 s, like the refresh lock,
+  instead of hanging every token load behind a wedged holder.
+
+### Changed — diligence pass
+
+- `schwab-types` and `schwab-mcp` have crate READMEs. `CONTRIBUTING.md`
+  and the architecture overview list the CI gates as they are.
+  `tools/test_sbom.py` covers the SBOM graph walk. The release workflow
+  checks the tag against the crate version.
+
 ### Changed — code quality and release evidence
 
 - Workspace lint policy (`[workspace.lints]`): `unsafe_code` is denied

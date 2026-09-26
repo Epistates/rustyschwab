@@ -91,10 +91,11 @@ under a principal policy an order must have a finite worst case:
 - One leg that is not an opening short: buys, and sells that close, are
   accepted; `SELL_SHORT`, `SELL_TO_OPEN` and multi-leg orders are refused
   for want of a portfolio risk engine.
-- A bounded price: `limit`, `stop_limit`, `net_debit` or `net_credit`. A
+- A bounded price: `limit`, `stop_limit`, or a limit-on-close order. A
   `market`, `stop` or `trailing_stop` on its own has no finite cost and is
   refused; a `bracket` with a `limit` entry is accepted, its exits being
-  priced at the entry.
+  priced at the entry. (`net_debit` and `net_credit` need two or more legs,
+  so the rule above refuses them.)
 - An option contract needs an operator-configured multiplier for its
   symbol.
 
