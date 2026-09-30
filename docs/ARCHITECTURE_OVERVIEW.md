@@ -416,13 +416,15 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`,
 `cargo test --workspace --doc --all-features --locked`, the SDK's feature
 combinations (no default features, `native-tls` alone with no rustls in its
 graph, `callback-server` alone), `cargo package` for the three crates,
-`cargo deny check advisories bans licenses sources` (`deny.toml`), an MSRV
+`cargo deny check advisories bans licenses sources` (`deny.toml`),
+`actionlint` (with shellcheck) on the workflows, an MSRV
 (1.89) build, `cargo-semver-checks`, and the stream soak harness
 (`examples/enterprise_bench` + `tools/soak.py`). `qualification.yml` runs the
 full test suite on Linux, macOS and Windows plus longer soaks; `release.yml`
-checks the tag against the crate version, builds the binaries with
-`cargo auditable` and checks them with `cargo audit bin`, and publishes them
-with a CycloneDX SBOM and build provenance attestation.
+checks the tag against the crate version and runs the tests, then builds the
+binaries for Linux (x86_64), macOS (aarch64) and Windows (x86_64) with
+`cargo auditable`, checks each with `cargo audit bin`, and publishes them per
+target with SHA-256 sums, a CycloneDX SBOM and build provenance attestation.
 Property tests use `proptest`;
 HTTP mocking uses `wiremock`. Evidence from local qualification runs is
 written to `docs/audit/`, which is git-ignored; the hosted workflows upload

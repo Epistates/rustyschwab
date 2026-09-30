@@ -53,15 +53,45 @@ pub fn freshness_from_env() -> Result<(Duration, i64), String> {
     use crate::server::{RECOVERY_INTERVAL_ENV, parse_recovery_interval};
     let interval = parse_recovery_interval(std::env::var(RECOVERY_INTERVAL_ENV).ok().as_deref())?;
     let max_age = parse_baseline_max_age(std::env::var(BASELINE_MAX_AGE_ENV).ok().as_deref())?;
-    check_freshness(interval, max_age)?;
+    check_freshness(interval, max_age, BASELINE_MAX_AGE_ENV)?;
     Ok((interval, max_age))
 }
 
-fn check_freshness(interval: Duration, max_age_ms: i64) -> Result<(), String> {
+/// Check the freshness settings against each account's risk limits. The
+/// risk check refuses an order against a baseline older than the account's
+/// `max_snapshot_age_ms`, so a recovery interval at or past it refuses
+/// every order; a readiness limit above it reports ready while orders are
+/// refused.
+pub fn check_risk_freshness(
+    interval: Duration,
+    max_age_ms: i64,
+    limits: &std::collections::HashMap<String, schwab_rs::risk::PortfolioLimits>,
+) -> Result<(), String> {
+    for (account, limits) in limits {
+        let limit = format!(
+            "the risk limits' max_snapshot_age_ms for account {}",
+            crate::redact::mask_accounts_in_text(account)
+        );
+        check_freshness(interval, limits.max_snapshot_age_ms, &limit)?;
+        if max_age_ms > limits.max_snapshot_age_ms {
+            tracing::warn!(
+                baseline_max_age_ms = max_age_ms,
+                max_snapshot_age_ms = limits.max_snapshot_age_ms,
+                "SCHWAB_BASELINE_MAX_AGE_MS exceeds an account's risk max_snapshot_age_ms: \
+                 readiness can report ready while that account's orders are refused"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The recovery interval must leave a baseline fresh until the next pass:
+/// below `limit` (named in the error), and warned about above half of it.
+fn check_freshness(interval: Duration, max_age_ms: i64, limit: &str) -> Result<(), String> {
     let interval_ms = i64::try_from(interval.as_millis()).unwrap_or(i64::MAX);
     if interval_ms >= max_age_ms {
         return Err(format!(
-            "SCHWAB_RECOVERY_INTERVAL_MS ({interval_ms}) must be below {BASELINE_MAX_AGE_ENV} \
+            "SCHWAB_RECOVERY_INTERVAL_MS ({interval_ms}) must be below {limit} \
              ({max_age_ms}): baselines would go stale between reconciliation passes"
         ));
     }
@@ -69,8 +99,9 @@ fn check_freshness(interval: Duration, max_age_ms: i64) -> Result<(), String> {
         tracing::warn!(
             interval_ms,
             max_age_ms,
+            limit,
             "A reconciliation pass that takes longer than the headroom between the recovery \
-             interval and the baseline age limit leaves baselines stale"
+             interval and a baseline age limit leaves baselines stale"
         );
     }
     Ok(())
@@ -535,9 +566,22 @@ mod tests {
             assert!(parse_baseline_max_age(Some(bad)).is_err(), "{bad}");
         }
         // The defaults fit; an interval at or past the age limit does not.
-        check_freshness(Duration::from_secs(2), BASELINE_MAX_AGE_MS).unwrap();
-        assert!(check_freshness(Duration::from_secs(5), 5_000).is_err());
-        assert!(check_freshness(Duration::from_secs(10), 5_000).is_err());
+        let limit = BASELINE_MAX_AGE_ENV;
+        check_freshness(Duration::from_secs(2), BASELINE_MAX_AGE_MS, limit).unwrap();
+        assert!(check_freshness(Duration::from_secs(5), 5_000, limit).is_err());
+        assert!(check_freshness(Duration::from_secs(10), 5_000, limit).is_err());
+        // An account whose risk limits refuse baselines the interval cannot
+        // keep fresh is refused at startup.
+        let risk: std::collections::HashMap<String, schwab_rs::risk::PortfolioLimits> =
+            serde_json::from_value(json!({"123456789": {
+                "max_open_quantity": "1", "max_open_notional": "1",
+                "max_position_quantity": "1", "max_snapshot_age_ms": 1500
+            }}))
+            .unwrap();
+        let refused = check_risk_freshness(Duration::from_secs(2), 5_000, &risk).unwrap_err();
+        assert!(refused.contains("max_snapshot_age_ms"), "{refused}");
+        assert!(!refused.contains("123456789"), "{refused}");
+        check_risk_freshness(Duration::from_secs(1), 1_500, &risk).unwrap();
         use crate::server::parse_recovery_interval;
         assert_eq!(parse_recovery_interval(None), Ok(Duration::from_secs(2)));
         assert_eq!(

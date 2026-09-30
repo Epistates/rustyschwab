@@ -94,7 +94,6 @@ jobs:
       SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
       SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
       SCHWAB_TOKEN_STORE: file
-      SCHWAB_TOKENS_FILE: ${{ runner.temp }}/schwab_tokens.json
       SCHWAB_LIVE_CONFORMANCE: '1'
       SCHWAB_LIVE_CONFORMANCE_REPORT: ${{ github.workspace }}/live-conformance.json
     steps:
@@ -106,9 +105,12 @@ jobs:
       - name: Materialize the token file (0600, outside the workspace)
         env:
           SCHWAB_TOKENS_JSON: ${{ secrets.SCHWAB_TOKENS_JSON }}
+        # The runner context is not available to job-level env.
         run: |
           umask 077
-          printf '%s' "$SCHWAB_TOKENS_JSON" > "$SCHWAB_TOKENS_FILE"
+          tokens="$RUNNER_TEMP/schwab_tokens.json"
+          printf '%s' "$SCHWAB_TOKENS_JSON" > "$tokens"
+          echo "SCHWAB_TOKENS_FILE=$tokens" >> "$GITHUB_ENV"
       - name: Live read-only conformance sweep
         run: cargo test -p schwab-rs --test live_conformance --all-features --locked -- --nocapture live_shapes_match_fixtures
       - name: Remove the token file

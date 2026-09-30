@@ -242,13 +242,19 @@ async fn live_backend(
         .rate_limit
         .enabled
         .then_some(config.client.rate_limit.requests_per_second);
-    let (recovery_interval, _) =
+    let (recovery_interval, baseline_max_age) =
         schwab_mcp::status::freshness_from_env().map_err(anyhow::Error::msg)?;
 
     let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
     match std::env::var("SCHWAB_RISK_POLICY_FILE") {
         Ok(path) => {
             let accounts = serde_json::from_slice(&std::fs::read(path)?)?;
+            schwab_mcp::status::check_risk_freshness(
+                recovery_interval,
+                baseline_max_age,
+                &accounts,
+            )
+            .map_err(anyhow::Error::msg)?;
             let risk = schwab_rs::risk::PortfolioRisk {
                 database: client.order_journal().database().clone(),
                 accounts,

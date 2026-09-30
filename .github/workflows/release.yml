@@ -11,46 +11,81 @@ env:
     schwab-mcp schwab-admin schwab-authority schwab-remote
     schwab-paper schwab-paper-verify schwab-eval
 jobs:
-  artifacts:
+  verify:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
-        with:
-          tool: cargo-auditable,cargo-audit
       - name: Tag matches the crate version
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "schwab-mcp") | .version')
           [ "${GITHUB_REF_NAME#v}" = "$version" ] || { echo "::error::tag $GITHUB_REF_NAME is not v$version"; exit 1; }
-      - run: cargo test --workspace --all-targets --all-features --locked
-      # Embeds the dependency list in each binary, so `cargo audit bin` can
-      # check a deployed artifact against RustSec long after the release.
-      - run: cargo auditable build -p schwab-mcp --bins --release --locked
-      - name: Stage binaries and SBOM
+      - name: The binary list matches the package
         run: |
-          mkdir -p dist
-          for bin in $BINARIES; do cp "target/release/$bin" dist/; done
-          # Fail if the package gained a binary this list does not ship.
           built=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "schwab-mcp") | .targets[] | select(.kind[] == "bin") | .name' | sort)
+          # shellcheck disable=SC2086 # BINARIES is a word list
           listed=$(printf '%s\n' $BINARIES | sort)
           [ "$built" = "$listed" ] || { echo "::error::binaries differ: $built vs $listed"; exit 1; }
+      - run: cargo test --workspace --all-targets --all-features --locked
+
+  artifacts:
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            exe: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: .exe
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-auditable,cargo-audit
+      # Embeds the dependency list in each binary, so `cargo audit bin` can
+      # check a deployed artifact against RustSec long after the release.
+      - run: cargo auditable build -p schwab-mcp --bins --release --locked --target ${{ matrix.target }}
+      - name: Stage binaries, SBOM and checksums
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.exe }}
+        run: |
+          mkdir -p dist
+          for bin in $BINARIES; do cp "target/$TARGET/release/$bin$EXE" dist/; done
           python3 tools/sbom.py dist/sbom.cdx.json
           # The embedded audit data must be present and clean.
-          for bin in $BINARIES; do cargo audit --deny warnings bin "dist/$bin"; done
-          (cd dist && sha256sum * > SHA256SUMS)
+          for bin in $BINARIES; do cargo audit --deny warnings bin "dist/$bin$EXE"; done
+          cd dist
+          if command -v sha256sum >/dev/null; then sha256sum -- * > SHA256SUMS; else shasum -a 256 -- * > SHA256SUMS; fi
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/*
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-release-evidence
+          name: ${{ matrix.target }}-release-evidence
           path: dist/

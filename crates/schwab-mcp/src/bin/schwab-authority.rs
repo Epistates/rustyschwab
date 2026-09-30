@@ -58,7 +58,8 @@ async fn main() -> anyhow::Result<()> {
         _recovery = None;
     } else {
         let config = SchwabConfig::from_env()?;
-        let (interval, _) = schwab_mcp::status::freshness_from_env().map_err(anyhow::Error::msg)?;
+        let (interval, baseline_max_age) =
+            schwab_mcp::status::freshness_from_env().map_err(anyhow::Error::msg)?;
         let live = SchwabClient::new(config)?;
         let limits: HashMap<String, PortfolioLimits> = serde_json::from_slice(&std::fs::read(
             args.risk
@@ -68,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
             !limits.is_empty(),
             "Required recovery accounts/risk limits must be configured"
         );
+        schwab_mcp::status::check_risk_freshness(interval, baseline_max_age, &limits)
+            .map_err(anyhow::Error::msg)?;
         let accounts: Vec<String> = limits.keys().cloned().collect();
         let risk = Arc::new(PortfolioRisk {
             database: live.order_journal().database().clone(),

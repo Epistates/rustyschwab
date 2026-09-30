@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — remaining review items
+
+- **Stream delivery.** Messages queued before an overflow or a reconnect
+  are delivered, in order, ahead of the `State` that reports the gap, so
+  `lost_messages` counts exactly the frames dropped. A status change that
+  arrived while the receiver waited on an empty queue was never reported;
+  it is now. The unused per-subscription field list is gone
+  (`SubscriptionManager::add_subscription` takes no fields).
+- **Suspension is not a halt.** `Error::Suspended` (kind `suspended`)
+  covers a data-recovery pause or a process drain; `Error::Halted` is only
+  an operator halt. MCP reports a suspension as `unavailable` (retry
+  later) instead of `halted` (ask the operator), and the authority as 503.
+- **Approvals survive unsent refusals.** An approval consumed by a
+  submission that never reached Schwab (halted, suspended, over a risk
+  limit, rate-limited, unavailable, timed out before sending) is refunded,
+  audited as `approval_refunded`, on the MCP path and the authority's
+  `/v1/orders`; a revoked approval stays revoked
+  (`OrderJournal::refund_approval`). Anything that reached Schwab still
+  spends it.
+- **Replacements read their order.** `replace_order` reads the order it
+  replaces and records it (`ExecutionStore::record_order`, and a
+  `RecordOrder` authority request) before the risk check, so an order not
+  yet reconciled is judged by its real payload instead of being refused,
+  and a replacement of an order Schwab no longer has is refused unsent.
+- **Leases after a clock jump.** A lease whose expiry lies further ahead
+  than any TTL allows (the clock moved back) is neither held nor free, as
+  quota already failed closed.
+- **Private files.** `security::open_private_file` / `read_private_file`
+  open with `O_NOFOLLOW` and `O_NONBLOCK` (`rustix`, no `unsafe`) and check
+  the open descriptor: a regular file, owned by this user or root, mode
+  0600. Token, key, config and bearer-token reads use them, so the file
+  read is the file checked. Lock files refuse symlinks and non-regular
+  files; token and state directories are verified after creation without
+  following links, and state directories must be owned by this user.
+  Windows opens without following a reparse point and refuses one.
+- **Streamer URL.** `StreamClientBuilder::streamer_info` now also takes
+  the `streamerSocketUrl` from Schwab's preferences, checked by
+  `StreamConfig::set_socket_url`; the default and the URL allowlist name
+  Schwab's documented streamer, `wss://streamer-api.schwab.com/ws`
+  (`config::DEFAULT_STREAMER_URL`). Loopback hosts are matched exactly, so
+  `*.localhost` no longer inherits their trust.
+- **Typed validation.** Every `validate()` returns `ValidationError`: a
+  `non_exhaustive` kind, the field at fault in Schwab's spelling
+  (`orderLegCollection[1].quantity`) and the same message. The SDK carries
+  it as `Error::Validation` (kind `invalid_parameter`); MCP names the field
+  to the model. `OrderSpec::build` still returns the message.
+- **Order rules.** A complex order's top-level `quantity` is its unit
+  count: each leg must be a whole multiple of it (a single leg, equal).
+  Legs may be `EQUITY`, `COLLECTIVE_INVESTMENT`, `OPTION` or `MUTUAL_FUND`
+  (`BUY`, `SELL`, `EXCHANGE`); other asset types are refused.
+- **Semver.** Response structs and the enums naming Schwab's vocabularies
+  (market data, streaming, `AssetMainType`, `AssetSubType`,
+  `StreamMessage`, `OrderSpec`) are `#[non_exhaustive]`; match with a
+  wildcard, and build a response with serde or `AccountNumberHash::new`.
+  Request and parameter types stay constructible with struct literals.
+- **Startup checks.** The recovery interval must also be below every
+  account's risk `max_snapshot_age_ms`, and a readiness age limit above
+  one draws a warning.
+- **Release and CI.** Release binaries are built, audited, checksummed and
+  attested for Linux (x86_64), macOS (aarch64) and Windows (x86_64). CI
+  lints the workflows with `actionlint` and shellcheck, which found that
+  `qualification.yml` read `runner.temp` where GitHub does not provide it
+  (the live-conformance job would not have loaded).
+- The paper calendar test builds "today" in New York time, as the feed
+  does; it failed every evening once UTC's date turned over.
+
 ### Fixed — diligence pass
 
 - Order quantities go to Schwab as JSON numbers (`"quantity": 10`), the

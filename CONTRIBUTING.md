@@ -50,6 +50,7 @@ cargo check -p schwab-rs --no-default-features --features callback-server --lock
 cargo check -p schwab-types --no-default-features --locked
 cargo package -p schwab-types -p schwab-rs -p schwab-mcp --locked
 cargo deny check advisories bans licenses sources
+actionlint   # when you change .github/workflows
 ```
 
 The two `cargo test` lines are both needed: `--all-targets` skips doctests.
