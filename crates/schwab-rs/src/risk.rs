@@ -141,7 +141,7 @@ impl PortfolioRisk {
         revalidate: bool,
         fence: Option<Lease>,
     ) -> Result<()> {
-        order.validate().map_err(Error::InvalidParameter)?;
+        order.validate()?;
         let limits = self
             .accounts
             .get(account)

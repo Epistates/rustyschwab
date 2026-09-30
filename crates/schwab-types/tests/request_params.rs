@@ -219,7 +219,7 @@ fn price_history_validate_accepts_documented_combinations() {
 #[test]
 fn price_history_validate_rejects_bad_combinations() {
     let err = PriceHistoryParams::new("  ").validate().unwrap_err();
-    assert!(err.contains("symbol"), "{err}");
+    assert!(err.to_string().contains("symbol"), "{err}");
 
     let params = PriceHistoryParams {
         period_type: Some(PeriodType::Day),
@@ -227,7 +227,10 @@ fn price_history_validate_rejects_bad_combinations() {
         ..PriceHistoryParams::new("AAPL")
     };
     let err = params.validate().unwrap_err();
-    assert!(err.contains("period 7") && err.contains("day"), "{err}");
+    assert!(
+        err.to_string().contains("period 7") && err.to_string().contains("day"),
+        "{err}"
+    );
 
     let params = PriceHistoryParams {
         period_type: Some(PeriodType::Month),
@@ -236,7 +239,8 @@ fn price_history_validate_rejects_bad_combinations() {
     };
     let err = params.validate().unwrap_err();
     assert!(
-        err.contains("frequencyType minute") && err.contains("daily, weekly"),
+        err.to_string().contains("frequencyType minute")
+            && err.to_string().contains("daily, weekly"),
         "{err}"
     );
 
@@ -248,7 +252,7 @@ fn price_history_validate_rejects_bad_combinations() {
     };
     let err = params.validate().unwrap_err();
     assert!(
-        err.contains("frequency 5") && err.contains("monthly"),
+        err.to_string().contains("frequency 5") && err.to_string().contains("monthly"),
         "{err}"
     );
 
@@ -258,7 +262,7 @@ fn price_history_validate_rejects_bad_combinations() {
         ..PriceHistoryParams::new("AAPL")
     };
     let err = params.validate().unwrap_err();
-    assert!(err.contains("frequency 7"), "{err}");
+    assert!(err.to_string().contains("frequency 7"), "{err}");
 
     let params = PriceHistoryParams {
         start_date: Some(2_000),
@@ -266,7 +270,7 @@ fn price_history_validate_rejects_bad_combinations() {
         ..PriceHistoryParams::new("AAPL")
     };
     let err = params.validate().unwrap_err();
-    assert!(err.contains("startDate"), "{err}");
+    assert!(err.to_string().contains("startDate"), "{err}");
 }
 
 #[test]
@@ -300,6 +304,7 @@ fn option_chain_validate() {
         OptionChainParams::new("")
             .validate()
             .unwrap_err()
+            .to_string()
             .contains("symbol")
     );
 
@@ -307,20 +312,38 @@ fn option_chain_validate() {
         strike_count: Some(0),
         ..OptionChainParams::new("AAPL")
     };
-    assert!(params.validate().unwrap_err().contains("strikeCount"));
+    assert!(
+        params
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("strikeCount")
+    );
 
     let params = OptionChainParams {
         days_to_expiration: Some(-1),
         ..OptionChainParams::new("AAPL")
     };
-    assert!(params.validate().unwrap_err().contains("daysToExpiration"));
+    assert!(
+        params
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("daysToExpiration")
+    );
 
     let params = OptionChainParams {
         from_date: NaiveDate::from_ymd_opt(2025, 2, 1),
         to_date: NaiveDate::from_ymd_opt(2025, 1, 1),
         ..OptionChainParams::new("AAPL")
     };
-    assert!(params.validate().unwrap_err().contains("fromDate"));
+    assert!(
+        params
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("fromDate")
+    );
 
     let params = OptionChainParams {
         entitlement: Some(Entitlement::PayingPro),
@@ -409,6 +432,7 @@ fn orders_params_validate() {
         OrdersParams::new(from, to)
             .validate()
             .unwrap_err()
+            .to_string()
             .contains("fromEnteredTime")
     );
     assert_eq!(OrdersParams::new(from, from).validate(), Ok(()));
@@ -416,7 +440,13 @@ fn orders_params_validate() {
         max_results: Some(0),
         ..OrdersParams::new(to, from)
     };
-    assert!(params.validate().unwrap_err().contains("maxResults"));
+    assert!(
+        params
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("maxResults")
+    );
 }
 
 #[test]
@@ -477,19 +507,27 @@ fn transactions_params_validate() {
         TransactionsParams::new(end, start, [TransactionType::Trade])
             .validate()
             .unwrap_err()
+            .to_string()
             .contains("startDate")
     );
     assert!(
         TransactionsParams::new(start, end, [])
             .validate()
             .unwrap_err()
+            .to_string()
             .contains("types")
     );
     let params = TransactionsParams {
         symbol: Some("  ".into()),
         ..TransactionsParams::new(start, end, [TransactionType::Trade])
     };
-    assert!(params.validate().unwrap_err().contains("symbol"));
+    assert!(
+        params
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("symbol")
+    );
 }
 
 #[test]

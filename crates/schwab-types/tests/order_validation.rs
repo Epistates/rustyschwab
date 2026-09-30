@@ -2,11 +2,11 @@
 //! before anything is sent.
 
 use chrono::NaiveDate;
-use schwab_types::Decimal;
 use schwab_types::trading::{
     OptionSymbol, OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg, OrderSession,
     OrderType, PriceLinkBasis, PriceLinkType,
 };
+use schwab_types::{Decimal, ValidationErrorKind};
 use serde_json::json;
 
 fn d(s: &str) -> Decimal {
@@ -23,7 +23,10 @@ fn parse(value: serde_json::Value) -> Result<OrderRequest, String> {
 
 fn rejects(order: &OrderRequest, needle: &str) {
     let err = order.validate().expect_err("order should be rejected");
-    assert!(err.contains(needle), "{err:?} does not mention {needle:?}");
+    assert!(
+        err.to_string().contains(needle),
+        "{err:?} does not mention {needle:?}"
+    );
 }
 
 #[test]
@@ -54,6 +57,24 @@ fn top_level_quantity_must_match_the_legs() {
     rejects(&order, "quantity must equal");
     order.quantity = Some(d("10"));
     order.validate().unwrap();
+
+    // A complex order's quantity is its unit count: a 1x2x1 butterfly of 5
+    // has legs of 5, 10 and 5, each a whole multiple of it.
+    let leg = |instruction, strike: &str, n: u32| {
+        OrderRequestLeg::option(instruction, format!("XYZ   240315C00{strike}000"), n)
+    };
+    let mut fly = OrderRequest::net_debit(
+        vec![
+            leg(OrderInstruction::BuyToOpen, "045", 5),
+            leg(OrderInstruction::SellToOpen, "050", 10),
+            leg(OrderInstruction::BuyToOpen, "055", 5),
+        ],
+        d("0.50"),
+    );
+    fly.quantity = Some(d("5"));
+    fly.validate().unwrap();
+    fly.quantity = Some(d("3"));
+    rejects(&fly, "whole multiple");
 }
 
 #[test]
@@ -147,14 +168,28 @@ fn instructions_symbols_and_quantities_fit_the_asset() {
         "AAPL",
         1,
     ));
-    rejects(&equity_with_option_instruction, "option instruction");
+    let wrong = equity_with_option_instruction.validate().unwrap_err();
+    assert_eq!(wrong.kind(), ValidationErrorKind::NotAllowed);
+    assert_eq!(wrong.field(), Some("orderLegCollection[0].instruction"));
 
     let option_with_equity_instruction = OrderRequest::market(OrderRequestLeg::option(
         OrderInstruction::Buy,
         "AAPL  240517P00190000",
         1,
     ));
-    rejects(&option_with_equity_instruction, "not an option instruction");
+    let wrong = option_with_equity_instruction.validate().unwrap_err();
+    assert_eq!(wrong.field(), Some("orderLegCollection[0].instruction"));
+    assert!(wrong.to_string().contains("BUY_TO_OPEN"), "{wrong}");
+
+    // Asset types this SDK does not submit are refused, not sent unchecked.
+    let mut index = OrderRequestLeg::equity(OrderInstruction::Buy, "$SPX", 1);
+    index.instrument.asset_type = schwab_types::common::AssetType::Index;
+    let refused = OrderRequest::market(index).validate().unwrap_err();
+    assert_eq!(refused.kind(), ValidationErrorKind::Unsupported);
+    assert_eq!(
+        refused.field(),
+        Some("orderLegCollection[0].instrument.assetType")
+    );
 
     let not_osi = OrderRequest::market(OrderRequestLeg::option(
         OrderInstruction::BuyToOpen,

@@ -15,6 +15,7 @@
 //! Rust fields use `snake_case` as per Rust conventions.
 
 use crate::common::{AssetMainType, AssetSubType};
+use crate::validation::{ValidationError, ValidationError as VE, ValidationErrorKind as K};
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -27,6 +28,7 @@ use std::collections::HashMap;
 /// reserved `errors` key alongside the symbol entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct QuotesResponse {
     /// Partial-failure report for invalid symbols/cusips/SSIDs in the request.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,6 +43,7 @@ pub struct QuotesResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteError {
     pub invalid_cusips: Option<Vec<String>>,
     #[serde(rename = "invalidSSIDs")]
@@ -55,6 +58,7 @@ pub struct QuoteError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteItem {
     pub symbol: Option<String>,
     pub asset_main_type: Option<AssetMainType>,
@@ -76,6 +80,7 @@ pub struct QuoteItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteQuote {
     #[serde(rename = "52WeekHigh")]
     pub fifty_two_week_high: Option<f64>,
@@ -124,6 +129,7 @@ pub struct QuoteQuote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteFundamental {
     pub avg10_days_volume: Option<f64>,
     pub avg1_year_volume: Option<f64>,
@@ -151,6 +157,7 @@ pub struct QuoteFundamental {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteExtended {
     pub extended_price: Option<f64>,
     pub extended_change: Option<f64>,
@@ -167,6 +174,7 @@ pub struct QuoteExtended {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteReference {
     pub cusip: Option<String>,
     pub description: Option<String>,
@@ -183,6 +191,7 @@ pub struct QuoteReference {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct QuoteRegular {
     pub regular_market_last_price: Option<f64>,
     pub regular_market_net_change: Option<f64>,
@@ -196,6 +205,7 @@ pub struct QuoteRegular {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PriceHistoryResponse {
     pub symbol: String,
     pub empty: bool,
@@ -210,6 +220,7 @@ pub struct PriceHistoryResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Candle {
     pub open: f64,
     pub high: f64,
@@ -226,6 +237,7 @@ pub struct Candle {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OptionChainResponse {
     pub symbol: String,
     pub status: Option<String>,
@@ -248,6 +260,7 @@ pub type ExpDateStrikeMap = HashMap<String, HashMap<String, Vec<OptionContract>>
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct UnderlyingQuote {
     pub ask: Option<f64>,
     pub ask_size: Option<i32>,
@@ -279,6 +292,7 @@ pub struct UnderlyingQuote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OptionContract {
     pub put_call: String,
     pub symbol: String,
@@ -327,6 +341,7 @@ pub struct OptionContract {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Greeks {
     pub delta: Option<f64>,
     pub gamma: Option<f64>,
@@ -339,6 +354,7 @@ pub struct Greeks {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ExpirationChainResponse {
     pub symbol: Option<String>,
     #[serde(rename = "expirationList")]
@@ -351,6 +367,7 @@ pub struct ExpirationChainResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ExpirationItem {
     pub expiration_date: NaiveDate,
     pub days_to_expiration: i32,
@@ -364,6 +381,7 @@ pub struct ExpirationItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct MoversResponse {
     pub screeners: Vec<MoverItem>,
     #[serde(flatten)]
@@ -381,6 +399,7 @@ pub struct MoversResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct MoverItem {
     pub symbol: String,
     pub description: Option<String>,
@@ -410,6 +429,7 @@ pub struct MoverItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Direction {
     /// Price moving up
     Up,
@@ -423,6 +443,7 @@ pub enum Direction {
 /// `{"instruments": [...]}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct InstrumentsResponse {
     pub instruments: Vec<Instrument>,
     #[serde(flatten)]
@@ -434,6 +455,7 @@ pub struct InstrumentsResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Instrument {
     /// Market Data's classification, the same value set as
     /// `assetMainType` on quotes.
@@ -457,6 +479,7 @@ pub struct Instrument {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct InstrumentFundamental {
     pub symbol: String,
     pub high52: Option<f64>,
@@ -532,6 +555,7 @@ pub struct InstrumentFundamental {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum QuoteField {
     /// Every section (Schwab's default when `fields` is omitted)
     All,
@@ -571,6 +595,7 @@ impl std::fmt::Display for QuoteField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum PeriodType {
     /// Daily period
     Day,
@@ -638,6 +663,7 @@ impl std::fmt::Display for PeriodType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum FrequencyType {
     /// Minute bars
     Minute,
@@ -679,6 +705,7 @@ impl std::fmt::Display for FrequencyType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum ContractType {
     /// Call options only
     Call,
@@ -692,6 +719,7 @@ pub enum ContractType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum OptionStrategy {
     /// Single leg options
     Single,
@@ -723,6 +751,7 @@ pub enum OptionStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum Range {
     /// In the money
     Itm,
@@ -744,6 +773,7 @@ pub enum Range {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum ExpirationMonth {
     /// January
     Jan,
@@ -777,6 +807,7 @@ pub enum ExpirationMonth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum MoverSort {
     /// Sort by volume
     Volume,
@@ -810,6 +841,7 @@ impl std::fmt::Display for MoverSort {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum MoverIndex {
     /// Dow Jones Industrial Average
     #[serde(rename = "$DJI")]
@@ -870,6 +902,7 @@ impl std::fmt::Display for MoverIndex {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema_repr))]
 #[serde(into = "u8", try_from = "u8")]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum MoverFrequency {
     /// Schwab's default window
     All = 0,
@@ -917,6 +950,7 @@ impl TryFrom<u8> for MoverFrequency {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum Projection {
     /// Symbol search
     SymbolSearch,
@@ -958,6 +992,7 @@ impl std::fmt::Display for Projection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Market {
     Equity,
     Option,
@@ -988,6 +1023,7 @@ impl std::fmt::Display for Market {
 /// Market-data entitlement of the requesting user, for option chains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub enum Entitlement {
     /// Non-paying professional
     #[serde(rename = "PN")]
@@ -1006,6 +1042,7 @@ pub enum Entitlement {
 /// [`Entitlement::PayingPro`] entitlement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub enum OptionType {
     /// Standard contracts only
     #[serde(rename = "S")]
@@ -1058,16 +1095,20 @@ impl PriceHistoryParams {
     /// Only combinations Schwab documents are cross-checked: `period`
     /// against `period_type`, `frequency_type` against `period_type`, and
     /// `frequency` against the explicit or defaulted `frequency_type`.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.symbol.trim().is_empty() {
-            return Err("symbol is required".into());
+            return Err(VE::new(K::Missing, Some("symbol"), "symbol is required"));
         }
         if let (Some(period_type), Some(period)) = (self.period_type, self.period)
             && !period_type.valid_periods().contains(&period)
         {
-            return Err(format!(
-                "period {period} is not valid for periodType {period_type}; expected one of {:?}",
-                period_type.valid_periods()
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("period"),
+                format!(
+                    "period {period} is not valid for periodType {period_type}; expected one of {:?}",
+                    period_type.valid_periods()
+                ),
             ));
         }
         if let (Some(period_type), Some(frequency_type)) = (self.period_type, self.frequency_type)
@@ -1075,10 +1116,14 @@ impl PriceHistoryParams {
                 .valid_frequency_types()
                 .contains(&frequency_type)
         {
-            return Err(format!(
-                "frequencyType {frequency_type} is not valid for periodType {period_type}; \
-                 expected one of {}",
-                join_names(period_type.valid_frequency_types())
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("frequencyType"),
+                format!(
+                    "frequencyType {frequency_type} is not valid for periodType {period_type}; \
+                     expected one of {}",
+                    join_names(period_type.valid_frequency_types())
+                ),
             ));
         }
         let frequency_type = self
@@ -1087,16 +1132,24 @@ impl PriceHistoryParams {
         if let (Some(frequency_type), Some(frequency)) = (frequency_type, self.frequency)
             && !frequency_type.valid_frequencies().contains(&frequency)
         {
-            return Err(format!(
-                "frequency {frequency} is not valid for frequencyType {frequency_type}; \
-                 expected one of {:?}",
-                frequency_type.valid_frequencies()
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("frequency"),
+                format!(
+                    "frequency {frequency} is not valid for frequencyType {frequency_type}; \
+                     expected one of {:?}",
+                    frequency_type.valid_frequencies()
+                ),
             ));
         }
         if let (Some(start), Some(end)) = (self.start_date, self.end_date)
             && start > end
         {
-            return Err("startDate must not be after endDate".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("startDate"),
+                "startDate must not be after endDate",
+            ));
         }
         Ok(())
     }
@@ -1151,20 +1204,32 @@ impl OptionChainParams {
     }
 
     /// Check the request against Schwab's documented bounds.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.symbol.trim().is_empty() {
-            return Err("symbol is required".into());
+            return Err(VE::new(K::Missing, Some("symbol"), "symbol is required"));
         }
         if self.strike_count.is_some_and(|count| count < 1) {
-            return Err("strikeCount must be at least 1".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("strikeCount"),
+                "strikeCount must be at least 1",
+            ));
         }
         if self.days_to_expiration.is_some_and(|days| days < 0) {
-            return Err("daysToExpiration must not be negative".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("daysToExpiration"),
+                "daysToExpiration must not be negative",
+            ));
         }
         if let (Some(from), Some(to)) = (self.from_date, self.to_date)
             && from > to
         {
-            return Err("fromDate must not be after toDate".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("fromDate"),
+                "fromDate must not be after toDate",
+            ));
         }
         Ok(())
     }
@@ -1173,6 +1238,7 @@ impl OptionChainParams {
 /// API error response item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct ApiError {
     pub id: Option<String>,
     pub status: Option<String>,
@@ -1186,6 +1252,7 @@ pub struct ApiError {
 /// Source location of an API error.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct ErrorSource {
     pub pointer: Option<Vec<String>>,
     pub parameter: Option<String>,
@@ -1197,6 +1264,7 @@ pub struct ErrorSource {
 /// Collection of API errors.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct ApiErrors {
     pub errors: Vec<ApiError>,
     #[serde(flatten)]
@@ -1208,6 +1276,7 @@ pub struct ApiErrors {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Session {
     pub start: Option<String>,
     pub end: Option<String>,
@@ -1220,6 +1289,7 @@ pub struct Session {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SessionHours {
     pub pre_market: Option<Vec<Session>>,
     pub regular_market: Option<Vec<Session>>,
@@ -1233,6 +1303,7 @@ pub struct SessionHours {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct MarketHours {
     pub date: Option<String>,
     pub category: Option<String>,
@@ -1247,6 +1318,7 @@ pub struct MarketHours {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum SessionPhase {
     PreMarket,
     Regular,

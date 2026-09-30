@@ -21,6 +21,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ResponseHeaders {
     #[serde(rename = "Schwab-Client-CorrelId")]
     pub schwab_client_correlid: Option<String>,
@@ -84,9 +85,16 @@ pub(crate) use wire_enum;
 wire_enum!(AssetType);
 
 /// Reject `Unknown` in a request field, naming the field.
-pub(crate) fn known<T: Wire>(field: &str, value: Option<&T>) -> Result<(), String> {
+pub(crate) fn known<T: Wire>(
+    field: &str,
+    value: Option<&T>,
+) -> Result<(), crate::validation::ValidationError> {
     match value {
-        Some(v) if v.is_unknown() => Err(format!("{field} is not a value Schwab accepts")),
+        Some(v) if v.is_unknown() => Err(crate::validation::ValidationError::new(
+            crate::validation::ValidationErrorKind::Unsupported,
+            Some(field),
+            format!("{field} is not a value Schwab accepts"),
+        )),
         _ => Ok(()),
     }
 }
@@ -100,6 +108,7 @@ pub(crate) fn known<T: Wire>(field: &str, value: Option<&T>) -> Result<(), Strin
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum AssetMainType {
     Bond,
     Equity,
@@ -126,6 +135,7 @@ pub enum AssetMainType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AccountsInstrument {
     pub asset_type: AssetType,
     pub symbol: String,
@@ -162,6 +172,7 @@ pub struct AccountsInstrument {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum AssetSubType {
     Adr,
     Cef,
@@ -191,6 +202,7 @@ pub enum PutCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct PageInfo {
     pub page_size: i32,
     pub page_number: i32,

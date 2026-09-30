@@ -572,6 +572,7 @@ field_table! {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct BookMarketMaker {
     pub market_maker_id: String,
     pub size: i64,
@@ -592,6 +593,7 @@ impl BookMarketMaker {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct BookLevel {
     pub price: f64,
     pub aggregate_size: i64,
@@ -663,6 +665,7 @@ field_table! {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ScreenerItem {
     pub symbol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

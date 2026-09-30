@@ -54,6 +54,7 @@ pub struct StreamRequests {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "UPPERCASE")]
+#[non_exhaustive]
 pub enum StreamCommand {
     Login,
     Logout,
@@ -88,6 +89,7 @@ pub struct StreamParameters {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum StreamMessage {
     #[serde(skip_deserializing)]
     State(StreamStatus),
@@ -98,6 +100,7 @@ pub enum StreamMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct StreamResponse {
     pub response: Vec<ResponseItem>,
 }
@@ -105,6 +108,7 @@ pub struct StreamResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ResponseItem {
     pub service: String,
     pub command: String,
@@ -117,6 +121,7 @@ pub struct ResponseItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct ResponseContent {
     pub code: i32,
     pub msg: String,
@@ -124,6 +129,7 @@ pub struct ResponseContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct StreamData {
     pub data: Vec<DataItem>,
 }
@@ -131,6 +137,7 @@ pub struct StreamData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct DataItem {
     pub service: String,
     pub timestamp: i64,
@@ -145,6 +152,7 @@ pub struct DataItem {
 /// payload's `from_content` (for example [`LevelOneEquity::from_content`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct DataContent {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +171,7 @@ pub struct DataContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct StreamNotify {
     pub notify: Vec<NotifyItem>,
 }
@@ -172,6 +181,7 @@ pub struct StreamNotify {
 /// rather than dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[non_exhaustive]
 pub struct NotifyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<String>,
@@ -182,6 +192,7 @@ pub struct NotifyItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[non_exhaustive]
 pub enum StreamService {
     Admin,
     LeveloneEquities,
@@ -256,6 +267,7 @@ impl StreamService {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum StreamResponseCode {
     Success = 0,
     LoginDenied = 3,

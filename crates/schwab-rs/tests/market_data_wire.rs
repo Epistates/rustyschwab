@@ -107,7 +107,7 @@ async fn invalid_price_history_combinations_never_reach_the_server() {
         assert!(
             matches!(
                 client.get_price_history(&params).await,
-                Err(Error::InvalidParameter(_))
+                Err(Error::Validation(_))
             ),
             "{params:?}"
         );
@@ -155,7 +155,7 @@ async fn option_chain_sends_entitlement_option_type_and_dates() {
     };
     assert!(matches!(
         client.get_option_chain(&bad).await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Validation(e)) if e.field() == Some("strikeCount")
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

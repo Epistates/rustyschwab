@@ -286,7 +286,7 @@ impl FromStr for ContractKey {
 /// Only single-leg chains have contracts to tabulate; spread strategies
 /// come back as Schwab's `monthlyStrategyList` and need the raw tool.
 pub fn check_contract_params(params: &OptionChainParams) -> Result<(), ToolFailure> {
-    params.validate().map_err(ToolFailure::invalid_arguments)?;
+    params.validate().map_err(ToolFailure::from)?;
     match params.strategy {
         None | Some(OptionStrategy::Single) | Some(OptionStrategy::Analytical) => Ok(()),
         Some(_) => Err(ToolFailure::invalid_arguments(

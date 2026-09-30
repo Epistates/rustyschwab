@@ -417,7 +417,7 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
     Ok(())
 }
 fn validate_order(order: &OrderRequest) -> Result<()> {
-    order.validate().map_err(Error::InvalidParameter)?;
+    order.validate()?;
     if order.order_strategy_type != OrderStrategyType::Single
         || order.order_leg_collection.len() != 1
         || !order.child_order_strategies.is_empty()

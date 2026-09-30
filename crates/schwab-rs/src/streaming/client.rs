@@ -1031,6 +1031,7 @@ fn record_stream_frame(msg: &StreamMessage) {
             )
             .increment(1);
         }
+        _ => {}
     }
 }
 
@@ -1732,8 +1733,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel(2);
         let sender = MessageSender::new(tx, health.clone());
-        let beat =
-            || StreamMessage::Notify(crate::types::streaming::StreamNotify { notify: vec![] });
+        let beat = || serde_json::from_str::<StreamMessage>(r#"{"notify":[]}"#).unwrap();
         sender.send(beat()).unwrap();
         sender.send(beat()).unwrap();
         // Full: dropped, counted, not ready; the socket is not closed.
@@ -2084,12 +2084,7 @@ mod tests {
     }
 
     fn heartbeat(id: &str) -> StreamMessage {
-        StreamMessage::Notify(crate::types::streaming::StreamNotify {
-            notify: vec![crate::types::streaming::NotifyItem {
-                heartbeat: Some(id.to_string()),
-                extra: Default::default(),
-            }],
-        })
+        serde_json::from_value(serde_json::json!({"notify": [{"heartbeat": id}]})).unwrap()
     }
 
     #[tokio::test]

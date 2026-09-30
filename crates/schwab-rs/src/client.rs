@@ -377,7 +377,7 @@ impl SchwabClient {
         fence: Option<&crate::coordination::Lease>,
     ) -> Result<OrderSubmitResponse> {
         self.ensure_live_state().await?;
-        order.validate().map_err(Error::InvalidParameter)?;
+        order.validate()?;
         let mut tagged_order = order.clone();
         if tagged_order.tag.is_none() {
             tagged_order.tag = Some(format!("rs-{}", uuid::Uuid::new_v4()));
@@ -713,7 +713,7 @@ impl SchwabClient {
         &self,
         params: &PriceHistoryParams,
     ) -> Result<PriceHistoryResponse> {
-        params.validate().map_err(Error::InvalidParameter)?;
+        params.validate()?;
         self.request_with_query(
             "get_price_history",
             Method::GET,
@@ -731,7 +731,7 @@ impl SchwabClient {
         &self,
         params: &OptionChainParams,
     ) -> Result<OptionChainResponse> {
-        params.validate().map_err(Error::InvalidParameter)?;
+        params.validate()?;
         self.request_with_query(
             "get_option_chain",
             Method::GET,
@@ -931,7 +931,7 @@ impl SchwabClient {
         account_hash: &str,
         params: &OrdersParams,
     ) -> Result<Vec<Order>> {
-        params.validate().map_err(Error::InvalidParameter)?;
+        params.validate()?;
         self.request_with_query(
             "get_account_orders",
             Method::GET,
@@ -1050,7 +1050,7 @@ impl SchwabClient {
         account_hash: &str,
         order: &OrderRequest,
     ) -> Result<serde_json::Value> {
-        order.validate().map_err(Error::InvalidParameter)?;
+        order.validate()?;
         self.request_with_body(
             "preview_order",
             Method::POST,
@@ -1065,7 +1065,7 @@ impl SchwabClient {
     /// Rejects an inverted window or a zero page size before the request is
     /// sent; see [`OrdersParams::validate`].
     pub async fn get_all_orders(&self, params: &OrdersParams) -> Result<Vec<Order>> {
-        params.validate().map_err(Error::InvalidParameter)?;
+        params.validate()?;
         self.request_with_query("get_all_orders", Method::GET, "/trader/v1/orders", params)
             .await
     }
@@ -1079,7 +1079,7 @@ impl SchwabClient {
         account_hash: &str,
         params: &TransactionsParams,
     ) -> Result<Vec<Transaction>> {
-        params.validate().map_err(Error::InvalidParameter)?;
+        params.validate()?;
         self.request_with_query(
             "get_transactions",
             Method::GET,

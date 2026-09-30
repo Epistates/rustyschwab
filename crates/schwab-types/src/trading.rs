@@ -45,6 +45,7 @@
 //! ```
 
 use crate::common::{AccountsInstrument, AssetType, PutCall};
+use crate::validation::{ValidationError, ValidationError as VE, ValidationErrorKind as K};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -66,6 +67,7 @@ pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Order {
     #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub order_id: Option<String>,
@@ -117,6 +119,7 @@ pub struct Order {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OrderLeg {
     pub order_leg_type: OrderLegType,
     pub leg_id: Option<i64>,
@@ -137,6 +140,7 @@ pub struct OrderLeg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct OrderActivity {
     pub activity_type: Option<OrderActivityType>,
     /// `FILL` is the only documented value; `CANCELED` has been observed.
@@ -166,6 +170,7 @@ pub enum OrderActivityType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct ExecutionLeg {
     pub leg_id: Option<i64>,
     pub price: Option<f64>,
@@ -569,12 +574,20 @@ impl OrdersParams {
     }
 
     /// Check the request against Schwab's documented bounds.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.from_entered_time > self.to_entered_time {
-            return Err("fromEnteredTime must not be after toEnteredTime".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("fromEnteredTime"),
+                "fromEnteredTime must not be after toEnteredTime",
+            ));
         }
         if self.max_results == Some(0) {
-            return Err("maxResults must be at least 1".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("maxResults"),
+                "maxResults must be at least 1",
+            ));
         }
         crate::common::known("status", self.status.as_ref())
     }
@@ -589,6 +602,7 @@ impl OrdersParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Transaction {
     pub activity_id: Option<i64>,
     pub time: Option<String>,
@@ -719,6 +733,7 @@ pub enum TransactionActivityType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TransferItem {
     pub instrument: Option<TransactionInstrument>,
     /// Quantity moved (shares, contracts, or currency units).
@@ -771,6 +786,7 @@ pub enum FeeType {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TransactionUser {
     pub cd_domain_id: Option<String>,
     pub login: Option<String>,
@@ -790,6 +806,7 @@ pub struct TransactionUser {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct TransactionInstrument {
     pub asset_type: AssetType,
     pub symbol: String,
@@ -877,18 +894,30 @@ impl TransactionsParams {
     }
 
     /// Check the request against Schwab's documented bounds.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         if self.start_date > self.end_date {
-            return Err("startDate must not be after endDate".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("startDate"),
+                "startDate must not be after endDate",
+            ));
         }
         if self.types.is_empty() {
-            return Err("types must name at least one transaction type".into());
+            return Err(VE::new(
+                K::Missing,
+                Some("types"),
+                "types must name at least one transaction type",
+            ));
         }
         for t in &self.types {
             crate::common::known("types", Some(t))?;
         }
         if self.symbol.as_deref().is_some_and(|s| s.trim().is_empty()) {
-            return Err("symbol must not be blank".into());
+            return Err(VE::new(
+                K::Symbol,
+                Some("symbol"),
+                "symbol must not be blank",
+            ));
         }
         Ok(())
     }
@@ -1145,15 +1174,17 @@ impl OrderRequest {
     /// asset, whole shares and contracts, canonical symbols, extended hours
     /// only for limit orders. Broker eligibility, buying power and
     /// asset-specific increments still require a preview.
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), ValidationError> {
         self.validate_depth(1)
     }
 
-    fn validate_depth(&self, depth: usize) -> Result<(), String> {
+    fn validate_depth(&self, depth: usize) -> Result<(), ValidationError> {
         use crate::common::known;
         if depth > MAX_STRATEGY_DEPTH {
-            return Err(format!(
-                "Order strategies nest at most {MAX_STRATEGY_DEPTH} levels"
+            return Err(VE::new(
+                K::Structure,
+                None,
+                format!("Order strategies nest at most {MAX_STRATEGY_DEPTH} levels"),
             ));
         }
         known("session", self.session.as_ref())?;
@@ -1179,23 +1210,35 @@ impl OrderRequest {
             ("stopPriceOffset", self.stop_price_offset),
         ] {
             if value.is_some_and(|v| v <= rust_decimal::Decimal::ZERO) {
-                return Err(format!("{name} must be positive"));
+                return Err(VE::new(
+                    K::OutOfRange,
+                    Some(name),
+                    format!("{name} must be positive"),
+                ));
             }
         }
         match self.order_strategy_type {
             OrderStrategyType::Oco => self.validate_oco_parent()?,
             OrderStrategyType::Single | OrderStrategyType::Trigger => self.validate_executable()?,
-            _ => return Err("Only SINGLE, OCO, and TRIGGER strategies can be submitted".into()),
+            _ => {
+                return Err(VE::new(
+                    K::Unsupported,
+                    Some("orderStrategyType"),
+                    "Only SINGLE, OCO, and TRIGGER strategies can be submitted",
+                ));
+            }
         }
-        for child in &self.child_order_strategies {
-            child.validate_depth(depth + 1)?;
+        for (i, child) in self.child_order_strategies.iter().enumerate() {
+            child
+                .validate_depth(depth + 1)
+                .map_err(|e| e.within(&format!("childOrderStrategies[{i}]")))?;
         }
         Ok(())
     }
 
     /// An OCO parent only groups its two children; anything executable on
     /// it would be ignored or misread.
-    fn validate_oco_parent(&self) -> Result<(), String> {
+    fn validate_oco_parent(&self) -> Result<(), ValidationError> {
         let executable = self.session.is_some()
             || self.duration.is_some()
             || self.order_type.is_some()
@@ -1214,29 +1257,54 @@ impl OrderRequest {
             || self.requested_destination.is_some()
             || !self.order_leg_collection.is_empty();
         if self.child_order_strategies.len() != 2 || executable {
-            return Err("OCO must contain exactly two children and no executable parent".into());
+            return Err(VE::new(
+                K::Structure,
+                None,
+                "OCO must contain exactly two children and no executable parent",
+            ));
         }
         Ok(())
     }
 
-    fn validate_executable(&self) -> Result<(), String> {
-        let (Some(kind), Some(session), Some(duration), false) = (
-            self.order_type,
-            self.session,
-            self.duration,
-            self.order_leg_collection.is_empty(),
-        ) else {
-            return Err("Executable orders require legs, session, duration, and orderType".into());
+    fn validate_executable(&self) -> Result<(), ValidationError> {
+        let missing = [
+            ("orderType", self.order_type.is_none()),
+            ("session", self.session.is_none()),
+            ("duration", self.duration.is_none()),
+            ("orderLegCollection", self.order_leg_collection.is_empty()),
+        ]
+        .into_iter()
+        .find_map(|(field, absent)| absent.then_some(field));
+        let (Some(kind), Some(session), Some(duration), None) =
+            (self.order_type, self.session, self.duration, missing)
+        else {
+            return Err(VE::new(
+                K::Missing,
+                missing,
+                "Executable orders require legs, session, duration, and orderType",
+            ));
         };
         let name = serde_json::to_value(kind).unwrap_or_default();
         let name = name.as_str().unwrap_or("this order type");
-        let rules = kind
-            .rules()
-            .ok_or_else(|| format!("{name} orders cannot be submitted"))?;
-        let field = |present: bool, required: bool, field: &str| -> Result<(), String> {
+        let rules = kind.rules().ok_or_else(|| {
+            VE::new(
+                K::Unsupported,
+                Some("orderType"),
+                format!("{name} orders cannot be submitted"),
+            )
+        })?;
+        let field = |present: bool, required: bool, field: &str| -> Result<(), ValidationError> {
             match (present, required) {
-                (false, true) => Err(format!("{name} requires {field}")),
-                (true, false) => Err(format!("{name} does not take {field}")),
+                (false, true) => Err(VE::new(
+                    K::Missing,
+                    Some(field),
+                    format!("{name} requires {field}"),
+                )),
+                (true, false) => Err(VE::new(
+                    K::NotAllowed,
+                    Some(field),
+                    format!("{name} does not take {field}"),
+                )),
                 _ => Ok(()),
             }
         };
@@ -1250,83 +1318,152 @@ impl OrderRequest {
             field(present, rules.trailing, f)?;
         }
         if self.price_link_basis.is_some() != self.price_link_type.is_some() {
-            return Err("priceLinkBasis and priceLinkType go together".into());
+            return Err(VE::new(
+                K::Missing,
+                Some(if self.price_link_basis.is_some() {
+                    "priceLinkType"
+                } else {
+                    "priceLinkBasis"
+                }),
+                "priceLinkBasis and priceLinkType go together",
+            ));
         }
         if self.price_link_basis.is_some() && !rules.price_link {
-            return Err(format!("{name} does not take priceLinkBasis"));
+            field(true, false, "priceLinkBasis")?;
         }
         if self.stop_type.is_some() && !rules.stop_type {
-            return Err(format!("{name} does not take stopType"));
+            field(true, false, "stopType")?;
         }
         if rules.trailing {
             if self.stop_price_link_basis == Some(PriceLinkBasis::Manual) {
-                return Err("A trailing stop cannot trail a MANUAL basis".into());
+                return Err(VE::new(
+                    K::OutOfRange,
+                    Some("stopPriceLinkBasis"),
+                    "A trailing stop cannot trail a MANUAL basis",
+                ));
             }
             if self.stop_price_link_type == Some(PriceLinkType::Percent)
                 && self
                     .stop_price_offset
                     .is_some_and(|o| o >= rust_decimal::Decimal::ONE_HUNDRED)
             {
-                return Err("A percentage trailing offset must be below 100".into());
+                return Err(VE::new(
+                    K::OutOfRange,
+                    Some("stopPriceOffset"),
+                    "A percentage trailing offset must be below 100",
+                ));
             }
         }
         if rules.net && self.order_leg_collection.len() < 2 {
-            return Err(format!("{name} needs two or more legs"));
+            return Err(VE::new(
+                K::Structure,
+                Some("orderLegCollection"),
+                format!("{name} needs two or more legs"),
+            ));
         }
         if session != OrderSession::Normal && kind != OrderType::Limit {
-            return Err("Extended-hours sessions accept only LIMIT orders".into());
+            return Err(VE::new(
+                K::Structure,
+                Some("session"),
+                "Extended-hours sessions accept only LIMIT orders",
+            ));
         }
         if matches!(kind, OrderType::MarketOnClose | OrderType::LimitOnClose)
             && (session != OrderSession::Normal || duration != OrderDuration::Day)
         {
-            return Err(format!(
-                "{name} requires the NORMAL session and DAY duration"
+            return Err(VE::new(
+                K::Structure,
+                Some(if session != OrderSession::Normal {
+                    "session"
+                } else {
+                    "duration"
+                }),
+                format!("{name} requires the NORMAL session and DAY duration"),
             ));
         }
-        for leg in &self.order_leg_collection {
-            leg.validate()?;
-            if self.quantity.is_some_and(|q| q != leg.quantity) {
-                return Err(
-                    "quantity must equal every leg's quantity; size orders on the legs".into(),
-                );
+        let single = self.order_leg_collection.len() == 1;
+        for (i, leg) in self.order_leg_collection.iter().enumerate() {
+            leg.validate()
+                .map_err(|e| e.within(&format!("orderLegCollection[{i}]")))?;
+            // Schwab reports a complex order's unit count here: every leg
+            // trades a whole multiple of it (a 1x2 ratio of 5 has legs of 5
+            // and 10), and a single leg trades exactly it.
+            let fits = |q: rust_decimal::Decimal| {
+                if single {
+                    q == leg.quantity
+                } else {
+                    (leg.quantity % q).is_zero()
+                }
+            };
+            if self.quantity.is_some_and(|q| !fits(q)) {
+                return Err(VE::new(
+                    K::Structure,
+                    Some("quantity"),
+                    if single {
+                        "quantity must equal the leg's quantity; size orders on the legs"
+                    } else {
+                        "quantity is the unit count; every leg's quantity must be a whole \
+                         multiple of it"
+                    },
+                ));
             }
         }
         match (
             self.order_strategy_type,
             self.child_order_strategies.is_empty(),
         ) {
-            (OrderStrategyType::Single, false) => {
-                Err("SINGLE cannot contain child strategies".into())
-            }
-            (OrderStrategyType::Trigger, true) => Err("TRIGGER requires child strategies".into()),
+            (OrderStrategyType::Single, false) => Err(VE::new(
+                K::Structure,
+                Some("childOrderStrategies"),
+                "SINGLE cannot contain child strategies",
+            )),
+            (OrderStrategyType::Trigger, true) => Err(VE::new(
+                K::Missing,
+                Some("childOrderStrategies"),
+                "TRIGGER requires child strategies",
+            )),
             _ => Ok(()),
         }
     }
 
     /// Enforce a caller-supplied broker/asset tick size on every price and
     /// on a trailing offset expressed as a value; never round implicitly.
-    pub fn validate_price_increment(&self, tick: rust_decimal::Decimal) -> Result<(), String> {
+    pub fn validate_price_increment(
+        &self,
+        tick: rust_decimal::Decimal,
+    ) -> Result<(), ValidationError> {
         self.validate()?;
         self.validate_ticks(tick)
     }
 
-    fn validate_ticks(&self, tick: rust_decimal::Decimal) -> Result<(), String> {
+    fn validate_ticks(&self, tick: rust_decimal::Decimal) -> Result<(), ValidationError> {
         if tick <= rust_decimal::Decimal::ZERO {
-            return Err("Tick size must be finite and positive".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                None,
+                "Tick size must be finite and positive",
+            ));
         }
         let value_offset = self
             .stop_price_offset
             .filter(|_| self.stop_price_link_type == Some(PriceLinkType::Value));
-        for price in [self.price, self.stop_price, value_offset]
-            .into_iter()
-            .flatten()
-        {
-            if price % tick != rust_decimal::Decimal::ZERO {
-                return Err("Price does not match the supplied tick size".into());
+        for (field, price) in [
+            ("price", self.price),
+            ("stopPrice", self.stop_price),
+            ("stopPriceOffset", value_offset),
+        ] {
+            if price.is_some_and(|price| price % tick != rust_decimal::Decimal::ZERO) {
+                return Err(VE::new(
+                    K::Tick,
+                    Some(field),
+                    "Price does not match the supplied tick size",
+                ));
             }
         }
-        for child in &self.child_order_strategies {
-            child.validate_ticks(tick)?;
+        for (i, child) in self.child_order_strategies.iter().enumerate() {
+            child
+                .validate_ticks(tick)
+                .map_err(|e| e.within(&format!("childOrderStrategies[{i}]")))?;
         }
         Ok(())
     }
@@ -1334,12 +1471,16 @@ impl OrderRequest {
 
 impl OrderRequestLeg {
     /// The leg-level rules [`OrderRequest::validate`] applies to each leg.
-    pub fn validate(&self) -> Result<(), String> {
+    ///
+    /// Legs may be equities (and ETFs, which positions report as
+    /// `COLLECTIVE_INVESTMENT`), options or mutual funds; other asset types
+    /// are refused rather than sent unchecked.
+    pub fn validate(&self) -> Result<(), ValidationError> {
         use crate::common::known;
         use OrderInstruction as I;
         known("instruction", Some(&self.instruction))?;
         known("positionEffect", self.position_effect.as_ref())?;
-        known("assetType", Some(&self.instrument.asset_type))?;
+        known("instrument.assetType", Some(&self.instrument.asset_type))?;
         known("quantityType", self.quantity_type.as_ref())?;
         known("divCapGains", self.div_cap_gains.as_ref())?;
         let symbol = &self.instrument.symbol;
@@ -1347,58 +1488,98 @@ impl OrderRequestLeg {
             || symbol.trim() != symbol
             || symbol.bytes().any(|b| b.is_ascii_lowercase())
         {
-            return Err(format!(
-                "Instrument symbol {symbol:?} must be non-empty, upper case and unpadded"
+            return Err(VE::new(
+                K::Symbol,
+                Some("instrument.symbol"),
+                format!("Instrument symbol {symbol:?} must be non-empty, upper case and unpadded"),
             ));
         }
         if self.quantity <= rust_decimal::Decimal::ZERO {
-            return Err("Leg quantity must be positive".into());
+            return Err(VE::new(
+                K::OutOfRange,
+                Some("quantity"),
+                "Leg quantity must be positive",
+            ));
         }
         let whole = self.quantity.fract().is_zero();
-        match self.instrument.asset_type {
-            AssetType::Equity => {
-                if !matches!(
-                    self.instruction,
-                    I::Buy | I::Sell | I::SellShort | I::BuyToCover | I::SellShortExempt
-                ) {
-                    return Err(format!(
-                        "{:?} is an option instruction; equities take BUY, SELL, \
-                         SELL_SHORT, SELL_SHORT_EXEMPT or BUY_TO_COVER",
+        let instruction = |allowed: bool, expected: &str| {
+            if allowed {
+                Ok(())
+            } else {
+                Err(VE::new(
+                    K::NotAllowed,
+                    Some("instruction"),
+                    format!(
+                        "{:?} does not fit this asset type; it takes {expected}",
                         self.instruction
-                    ));
-                }
+                    ),
+                ))
+            }
+        };
+        let not_whole = |message: &str| VE::new(K::NotWhole, Some("quantity"), message);
+        match self.instrument.asset_type {
+            AssetType::Equity | AssetType::CollectiveInvestment => {
+                instruction(
+                    matches!(
+                        self.instruction,
+                        I::Buy | I::Sell | I::SellShort | I::BuyToCover | I::SellShortExempt
+                    ),
+                    "BUY, SELL, SELL_SHORT, SELL_SHORT_EXEMPT or BUY_TO_COVER",
+                )?;
                 if !whole {
-                    return Err("Equity orders are for whole shares".into());
+                    return Err(not_whole("Equity orders are for whole shares"));
                 }
             }
             AssetType::Option => {
-                if !matches!(
-                    self.instruction,
-                    I::BuyToOpen | I::BuyToClose | I::SellToOpen | I::SellToClose
-                ) {
-                    return Err(format!(
-                        "{:?} is not an option instruction; options take BUY_TO_OPEN, \
-                         BUY_TO_CLOSE, SELL_TO_OPEN or SELL_TO_CLOSE",
-                        self.instruction
-                    ));
-                }
-                symbol.parse::<OptionSymbol>()?;
+                instruction(
+                    matches!(
+                        self.instruction,
+                        I::BuyToOpen | I::BuyToClose | I::SellToOpen | I::SellToClose
+                    ),
+                    "BUY_TO_OPEN, BUY_TO_CLOSE, SELL_TO_OPEN or SELL_TO_CLOSE",
+                )?;
+                symbol
+                    .parse::<OptionSymbol>()
+                    .map_err(|e| VE::new(K::Symbol, Some("instrument.symbol"), e))?;
                 if !whole {
-                    return Err("Option orders are for whole contracts".into());
+                    return Err(not_whole("Option orders are for whole contracts"));
                 }
             }
-            _ => {}
+            AssetType::MutualFund => {
+                instruction(
+                    matches!(self.instruction, I::Buy | I::Sell | I::Exchange),
+                    "BUY, SELL or EXCHANGE",
+                )?;
+            }
+            _ => {
+                return Err(VE::new(
+                    K::Unsupported,
+                    Some("instrument.assetType"),
+                    "Order legs may be EQUITY, COLLECTIVE_INVESTMENT, OPTION or MUTUAL_FUND",
+                ));
+            }
         }
-        let fund = self.instrument.asset_type == AssetType::MutualFund;
-        if !fund
-            && (self.quantity_type.is_some()
-                || self.div_cap_gains.is_some()
-                || self.to_symbol.is_some())
-        {
-            return Err("quantityType, divCapGains and toSymbol apply to mutual funds only".into());
+        if self.instrument.asset_type != AssetType::MutualFund {
+            for (present, field) in [
+                (self.quantity_type.is_some(), "quantityType"),
+                (self.div_cap_gains.is_some(), "divCapGains"),
+                (self.to_symbol.is_some(), "toSymbol"),
+            ] {
+                if present {
+                    return Err(VE::new(
+                        K::NotAllowed,
+                        Some(field),
+                        "quantityType, divCapGains and toSymbol apply to mutual funds only",
+                    ));
+                }
+            }
         }
         if (self.instruction == I::Exchange) != self.to_symbol.is_some() {
-            return Err("EXCHANGE takes a toSymbol, and only EXCHANGE does".into());
+            return Err(VE::new(
+                K::Structure,
+                Some("toSymbol"),
+                "EXCHANGE takes a toSymbol, and only EXCHANGE does",
+            ));
         }
         Ok(())
     }

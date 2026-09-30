@@ -182,7 +182,7 @@ pub(crate) fn order_request(
     let order: schwab_types::trading::OrderRequest =
         serde_json::from_value(args.get("order").cloned().unwrap_or(Value::Null))
             .map_err(|e| ToolFailure::invalid_arguments(format!("Invalid order request: {e}")))?;
-    order.validate().map_err(ToolFailure::invalid_arguments)?;
+    order.validate().map_err(ToolFailure::from)?;
     Ok(order)
 }
 /// Validate a principal set as a whole, at startup and on every reload: each

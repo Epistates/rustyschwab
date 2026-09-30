@@ -183,6 +183,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("💓 Heartbeat #{}: Stream alive", notify_count);
                         }
                     }
+                    // New message kinds may be added.
+                    _ => {}
                 }
 
                 if message_count % 500 == 0 {

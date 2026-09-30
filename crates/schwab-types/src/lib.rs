@@ -65,6 +65,10 @@ pub mod trading;
 /// Common types shared across multiple modules.
 pub mod common;
 
+/// Typed errors from request validation.
+pub mod validation;
+pub use validation::{ValidationError, ValidationErrorKind};
+
 /// The exact-decimal type prices and quantities use, so callers do not need
 /// their own `rust_decimal` dependency to build orders.
 pub use rust_decimal::Decimal;

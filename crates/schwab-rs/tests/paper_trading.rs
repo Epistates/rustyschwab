@@ -1338,14 +1338,12 @@ async fn synthetic_candle_quotes_drive_a_replay_venue_and_fill_within_the_bar() 
     let b = PaperBroker::open(dir.path().join("state/paper.sqlite3"), config())
         .await
         .unwrap();
-    let candle = |datetime: i64, open: f64, high: f64, low: f64, close: f64| Candle {
-        open,
-        high,
-        low,
-        close,
-        volume: 4000,
-        datetime,
-        extra: Default::default(),
+    let candle = |datetime: i64, open: f64, high: f64, low: f64, close: f64| -> Candle {
+        serde_json::from_value(json!({
+            "open": open, "high": high, "low": low, "close": close,
+            "volume": 4000, "datetime": datetime,
+        }))
+        .unwrap()
     };
     // 2024-05-17 09:30 and 09:31 America/New_York.
     let open = 1_715_952_600_000;
@@ -1355,17 +1353,15 @@ async fn synthetic_candle_quotes_drive_a_replay_venue_and_fill_within_the_bar() 
         participation_bps: d("1000"),
     }
     .events(
-        &[PriceHistoryResponse {
-            symbol: "ABC".into(),
-            empty: false,
-            previous_close: None,
-            previous_close_date: None,
-            candles: vec![
+        &[serde_json::from_value::<PriceHistoryResponse>(json!({
+            "symbol": "ABC",
+            "empty": false,
+            "candles": [
                 candle(open, 10.0, 10.2, 9.8, 10.1),
                 candle(open + 60_000, 10.1, 10.3, 10.0, 10.25),
             ],
-            extra: Default::default(),
-        }],
+        }))
+        .unwrap()],
         1,
     )
     .unwrap();

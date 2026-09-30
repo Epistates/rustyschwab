@@ -255,6 +255,7 @@ impl From<schwab_rs::Error> for ToolFailure {
                 let logged = Self::internal("Schwab session is not authenticated", &e);
                 return Self::unauthenticated(logged.message);
             }
+            Error::Validation(invalid) => return Self::from(invalid.clone()),
             _ => {}
         }
         match e.kind() {
@@ -289,6 +290,16 @@ impl From<schwab_rs::Error> for ToolFailure {
 }
 
 /// Residual `McpError`s (argument parsing, local helpers) map by kind.
+/// A request that failed its own validation: change the named field.
+impl From<schwab_types::ValidationError> for ToolFailure {
+    fn from(e: schwab_types::ValidationError) -> Self {
+        match e.field() {
+            Some(field) => Self::invalid_arguments(format!("{e} (field `{field}`)")),
+            None => Self::invalid_arguments(e.to_string()),
+        }
+    }
+}
+
 impl From<McpError> for ToolFailure {
     fn from(e: McpError) -> Self {
         use turbomcp_core::ErrorKind;

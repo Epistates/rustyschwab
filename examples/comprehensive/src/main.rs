@@ -154,6 +154,8 @@ async fn main() -> Result<()> {
                                 info!("Stream response: {:?}", resp)
                             }
                             StreamMessage::Notify(_) => info!("Heartbeat"),
+                            // New message kinds may be added.
+                            _ => {}
                         }
                     }
                 })

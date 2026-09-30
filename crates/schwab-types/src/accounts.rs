@@ -21,15 +21,27 @@ type Extra = HashMap<String, serde_json::Value>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AccountNumberHash {
     pub account_number: String,
     pub hash_value: String,
+}
+
+impl AccountNumberHash {
+    /// An account number and the hash Schwab's account paths take in its place.
+    pub fn new(account_number: impl Into<String>, hash_value: impl Into<String>) -> Self {
+        Self {
+            account_number: account_number.into(),
+            hash_value: hash_value.into(),
+        }
+    }
 }
 
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Account {
     pub securities_account: SecuritiesAccount,
     #[serde(flatten)]
@@ -40,6 +52,7 @@ pub struct Account {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct SecuritiesAccount {
     pub account_number: String,
     #[serde(rename = "type")]
@@ -59,6 +72,7 @@ pub struct SecuritiesAccount {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Position {
     pub short_quantity: Option<f64>,
     pub average_price: Option<f64>,
@@ -93,6 +107,7 @@ pub struct Position {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Balance {
     pub accrued_interest: Option<f64>,
     pub cash_balance: Option<f64>,
@@ -154,6 +169,7 @@ pub struct Balance {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AccountsResponse {
     pub accounts: Vec<Account>,
 }
@@ -161,6 +177,7 @@ pub struct AccountsResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct UserPreferences {
     pub accounts: Option<Vec<AccountPreferences>>,
     pub streamer_info: Option<Vec<StreamerInfo>>,
@@ -173,6 +190,7 @@ pub struct UserPreferences {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct AccountPreferences {
     pub account_number: Option<String>,
     pub primary_account: Option<bool>,
@@ -189,6 +207,7 @@ pub struct AccountPreferences {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct StreamerInfo {
     pub streamer_socket_url: String,
     pub schwab_client_customer_id: String,
@@ -201,6 +220,7 @@ pub struct StreamerInfo {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
+#[non_exhaustive]
 pub struct Offer {
     pub level2_permissions: Option<bool>,
     pub mkt_data_permission: Option<String>,

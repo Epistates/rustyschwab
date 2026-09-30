@@ -290,31 +290,24 @@ fn path(candle: &Candle) -> [f64; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn d(v: &str) -> Decimal {
         v.parse().unwrap()
     }
     fn candle(datetime: i64, open: f64, high: f64, low: f64, close: f64, volume: i64) -> Candle {
-        Candle {
-            open,
-            high,
-            low,
-            close,
-            volume,
-            datetime,
-            extra: HashMap::new(),
-        }
+        serde_json::from_value(serde_json::json!({
+            "open": open, "high": high, "low": low, "close": close,
+            "volume": volume, "datetime": datetime,
+        }))
+        .unwrap()
     }
     fn history(symbol: &str, candles: Vec<Candle>) -> PriceHistoryResponse {
-        PriceHistoryResponse {
-            symbol: symbol.into(),
-            empty: candles.is_empty(),
-            previous_close: None,
-            previous_close_date: None,
-            candles,
-            extra: HashMap::new(),
-        }
+        serde_json::from_value(serde_json::json!({
+            "symbol": symbol,
+            "empty": candles.is_empty(),
+            "candles": candles,
+        }))
+        .unwrap()
     }
     fn model() -> SyntheticBbo {
         SyntheticBbo {

@@ -51,6 +51,7 @@ use serde_with::skip_serializing_none;
     )
 )]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum OrderSpec {
     /// Fill at the market.
     Market {
@@ -171,6 +172,7 @@ pub struct LegSpec {
     rename_all = "SCREAMING_SNAKE_CASE",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum InstrumentSpec {
     Equity {
         symbol: String,
@@ -295,7 +297,7 @@ impl OrderSpec {
     /// Expand into a validated [`OrderRequest`].
     pub fn build(self) -> Result<OrderRequest, String> {
         let order = self.expand()?;
-        order.validate()?;
+        order.validate().map_err(|e| e.to_string())?;
         Ok(order)
     }
 

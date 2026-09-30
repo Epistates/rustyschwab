@@ -107,10 +107,7 @@ impl Backend {
             Self::Live(client) => Ok(client.get_account_numbers().await?),
             Self::Paper(paper) => Ok(paper
                 .accounts()
-                .map(|name| AccountNumberHash {
-                    account_number: name.clone(),
-                    hash_value: name.clone(),
-                })
+                .map(|name| AccountNumberHash::new(name.clone(), name.clone()))
                 .collect()),
         }
     }

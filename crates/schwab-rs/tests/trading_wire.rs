@@ -133,7 +133,7 @@ async fn invalid_listing_params_never_reach_the_server() {
         client
             .get_account_orders("HASH", &OrdersParams::new(later, earlier))
             .await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Validation(_))
     ));
     assert!(matches!(
         client
@@ -142,13 +142,13 @@ async fn invalid_listing_params_never_reach_the_server() {
                 ..OrdersParams::new(earlier, later)
             })
             .await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Validation(_))
     ));
     assert!(matches!(
         client
             .get_transactions("HASH", &TransactionsParams::new(earlier, later, []))
             .await,
-        Err(Error::InvalidParameter(_))
+        Err(Error::Validation(_))
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }

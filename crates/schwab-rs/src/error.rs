@@ -238,6 +238,12 @@ pub enum Error {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// A request failed its own validation before anything was sent; the
+    /// [`ValidationError`](crate::types::ValidationError) says which field
+    /// and why. Its kind is [`ErrorKind::InvalidParameter`].
+    #[error("Invalid parameter: {0}")]
+    Validation(#[from] crate::types::ValidationError),
+
     /// Request timed out after specified duration
     ///
     /// **Recovery**: Retry with longer timeout or check server status
@@ -430,7 +436,7 @@ impl Error {
             Self::Api { .. } => ErrorKind::Api,
             Self::Config(_) => ErrorKind::Config,
             Self::Network(_) => ErrorKind::Network,
-            Self::InvalidParameter(_) => ErrorKind::InvalidParameter,
+            Self::InvalidParameter(_) | Self::Validation(_) => ErrorKind::InvalidParameter,
             Self::Timeout { .. } => ErrorKind::Timeout,
             Self::ConnectionClosed => ErrorKind::ConnectionClosed,
             Self::Subscription(_) => ErrorKind::Subscription,
@@ -674,6 +680,7 @@ impl From<&Error> for ErrorEnvelope {
                 envelope.message = message.clone();
             }
             // Rebuilt on decode, so carry the inner text without the prefix
+            Error::Validation(inner) => envelope.message = inner.to_string(),
             Error::Serialization(inner) => envelope.message = inner.to_string(),
             Error::Io(inner) => envelope.message = inner.to_string(),
             Error::OwnershipLost
