@@ -28,6 +28,10 @@ const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,N
 const RESOLVE_SUBMISSION: &str =
     "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
 const SELECT_SUBMISSION_OUTCOME: &str = "SELECT outcome FROM submissions WHERE id=?1";
+const SELECT_SUBMISSION_DEDUP: &str =
+    "SELECT dedup_key,outcome IS NOT NULL FROM submissions WHERE id=?1";
+const SELECT_APPROVAL_REVOKED: &str =
+    "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='approval_revoked' AND subject=?1)";
 const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,dedup_key \
      FROM submissions ORDER BY created_at,id";
 const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
@@ -468,6 +472,60 @@ impl OrderJournal {
             })
             .await
     }
+    /// Give back the one-use approval that submission `id` consumed, when the
+    /// broker never saw it, so the same intent can be submitted again while
+    /// the approval lasts. The caller vouches that nothing was sent (the SDK
+    /// reports anything else as `SubmissionUnknown`), and `id`'s dedup key
+    /// must be an approval digest, not an idempotency key. The submission
+    /// must be resolved; its order tag is released with the approval, and a
+    /// revoked approval stays revoked. Audited as `approval_refunded`.
+    pub async fn refund_approval(&self, id: &str) -> Result<()> {
+        let id = id.to_owned();
+        self.database
+            .run(move |c| {
+                use rusqlite::OptionalExtension;
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let row: Option<(Option<String>, bool)> = tx
+                    .query_row(SELECT_SUBMISSION_DEDUP, [&id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })
+                    .optional()
+                    .map_err(sql)?;
+                let (digest, resolved) =
+                    row.ok_or_else(|| Error::InvalidParameter("Submission is unknown".into()))?;
+                let digest = digest.ok_or_else(|| {
+                    Error::InvalidParameter("Submission consumed no approval".into())
+                })?;
+                if !resolved {
+                    return Err(Error::InvalidParameter(
+                        "Submission is unresolved; reconcile it first".into(),
+                    ));
+                }
+                let revoked: bool = tx
+                    .query_row(SELECT_APPROVAL_REVOKED, [&digest], |r| r.get(0))
+                    .map_err(sql)?;
+                if !revoked {
+                    tx.execute("DELETE FROM consumed_approvals WHERE key=?1", [&digest])
+                        .map_err(sql)?;
+                    tx.execute("UPDATE approvals SET consumed=0 WHERE digest=?1", [&digest])
+                        .map_err(sql)?;
+                }
+                tx.execute(RELEASE_ORDER_TAG, [&id]).map_err(sql)?;
+                // The digest is unique across submissions; the retry takes it.
+                tx.execute("UPDATE submissions SET dedup_key=NULL WHERE id=?1", [&id])
+                    .map_err(sql)?;
+                audit(
+                    &tx,
+                    "approval_refunded",
+                    &id,
+                    &serde_json::json!({"digest": digest, "revoked": revoked}),
+                )?;
+                tx.commit().map_err(sql)
+            })
+            .await
+    }
     pub async fn revoke_approval(&self, digest: &str, operator: &str) -> Result<()> {
         let digest = digest.to_owned();
         let operator = operator.to_owned();
@@ -533,6 +591,9 @@ pub trait ExecutionStore: Send + Sync {
     }
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>>;
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
+    /// Store the broker's current view of one order (its payload as
+    /// `GET .../orders/{id}` returns it), as a reconciliation pass would.
+    async fn record_order(&self, account: &str, order: serde_json::Value) -> Result<()>;
     async fn operator_halt(&self) -> Result<Option<String>>;
     async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()>;
 }
@@ -570,6 +631,30 @@ impl ExecutionStore for OrderJournal {
                 )
                 .map_err(sql)?;
                 Ok(())
+            })
+            .await
+    }
+    async fn record_order(&self, account: &str, order: serde_json::Value) -> Result<()> {
+        if crate::reconciliation::broker_id(order.get("orderId")).is_none() {
+            return Err(Error::InvalidParameter(
+                "Broker order payload has no order ID".into(),
+            ));
+        }
+        let account = account.to_owned();
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let mut activities = 0;
+                crate::reconciliation::persist_order(
+                    &tx,
+                    &account,
+                    &order,
+                    chrono::Utc::now().timestamp_millis(),
+                    &mut activities,
+                )?;
+                tx.commit().map_err(sql)
             })
             .await
     }

@@ -322,9 +322,8 @@ impl StreamResponseCode {
 /// Local lifecycle notification, never accepted from the broker wire.
 /// `lost_messages` is cumulative; any increase requires REST reconciliation
 /// for account activity. A new session does not recover missed executions.
-/// It counts frames dropped at a full queue, not the frames still queued
-/// when the gap began: like those from before a reconnect, they are
-/// discarded unread, so treat the whole pre-gap view as stale.
+/// It counts exactly the frames dropped at a full queue. Frames queued
+/// before a gap are delivered ahead of the status that reports it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamStatus {

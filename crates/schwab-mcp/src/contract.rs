@@ -122,6 +122,31 @@ impl FailureCode {
     fn retryable(self) -> bool {
         matches!(self, Self::Unavailable | Self::RateLimited | Self::Timeout)
     }
+    /// A submission refused with this code never reached the broker, and the
+    /// same intent may succeed later, so it gives back the one-use approval
+    /// it consumed. (A submission that may have been sent is always
+    /// `reconciliation_required`.)
+    pub fn keeps_approval(self) -> bool {
+        self.retryable() || matches!(self, Self::Halted | Self::RiskDenied)
+    }
+}
+
+/// [`FailureCode::keeps_approval`] for an SDK error, as the authority sees it.
+pub fn refusal_keeps_approval(kind: schwab_rs::ErrorKind) -> bool {
+    use schwab_rs::ErrorKind;
+    matches!(
+        kind,
+        ErrorKind::Halted
+            | ErrorKind::Suspended
+            | ErrorKind::RiskDenied
+            | ErrorKind::BaselineStale
+            | ErrorKind::CircuitOpen
+            | ErrorKind::OwnershipLost
+            | ErrorKind::LeaseBusy
+            | ErrorKind::Auth
+            | ErrorKind::RateLimit
+            | ErrorKind::Timeout
+    )
 }
 
 /// A failure the model can act on. Build with the code constructors so
@@ -245,6 +270,7 @@ impl From<schwab_rs::Error> for ToolFailure {
             ErrorKind::ApprovalInvalid => Self::new(FailureCode::ApprovalRequired, e.to_string()),
             ErrorKind::Halted => Self::new(FailureCode::Halted, e.to_string()),
             ErrorKind::BaselineStale
+            | ErrorKind::Suspended
             | ErrorKind::CircuitOpen
             | ErrorKind::OwnershipLost
             | ErrorKind::LeaseBusy => Self::new(FailureCode::Unavailable, e.to_string()),

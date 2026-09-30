@@ -24,18 +24,29 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// A queued message with the stream state it was produced under.
+#[derive(Debug)]
+pub(crate) struct Queued {
+    generation: u64,
+    /// Whether the stream was ready. Messages produced while it was not
+    /// (between a reconnect and its resubscription) are never delivered.
+    ready: bool,
+    message: StreamMessage,
+}
+
 /// Generation-tagged sender feeding the subscriber queue.
 ///
-/// Every message carries the generation it was produced under so the
-/// receiver can discard data that predates a reconnect or a gap. Queue
-/// overflow is never silent: it flips the shared [`StreamStatus`] to
-/// not-ready and bumps `lost_messages`. The connection stays up: frames are
-/// dropped (and counted) until the consumer has drained half the queue, then
-/// delivery resumes under a new generation, so the consumer re-baselines as
-/// after a reconnect without a new LOGIN or resubscription.
+/// Every message carries the generation and readiness it was produced under,
+/// so the receiver can tell pre-gap data from what follows a reconnect or a
+/// gap. Queue overflow is never silent: it flips the shared [`StreamStatus`]
+/// to not-ready and bumps `lost_messages` once per dropped frame. The
+/// connection stays up: frames are dropped (and counted) until the consumer
+/// has drained half the queue, then delivery resumes under a new generation,
+/// so the consumer re-baselines as after a reconnect without a new LOGIN or
+/// resubscription.
 #[derive(Debug)]
 pub(crate) struct MessageSender {
-    tx: mpsc::Sender<(u64, StreamMessage)>,
+    tx: mpsc::Sender<Queued>,
     state: tokio::sync::watch::Sender<StreamStatus>,
     overflow: std::sync::atomic::AtomicU8,
 }
@@ -47,7 +58,7 @@ const OVERFLOWED_WHILE_UNREADY: u8 = 2;
 
 impl MessageSender {
     pub(crate) fn new(
-        tx: mpsc::Sender<(u64, StreamMessage)>,
+        tx: mpsc::Sender<Queued>,
         state: tokio::sync::watch::Sender<StreamStatus>,
     ) -> Self {
         Self {
@@ -76,13 +87,20 @@ impl MessageSender {
                 s.ready = overflow == OVERFLOWED_WHILE_READY;
             });
         }
-        let generation = self.state.borrow().generation;
-        match self.tx.try_send((generation, msg)) {
+        let (generation, ready) = {
+            let state = self.state.borrow();
+            (state.generation, state.ready)
+        };
+        let queued = Queued {
+            generation,
+            ready,
+            message: msg,
+        };
+        match self.tx.try_send(queued) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                let was_ready = self.state.borrow().ready;
                 self.overflow.store(
-                    if was_ready {
+                    if ready {
                         OVERFLOWED_WHILE_READY
                     } else {
                         OVERFLOWED_WHILE_UNREADY
@@ -115,25 +133,38 @@ impl MessageSender {
 
 /// Subscriber-side handle for stream messages.
 ///
-/// Only messages produced under the current, ready generation are delivered;
-/// [`StreamMessage::State`] notifications are interleaved whenever readiness
-/// or the generation changes so consumers can re-baseline.
+/// Messages arrive in order, each under the [`StreamStatus`] last reported
+/// to the consumer: a [`StreamMessage::State`] is interleaved whenever
+/// readiness or the generation changes, so consumers can re-baseline. What
+/// was queued before a gap (an overflow or a reconnect) is complete,
+/// in-order data, so it is delivered ahead of the `State` that reports the
+/// gap; `lost_messages` counts exactly the frames that were dropped.
+/// Messages produced while the stream was not ready are never delivered.
 #[derive(Debug)]
 pub struct MessageReceiver {
-    rx: mpsc::Receiver<(u64, StreamMessage)>,
-    pending: Option<(u64, StreamMessage)>,
+    rx: mpsc::Receiver<Queued>,
+    pending: Option<Queued>,
     state: tokio::sync::watch::Receiver<StreamStatus>,
+    /// The status last reported to the consumer (at first, the status when
+    /// the receiver was created).
+    reported: StreamStatus,
+    /// The status changed since it was last reported. Awaiting a change
+    /// marks it seen, so this remembers it until it is reported.
+    unreported: bool,
 }
 
 impl MessageReceiver {
     pub(crate) fn new(
-        rx: mpsc::Receiver<(u64, StreamMessage)>,
-        state: tokio::sync::watch::Receiver<StreamStatus>,
+        rx: mpsc::Receiver<Queued>,
+        mut state: tokio::sync::watch::Receiver<StreamStatus>,
     ) -> Self {
+        let reported = state.borrow_and_update().clone();
         Self {
             rx,
             pending: None,
             state,
+            reported,
+            unreported: false,
         }
     }
 
@@ -142,48 +173,70 @@ impl MessageReceiver {
     /// Returns `None` when the stream client has been dropped and all
     /// messages have been received.
     pub async fn recv(&mut self) -> Option<StreamMessage> {
-        let Self { rx, pending, state } = self;
         loop {
-            if !state.has_changed().unwrap_or(true)
-                && let Some((generation, message)) = pending.take()
-            {
-                let current = state.borrow();
-                if current.ready && current.generation == generation {
-                    return Some(message);
+            let next = self.pending.take().or_else(|| self.rx.try_recv().ok());
+            if let Some(queued) = next {
+                if self.deliverable(&queued) {
+                    return Some(queued.message);
                 }
+                if self.changed() {
+                    // Newer than what the consumer knows: report the change
+                    // first, then judge the message against it.
+                    self.pending = Some(queued);
+                    return Some(self.report());
+                }
+                // Produced before a restart the consumer was already told
+                // of, or while the stream was not ready.
+                continue;
             }
-            tokio::select! {
-                biased;
-                changed = state.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                    let current = state.borrow_and_update().clone();
-                    let stale = pending.as_ref().is_some_and(|(generation, _)| {
-                        !current.ready || *generation != current.generation
-                    });
-                    if stale {
-                        *pending = None;
-                    }
-                    if pending.is_none() {
-                        while let Ok((generation, message)) = rx.try_recv() {
-                            if current.ready && generation == current.generation {
-                                *pending = Some((generation, message));
-                                break;
-                            }
-                        }
-                    }
-                    return Some(StreamMessage::State(current));
+            if self.changed() {
+                return Some(self.report());
+            }
+            let Self {
+                rx,
+                state,
+                unreported,
+                pending,
+                ..
+            } = self;
+            if state.has_changed().is_ok() {
+                tokio::select! {
+                    changed = state.changed() => *unreported |= changed.is_ok(),
+                    item = rx.recv() => *pending = Some(item?),
                 }
-                item = rx.recv() => {
-                    let (generation, msg) = item?;
-                    let current = state.borrow();
-                    if current.ready && current.generation == generation {
-                        return Some(msg);
-                    }
-                }
+            } else {
+                // The client is gone: drain what it queued, then end.
+                *pending = Some(rx.recv().await?);
             }
         }
+    }
+
+    /// Whether the status changed since it was last reported.
+    fn changed(&self) -> bool {
+        self.unreported || self.state.has_changed().unwrap_or(false)
+    }
+
+    fn deliverable(&self, queued: &Queued) -> bool {
+        self.reported.ready && queued.ready && queued.generation == self.reported.generation
+    }
+
+    /// Report the current status, dropping queued messages it makes stale so
+    /// an overflowed sender sees the capacity it waits for.
+    fn report(&mut self) -> StreamMessage {
+        self.reported = self.state.borrow_and_update().clone();
+        self.unreported = false;
+        let mut next = self.pending.take().or_else(|| self.rx.try_recv().ok());
+        loop {
+            match next {
+                Some(queued) if self.deliverable(&queued) => {
+                    self.pending = Some(queued);
+                    break;
+                }
+                Some(_) => next = self.rx.try_recv().ok(),
+                None => break,
+            }
+        }
+        StreamMessage::State(self.reported.clone())
     }
 }
 
@@ -788,7 +841,7 @@ impl StreamClient {
             &service,
             StreamParameters {
                 keys: Some(symbols.join(",")),
-                fields: Some(fields.clone()),
+                fields: Some(fields),
                 authorization: None,
                 schwab_client_channel: None,
                 schwab_client_function_id: None,
@@ -798,7 +851,7 @@ impl StreamClient {
         self.send_request(request).await?;
         self.inner
             .subscriptions
-            .add_subscription(service.as_str().to_string(), symbols, fields);
+            .add_subscription(service.as_str().to_string(), symbols);
         Ok(())
     }
 
@@ -1682,13 +1735,13 @@ mod tests {
         sender.send(beat()).unwrap();
         assert_eq!(health.borrow().lost_messages, 2);
         // The consumer drains; the next frame opens generation 2, ready.
-        assert_eq!(rx.try_recv().unwrap().0, 1);
-        assert_eq!(rx.try_recv().unwrap().0, 1);
+        assert_eq!(rx.try_recv().unwrap().generation, 1);
+        assert_eq!(rx.try_recv().unwrap().generation, 1);
         sender.send(beat()).unwrap();
         let status = health.borrow().clone();
         assert!(status.ready);
         assert_eq!(status.generation, 2);
-        assert_eq!(rx.try_recv().unwrap().0, 2);
+        assert_eq!(rx.try_recv().unwrap().generation, 2);
         // A dropped receiver is the only error.
         drop(rx);
         assert!(sender.send(beat()).is_err());
@@ -1920,13 +1973,104 @@ mod tests {
         capacity: usize,
         initial: StreamStatus,
     ) -> (
-        mpsc::Sender<(u64, StreamMessage)>,
+        mpsc::Sender<Queued>,
         tokio::sync::watch::Sender<StreamStatus>,
         MessageReceiver,
     ) {
         let (tx, rx) = mpsc::channel(capacity);
         let (status, state) = tokio::sync::watch::channel(initial);
         (tx, status, MessageReceiver::new(rx, state))
+    }
+
+    fn queued(generation: u64, ready: bool, message: StreamMessage) -> Queued {
+        Queued {
+            generation,
+            ready,
+            message,
+        }
+    }
+
+    fn heartbeat_id(message: Option<StreamMessage>) -> Option<String> {
+        match message {
+            Some(StreamMessage::Notify(notify)) => notify.notify[0].heartbeat.clone(),
+            _ => None,
+        }
+    }
+
+    /// A status change while the receiver waits on an empty queue is
+    /// reported, not swallowed by the wait that noticed it.
+    #[tokio::test]
+    async fn a_change_while_waiting_is_reported() {
+        let ready = StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        };
+        let (_tx, status, mut receiver) = tracked_receiver(1, ready);
+        let waiting = tokio::spawn(async move { receiver.recv().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        status.send_modify(|s| s.ready = false);
+        let reported = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("the change must wake the receiver")
+            .unwrap();
+        assert!(matches!(reported, Some(StreamMessage::State(s)) if !s.ready));
+    }
+
+    /// What was queued before an overflow or a reconnect is delivered, in
+    /// order, ahead of the state change that reports the gap; data queued
+    /// while the stream was not ready never is.
+    #[tokio::test]
+    async fn pre_gap_messages_arrive_before_the_gap_is_reported() {
+        let ready = StreamStatus {
+            ready: true,
+            generation: 1,
+            lost_messages: 0,
+        };
+        let (tx, status, mut receiver) = tracked_receiver(4, ready);
+        tx.send(queued(1, true, heartbeat("a"))).await.unwrap();
+        tx.send(queued(1, true, heartbeat("b"))).await.unwrap();
+        // Overflow: the gap is recorded after both were queued.
+        status.send_modify(|s| {
+            s.ready = false;
+            s.lost_messages = 3;
+        });
+        assert_eq!(heartbeat_id(receiver.recv().await).as_deref(), Some("a"));
+        assert_eq!(heartbeat_id(receiver.recv().await).as_deref(), Some("b"));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if !s.ready && s.lost_messages == 3
+        ));
+        // A reconnect: frames before it are delivered, frames before its
+        // resubscription completes are not, and what follows is.
+        status.send_modify(|s| {
+            s.ready = true;
+            s.generation = 2;
+        });
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if s.generation == 2 && s.ready
+        ));
+        tx.send(queued(2, true, heartbeat("c"))).await.unwrap();
+        status.send_modify(|s| {
+            s.ready = false;
+            s.generation = 3;
+        });
+        tx.send(queued(3, false, heartbeat("unready")))
+            .await
+            .unwrap();
+        assert_eq!(heartbeat_id(receiver.recv().await).as_deref(), Some("c"));
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if s.generation == 3 && !s.ready
+        ));
+        status.send_modify(|s| s.ready = true);
+        tx.send(queued(3, true, heartbeat("d"))).await.unwrap();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if s.generation == 3 && s.ready
+        ));
+        assert_eq!(heartbeat_id(receiver.recv().await).as_deref(), Some("d"));
     }
 
     fn heartbeat(id: &str) -> StreamMessage {
@@ -1946,8 +2090,10 @@ mod tests {
             lost_messages: 0,
         };
         let (tx, _status, mut receiver) = tracked_receiver(10, ready);
-        tx.send((1, heartbeat("stale"))).await.unwrap();
-        tx.send((2, heartbeat("current"))).await.unwrap();
+        tx.send(queued(1, true, heartbeat("stale"))).await.unwrap();
+        tx.send(queued(2, true, heartbeat("current")))
+            .await
+            .unwrap();
 
         match receiver.recv().await {
             Some(StreamMessage::Notify(notify)) => {
@@ -1982,8 +2128,8 @@ mod tests {
                 lost_messages: 0,
             })
         };
-        tx.send((1, message())).await.unwrap();
-        tx.send((2, message())).await.unwrap();
+        tx.send(queued(1, false, message())).await.unwrap();
+        tx.send(queued(2, true, message())).await.unwrap();
         status
             .send(StreamStatus {
                 ready: true,

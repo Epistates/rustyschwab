@@ -67,6 +67,10 @@ pub enum BackendRequest {
         account: String,
         order_id: String,
     },
+    RecordOrder {
+        account: String,
+        order: Value,
+    },
     Halt,
     SetHalt {
         reason: Option<String>,
@@ -173,6 +177,9 @@ impl BackendRequest {
             }
             Self::Track { account, order_id } => {
                 serde_json::to_value(execution.track_order(&account, &order_id).await?)?
+            }
+            Self::RecordOrder { account, order } => {
+                serde_json::to_value(execution.record_order(&account, order).await?)?
             }
             Self::Halt => serde_json::to_value(execution.operator_halt().await?)?,
             Self::SetHalt { reason, operator } => {
@@ -441,6 +448,13 @@ impl ExecutionStore for RemoteBackend {
         self.call(&BackendRequest::Track {
             account: account.to_owned(),
             order_id: order_id.to_owned(),
+        })
+        .await
+    }
+    async fn record_order(&self, account: &str, order: Value) -> Result<()> {
+        self.call(&BackendRequest::RecordOrder {
+            account: account.to_owned(),
+            order,
         })
         .await
     }

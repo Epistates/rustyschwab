@@ -349,7 +349,7 @@ impl Backend {
                     return Err(Error::Halted("Operator trading halt is active".into()).into());
                 }
                 if paper.broker.is_draining() {
-                    return Err(Error::Halted("Paper broker is draining".into()).into());
+                    return Err(Error::Suspended("Paper broker is draining".into()).into());
                 }
                 Ok(())
             }

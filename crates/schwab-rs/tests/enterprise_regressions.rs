@@ -454,7 +454,7 @@ async fn recovery_and_process_drain_close_submission_admission_before_wire() {
     client.suspend_submissions("stream gap");
     assert!(matches!(
         client.place_order("hash", &limit_order()).await,
-        Err(Error::Halted(_))
+        Err(Error::Suspended(_))
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
     client.resume_submissions();
@@ -464,7 +464,7 @@ async fn recovery_and_process_drain_close_submission_admission_before_wire() {
     assert!(client.clone().submissions_suspended());
     assert!(matches!(
         client.place_order("hash", &limit_order()).await,
-        Err(Error::Halted(_))
+        Err(Error::Suspended(_))
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
@@ -834,6 +834,82 @@ async fn incremental_reconciliation_narrows_the_window_and_skips_listed_targets(
     assert!(
         (from.timestamp_millis() - expected.timestamp_millis()).abs() < 1000,
         "window starts {from}, expected {expected}"
+    );
+    server.verify().await;
+}
+
+/// A replacement reads the order it replaces first, so the risk check judges
+/// an order placed elsewhere and not reconciled yet by its real payload, and
+/// a replacement of an order Schwab no longer has is refused unsent.
+#[tokio::test]
+async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
+    use schwab_rs::risk::{PortfolioLimits, PortfolioRisk};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    let server = MockServer::start().await;
+    let (base, _dir, _) = client(&server, false);
+    let db = base.order_journal().database().clone();
+    db.invalidate_account("hash", 1).await.unwrap();
+    db.reconcile_snapshot(
+        "hash",
+        1,
+        chrono::Utc::now().timestamp_millis(),
+        serde_json::json!({"securitiesAccount":{"currentBalances":{"availableFunds":"1000"},"positions":[]}}),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let limits = PortfolioLimits {
+        max_open_quantity: 10.into(),
+        max_open_notional: 1000.into(),
+        max_position_quantity: 10.into(),
+        max_snapshot_age_ms: 60_000,
+        max_daily_loss: None,
+    };
+    let client = base
+        .with_risk_provider(Arc::new(PortfolioRisk {
+            database: db,
+            accounts: HashMap::from([("hash".into(), limits)]),
+        }))
+        .unwrap();
+    Mock::given(method("GET"))
+        .and(path("/trader/v1/accounts/hash/orders/77"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "orderId": 77, "status": "WORKING", "orderStrategyType": "SINGLE",
+            "orderType": "LIMIT", "price": 10.0, "quantity": 1.0,
+            "filledQuantity": 0.0, "remainingQuantity": 1.0,
+            "orderLegCollection": [{"orderLegType": "EQUITY", "legId": 1,
+                "instruction": "BUY", "quantity": 1.0,
+                "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/trader/v1/accounts/hash/orders/77"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://api.schwabapi.com/trader/v1/accounts/hash/orders/78",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let replaced = client
+        .replace_order("hash", "77", &limit_order())
+        .await
+        .unwrap();
+    assert_eq!(replaced.order_id.as_deref(), Some("78"));
+
+    Mock::given(method("GET"))
+        .and(path("/trader/v1/accounts/hash/orders/99"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    assert!(
+        client
+            .replace_order("hash", "99", &limit_order())
+            .await
+            .is_err()
     );
     server.verify().await;
 }

@@ -532,7 +532,7 @@ fn end_order(
 }
 fn check_admission(c: &Connection, fence: Option<&Lease>, draining: bool) -> Result<()> {
     if draining {
-        return Err(Error::Halted("Paper broker is draining".into()));
+        return Err(Error::Suspended("Paper broker is draining".into()));
     }
     ensure_not_halted(c)?;
     if let Some(fence) = fence

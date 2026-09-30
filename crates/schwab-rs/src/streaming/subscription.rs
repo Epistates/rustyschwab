@@ -3,17 +3,20 @@
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 
+/// The keys subscribed on one service. The fields streamed are per service,
+/// not per subscription: see [`SubscriptionManager::get_service_fields`].
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub service: String,
     pub symbols: HashSet<String>,
-    pub fields: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct SubscriptionManager {
     subscriptions: RwLock<HashMap<String, Subscription>>,
-    service_fields: RwLock<HashMap<String, String>>, // service -> comma-separated field ids
+    /// Service -> comma-separated field numbers, used by every ADD, VIEW and
+    /// resubscription for that service.
+    service_fields: RwLock<HashMap<String, String>>,
 }
 
 impl SubscriptionManager {
@@ -24,23 +27,13 @@ impl SubscriptionManager {
         }
     }
 
-    pub fn add_subscription(&self, service: String, symbols: Vec<String>, fields: String) {
+    pub fn add_subscription(&self, service: String, symbols: Vec<String>) {
         let mut subs = self.subscriptions.write();
-
         let entry = subs.entry(service.clone()).or_insert_with(|| Subscription {
             service,
             symbols: HashSet::new(),
-            fields: Vec::new(),
         });
-
-        for symbol in symbols {
-            entry.symbols.insert(symbol);
-        }
-
-        // Update fields if provided (use comma-separated string)
-        if !fields.is_empty() {
-            entry.fields = fields.split(',').map(|s| s.to_string()).collect();
-        }
+        entry.symbols.extend(symbols);
     }
 
     pub fn remove_subscription(&self, service: String, symbols: Vec<String>) {
@@ -116,7 +109,6 @@ mod tests {
         manager.add_subscription(
             "LEVELONE_EQUITIES".to_string(),
             vec!["AAPL".to_string(), "GOOGL".to_string()],
-            "0,1,2,3".to_string(),
         );
 
         assert!(manager.is_subscribed("LEVELONE_EQUITIES", "AAPL"));
@@ -124,11 +116,7 @@ mod tests {
         assert!(!manager.is_subscribed("LEVELONE_EQUITIES", "MSFT"));
 
         // Add more symbols to existing service
-        manager.add_subscription(
-            "LEVELONE_EQUITIES".to_string(),
-            vec!["MSFT".to_string()],
-            "0,1,2,3".to_string(),
-        );
+        manager.add_subscription("LEVELONE_EQUITIES".to_string(), vec!["MSFT".to_string()]);
 
         assert!(manager.is_subscribed("LEVELONE_EQUITIES", "MSFT"));
         assert_eq!(manager.get_symbol_count(), 3);

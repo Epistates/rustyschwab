@@ -12,13 +12,23 @@ const SELECT_LEASE: &str = "SELECT owner,epoch,expires_at FROM leases WHERE reso
 const UPSERT_LEASE: &str = "INSERT INTO leases VALUES(?1,?2,?3,?4) \
      ON CONFLICT(resource) DO UPDATE SET owner=excluded.owner,epoch=excluded.epoch,\
      expires_at=excluded.expires_at";
-/// Extends a lease only while the caller still holds the current epoch.
+/// Extends a lease only while the caller still holds the current epoch, and
+/// the clock has not moved back past it (see [`MAX_TTL`]).
 const RENEW_LEASE: &str = "UPDATE leases SET expires_at=?1 \
-     WHERE resource=?2 AND owner=?3 AND epoch=?4 AND expires_at>?5";
+     WHERE resource=?2 AND owner=?3 AND epoch=?4 AND expires_at>?5 AND expires_at<=?6";
 const RELEASE_LEASE: &str =
     "UPDATE leases SET expires_at=0 WHERE resource=?1 AND owner=?2 AND epoch=?3";
 const SELECT_LEASE_HELD: &str = "SELECT EXISTS(SELECT 1 FROM leases \
-     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4)";
+     WHERE resource=?1 AND owner=?2 AND epoch=?3 AND expires_at>?4 AND expires_at<=?5)";
+
+/// The longest lease a store grants. An expiry further ahead than this was
+/// written before the clock moved back, so the lease is treated as neither
+/// held nor free: fail closed, as [`Coordinator::quota`] does.
+const MAX_TTL: Duration = Duration::from_secs(300);
+
+fn clock_moved_back() -> Error {
+    Error::Storage("Clock moved backwards; lease state is not trustworthy".into())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Lease {
@@ -39,7 +49,13 @@ pub(crate) fn lease_held(c: &rusqlite::Connection, lease: &Lease) -> Result<bool
     let now = chrono::Utc::now().timestamp_millis();
     c.query_row(
         SELECT_LEASE_HELD,
-        params![lease.resource, lease.owner, epoch, now],
+        params![
+            lease.resource,
+            lease.owner,
+            epoch,
+            now,
+            now + MAX_TTL.as_millis() as i64
+        ],
         |r| r.get(0),
     )
     .map_err(sql)
@@ -54,7 +70,7 @@ pub trait Coordinator: std::fmt::Debug + Send + Sync {
     async fn valid(&self, lease: &Lease) -> Result<bool>;
 }
 fn expiry(now: i64, ttl: Duration) -> Result<i64> {
-    if ttl < Duration::from_secs(1) || ttl > Duration::from_secs(300) {
+    if ttl < Duration::from_secs(1) || ttl > MAX_TTL {
         return Err(Error::InvalidParameter(
             "Lease TTL must be between 1 and 300 seconds".into(),
         ));
@@ -149,6 +165,12 @@ impl Coordinator for StateDatabase {
                 })
                 .optional()
                 .map_err(sql)?;
+            if old
+                .as_ref()
+                .is_some_and(|(_, _, until)| *until > now + MAX_TTL.as_millis() as i64)
+            {
+                return Err(clock_moved_back());
+            }
             if old.as_ref().is_some_and(|(_, _, until)| *until > now) {
                 return Err(Error::LeaseBusy);
             }
@@ -178,7 +200,8 @@ impl Coordinator for StateDatabase {
                         lease.resource,
                         lease.owner,
                         lease.epoch as i64,
-                        now
+                        now,
+                        now + MAX_TTL.as_millis() as i64
                     ],
                 )
                 .map_err(sql)?;
@@ -335,5 +358,40 @@ impl LeaseSession {
 impl Drop for LeaseSession {
     fn drop(&mut self) {
         self.stop.take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A lease written before the clock moved back expires further ahead
+    /// than any TTL allows: it is neither held nor free, as with quota.
+    #[tokio::test]
+    async fn a_lease_from_before_a_backward_clock_jump_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = StateDatabase::new(dir.path().join("state.json"));
+        let lease = db
+            .acquire("stream", "a", Duration::from_secs(10))
+            .await
+            .unwrap();
+        // As if the clock had just moved back an hour.
+        let resource = lease.resource.clone();
+        db.run(move |c| {
+            c.execute(
+                "UPDATE leases SET expires_at=expires_at+3600000 WHERE resource=?1",
+                [resource],
+            )
+            .map_err(sql)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!db.valid(&lease).await.unwrap());
+        assert!(db.renew(&lease, Duration::from_secs(10)).await.is_err());
+        assert!(matches!(
+            db.acquire("stream", "b", Duration::from_secs(10)).await,
+            Err(Error::Storage(_))
+        ));
     }
 }

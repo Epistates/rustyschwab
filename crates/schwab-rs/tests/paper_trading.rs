@@ -1128,7 +1128,8 @@ async fn a_closed_calendar_day_closes_the_session_instead_of_faulting_the_feed()
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
     let (client, _tokens_dir, _) = common::mock_client(&server, false);
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    // The feed's day is New York's, which is not UTC's in the evening.
+    let today = feed::trading_date(chrono::Utc::now()).to_string();
     Mock::given(method("GET"))
         .and(path("/marketdata/v1/markets/equity"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({

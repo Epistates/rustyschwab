@@ -329,7 +329,7 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
     }
     Ok(())
 }
-fn broker_id(value: Option<&Value>) -> Option<String> {
+pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
     value.and_then(|v| match v {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) if n.is_u64() => Some(n.to_string()),
@@ -358,7 +358,7 @@ fn matches_request(request: &Value, order: &Value) -> bool {
         }
     }
 }
-fn persist_order(
+pub(crate) fn persist_order(
     c: &rusqlite::Connection,
     account: &str,
     order: &Value,

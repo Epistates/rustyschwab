@@ -177,8 +177,8 @@ impl SchwabClient {
             return Err(Error::Halted("Operator trading halt is active".into()));
         }
         if self.submissions_suspended() {
-            return Err(Error::Halted(
-                "Required data recovery is incomplete; submissions suspended".into(),
+            return Err(Error::Suspended(
+                "Required data recovery is incomplete, or the process is draining".into(),
             ));
         }
         Ok(())
@@ -385,9 +385,16 @@ impl SchwabClient {
         let order = &tagged_order;
         let account = path.split('/').nth(4).unwrap_or_default();
         if op == "replace_order" {
+            // Risk counts the order being replaced until Schwab replaces it,
+            // and one this client has not reconciled yet has no exposure it
+            // can judge: read it first. That also refuses, before anything
+            // is sent, a replacement of an order Schwab no longer has.
+            let order_id = path.rsplit('/').next().unwrap_or_default();
+            self.inner.execution.track_order(account, order_id).await?;
+            let current = self.get_order(account, order_id).await?;
             self.inner
                 .execution
-                .track_order(account, path.rsplit('/').next().unwrap_or_default())
+                .record_order(account, serde_json::to_value(current)?)
                 .await?;
         }
         let attempt_id = self

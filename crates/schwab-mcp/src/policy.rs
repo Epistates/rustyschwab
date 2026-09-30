@@ -589,12 +589,13 @@ impl AuthorizedServer {
             // The refusal says which: a consumed approval or reused tag is a
             // duplicate, an unresolved earlier submission needs
             // reconciliation, and a lapsed approval needs a new one.
+            let consumes_approval = dedup.is_some();
             let id = self
                 .audit
                 .begin_once(&audit_scope, name, request, dedup)
                 .await
                 .map_err(|e| ToolFailure::from(e).with_intent(digest))?;
-            Some(id)
+            Some((id, consumes_approval))
         } else {
             None
         };
@@ -603,11 +604,12 @@ impl AuthorizedServer {
             .call_tool(name, args, ctx)
             .await
             .map(crate::contract::normalize);
-        if let Some(id) = audit_id {
+        if let Some((id, consumed_approval)) = audit_id {
             // The SDK journal owns broker reconciliation. Keep dispatch outcome
             // attribution separately without claiming a tool success is a fill.
+            let dispatch = crate::journal::Dispatch::of(&result);
             let outcome = schwab_rs::execution::SubmissionOutcome::Reconciled {
-                evidence: crate::journal::Dispatch::of(&result).evidence(),
+                evidence: dispatch.evidence(),
             };
             self.audit.finish(&id, outcome).await.map_err(|e| {
                 ToolFailure::new(
@@ -617,8 +619,17 @@ impl AuthorizedServer {
                          reconcile before retrying"
                     ),
                 )
-                .with_attempt(id)
+                .with_attempt(id.clone())
             })?;
+            // Refused before anything reached the broker: the approval is
+            // not spent, so the same intent may go once the refusal clears.
+            if consumed_approval
+                && let crate::journal::Dispatch::Failed { code: Some(code) } = dispatch
+                && code.keeps_approval()
+                && let Err(e) = self.audit.refund_approval(&id).await
+            {
+                tracing::warn!(attempt = %id, error = %e, "approval refund failed; it stays spent");
+            }
         }
         Ok(result)
     }
@@ -1183,6 +1194,44 @@ mod tests {
         );
         assert_eq!(malformed["code"], "invalid_arguments");
     }
+    /// An approved submission that fails before reaching the broker (here,
+    /// for want of a Schwab session) keeps its approval for the retry.
+    #[tokio::test]
+    async fn an_unsent_submission_gives_its_approval_back() {
+        let server = authorized_as(
+            Switches {
+                trading: true,
+                cancel: false,
+            },
+            policy(),
+        );
+        let ctx = RequestContext::stdio();
+        let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
+        let digest = intent_digest("place_order", &args);
+        server
+            .audit
+            .approve(
+                "desk",
+                &digest,
+                "operator",
+                chrono::Utc::now().timestamp() + 60,
+            )
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let failed = server
+                .call_tool("place_order", args.clone(), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(
+                failed.structured_content.unwrap()["error"]["code"],
+                "unavailable"
+            );
+            assert!(server.audit.is_approved("desk", &digest).await.unwrap());
+        }
+        assert_eq!(server.audit.records().await.unwrap().len(), 2);
+    }
+
     /// The digest and approval bind the model's arguments; only the
     /// dispatched copy carries the derived tag, and an explicit tag stays.
     #[tokio::test]

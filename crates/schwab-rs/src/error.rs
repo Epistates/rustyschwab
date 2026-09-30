@@ -19,8 +19,10 @@
 //! - HTTP 4xx errors (except 429) - Fix request parameters
 //!
 //! ## Trading Control Errors (Resolve the condition, then submit a new intent)
-//! - [`Error::Halted`] - An operator halt, recovery suspension or drain is
-//!   active; wait for the operator to lift it
+//! - [`Error::Halted`] - An operator halt is active; wait for the operator
+//!   to lift it
+//! - [`Error::Suspended`] - Data recovery or a process drain paused
+//!   submissions; nothing was sent, so retry shortly
 //! - [`Error::RiskDenied`] - A risk policy rejected the order; adjust size or
 //!   wait for exposure to fall
 //! - [`Error::BaselineStale`] - Reconcile the account, then resubmit
@@ -101,10 +103,15 @@ pub enum Error {
     CircuitOpen,
     #[error("Reconciliation is required for pending submission {attempt_id}")]
     ReconciliationRequired { attempt_id: String },
-    /// Trading is administratively paused: an operator halt, a recovery
-    /// suspension after data loss, or a paper broker drain.
+    /// Trading is administratively paused: an operator halt, or one a
+    /// control (the daily-loss limit) recorded. Only an operator lifts it.
     #[error("Trading halted: {0}")]
     Halted(String),
+    /// Submissions are paused for a moment, not by an operator: required data
+    /// is recovering after a stream gap, or the process is draining. Nothing
+    /// was sent; retry shortly (on another process, when draining).
+    #[error("Submissions suspended: {0}")]
+    Suspended(String),
     /// A risk policy (built-in portfolio limits, an external provider, or the
     /// paper venue's capacity limits) refused the order.
     #[error("Risk policy denied the order: {0}")]
@@ -406,6 +413,7 @@ impl Error {
             Self::CircuitOpen => ErrorKind::CircuitOpen,
             Self::ReconciliationRequired { .. } => ErrorKind::ReconciliationRequired,
             Self::Halted(_) => ErrorKind::Halted,
+            Self::Suspended(_) => ErrorKind::Suspended,
             Self::RiskDenied(_) => ErrorKind::RiskDenied,
             Self::BaselineStale { .. } => ErrorKind::BaselineStale,
             Self::Duplicate(_) => ErrorKind::Duplicate,
@@ -512,6 +520,7 @@ pub enum ErrorKind {
     CircuitOpen,
     ReconciliationRequired,
     Halted,
+    Suspended,
     RiskDenied,
     BaselineStale,
     Duplicate,
@@ -550,6 +559,7 @@ impl ErrorKind {
             Self::CircuitOpen => "circuit_open",
             Self::ReconciliationRequired => "reconciliation_required",
             Self::Halted => "halted",
+            Self::Suspended => "suspended",
             Self::RiskDenied => "risk_denied",
             Self::BaselineStale => "baseline_stale",
             Self::Duplicate => "duplicate",
@@ -630,6 +640,7 @@ impl From<&Error> for ErrorEnvelope {
         match error {
             Error::Storage(message)
             | Error::Halted(message)
+            | Error::Suspended(message)
             | Error::RiskDenied(message)
             | Error::Duplicate(message)
             | Error::ApprovalInvalid(message)
@@ -707,6 +718,7 @@ impl From<ErrorEnvelope> for Error {
                 None => malformed(&envelope),
             },
             ErrorKind::Halted => Error::Halted(envelope.message),
+            ErrorKind::Suspended => Error::Suspended(envelope.message),
             ErrorKind::RiskDenied => Error::RiskDenied(envelope.message),
             ErrorKind::BaselineStale => Error::BaselineStale {
                 account: envelope.account.unwrap_or_default(),
@@ -825,8 +837,12 @@ mod tests {
     #[test]
     fn envelope_round_trips_typed_variants() {
         assert!(matches!(
-            round_trip(Error::Halted("drain".into())),
-            Error::Halted(m) if m == "drain"
+            round_trip(Error::Halted("review".into())),
+            Error::Halted(m) if m == "review"
+        ));
+        assert!(matches!(
+            round_trip(Error::Suspended("drain".into())),
+            Error::Suspended(m) if m == "drain"
         ));
         assert!(matches!(
             round_trip(Error::RiskDenied("limit".into())),

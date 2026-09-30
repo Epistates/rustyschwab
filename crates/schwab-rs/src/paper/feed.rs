@@ -20,7 +20,7 @@ const FEED_DEADLINE: Duration = Duration::from_secs(10);
 /// The US equity trading day `now` falls in: New York's calendar date. The
 /// UTC date turns over at 8 pm Eastern (7 pm in winter), which would open
 /// the next day's session hours early.
-fn trading_date(now: DateTime<Utc>) -> chrono::NaiveDate {
+pub fn trading_date(now: DateTime<Utc>) -> chrono::NaiveDate {
     now.with_timezone(&chrono_tz::America::New_York)
         .date_naive()
 }

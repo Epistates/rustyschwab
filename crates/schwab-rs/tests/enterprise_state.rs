@@ -153,6 +153,54 @@ async fn approvals_expire_revoke_and_cannot_be_self_issued() {
     );
 }
 
+/// An approval spent on a submission the broker never saw can be given back
+/// once the submission is resolved; a revoked one cannot.
+#[tokio::test]
+async fn approvals_refund_only_for_resolved_unsent_submissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let j = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "b".repeat(64);
+    let expires = chrono::Utc::now().timestamp() + 60;
+    j.approve("desk", &digest, "operator", expires)
+        .await
+        .unwrap();
+    let request = json!({"tag": "intent-tag"});
+    let first = j
+        .begin_once("desk", "place_order", request.clone(), Some(digest.clone()))
+        .await
+        .unwrap();
+    assert!(!j.is_approved("desk", &digest).await.unwrap());
+    // Pending: it may still reach the broker.
+    assert!(j.refund_approval(&first).await.is_err());
+    j.finish(&first, SubmissionOutcome::Rejected).await.unwrap();
+    j.refund_approval(&first).await.unwrap();
+    assert!(j.is_approved("desk", &digest).await.unwrap());
+    // The same intent, tag included, goes again, and spends it again.
+    let second = j
+        .begin_once("desk", "place_order", request.clone(), Some(digest.clone()))
+        .await
+        .unwrap();
+    assert!(!j.is_approved("desk", &digest).await.unwrap());
+    j.finish(&second, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    j.revoke_approval(&digest, "operator").await.unwrap();
+    j.refund_approval(&second).await.unwrap();
+    assert!(!j.is_approved("desk", &digest).await.unwrap());
+    assert!(
+        j.begin_once("desk", "place_order", request, Some(digest))
+            .await
+            .is_err()
+    );
+    // A submission without an approval has nothing to give back.
+    let plain = j
+        .begin_once("other", "place_order", json!({}), None)
+        .await
+        .unwrap();
+    j.finish(&plain, SubmissionOutcome::Rejected).await.unwrap();
+    assert!(j.refund_approval(&plain).await.is_err());
+}
+
 #[tokio::test]
 async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidence() {
     let dir = tempfile::tempdir().unwrap();

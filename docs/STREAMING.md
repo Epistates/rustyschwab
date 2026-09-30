@@ -130,12 +130,12 @@ stream_client.view(StreamService::LeveloneEquities, fields).await?;
 
 ### Slow consumers
 The queue is bounded (4,096 messages by default). When it fills, frames are
-dropped and counted (`lost_messages`, `schwab_stream_dropped_messages_total`),
-and the receiver yields `StreamMessage::State` with `ready: false`. The
-connection stays up. Once your consumer has drained half the queue, delivery
-resumes under a new `generation`; frames from the gap are never delivered.
-Treat any generation change as a gap: re-read a REST baseline before trusting
-derived state.
+dropped and counted (`lost_messages`, `schwab_stream_dropped_messages_total`).
+The frames already queued are delivered first, in order; then the receiver
+yields `StreamMessage::State` with `ready: false`. The connection stays up.
+Once your consumer has drained half the queue, delivery resumes under a new
+`generation`; the dropped frames are never delivered. Treat any generation
+change as a gap: re-read a REST baseline before trusting derived state.
 
 ### Resource Management
 Ensure the receiver loop is running in a spawned task if your main thread needs to perform other work. The `StreamClient` will continue to run in the background as long as it's not dropped.

@@ -298,9 +298,11 @@ fn status_for(envelope: &ErrorEnvelope) -> StatusCode {
         ErrorKind::RiskDenied | ErrorKind::BaselineStale => StatusCode::UNPROCESSABLE_ENTITY,
         ErrorKind::Halted => StatusCode::LOCKED,
         ErrorKind::RateLimit => StatusCode::TOO_MANY_REQUESTS,
-        ErrorKind::Storage | ErrorKind::Remote | ErrorKind::CircuitOpen | ErrorKind::LeaseBusy => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        ErrorKind::Storage
+        | ErrorKind::Remote
+        | ErrorKind::CircuitOpen
+        | ErrorKind::LeaseBusy
+        | ErrorKind::Suspended => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -313,6 +315,7 @@ fn envelope(error: &schwab_rs::Error) -> ErrorEnvelope {
         envelope.kind,
         ErrorKind::InvalidParameter
             | ErrorKind::Halted
+            | ErrorKind::Suspended
             | ErrorKind::RiskDenied
             | ErrorKind::BaselineStale
             | ErrorKind::Duplicate
@@ -635,7 +638,8 @@ async fn order(
             {
                 order.tag = Some(crate::policy::intent_tag(&digest));
             }
-            let key = if !cancel && principal.require_approval {
+            let consumes_approval = !cancel && principal.require_approval;
+            let key = if consumes_approval {
                 // As on the MCP path: refuse a halted or suspended submission
                 // before the audit consumes its one-use approval.
                 state.client.submission_admission().await?;
@@ -700,6 +704,14 @@ async fn order(
                         && !(cancel && error.is_retryable()) =>
                 {
                     audit.finish(&attempt, SubmissionOutcome::Rejected).await?;
+                    // Refused before anything reached the broker: as on the
+                    // MCP path, the approval is not spent.
+                    if consumes_approval
+                        && crate::contract::refusal_keeps_approval(error.kind())
+                        && let Err(e) = audit.refund_approval(&attempt).await
+                    {
+                        tracing::warn!(%attempt, error = %e, "approval refund failed; it stays spent");
+                    }
                     Ok(json!({"mode":state.client.mode(),"status":"rejected","attempt_id":attempt,"error":envelope(&error)}))
                 }
                 _ => Ok(json!({"mode":state.client.mode(),"status":"unknown","attempt_id":attempt})),
