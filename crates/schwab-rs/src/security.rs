@@ -278,86 +278,122 @@ pub fn secure_file_write(_path: &Path, _data: &[u8]) -> Result<()> {
     ))
 }
 
-/// Verifies that a file has secure permissions (Unix: 0600)
+/// Open an existing private file for reading, checking the open descriptor
+/// rather than the path, so the file read is the file checked: a path
+/// swapped for a symlink between a check and a read cannot slip through.
 ///
-/// # Security
+/// - **Unix**: opened with `O_NOFOLLOW` (a symlink is refused) and
+///   `O_NONBLOCK` (a planted FIFO cannot hang the open), then required to
+///   be a regular file owned by this user (or root) with mode exactly 0600.
+/// - **Windows**: an owner-only protected DACL, opened without following a
+///   reparse point, and refused if the handle is one.
 ///
-/// - **Unix**: a regular file (not a symlink) with mode exactly 0600
-/// - **Windows**: not a reparse point, with an owner-only protected DACL
-///
-/// # Arguments
-///
-/// * `path` - File path to check
-///
-/// # Errors
-///
-/// Returns `AuthError::TokenFileInsecure` if permissions are too permissive
+/// A missing file is [`Error::Io`] with [`std::io::ErrorKind::NotFound`].
 #[cfg(unix)]
-pub fn verify_file_permissions(path: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .map_err(|e| AuthError::TokenFileError(format!("Failed to read file metadata: {}", e)))?;
-
+pub fn open_private_file(path: &Path) -> Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => std::fs::File::from(fd),
+        // What O_NOFOLLOW answers for a symlink (EMLINK on the BSDs).
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+            return Err(insecure(path, "is a symbolic link"));
+        }
+        Err(errno) => return Err(Error::Io(errno.into())),
+    };
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
-        return Err(Error::Auth(AuthError::TokenFileInsecure(
-            "Token path must be a regular file".into(),
-        )));
+        return Err(insecure(path, "is not a regular file"));
     }
-    let mode = metadata.permissions().mode();
-    let perms = mode & 0o777; // Extract permission bits
-
+    let owner = metadata.uid();
+    if owner != rustix::process::geteuid().as_raw() && owner != 0 {
+        return Err(insecure(path, "is owned by another account"));
+    }
+    let perms = metadata.permissions().mode() & 0o777;
     if perms != 0o600 {
-        // Keep the absolute path out of the error string: this error can
-        // propagate to an MCP tool response (and thus to an LLM), and the
-        // path discloses the home-directory layout / username. The full
-        // path goes to the operator log instead.
-        tracing::error!(
-            ?path,
-            mode = format!("{:o}", perms),
-            "token file has insecure permissions (expected 0600)"
-        );
-        return Err(Error::Auth(AuthError::TokenFileInsecure(format!(
-            "token file has insecure permissions {perms:o} (expected 0600); \
-             see server logs for the path"
-        ))));
+        return Err(insecure(
+            path,
+            &format!("has insecure permissions {perms:o} (expected 0600)"),
+        ));
     }
+    Ok(file)
+}
 
-    Ok(())
+#[cfg(windows)]
+pub use crate::security_windows::open_private_file;
+
+#[cfg(not(any(unix, windows)))]
+pub fn open_private_file(_path: &Path) -> Result<std::fs::File> {
+    Err(Error::Config(
+        "Secure file storage is unsupported on this platform".into(),
+    ))
+}
+
+/// A refusal that keeps the path out of the error string: it can reach an
+/// MCP tool response (and so a model), and the path discloses the home
+/// directory layout. The operator log gets the path.
+pub(crate) fn insecure(path: &Path, why: &str) -> Error {
+    tracing::error!(?path, "secret file {why}");
+    Error::Auth(AuthError::TokenFileInsecure(format!(
+        "secret file {why}; see server logs for the path"
+    )))
+}
+
+/// Verify that `path` is a private file, as [`open_private_file`] does.
+pub fn verify_file_permissions(path: &Path) -> Result<()> {
+    open_private_file(path).map(drop)
+}
+
+/// Read a private file (see [`open_private_file`]) whole, into a buffer
+/// sized to it and wiped on drop.
+pub fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    let file = open_private_file(path)?;
+    let len = file.metadata()?.len();
+    let mut contents = Zeroizing::new(Vec::with_capacity(usize::try_from(len).unwrap_or(0)));
+    // Read what was there when it was opened, so the buffer never grows.
+    file.take(len).read_to_end(&mut contents)?;
+    Ok(contents)
 }
 
 /// Create a private directory before any database or auxiliary file is opened.
+///
+/// A directory created here is 0700; an existing one must already be a
+/// real directory (not a symlink), owned by this user and closed to others.
 #[cfg(unix)]
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if !path.exists() {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(path)?;
     }
+    // Checked without following links, after creation: a symlink planted
+    // between the existence check and `create` is refused, not written through.
     let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
         return Err(Error::Storage(
-            "State directory must be private (0700) and not a symlink".into(),
+            "State directory must be private (0700), owned by this account, \
+             and not a symlink"
+                .into(),
         ));
     }
     Ok(())
 }
 
-#[cfg(windows)]
-pub use crate::security_windows::verify_file_permissions;
-#[cfg(not(any(unix, windows)))]
-pub fn verify_file_permissions(_path: &Path) -> Result<()> {
-    Err(Error::Config(
-        "Secure file storage is unsupported on this platform".into(),
-    ))
-}
-
-/// Read a one-line secret (a bearer token, for example) from an owner-only
-/// file, trimming surrounding whitespace. The read buffer is wiped on drop.
+/// Read a one-line secret (a bearer token, for example) from a private file
+/// (see [`open_private_file`]), trimming surrounding whitespace. The read
+/// buffer is wiped on drop.
 pub fn read_secret_file(path: &Path) -> Result<SecretString> {
-    verify_file_permissions(path)?;
-    let contents = Zeroizing::new(std::fs::read_to_string(path)?);
-    Ok(SecretString::from(contents.trim()))
+    let contents = read_private_file(path)?;
+    let text = std::str::from_utf8(&contents)
+        .map_err(|_| Error::Config("Secret file is not UTF-8".into()))?;
+    Ok(SecretString::from(text.trim()))
 }
 
 #[cfg(test)]
@@ -435,6 +471,52 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn private_files_refuse_links_fifos_and_loose_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("tokens.json");
+        secure_file_write(&real, b"secret").unwrap();
+        assert_eq!(&*read_private_file(&real).unwrap(), b"secret");
+
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            read_private_file(&link),
+            Err(Error::Auth(AuthError::TokenFileInsecure(_)))
+        ));
+
+        let fifo = dir.path().join("fifo");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Refused without blocking on a writer.
+        assert!(verify_file_permissions(&fifo).is_err());
+
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(verify_file_permissions(&real).is_err());
+
+        let missing = read_private_file(&dir.path().join("missing")).unwrap_err();
+        assert!(matches!(missing, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_directories_refuse_a_symlinked_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        ensure_private_directory(&elsewhere).unwrap();
+        let link = dir.path().join("state");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        assert!(ensure_private_directory(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_secure_file_write_permissions() {
         use tempfile::NamedTempFile;
 

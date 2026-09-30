@@ -108,6 +108,9 @@ callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls"]
 schemars = ["schwab-types/schemars"]
 full = ["rustls", "callback-server", "schemars"]
 
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 

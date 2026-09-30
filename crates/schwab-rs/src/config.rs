@@ -11,13 +11,16 @@ use std::time::Duration;
 use url::Url;
 
 /// Allowed API domains for security - prevents configuration injection attacks (SSRF)
+/// Schwab hosts, matched exactly or as a parent domain.
 const ALLOWED_API_DOMAINS: &[&str] = &[
     "api.schwabapi.com",
     "streamer.schwabapi.com",
-    // Allow localhost for testing and development
-    "127.0.0.1",
-    "localhost",
+    // The `streamerSocketUrl` Schwab's user preferences name.
+    "streamer-api.schwab.com",
 ];
+/// Loopback hosts for tests and development, matched exactly: no
+/// `*.localhost` name inherits their trust (or their plain `http`/`ws`).
+const LOOPBACK_HOSTS: &[&str] = &["127.0.0.1", "localhost"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchwabConfig {
@@ -51,6 +54,10 @@ pub enum ChannelKind {
     /// generation on the same connection.
     Bounded(usize),
 }
+
+/// The streamer Schwab's user preferences name today. Prefer the
+/// `streamerSocketUrl` they carry: see [`StreamConfig::set_socket_url`].
+pub const DEFAULT_STREAMER_URL: &str = "wss://streamer-api.schwab.com/ws";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
@@ -158,10 +165,21 @@ impl Default for ClientConfig {
     }
 }
 
+impl StreamConfig {
+    /// Stream from the `streamerSocketUrl` of Schwab's user preferences,
+    /// where the LOGIN it issues is valid. Refused unless it passes the same
+    /// host and scheme checks as configured URLs.
+    pub fn set_socket_url(&mut self, url: &str) -> Result<()> {
+        SchwabConfig::validate_url_domain(url, "streamerSocketUrl")?;
+        self.websocket_url = url.to_owned();
+        Ok(())
+    }
+}
+
 impl Default for StreamConfig {
     fn default() -> Self {
         Self {
-            websocket_url: "wss://streamer.schwabapi.com/ws".to_string(),
+            websocket_url: DEFAULT_STREAMER_URL.to_string(),
             reconnect: ReconnectConfig::default(),
             heartbeat_interval: Duration::from_secs(20), // WebSocket heartbeat interval
             ping_timeout: Duration::from_secs(30),       // WebSocket ping timeout
@@ -239,21 +257,20 @@ impl SchwabConfig {
 
         let scheme = url.scheme();
 
-        // Check if host matches any allowed domain
-        let is_allowed = ALLOWED_API_DOMAINS.iter().any(|allowed| {
-            // Exact match or subdomain match (for *.schwabapi.com)
-            host == *allowed || host.ends_with(&format!(".{}", allowed))
-        });
+        let is_localhost = LOOPBACK_HOSTS.contains(&host);
+        let is_allowed = is_localhost
+            || ALLOWED_API_DOMAINS
+                .iter()
+                .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")));
 
         if !is_allowed {
             return Err(Error::Config(format!(
-                "Domain '{}' not in allowed list for {} (allowed: {:?})",
+                "Domain '{}' not in allowed list for {} (allowed: {:?} and loopback)",
                 host, field_name, ALLOWED_API_DOMAINS
             )));
         }
 
         // Strict scheme validation: Only localhost can use http/ws. External must use https/wss.
-        let is_localhost = host == "localhost" || host == "127.0.0.1";
         if !is_localhost {
             if scheme != "https" && scheme != "wss" {
                 return Err(Error::Config(format!(
@@ -342,7 +359,7 @@ impl SchwabConfig {
         {
             Some(StreamConfig {
                 websocket_url: env::var("SCHWAB_WEBSOCKET_URL")
-                    .unwrap_or_else(|_| "wss://streamer.schwabapi.com/ws".to_string()),
+                    .unwrap_or_else(|_| DEFAULT_STREAMER_URL.to_string()),
                 ..StreamConfig::default()
             })
         } else {
@@ -366,11 +383,7 @@ impl SchwabConfig {
     /// file (not a symlink) readable by its owner only.
     pub fn from_file(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
-        crate::security::verify_file_permissions(path)?;
-        let contents = zeroize::Zeroizing::new(
-            std::fs::read(path)
-                .map_err(|e| Error::Config(format!("Failed to read config file: {}", e)))?,
-        );
+        let contents = crate::security::read_private_file(path)?;
 
         let config: Self = serde_json::from_slice(&contents)
             .map_err(|e| Error::Config(format!("Failed to parse config file: {}", e)))?;

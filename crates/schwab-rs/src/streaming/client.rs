@@ -1591,6 +1591,7 @@ pub struct StreamClientBuilder {
     correl_id: Option<String>,
     channel: Option<String>,
     function_id: Option<String>,
+    socket_url: Option<String>,
 }
 
 impl StreamClientBuilder {
@@ -1602,6 +1603,7 @@ impl StreamClientBuilder {
             correl_id: None,
             channel: None,
             function_id: None,
+            socket_url: None,
         }
     }
 
@@ -1637,9 +1639,14 @@ impl StreamClientBuilder {
         self
     }
 
-    /// Populate customer/correl IDs, channel, and function ID from a
-    /// `streamerInfo` entry of the user-preferences response.
+    /// Populate customer/correl IDs, channel, function ID and the socket URL
+    /// from a `streamerInfo` entry of the user-preferences response. The URL
+    /// is checked when the client is built (see
+    /// [`StreamConfig::set_socket_url`](crate::config::StreamConfig::set_socket_url)).
     pub fn streamer_info(mut self, info: &crate::types::accounts::StreamerInfo) -> Self {
+        if !info.streamer_socket_url.is_empty() {
+            self.socket_url = Some(info.streamer_socket_url.clone());
+        }
         let identity = StreamerIdentity::from_streamer_info(info);
         self.customer_id = Some(identity.customer_id);
         self.correl_id = Some(identity.correl_id);
@@ -1649,9 +1656,12 @@ impl StreamClientBuilder {
     }
 
     pub fn build(self) -> Result<StreamClient> {
-        let config = self
+        let mut config = self
             .config
             .ok_or_else(|| Error::Config("Stream config required".to_string()))?;
+        if let Some(url) = &self.socket_url {
+            config.set_socket_url(url)?;
+        }
         let auth_manager = self
             .auth_manager
             .ok_or_else(|| Error::Config("Auth manager required".to_string()))?;

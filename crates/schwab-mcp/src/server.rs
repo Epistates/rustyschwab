@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use schwab_rs::client::OptionChainParams;
 use schwab_rs::config::StreamConfig;
-use schwab_rs::streaming::{StreamClient, StreamerIdentity};
+use schwab_rs::streaming::StreamClient;
 use schwab_types::market_data::{
     Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
 };
@@ -1407,17 +1407,12 @@ impl SchwabMcp {
                 )
             })?;
 
-        let mut cfg = self.stream_config.clone();
-        if !streamer.streamer_socket_url.is_empty() {
-            cfg.websocket_url = streamer.streamer_socket_url.clone();
-        }
-
-        let client = StreamClient::new(
-            cfg,
-            schwab.auth_manager(),
-            StreamerIdentity::from_streamer_info(streamer),
-        )?
-        .with_coordinator(schwab.coordinator())?;
+        let client = StreamClient::builder()
+            .config(self.stream_config.clone())
+            .auth_manager(schwab.auth_manager())
+            .streamer_info(streamer)
+            .build()?
+            .with_coordinator(schwab.coordinator())?;
         client.connect().await?;
 
         let rx = client.get_receiver().ok_or_else(|| {

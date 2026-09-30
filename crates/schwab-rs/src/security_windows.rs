@@ -97,7 +97,25 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     result
 }
 
-pub fn verify_file_permissions(path: &Path) -> Result<()> {
+/// See [`crate::security::open_private_file`]. The DACL is checked by path,
+/// then the file is opened without following a reparse point, so a path
+/// swapped for a link after the check opens the link, which is refused.
+pub fn open_private_file(path: &Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    verify_file_permissions(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::Auth(AuthError::TokenFileInsecure(
+            "Token file must not be a reparse point".into(),
+        )));
+    }
+    Ok(file)
+}
+
+pub(crate) fn verify_file_permissions(path: &Path) -> Result<()> {
     // Reject links before obtaining their target's descriptor.
     let metadata = std::fs::symlink_metadata(path)?;
     use std::os::windows::fs::MetadataExt;

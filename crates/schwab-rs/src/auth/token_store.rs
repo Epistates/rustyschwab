@@ -14,9 +14,7 @@
 //! | Keychain | ✅ OS-native | ✅ OS-native | ✅ Yes | ⭐⭐⭐⭐⭐ Best |
 
 use crate::error::{AuthError, Error};
-use crate::security::{
-    EncryptedToken, generate_random_key, secure_file_write, verify_file_permissions,
-};
+use crate::security::{EncryptedToken, generate_random_key, read_private_file, secure_file_write};
 use chrono::{DateTime, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -274,10 +272,7 @@ impl TokenStore for FileTokenStore {
     }
 
     fn load(&self) -> AuthResult<TokenSet> {
-        to_auth_result(verify_file_permissions(&self.path))?;
-
-        // `fs::read` sizes the buffer from the file, so it is never copied.
-        let json = Zeroizing::new(std::fs::read(&self.path).map_err(AuthError::TokenStorage)?);
+        let json = to_auth_result(read_private_file(&self.path))?;
 
         let tokens: TokenSet = serde_json::from_slice(&json).map_err(|e| {
             AuthError::TokenStorage(std::io::Error::new(
@@ -335,13 +330,13 @@ impl EncryptedFileTokenStore {
                 Err(std::fs::TryLockError::Error(e)) => return Err(AuthError::TokenStorage(e)),
             }
         }
-        if self.key_path.exists() {
-            to_auth_result(verify_file_permissions(&self.key_path))?;
-            let key_bytes =
-                Zeroizing::new(std::fs::read(&self.key_path).map_err(|e| {
-                    AuthError::TokenFileError(format!("Failed to read key: {}", e))
-                })?);
-
+        // Read, or generate when there is none: no separate existence check
+        // for the file to change under.
+        let read = match read_private_file(&self.key_path) {
+            Err(crate::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            other => Some(to_auth_result(other)?),
+        };
+        if let Some(key_bytes) = read {
             if key_bytes.len() != 32 {
                 return Err(AuthError::TokenFileError(format!(
                     "Invalid key length: expected 32, got {}",
@@ -385,10 +380,7 @@ impl TokenStore for EncryptedFileTokenStore {
     fn load(&self) -> AuthResult<TokenSet> {
         let key = self.load_or_generate_key()?;
 
-        to_auth_result(verify_file_permissions(&self.path))?;
-
-        let encrypted_json = std::fs::read(&self.path)
-            .map_err(|e| AuthError::DecryptionFailed(format!("Failed to read file: {}", e)))?;
+        let encrypted_json = to_auth_result(read_private_file(&self.path))?;
 
         let encrypted: EncryptedToken = serde_json::from_slice(&encrypted_json).map_err(|e| {
             AuthError::DecryptionFailed(format!("Failed to parse encrypted data: {}", e))
@@ -521,16 +513,9 @@ pub(crate) fn prepare_secret_directory(file: &std::path::Path) -> AuthResult<()>
         return Ok(());
     };
     if !dir.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            return std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(dir)
-                .map_err(AuthError::TokenStorage);
-        }
-        #[cfg(not(unix))]
+        // Created owner-only, then checked without following links, so a
+        // symlink planted between the existence check and the creation is
+        // refused rather than written through.
         return to_auth_result(crate::security::ensure_private_directory(dir));
     }
     #[cfg(unix)]
@@ -560,14 +545,35 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
     if let Ok(file) = crate::security_windows::secure_create_new(path) {
         return Ok(file);
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Never through a symlink, and never anything but a regular file (a
+        // planted FIFO would otherwise hang the open).
+        use rustix::fs::{Mode, OFlags};
+        let flags =
+            OFlags::CREATE | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let file = match rustix::fs::open(path, flags, Mode::from_raw_mode(0o600)) {
+            Ok(fd) => std::fs::File::from(fd),
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::MLINK) => {
+                return to_auth_result(Err(crate::security::insecure(path, "is a symbolic link")));
+            }
+            Err(errno) => return Err(AuthError::TokenStorage(errno.into())),
+        };
+        if !file.metadata().map_err(AuthError::TokenStorage)?.is_file() {
+            return to_auth_result(Err(crate::security::insecure(
+                path,
+                "is not a regular file",
+            )));
+        }
+        Ok(file)
     }
-    options.open(path).map_err(AuthError::TokenStorage)
+    #[cfg(not(unix))]
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(AuthError::TokenStorage)
 }
 
 #[cfg(test)]
@@ -590,6 +596,23 @@ mod tests {
             store.load().unwrap().access_token().unwrap(),
             "access_token_12345"
         );
+    }
+
+    /// A lock file is never opened through a symlink, which could point it
+    /// at any file the account can write.
+    #[cfg(unix)]
+    #[test]
+    fn lock_files_refuse_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        let lock = dir.path().join("tokens.refresh.lock");
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        assert!(matches!(
+            open_lock_file(&lock),
+            Err(AuthError::TokenFileInsecure(_))
+        ));
+        open_lock_file(&dir.path().join("fresh.lock")).unwrap();
     }
 
     /// A holder that never lets go makes waiters fail, not hang.

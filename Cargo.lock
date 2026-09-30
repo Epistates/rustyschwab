@@ -3533,6 +3533,7 @@ dependencies = [
  "ring",
  "rusqlite",
  "rust_decimal",
+ "rustix",
  "rustls",
  "rustls-platform-verifier",
  "schwab-types",

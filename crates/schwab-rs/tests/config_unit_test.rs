@@ -13,6 +13,29 @@ use std::sync::Mutex;
 // Mutex to ensure tests that modify environment variables run sequentially
 static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
+/// The streamer URL Schwab's preferences name is accepted; loopback is
+/// matched exactly, so no `*.localhost` name inherits its plain `ws://`.
+#[test]
+fn streamer_socket_urls_come_from_schwab_hosts_only() {
+    use schwab_rs::config::{DEFAULT_STREAMER_URL, StreamConfig};
+    let mut config = StreamConfig::default();
+    assert_eq!(config.websocket_url, DEFAULT_STREAMER_URL);
+    config
+        .set_socket_url("wss://streamer-api.schwab.com/ws")
+        .unwrap();
+    config.set_socket_url("ws://127.0.0.1:9000/ws").unwrap();
+    for bad in [
+        "ws://streamer-api.schwab.com/ws",
+        "wss://evil.example/ws",
+        "wss://evil.localhost/ws",
+        "ws://evil.localhost/ws",
+        "wss://schwab.com.evil.example/ws",
+    ] {
+        assert!(config.set_socket_url(bad).is_err(), "{bad}");
+    }
+    assert_eq!(config.websocket_url, "ws://127.0.0.1:9000/ws");
+}
+
 #[test]
 fn test_domain_validation_allowed_schwab_api() {
     let _lock = ENV_MUTEX.lock().unwrap();
