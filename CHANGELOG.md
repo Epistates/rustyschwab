@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — execution safety (second diligence pass)
+
+- **Abandoned submissions finish.** An order submission runs on its own
+  task once journaled, in the SDK, on the MCP path and at the authority's
+  `/v1/orders`: a caller that cancels, disconnects or hits a transport
+  deadline abandons only the answer. Before, the intent stayed pending and
+  blocked every submission on the account (and every principal's) until
+  an operator resolved it. The approval hold (`wait_ms`) is now at most
+  45 s, under common 60 s client timeouts. The authority refuses a gateway
+  submission when the caller's credential has under 15 s left.
+- **Never-sent intents resolve themselves.** Each intent is armed in the
+  journal immediately before its request leaves (`ExecutionStore::arm`,
+  `SubmissionRecord::armed`). Reconciliation resolves an unarmed intent
+  older than ten minutes as rejected (`never_dispatched`), freeing its tag
+  and reservation; arming a resolved intent fails, so it is never sent.
+  A principal's audit record stranded by a process exit is settled from
+  the venue journal on the next submission (`journal::settle_stranded`).
+- **Replacing an unknown order no longer wedges the account.** The
+  previous round recorded a placeholder for the replaced order before
+  reading it; a mistyped ID then failed every reconciliation pass and
+  refused every order. The order is now read first and recorded only if
+  Schwab has it, and reconciliation drops a placeholder Schwab answers 404
+  for (`ExecutionStore::forget_placeholder`).
+- **Cash accounts can trade.** The built-in risk provider read only
+  `availableFunds`, which cash accounts (and IRAs) do not have, so it
+  refused every order on them. It falls back to `cashAvailableForTrading`,
+  and only buys need funds.
+- **Sells are judged per symbol.** A sell was checked against every open
+  order on the account, so a working MSFT buy blocked selling AAPL, and
+  sells drew on the buy caps. A sell may now sell the symbol's position
+  less its other working sells; `max_open_quantity`, `max_open_notional`
+  and funds bound working buys, and `max_position_quantity` one symbol.
+- **Replacements do not count what they replace.**
+  `RiskProvider::reserve_replacement` (default: `reserve`) excludes the
+  order being replaced, so a protective sell of a whole position can be
+  moved.
+- **Reservations follow the journal.** `finish` releases the reservation
+  in the same transaction as a rejection or an operator resolution; an
+  operator's `resolve` used to leak it permanently. Reconciliation sweeps
+  reservations leaked before.
+- **Tags the broker holds stay spent.** Reconciliation records every tag
+  it sees on a broker order, and a rejection never frees one, so an order
+  accepted after a backup cannot be sent again from the restored state. A
+  restore marks every baseline unreconciled.
+- **Risk and reconciliation scale with working orders.** The risk check ran
+  a correlated subquery over every stored order inside a write
+  transaction (seconds at a few thousand orders, holding the lock);
+  terminal orders are now filtered through indexes. Reconciliation
+  releases only reservations it changes, audits a pass only when
+  something changed (it wrote one row per account per interval), and
+  queries unresolved intents per account (`unresolved_records`) instead
+  of the whole history. `prune-history` removes terminal orders, their
+  activity and released reservations.
+- **A lost race does not invalidate a newer baseline.** A superseded pass
+  writes nothing and reports `superseded`; a failed pass invalidates only
+  if no later pass has committed. A pass whose start is ahead of the
+  store's clock is refused, and its baseline age is clamped.
+- **Leases and quotas.** A busy store no longer reads as a lost lease
+  (renewal reports `OwnershipLost` only when fenced); the same owner
+  re-acquiring gets its lease back; a changed request quota is taken
+  over, audited as `quota_config_changed`, instead of failing every call.
+- **Recovery says why.** The recovery worker logs failed and unresolved
+  passes and counts failures (`schwab_recovery_failures_total`).
+- State schema 3 adds the armed marker, reservation scope and indexes.
+
 ### Changed — remaining review items
 
 - **Stream delivery.** Messages queued before an overflow or a reconnect

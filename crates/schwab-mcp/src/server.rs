@@ -960,7 +960,7 @@ impl SchwabMcp {
     /// `rationale` (at most 2000 characters) is why you are placing this
     /// order, kept in the trade journal for `get_trade_journal` and the
     /// operator's audit; it is never sent to the venue and does not
-    /// change the intent digest. `wait_ms` (at most 60000) holds the call
+    /// change the intent digest. `wait_ms` (at most 45000) holds the call
     /// for that long when the only thing missing is the operator's
     /// approval of this intent, instead of failing `approval_required`
     /// straight away; the order is submitted the moment the approval

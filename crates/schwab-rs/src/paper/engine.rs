@@ -830,7 +830,8 @@ impl PaperBroker {
                 )
                 .map_err(sql)?;
                 tx.execute(
-                    "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,?6,NULL)",
+                    "INSERT INTO submissions(id,account,operation,created_at,request,outcome) \
+                     VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
                         attempt,
                         account,
@@ -846,12 +847,15 @@ impl PaperBroker {
                 )
                 .map_err(sql)?;
                 tx.execute(
-                    "INSERT INTO reservations VALUES(?1,?2,?3,?4,'held')",
+                    "INSERT INTO reservations(id,account,quantity,notional,state,symbol,side) \
+                     VALUES(?1,?2,?3,?4,'held',?5,?6)",
                     params![
                         attempt,
                         account,
                         order.remaining_quantity.to_string(),
-                        order.reserved_cash.to_string()
+                        order.reserved_cash.to_string(),
+                        symbol(&order),
+                        if buy(&order) { "BUY" } else { "SELL" }
                     ],
                 )
                 .map_err(sql)?;

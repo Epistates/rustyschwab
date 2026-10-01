@@ -702,6 +702,8 @@ async fn a_submission_can_hold_for_an_approval_that_lands_out_of_band() {
     let approving = server.audit.clone();
     let landing = digest.clone();
     tokio::spawn(async move {
+        // Land after the hold has begun.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         approving
             .approve(
                 "paper-desk",

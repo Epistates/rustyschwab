@@ -62,6 +62,13 @@ enum DurableCommand {
         #[arg(long)]
         exported_through: i64,
     },
+    /// Delete terminal broker orders, their observed activity and released
+    /// risk reservations last seen before `--before-ms`. Working orders,
+    /// held reservations, spent tags and audit events are kept.
+    PruneHistory {
+        #[arg(long)]
+        before_ms: i64,
+    },
     Approve {
         principal: String,
         digest: String,
@@ -141,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
             "{}",
             journal.prune_resolved(before_ms, exported_through).await?
         ),
+        DurableCommand::PruneHistory { before_ms } => {
+            println!("{}", journal.prune_history(before_ms).await?)
+        }
         DurableCommand::Approve {
             principal,
             digest,

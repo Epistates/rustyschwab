@@ -14,6 +14,12 @@ groups:
         annotations:
           summary: A pending submission has a matching broker order without its tag; reconcile it with evidence
           runbook: docs/OPERATIONS.md
+      - alert: SchwabRecoveryFailing
+        expr: increase(schwab_recovery_failures_total[5m]) > 3
+        labels: {severity: warning}
+        annotations:
+          summary: Reconciliation passes keep failing; the recovery log names the account and cause
+          runbook: docs/OPERATIONS.md
       - alert: SchwabStreamLoss
         expr: increase(schwab_stream_dropped_messages_total[5m]) > 0
         labels: {severity: warning}

@@ -71,6 +71,29 @@ const MIGRATIONS: &[Migration] = &[
         sql: "INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(request,'$.tag') FROM submissions WHERE json_type(request,'$.tag')='text';
             DELETE FROM meta WHERE key='tags_imported';",
     },
+    // `armed` marks an intent whose request may have left this host; rows
+    // written before it existed are assumed armed. Reservations learn what
+    // they would buy or sell, so sells are judged per symbol and a
+    // replacement does not count the order it replaces. The indexes keep
+    // the risk check and reconciliation proportional to working orders
+    // rather than to history, and every tag Schwab is known to hold is
+    // spent.
+    Migration {
+        version: 3,
+        name: "armed_intents_reservation_scope",
+        sql: "ALTER TABLE submissions ADD COLUMN armed INTEGER NOT NULL DEFAULT 1;
+            ALTER TABLE reservations ADD COLUMN symbol TEXT;
+            ALTER TABLE reservations ADD COLUMN side TEXT;
+            ALTER TABLE reservations ADD COLUMN replaces TEXT;
+            UPDATE reservations SET
+              symbol=(SELECT json_extract(s.request,'$.orderLegCollection[0].instrument.symbol') FROM submissions s WHERE s.id=reservations.id),
+              side=(SELECT json_extract(s.request,'$.orderLegCollection[0].instruction') FROM submissions s WHERE s.id=reservations.id);
+            CREATE INDEX IF NOT EXISTS reservations_held ON reservations(account) WHERE state='held';
+            CREATE INDEX IF NOT EXISTS submissions_order ON submissions(account,json_extract(outcome,'$.order_id'));
+            CREATE INDEX IF NOT EXISTS orders_status ON orders(account,json_extract(payload,'$.status'));
+            CREATE INDEX IF NOT EXISTS orders_tag ON orders(account,json_extract(payload,'$.tag'));
+            INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(payload,'$.tag') FROM orders WHERE json_type(payload,'$.tag')='text';",
+    },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
@@ -211,7 +234,25 @@ impl StateDatabase {
         })
         .await
         .map_err(|_| Error::Storage("Restore worker failed".into()))??;
-        target.run(|c| integrity_check(c)).await?;
+        // A backup predates whatever reached the broker since it was taken:
+        // no account baseline in it may be trusted until reconciliation
+        // reads the broker again (and learns the order tags it now holds).
+        target
+            .run(|c| {
+                integrity_check(c)?;
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let accounts = tx.execute("UPDATE accounts SET valid=0", []).map_err(sql)?;
+                audit(
+                    &tx,
+                    "state_restored",
+                    "state",
+                    &serde_json::json!({"invalidated_accounts": accounts}),
+                )?;
+                tx.commit().map_err(sql)
+            })
+            .await?;
         Ok(target)
     }
 }
@@ -413,7 +454,8 @@ fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
             .map_err(sql)?;
         }
         tx.execute(
-            "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO submissions(id,account,operation,created_at,request,outcome,dedup_key) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
             rusqlite::params![
                 record.attempt_id,
                 record.account,

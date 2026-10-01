@@ -209,6 +209,57 @@ fn limit_order() -> OrderRequest {
     )
 }
 
+/// A caller that stops waiting abandons only the answer: the submission
+/// still runs to its outcome, so the account is not left blocked behind an
+/// intent nobody will finish.
+#[tokio::test]
+async fn an_abandoned_submission_still_records_its_outcome() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(
+            ResponseTemplate::new(201)
+                .insert_header(
+                    "Location",
+                    "https://api.schwabapi.com/trader/v1/accounts/hash/orders/4242",
+                )
+                .set_delay(Duration::from_millis(300)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (client, _dir, _) = client(&server, false);
+    let submission = tokio::spawn({
+        let client = client.clone();
+        async move { client.place_order("hash", &limit_order()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while server.received_requests().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    submission.abort();
+    let journal = client.order_journal();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(outcome) = journal.records().await.unwrap()[0].outcome.clone() {
+                return outcome;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        schwab_rs::execution::SubmissionOutcome::Accepted { order_id: Some(id) } if id == "4242"
+    ));
+    assert!(journal.records().await.unwrap()[0].armed);
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn cancelled_submission_remains_pending_on_restart() {
     let server = MockServer::start().await;
@@ -911,5 +962,28 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
             .await
             .is_err()
     );
+    // The refusal leaves no trace: no placeholder for reconciliation to
+    // chase, and the account still admits orders.
+    use schwab_rs::execution::ExecutionStore;
+    assert!(
+        !client
+            .order_journal()
+            .reconciliation_targets("hash")
+            .await
+            .unwrap()
+            .contains(&"99".to_string())
+    );
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://api.schwabapi.com/trader/v1/accounts/hash/orders/79",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut other = limit_order();
+    other.tag = Some("after-refusal".into());
+    client.place_order("hash", &other).await.unwrap();
     server.verify().await;
 }

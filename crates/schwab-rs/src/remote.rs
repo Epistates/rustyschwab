@@ -36,7 +36,25 @@ pub enum BackendRequest {
         id: String,
         outcome: SubmissionOutcome,
     },
+    Arm {
+        id: String,
+    },
     Records,
+    UnresolvedRecords {
+        account: String,
+    },
+    SubmissionByTag {
+        account: String,
+        tag: String,
+    },
+    ForgetPlaceholder {
+        account: String,
+        order_id: String,
+    },
+    TagSpent {
+        account: String,
+        tag: String,
+    },
     Invalidate {
         account: String,
         generation: u64,
@@ -101,6 +119,12 @@ pub enum BackendRequest {
         attempt_id: String,
         order: OrderRequest,
     },
+    ReserveReplacement {
+        account: String,
+        attempt_id: String,
+        order: OrderRequest,
+        replaces: String,
+    },
     Revalidate {
         account: String,
         attempt_id: String,
@@ -145,7 +169,20 @@ impl BackendRequest {
             Self::Finish { id, outcome } => {
                 serde_json::to_value(execution.finish(&id, outcome).await?)?
             }
+            Self::Arm { id } => serde_json::to_value(execution.arm(&id).await?)?,
             Self::Records => serde_json::to_value(execution.records().await?)?,
+            Self::UnresolvedRecords { account } => {
+                serde_json::to_value(execution.unresolved_records(&account).await?)?
+            }
+            Self::SubmissionByTag { account, tag } => {
+                serde_json::to_value(execution.submission_by_tag(&account, &tag).await?)?
+            }
+            Self::ForgetPlaceholder { account, order_id } => {
+                serde_json::to_value(execution.forget_placeholder(&account, &order_id).await?)?
+            }
+            Self::TagSpent { account, tag } => {
+                serde_json::to_value(execution.tag_spent(&account, &tag).await?)?
+            }
             Self::Invalidate {
                 account,
                 generation,
@@ -205,6 +242,15 @@ impl BackendRequest {
                 attempt_id,
                 order,
             } => serde_json::to_value(risk.reserve(&account, &attempt_id, &order).await?)?,
+            Self::ReserveReplacement {
+                account,
+                attempt_id,
+                order,
+                replaces,
+            } => serde_json::to_value(
+                risk.reserve_replacement(&account, &attempt_id, &order, &replaces)
+                    .await?,
+            )?,
             Self::Revalidate {
                 account,
                 attempt_id,
@@ -385,8 +431,42 @@ impl ExecutionStore for RemoteBackend {
         })
         .await
     }
+    async fn arm(&self, id: &str) -> Result<()> {
+        self.call(&BackendRequest::Arm { id: id.to_owned() }).await
+    }
     async fn records(&self) -> Result<Vec<SubmissionRecord>> {
         self.call(&BackendRequest::Records).await
+    }
+    async fn unresolved_records(&self, account: &str) -> Result<Vec<SubmissionRecord>> {
+        self.call(&BackendRequest::UnresolvedRecords {
+            account: account.to_owned(),
+        })
+        .await
+    }
+    async fn submission_by_tag(
+        &self,
+        account: &str,
+        tag: &str,
+    ) -> Result<Option<SubmissionRecord>> {
+        self.call(&BackendRequest::SubmissionByTag {
+            account: account.to_owned(),
+            tag: tag.to_owned(),
+        })
+        .await
+    }
+    async fn tag_spent(&self, account: &str, tag: &str) -> Result<bool> {
+        self.call(&BackendRequest::TagSpent {
+            account: account.to_owned(),
+            tag: tag.to_owned(),
+        })
+        .await
+    }
+    async fn forget_placeholder(&self, account: &str, order_id: &str) -> Result<bool> {
+        self.call(&BackendRequest::ForgetPlaceholder {
+            account: account.to_owned(),
+            order_id: order_id.to_owned(),
+        })
+        .await
     }
     async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
         self.call(&BackendRequest::Invalidate {
@@ -529,6 +609,21 @@ impl RiskProvider for RemoteBackend {
             account: account.to_owned(),
             attempt_id: attempt_id.to_owned(),
             order: order.clone(),
+        })
+        .await
+    }
+    async fn reserve_replacement(
+        &self,
+        account: &str,
+        attempt_id: &str,
+        order: &OrderRequest,
+        replaces: &str,
+    ) -> Result<()> {
+        self.call(&BackendRequest::ReserveReplacement {
+            account: account.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            order: order.clone(),
+            replaces: replaces.to_owned(),
         })
         .await
     }

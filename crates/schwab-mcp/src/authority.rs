@@ -347,6 +347,9 @@ fn response(result: Result<Value, Denial>) -> Response {
         }
     }
 }
+/// The least credential lifetime a gateway submission must have left: room
+/// for the SDK's own deadline and an answer.
+const MIN_DISPATCH_ALLOWANCE: Duration = Duration::from_secs(15);
 fn allowance(identity: &ServiceIdentity) -> Duration {
     Duration::from_secs(
         identity
@@ -609,6 +612,25 @@ async fn order(
                 }
             }
             let audit = state.journal(&principal.name);
+            if !cancel {
+                use schwab_rs::execution::ExecutionStore;
+                // An earlier dispatch interrupted by a process exit would
+                // block this one (and may hold its approval): settle it
+                // first, from the venue's journal, where that decides it.
+                let venue = state.client.execution_store();
+                for record in audit
+                    .unresolved_records(&principal.name)
+                    .await
+                    .unwrap_or_default()
+                {
+                    if let Err(e) =
+                        crate::journal::settle_stranded(&audit, venue.as_ref(), &record.attempt_id)
+                            .await
+                    {
+                        tracing::warn!(attempt = %record.attempt_id, error = %e, "could not settle a stranded dispatch");
+                    }
+                }
+            }
             let digest = intent_digest(tool, &args);
             principal.approved_intents.clear();
             if audit.is_approved(&principal.name, &digest).await? {
@@ -652,6 +674,12 @@ async fn order(
             } else {
                 principal.name.clone()
             };
+            // A submission that cannot finish inside the caller's
+            // credential is refused before it is audited, not abandoned
+            // after.
+            if allowance(&identity) < MIN_DISPATCH_ALLOWANCE {
+                return Err(StatusCode::UNAUTHORIZED.into());
+            }
             let attempt = audit
                 .begin_once(
                     &scope,
@@ -660,61 +688,76 @@ async fn order(
                     Some(key),
                 )
                 .await?;
-            // After durable dispatch intent, all interruption paths remain pending.
-            let execute = async {
+            // From the audit record on, the dispatch runs on its own task:
+            // a caller that disconnects or times out abandons only the
+            // answer, and the record still reaches its outcome.
+            let client = state.client.clone();
+            let account = request.account_hash.clone();
+            let lease = request.lease.clone();
+            let execute = async move {
                 match request.action {
-                    GatewayAction::Place { order } => state
-                        .client
-                        .place_order_fenced(
-                            &request.account_hash,
-                            &order,
-                            request.lease.as_ref().unwrap(),
-                        )
+                    GatewayAction::Place { order } => client
+                        .place_order_fenced(&account, &order, lease.as_ref().unwrap())
                         .await
                         .map(Some),
-                    GatewayAction::Replace { order_id, order } => state
-                        .client
-                        .replace_order_fenced(
-                            &request.account_hash,
-                            &order_id,
-                            &order,
-                            request.lease.as_ref().unwrap(),
-                        )
+                    GatewayAction::Replace { order_id, order } => client
+                        .replace_order_fenced(&account, &order_id, &order, lease.as_ref().unwrap())
                         .await
                         .map(Some),
-                    GatewayAction::Cancel { order_id } => state
-                        .client
-                        .cancel_order(&request.account_hash, &order_id)
+                    GatewayAction::Cancel { order_id } => client
+                        .cancel_order(&account, &order_id)
                         .await
                         .map(|_| None),
                 }
             };
-            match tokio::time::timeout(allowance(&identity), execute).await {
-                Ok(Ok(result)) => {
-                    let outcome = SubmissionOutcome::Accepted {
-                        order_id: result.as_ref().and_then(|r| r.order_id.clone()),
-                    };
-                    if audit.finish(&attempt, outcome).await.is_err() {
-                        return Ok(json!({"mode":state.client.mode(),"status":"unknown","attempt_id":attempt}));
+            let mode = state.client.mode();
+            let finish = {
+                let audit = audit.clone();
+                let attempt = attempt.clone();
+                async move {
+                    let result = execute.await;
+                    match &result {
+                        Ok(result) => {
+                            let outcome = SubmissionOutcome::Accepted {
+                                order_id: result.as_ref().and_then(|r| r.order_id.clone()),
+                            };
+                            let recorded = audit.finish(&attempt, outcome).await.is_ok();
+                            (Ok(result.clone()), recorded)
+                        }
+                        Err(error)
+                            if !matches!(error, schwab_rs::Error::SubmissionUnknown { .. })
+                                && !(cancel && error.is_retryable()) =>
+                        {
+                            let recorded = audit
+                                .finish(&attempt, SubmissionOutcome::Rejected)
+                                .await
+                                .is_ok();
+                            // Refused before anything reached the broker: as
+                            // on the MCP path, the approval is not spent.
+                            if recorded
+                                && consumes_approval
+                                && crate::contract::refusal_keeps_approval(error.kind())
+                                && let Err(e) = audit.refund_approval(&attempt).await
+                            {
+                                tracing::warn!(%attempt, error = %e, "approval refund failed; it stays spent");
+                            }
+                            (result, recorded)
+                        }
+                        Err(_) => (result, false),
                     }
-                    Ok(json!({"mode":state.client.mode(),"status":"accepted","attempt_id":attempt,"result":result}))
                 }
-                Ok(Err(error))
-                    if !matches!(error, schwab_rs::Error::SubmissionUnknown { .. })
-                        && !(cancel && error.is_retryable()) =>
-                {
-                    audit.finish(&attempt, SubmissionOutcome::Rejected).await?;
-                    // Refused before anything reached the broker: as on the
-                    // MCP path, the approval is not spent.
-                    if consumes_approval
-                        && crate::contract::refusal_keeps_approval(error.kind())
-                        && let Err(e) = audit.refund_approval(&attempt).await
-                    {
-                        tracing::warn!(%attempt, error = %e, "approval refund failed; it stays spent");
-                    }
-                    Ok(json!({"mode":state.client.mode(),"status":"rejected","attempt_id":attempt,"error":envelope(&error)}))
+            };
+            let task = tokio::spawn(finish);
+            match tokio::time::timeout(allowance(&identity), task).await {
+                Ok(Ok((Ok(result), true))) => {
+                    Ok(json!({"mode":mode,"status":"accepted","attempt_id":attempt,"result":result}))
                 }
-                _ => Ok(json!({"mode":state.client.mode(),"status":"unknown","attempt_id":attempt})),
+                Ok(Ok((Err(error), true))) => {
+                    Ok(json!({"mode":mode,"status":"rejected","attempt_id":attempt,"error":envelope(&error)}))
+                }
+                // Ambiguous, unrecorded, or still running past the caller's
+                // credential: the record settles on its own task.
+                _ => Ok(json!({"mode":mode,"status":"unknown","attempt_id":attempt})),
             }
         }
         .await,

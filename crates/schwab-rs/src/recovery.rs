@@ -73,6 +73,20 @@ impl RecoveryWorker {
                         .reconcile_account_with_options(account, current, options)
                         .await
                     {
+                        // A newer pass (another worker's) committed first:
+                        // its verdict is the account's.
+                        Ok(report) if report.superseded => {
+                            let reconciled = client
+                                .execution_store()
+                                .account_state(account)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|s| s.reconciled);
+                            if !reconciled {
+                                pending.push(account.clone());
+                            }
+                        }
                         // The scan completed, so the window may advance even
                         // if intents remain unresolved: they widen it anyway.
                         Ok(report) => {
@@ -83,11 +97,24 @@ impl RecoveryWorker {
                                 full.insert(account.clone(), started);
                             }
                             if !report.reconciled {
+                                tracing::warn!(
+                                    account = %crate::utils::mask_account(account),
+                                    unresolved = report.unresolved_attempts.len(),
+                                    "Account has unresolved submissions; trading waits for reconciliation"
+                                );
                                 pending.push(account.clone());
                             }
                         }
                         // An incomplete scan leaves the window where it was.
-                        Err(_) => pending.push(account.clone()),
+                        Err(error) => {
+                            metrics::counter!(crate::metrics::RECOVERY_FAILURES_TOTAL).increment(1);
+                            tracing::warn!(
+                                account = %crate::utils::mask_account(account),
+                                %error,
+                                "Reconciliation pass failed; the account is not ready"
+                            );
+                            pending.push(account.clone());
+                        }
                     }
                 }
                 let ready = pending.is_empty();

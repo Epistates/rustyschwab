@@ -123,6 +123,86 @@ impl Dispatch {
     }
 }
 
+/// How long a principal's audit record may stay unresolved before it is
+/// judged stranded. A dispatch runs on its own task, so only a process that
+/// died mid-dispatch leaves one; its venue journal has an intent within
+/// seconds of the audit record, so this is ample.
+pub const STRANDED_AFTER: Duration = Duration::minutes(2);
+
+const STRANDED: &str = "Dispatch interrupted; settled from the venue journal";
+
+/// Settle `attempt_id`, a principal audit record its dispatch never
+/// finished (the process died mid-dispatch), from what the venue's own
+/// journal knows of the order tag it carried:
+///
+/// - the venue resolved its intent: the record is settled with that outcome;
+/// - the venue's intent is still unresolved: nothing is settled, since the
+///   order may exist (venue reconciliation resolves it, and a later call
+///   settles this record);
+/// - the tag is spent with no intent (the venue holds an order under it):
+///   settled as such;
+/// - the tag was never spent: nothing reached the venue. Settled, and a
+///   one-use approval it consumed is given back.
+///
+/// Returns whether the record was settled; a record that is not stranded,
+/// is younger than [`STRANDED_AFTER`], or carries no order tag is left
+/// alone.
+pub async fn settle_stranded(
+    audit: &OrderJournal,
+    venue: &dyn schwab_rs::execution::ExecutionStore,
+    attempt_id: &str,
+) -> schwab_rs::Result<bool> {
+    let Some(record) = audit.record(attempt_id).await? else {
+        return Ok(false);
+    };
+    let age = Utc::now().timestamp_millis() - record.created_at;
+    if record.outcome.is_some() || age < STRANDED_AFTER.num_milliseconds() {
+        return Ok(false);
+    }
+    let arguments = &record.request["arguments"];
+    let (Some(account), Some(tag)) = (
+        arguments.get("account_hash").and_then(Value::as_str),
+        arguments.pointer("/order/tag").and_then(Value::as_str),
+    ) else {
+        return Ok(false);
+    };
+    let (evidence, refund) = match venue.submission_by_tag(account, tag).await? {
+        Some(intent) => match intent.outcome {
+            None => return Ok(false),
+            Some(outcome) => (
+                format!(
+                    "{STRANDED}: venue attempt {} {}",
+                    intent.attempt_id,
+                    serde_json::to_string(&outcome)?
+                ),
+                false,
+            ),
+        },
+        None if venue.tag_spent(account, tag).await? => (
+            format!("{STRANDED}: the venue holds an order tagged {tag}"),
+            false,
+        ),
+        None => (format!("{STRANDED}: nothing reached the venue"), true),
+    };
+    audit
+        .finish(attempt_id, SubmissionOutcome::Reconciled { evidence })
+        .await?;
+    // Only an approval digest is given back; a gateway idempotency key
+    // stays spent.
+    let approval = record
+        .dedup_key
+        .as_deref()
+        .is_some_and(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()));
+    if refund
+        && approval
+        && let Err(e) = audit.refund_approval(attempt_id).await
+    {
+        tracing::warn!(attempt = %attempt_id, error = %e, "approval refund failed; it stays spent");
+    }
+    tracing::warn!(attempt = %attempt_id, "settled an interrupted dispatch from the venue journal");
+    Ok(true)
+}
+
 /// `get_trade_journal` arguments, the shape of the tool's signature, so
 /// the authorized transport extracts them from raw arguments exactly as
 /// the `#[tool]` macro does.
@@ -516,6 +596,7 @@ mod tests {
             created_at: at,
             outcome,
             dedup_key: None,
+            armed: true,
         }
     }
 

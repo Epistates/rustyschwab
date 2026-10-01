@@ -16,18 +16,31 @@ use std::collections::HashMap;
 
 const SELECT_ACCOUNT_BASELINE: &str =
     "SELECT observed_at,valid,snapshot FROM accounts WHERE account=?1";
-const SELECT_HELD_RESERVATION: &str =
-    "SELECT quantity,notional FROM reservations WHERE id=?1 AND account=?2 AND state='held'";
-/// Every held reservation for the account except (when revalidating) our own.
-const SELECT_OTHER_HELD_RESERVATIONS: &str = "SELECT quantity,notional FROM reservations \
-     WHERE account=?1 AND state='held' AND (NOT ?2 OR id<>?3)";
-/// Broker orders for the account that no held local reservation is linked to.
+const SELECT_HELD_RESERVATION: &str = "SELECT quantity,notional,replaces FROM reservations \
+     WHERE id=?1 AND account=?2 AND state='held'";
+/// Every held reservation for the account except (when revalidating) our
+/// own and the one for the order `?4` replaces, with what it would buy or
+/// sell. Rows from before reservations kept their scope have no symbol or
+/// side and count against every check.
+const SELECT_OTHER_HELD_RESERVATIONS: &str = "SELECT r.quantity,r.notional,r.symbol,r.side \
+     FROM reservations r WHERE r.account=?1 AND r.state='held' AND (NOT ?2 OR r.id<>?3) \
+       AND NOT (?4 IS NOT NULL AND EXISTS(SELECT 1 FROM submissions s WHERE s.id=r.id \
+         AND s.account=r.account AND json_extract(s.outcome,'$.order_id')=?4))";
+/// Working broker orders for the account, except the one `?2` replaces,
+/// that no held local reservation is linked to. Terminal orders are skipped
+/// in SQL through the status index, so the check grows with working orders,
+/// not with history.
 const SELECT_UNRESERVED_BROKER_ORDERS: &str = "SELECT o.payload FROM orders o \
-     WHERE o.account=?1 AND NOT EXISTS(\
-       SELECT 1 FROM reservations r JOIN submissions s ON s.id=r.id \
-       WHERE r.state='held' AND s.account=o.account \
-         AND json_extract(s.outcome,'$.order_id')=o.order_id)";
-const INSERT_HELD_RESERVATION: &str = "INSERT INTO reservations VALUES(?1,?2,?3,?4,'held')";
+     WHERE o.account=?1 AND (?2 IS NULL OR o.order_id<>?2) \
+       AND (json_extract(o.payload,'$.status') IS NULL \
+         OR json_extract(o.payload,'$.status') \
+           NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')) \
+       AND NOT EXISTS(SELECT 1 FROM reservations r JOIN submissions s ON s.id=r.id \
+         WHERE r.state='held' AND s.account=o.account \
+           AND json_extract(s.outcome,'$.order_id')=o.order_id)";
+const INSERT_HELD_RESERVATION: &str = "INSERT INTO \
+     reservations(id,account,quantity,notional,state,symbol,side,replaces) \
+     VALUES(?1,?2,?3,?4,'held',?5,?6,?7)";
 /// Audit subject of a halt the daily-loss control trips, live or paper.
 pub const DAILY_LOSS_CONTROL: &str = "daily-loss-control";
 
@@ -35,6 +48,20 @@ pub const DAILY_LOSS_CONTROL: &str = "daily-loss-control";
 pub trait RiskProvider: Send + Sync {
     /// Atomically reserve exposure. Implementations must retain it on unknown outcomes.
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()>;
+    /// Reserve exposure for `order` replacing broker order `replaces`.
+    /// Schwab cancels the old order and creates the new one atomically, so
+    /// a provider that can tell the two apart should not count both; the
+    /// default counts both, which only over-reserves.
+    async fn reserve_replacement(
+        &self,
+        account: &str,
+        attempt_id: &str,
+        order: &OrderRequest,
+        replaces: &str,
+    ) -> Result<()> {
+        let _ = replaces;
+        self.reserve(account, attempt_id, order).await
+    }
     /// The account's baseline was just reconciled. Providers with a
     /// daily-loss control judge it here, so a breach halts submissions before
     /// the next order rather than at it; the default observes nothing.
@@ -69,11 +96,22 @@ pub trait RiskProvider: Send + Sync {
     /// Release only after a definite rejection or authoritative terminal broker state.
     async fn release(&self, attempt_id: &str) -> Result<()>;
 }
+/// Per-account limits for [`PortfolioRisk`].
+///
+/// The open-order caps and available funds bound what working buy orders
+/// could still add to the account. A sell is bounded by what it could sell:
+/// the symbol's long position less the symbol's other working sells. Selling
+/// what the account holds only reduces exposure, so sells do not draw on the
+/// open-order caps or funds.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortfolioLimits {
+    /// Shares all working buy orders on the account may still buy.
     pub max_open_quantity: Decimal,
+    /// Notional (quantity × limit) of all working buy orders on the account.
     pub max_open_notional: Decimal,
+    /// The most shares of one symbol the account may hold once its working
+    /// buys fill.
     pub max_position_quantity: Decimal,
     #[serde(default = "max_age")]
     pub max_snapshot_age_ms: i64,
@@ -132,14 +170,76 @@ pub(crate) fn daily_loss_reason(
          {measure} {start} at the open, {current} now"
     )
 }
+/// What one working order or reservation could still do to the account.
+/// `symbol` and `sell` are unknown for reservations from before they were
+/// recorded; such an exposure counts against every symbol and both sides.
+struct Exposure {
+    symbol: Option<String>,
+    sell: Option<bool>,
+    quantity: Decimal,
+    notional: Decimal,
+}
+impl Exposure {
+    fn may_buy(&self) -> bool {
+        self.sell != Some(true)
+    }
+    fn may_sell(&self) -> bool {
+        self.sell != Some(false)
+    }
+    fn touches(&self, symbol: &str) -> bool {
+        self.symbol.as_deref().is_none_or(|s| s == symbol)
+    }
+}
+/// Totals over the account's other working orders that the new one is
+/// judged against.
+#[derive(Default)]
+struct Outstanding {
+    buy_quantity: Decimal,
+    buy_notional: Decimal,
+    symbol_buys: Decimal,
+    symbol_sells: Decimal,
+}
+impl Outstanding {
+    fn add(&mut self, exposure: &Exposure, symbol: &str) -> Result<()> {
+        let overflow = || Error::Storage("Risk total overflow".into());
+        if exposure.may_buy() {
+            self.buy_quantity = self
+                .buy_quantity
+                .checked_add(exposure.quantity)
+                .ok_or_else(overflow)?;
+            self.buy_notional = self
+                .buy_notional
+                .checked_add(exposure.notional)
+                .ok_or_else(overflow)?;
+            if exposure.touches(symbol) {
+                self.symbol_buys = self
+                    .symbol_buys
+                    .checked_add(exposure.quantity)
+                    .ok_or_else(overflow)?;
+            }
+        }
+        if exposure.may_sell() && exposure.touches(symbol) {
+            self.symbol_sells = self
+                .symbol_sells
+                .checked_add(exposure.quantity)
+                .ok_or_else(overflow)?;
+        }
+        Ok(())
+    }
+}
+/// The cash a buy may draw on: a margin account's `availableFunds`, or a
+/// cash account's `cashAvailableForTrading` (it has no `availableFunds`).
+fn available_funds(account: &serde_json::Value) -> Option<Decimal> {
+    decimal(account.pointer("/currentBalances/availableFunds"))
+        .or_else(|| decimal(account.pointer("/currentBalances/cashAvailableForTrading")))
+}
 impl PortfolioRisk {
     async fn validate_and_reserve(
         &self,
         account: &str,
         attempt_id: &str,
         order: &OrderRequest,
-        revalidate: bool,
-        fence: Option<Lease>,
+        check: Check,
     ) -> Result<()> {
         order.validate()?;
         let limits = self
@@ -191,6 +291,7 @@ impl PortfolioRisk {
             .checked_mul(price)
             .ok_or_else(|| Error::InvalidParameter("Risk arithmetic overflow".into()))?;
         let sell = leg.instruction == OrderInstruction::Sell;
+        let side = if sell { "SELL" } else { "BUY" };
         let symbol = leg.instrument.symbol.clone();
         let account = account.to_owned();
         let id = attempt_id.to_owned();
@@ -213,9 +314,10 @@ impl PortfolioRisk {
                 let (at, valid, body) =
                     state.ok_or_else(|| stale("Account requires reconciliation before trading"))?;
                 let now = chrono::Utc::now().timestamp_millis();
+                let revalidate = !matches!(check, Check::Reserve { .. });
                 if revalidate {
                     ensure_not_halted(&tx)?;
-                    if let Some(lease) = &fence
+                    if let Check::Revalidate { fence: Some(lease) } = &check
                         && !lease_held(&tx, lease)?
                     {
                         return Err(Error::OwnershipLost);
@@ -245,8 +347,6 @@ impl PortfolioRisk {
                         return Err(Error::Halted(reason));
                     }
                 }
-                let funds = decimal(account_value.pointer("/currentBalances/availableFunds"))
-                    .ok_or_else(|| stale("Available funds missing from risk baseline"))?;
                 let position = account_value
                     .get("positions")
                     .and_then(serde_json::Value::as_array)
@@ -263,87 +363,126 @@ impl PortfolioRisk {
                         sum.checked_add(quantity)
                             .ok_or_else(|| stale("Position arithmetic overflow"))
                     })?;
-                if revalidate {
-                    let held: Option<(String, String)> = tx
-                        .query_row(
-                            SELECT_HELD_RESERVATION,
-                            rusqlite::params![id, account],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
-                        )
-                        .optional()
-                        .map_err(sql)?;
-                    if held != Some((quantity.to_string(), notional.to_string())) {
-                        return Err(Error::Storage(
-                            "Dispatch reservation missing or changed".into(),
-                        ));
+                let replaces = match &check {
+                    Check::Reserve { replaces } => replaces.clone(),
+                    Check::Revalidate { .. } => {
+                        let held: Option<(String, String, Option<String>)> = tx
+                            .query_row(
+                                SELECT_HELD_RESERVATION,
+                                rusqlite::params![id, account],
+                                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                            )
+                            .optional()
+                            .map_err(sql)?;
+                        match held {
+                            Some((q, n, replaces))
+                                if q == quantity.to_string() && n == notional.to_string() =>
+                            {
+                                replaces
+                            }
+                            _ => {
+                                return Err(Error::Storage(
+                                    "Dispatch reservation missing or changed".into(),
+                                ));
+                            }
+                        }
                     }
-                }
+                };
+                let invalid = || Error::Storage("Invalid risk reservation".into());
+                let mut outstanding = Outstanding::default();
                 let mut stmt = tx.prepare(SELECT_OTHER_HELD_RESERVATIONS).map_err(sql)?;
                 let rows = stmt
-                    .query_map(rusqlite::params![account, revalidate, id], |r| {
-                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    .query_map(rusqlite::params![account, revalidate, id, replaces], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
                     })
                     .map_err(sql)?;
-                let mut open_q = Decimal::ZERO;
-                let mut open_n = Decimal::ZERO;
                 for row in rows {
-                    let (q, n) = row.map_err(sql)?;
-                    let q: Decimal = q
-                        .parse()
-                        .map_err(|_| Error::Storage("Invalid risk reservation".into()))?;
-                    let n: Decimal = n
-                        .parse()
-                        .map_err(|_| Error::Storage("Invalid risk reservation".into()))?;
-                    open_q = open_q
-                        .checked_add(q)
-                        .ok_or_else(|| Error::Storage("Risk total overflow".into()))?;
-                    open_n = open_n
-                        .checked_add(n)
-                        .ok_or_else(|| Error::Storage("Risk total overflow".into()))?;
+                    let (q, n, symbol_held, side_held) = row.map_err(sql)?;
+                    let exposure = Exposure {
+                        sell: side_held.map(|s| s == "SELL"),
+                        symbol: symbol_held,
+                        quantity: q.parse().map_err(|_| invalid())?,
+                        notional: n.parse().map_err(|_| invalid())?,
+                    };
+                    outstanding.add(&exposure, &symbol)?;
                 }
                 drop(stmt);
                 // Include broker orders from all writers. Locally held, positively
                 // linked orders are already reserved; do not count them twice.
                 let mut orders = tx.prepare(SELECT_UNRESERVED_BROKER_ORDERS).map_err(sql)?;
                 for row in orders
-                    .query_map([&account], |r| r.get::<_, String>(0))
+                    .query_map(rusqlite::params![account, replaces], |r| {
+                        r.get::<_, String>(0)
+                    })
                     .map_err(sql)?
                 {
                     let order: serde_json::Value = serde_json::from_str(&row.map_err(sql)?)?;
-                    let (q, n) = external_exposure(&order)?;
-                    open_q = open_q
-                        .checked_add(q)
-                        .ok_or_else(|| Error::Storage("External quantity overflow".into()))?;
-                    open_n = open_n
-                        .checked_add(n)
-                        .ok_or_else(|| Error::Storage("External notional overflow".into()))?;
+                    outstanding.add(&external_exposure(&order)?, &symbol)?;
                 }
                 drop(orders);
-                let projected_q = open_q
-                    .checked_add(quantity)
-                    .ok_or_else(|| Error::RiskDenied("Risk quantity overflow".into()))?;
-                let projected_n = open_n
-                    .checked_add(notional)
-                    .ok_or_else(|| Error::RiskDenied("Risk notional overflow".into()))?;
-                let buy_exceeds = !sell
-                    && (projected_n > funds
-                        || position
-                            .checked_add(projected_q)
-                            .is_none_or(|v| v > limits.max_position_quantity));
-                let sell_exceeds = sell && projected_q > position;
-                if projected_q > limits.max_open_quantity
-                    || projected_n > limits.max_open_notional
-                    || buy_exceeds
-                    || sell_exceeds
-                {
-                    return Err(Error::RiskDenied(
-                        "Portfolio or outstanding-order limit exceeded".into(),
-                    ));
+                let denied = |what: &str| {
+                    Err(Error::RiskDenied(format!(
+                        "{what} limit exceeded for this account"
+                    )))
+                };
+                let overflow = || Error::RiskDenied("Risk arithmetic overflow".into());
+                if sell {
+                    // Only what the account holds and has not already
+                    // offered may be sold.
+                    let offered = outstanding
+                        .symbol_sells
+                        .checked_add(quantity)
+                        .ok_or_else(overflow)?;
+                    if offered > position {
+                        return Err(Error::RiskDenied(
+                            "Sell exceeds the position less the symbol's working sells".into(),
+                        ));
+                    }
+                } else {
+                    let funds = available_funds(account_value)
+                        .ok_or_else(|| stale("Available funds missing from risk baseline"))?;
+                    let buy_quantity = outstanding
+                        .buy_quantity
+                        .checked_add(quantity)
+                        .ok_or_else(overflow)?;
+                    let buy_notional = outstanding
+                        .buy_notional
+                        .checked_add(notional)
+                        .ok_or_else(overflow)?;
+                    let holding = position
+                        .checked_add(outstanding.symbol_buys)
+                        .and_then(|v| v.checked_add(quantity))
+                        .ok_or_else(overflow)?;
+                    if buy_quantity > limits.max_open_quantity {
+                        return denied("Open buy quantity");
+                    }
+                    if buy_notional > limits.max_open_notional {
+                        return denied("Open buy notional");
+                    }
+                    if buy_notional > funds {
+                        return denied("Available funds");
+                    }
+                    if holding > limits.max_position_quantity {
+                        return denied("Position quantity");
+                    }
                 }
                 if !revalidate {
                     tx.execute(
                         INSERT_HELD_RESERVATION,
-                        rusqlite::params![id, account, quantity.to_string(), notional.to_string()],
+                        rusqlite::params![
+                            id,
+                            account,
+                            quantity.to_string(),
+                            notional.to_string(),
+                            symbol,
+                            side,
+                            replaces
+                        ],
                     )
                     .map_err(sql)?;
                     crate::storage::audit(
@@ -352,7 +491,10 @@ impl PortfolioRisk {
                         &id,
                         &serde_json::json!({
                             "quantity": quantity.to_string(),
-                            "notional": notional.to_string()
+                            "notional": notional.to_string(),
+                            "symbol": symbol,
+                            "side": side,
+                            "replaces": replaces,
                         }),
                     )?;
                 }
@@ -362,10 +504,35 @@ impl PortfolioRisk {
             .await
     }
 }
+/// What [`PortfolioRisk::validate_and_reserve`] is asked to do.
+enum Check {
+    /// Reserve a new order's exposure, replacing broker order `replaces`
+    /// if set.
+    Reserve { replaces: Option<String> },
+    /// Recheck the held reservation just before transmission, inside the
+    /// dispatch fence if one is given.
+    Revalidate { fence: Option<Lease> },
+}
 #[async_trait]
 impl RiskProvider for PortfolioRisk {
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()> {
-        self.validate_and_reserve(account, attempt_id, order, false, None)
+        self.validate_and_reserve(
+            account,
+            attempt_id,
+            order,
+            Check::Reserve { replaces: None },
+        )
+        .await
+    }
+    async fn reserve_replacement(
+        &self,
+        account: &str,
+        attempt_id: &str,
+        order: &OrderRequest,
+        replaces: &str,
+    ) -> Result<()> {
+        let replaces = Some(replaces.to_owned());
+        self.validate_and_reserve(account, attempt_id, order, Check::Reserve { replaces })
             .await
     }
     /// Trips the halt as soon as a reconciled baseline shows the day's loss
@@ -419,8 +586,13 @@ impl RiskProvider for PortfolioRisk {
         attempt_id: &str,
         order: &OrderRequest,
     ) -> Result<()> {
-        self.validate_and_reserve(account, attempt_id, order, true, None)
-            .await
+        self.validate_and_reserve(
+            account,
+            attempt_id,
+            order,
+            Check::Revalidate { fence: None },
+        )
+        .await
     }
     async fn revalidate_fenced(
         &self,
@@ -429,7 +601,8 @@ impl RiskProvider for PortfolioRisk {
         order: &OrderRequest,
         lease: &Lease,
     ) -> Result<()> {
-        self.validate_and_reserve(account, attempt_id, order, true, Some(lease.clone()))
+        let fence = Some(lease.clone());
+        self.validate_and_reserve(account, attempt_id, order, Check::Revalidate { fence })
             .await
     }
     async fn release(&self, attempt_id: &str) -> Result<()> {
@@ -437,7 +610,7 @@ impl RiskProvider for PortfolioRisk {
         self.database
             .run(move |c| {
                 c.execute(
-                    "UPDATE reservations SET state='released' WHERE id=?1",
+                    "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'",
                     [&id],
                 )
                 .map_err(sql)?;
@@ -447,15 +620,21 @@ impl RiskProvider for PortfolioRisk {
     }
 }
 
-/// Conservative gross exposure for broker orders not covered by local holds.
-fn external_exposure(order: &serde_json::Value) -> Result<(Decimal, Decimal)> {
+/// Conservative exposure for broker orders not covered by local holds:
+/// what their unfilled remainder could still buy or sell.
+fn external_exposure(order: &serde_json::Value) -> Result<Exposure> {
     let deny =
         || Error::RiskDenied("External open order needs a supported, bounded risk model".into());
     if matches!(
         order.get("status").and_then(|v| v.as_str()),
         Some("FILLED" | "CANCELED" | "REJECTED" | "EXPIRED" | "REPLACED")
     ) {
-        return Ok((Decimal::ZERO, Decimal::ZERO));
+        return Ok(Exposure {
+            symbol: None,
+            sell: None,
+            quantity: Decimal::ZERO,
+            notional: Decimal::ZERO,
+        });
     }
     if order.get("status").and_then(|v| v.as_str()).is_none()
         || order.get("orderStrategyType").and_then(|v| v.as_str()) != Some("SINGLE")
@@ -500,5 +679,16 @@ fn external_exposure(order: &serde_json::Value) -> Result<(Decimal, Decimal)> {
     {
         return Err(deny());
     }
-    Ok((remaining, remaining.checked_mul(price).ok_or_else(deny)?))
+    Ok(Exposure {
+        symbol: Some(
+            legs[0]
+                .pointer("/instrument/symbol")
+                .and_then(|v| v.as_str())
+                .ok_or_else(deny)?
+                .to_owned(),
+        ),
+        sell: Some(legs[0].get("instruction").and_then(|v| v.as_str()) == Some("SELL")),
+        quantity: remaining,
+        notional: remaining.checked_mul(price).ok_or_else(deny)?,
+    })
 }

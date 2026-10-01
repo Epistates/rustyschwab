@@ -251,8 +251,8 @@ submission, and a `duplicate_intent` is only detected there.
 
 When the approval is the only thing missing, `place_order` and
 `replace_order` can hold for it instead of failing and being retried:
-`wait_ms` (at most 60000, half the 120-second ceiling both network
-transports put on a request) polls the durable approval store and submits
+`wait_ms` (at most 45000, under the 60-second request timeout common MCP
+clients default to) polls the durable approval store and submits
 the moment an operator grants that digest. It holds for nothing else, so a
 `risk_denied` or an argument the model must fix comes back at once, and
 the hold happens before anything is audited or dispatched: a call that ends

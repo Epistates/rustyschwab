@@ -88,22 +88,43 @@ impl Coordinator for StateDatabase {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            tx.execute(
-                "INSERT OR IGNORE INTO quota_config VALUES(?1,?2,?3)",
-                params![key, rps, burst],
-            )
-            .map_err(sql)?;
-            let config: (u32, u32) = tx
+            // The configured rate is the credential's; a process started
+            // with a new one takes it over, audited, rather than every
+            // request failing until someone edits the state file. Two
+            // processes that disagree show up as alternating changes.
+            let config: Option<(u32, u32)> = tx
                 .query_row(
                     "SELECT per_second,burst FROM quota_config WHERE key=?1",
                     [&key],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
+                .optional()
                 .map_err(sql)?;
-            if config != (rps, burst) {
-                return Err(Error::Config(
-                    "Credential quota configuration conflicts with durable configuration".into(),
-                ));
+            if config != Some((rps, burst)) {
+                tx.execute(
+                    "INSERT INTO quota_config VALUES(?1,?2,?3) ON CONFLICT(key) \
+                     DO UPDATE SET per_second=excluded.per_second,burst=excluded.burst",
+                    params![key, rps, burst],
+                )
+                .map_err(sql)?;
+                if let Some((per_second, previous_burst)) = config {
+                    tracing::warn!(
+                        per_second,
+                        burst = previous_burst,
+                        new_per_second = rps,
+                        new_burst = burst,
+                        "Credential request quota changed"
+                    );
+                    crate::storage::audit(
+                        &tx,
+                        "quota_config_changed",
+                        "quota",
+                        &serde_json::json!({
+                            "from": {"per_second": per_second, "burst": previous_burst},
+                            "to": {"per_second": rps, "burst": burst},
+                        }),
+                    )?;
+                }
             }
             let now = chrono::Utc::now().timestamp_millis();
             let last: Option<i64> = tx
@@ -171,8 +192,24 @@ impl Coordinator for StateDatabase {
             {
                 return Err(clock_moved_back());
             }
-            if old.as_ref().is_some_and(|(_, _, until)| *until > now) {
-                return Err(Error::LeaseBusy);
+            // The same owner asking again (its earlier reply was lost)
+            // gets its live lease back, extended, rather than waiting on
+            // itself.
+            if let Some((holder, epoch, until)) = &old
+                && *until > now
+            {
+                if *holder != owner {
+                    return Err(Error::LeaseBusy);
+                }
+                tx.execute(UPSERT_LEASE, params![resource, owner, epoch, expires_at])
+                    .map_err(sql)?;
+                tx.commit().map_err(sql)?;
+                return Ok(Lease {
+                    resource,
+                    owner,
+                    epoch: *epoch as u64,
+                    expires_at,
+                });
             }
             let epoch = old.map_or(1, |(_, epoch, _)| epoch + 1);
             tx.execute(UPSERT_LEASE, params![resource, owner, epoch, expires_at])
@@ -206,7 +243,7 @@ impl Coordinator for StateDatabase {
                 )
                 .map_err(sql)?;
             if renewed != 1 {
-                return Err(Error::Storage("Lease expired or fenced".into()));
+                return Err(Error::OwnershipLost);
             }
             lease.expires_at = expires_at;
             Ok(lease)
@@ -302,16 +339,18 @@ impl LeaseSession {
                         match renewal {
                             Ok(Ok(_)) => {}
                             // The store answered: the lease is gone.
-                            Ok(Err(_)) => {
+                            Ok(Err(Error::OwnershipLost)) => {
                                 let _ = lost_tx.send(true);
                                 break;
                             }
-                            // The store did not answer in time. The renewal may
-                            // still commit (blocking SQLite work outlives a
-                            // dropped future), so ask before giving up: an
-                            // unconfirmed lease is treated as lost, and never
-                            // released, since it may belong to a successor.
-                            Err(_) => {
+                            // The store did not answer, in time or at all
+                            // (a busy lock, a dropped connection). The
+                            // renewal may still commit (blocking SQLite
+                            // work outlives a dropped future), so ask before
+                            // giving up: an unconfirmed lease is treated as
+                            // lost, and never released, since it may belong
+                            // to a successor.
+                            Ok(Err(_)) | Err(_) => {
                                 let held_now = tokio::time::timeout(RENEW_WITHIN, backend.valid(&held))
                                     .await;
                                 if !matches!(held_now, Ok(Ok(true))) {

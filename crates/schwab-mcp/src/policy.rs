@@ -365,10 +365,11 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
 
 /// The longest a submission may hold for an operator's approval.
 ///
-/// Half the 120-second ceiling both network transports put on a request,
-/// so the submission the wait was for still has room to reach the venue
-/// and be retried inside the same call.
-pub const MAX_APPROVAL_WAIT_MS: u64 = 60_000;
+/// Under the 60-second request timeout common MCP clients default to, so
+/// the submission the wait was for still reaches the venue and answers
+/// inside the same call. A client that gives up anyway abandons only the
+/// answer: once audited, a dispatch runs to its outcome.
+pub const MAX_APPROVAL_WAIT_MS: u64 = 45_000;
 
 /// How often a holding submission re-reads the approval store.
 const APPROVAL_POLL: Duration = Duration::from_secs(1);
@@ -538,6 +539,12 @@ impl AuthorizedServer {
             _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
+        if submission {
+            // An earlier dispatch interrupted by a process exit would block
+            // this one (and may hold its approval): settle it first, from
+            // the venue's journal, where that decides it.
+            self.settle_stranded().await;
+        }
         let digest = intent_digest(name, &args);
         let wait = approval_wait(&args)?;
         let effective = self.effective_policy(name, &digest).await?;
@@ -599,39 +606,84 @@ impl AuthorizedServer {
         } else {
             None
         };
+        let Some(audit_id) = audit_id else {
+            return Ok(self
+                .inner
+                .call_tool(name, args, ctx)
+                .await
+                .map(crate::contract::normalize));
+        };
+        // From the audit record on, the dispatch runs on its own task: a
+        // client that cancels, disconnects or times out abandons only the
+        // answer, and the record still reaches its outcome rather than
+        // blocking every later submission of this principal.
+        let this = self.clone();
+        let name = name.to_owned();
+        let ctx = ctx.clone();
+        tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await })
+            .await
+            .map_err(|e| ToolFailure::internal("Dispatch task failed", e))?
+    }
+
+    /// The audited half of [`dispatch`](Self::dispatch): run the tool and
+    /// record how it ended against `id`.
+    async fn audited(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &RequestContext,
+        (id, consumed_approval): (String, bool),
+    ) -> Result<McpResult<ToolResult>, ToolFailure> {
         let result = self
             .inner
             .call_tool(name, args, ctx)
             .await
             .map(crate::contract::normalize);
-        if let Some((id, consumed_approval)) = audit_id {
-            // The SDK journal owns broker reconciliation. Keep dispatch outcome
-            // attribution separately without claiming a tool success is a fill.
-            let dispatch = crate::journal::Dispatch::of(&result);
-            let outcome = schwab_rs::execution::SubmissionOutcome::Reconciled {
-                evidence: dispatch.evidence(),
-            };
-            self.audit.finish(&id, outcome).await.map_err(|e| {
-                ToolFailure::new(
-                    FailureCode::ReconciliationRequired,
-                    format!(
-                        "Execution may have completed but the audit commit failed ({e}); \
-                         reconcile before retrying"
-                    ),
-                )
-                .with_attempt(id.clone())
-            })?;
-            // Refused before anything reached the broker: the approval is
-            // not spent, so the same intent may go once the refusal clears.
-            if consumed_approval
-                && let crate::journal::Dispatch::Failed { code: Some(code) } = dispatch
-                && code.keeps_approval()
-                && let Err(e) = self.audit.refund_approval(&id).await
-            {
-                tracing::warn!(attempt = %id, error = %e, "approval refund failed; it stays spent");
-            }
+        // The SDK journal owns broker reconciliation. Keep dispatch outcome
+        // attribution separately without claiming a tool success is a fill.
+        let dispatch = crate::journal::Dispatch::of(&result);
+        let outcome = schwab_rs::execution::SubmissionOutcome::Reconciled {
+            evidence: dispatch.evidence(),
+        };
+        self.audit.finish(&id, outcome).await.map_err(|e| {
+            ToolFailure::new(
+                FailureCode::ReconciliationRequired,
+                format!(
+                    "Execution may have completed but the audit commit failed ({e}); \
+                     reconcile before retrying"
+                ),
+            )
+            .with_attempt(id.clone())
+        })?;
+        // Refused before anything reached the broker: the approval is
+        // not spent, so the same intent may go once the refusal clears.
+        if consumed_approval
+            && let crate::journal::Dispatch::Failed { code: Some(code) } = dispatch
+            && code.keeps_approval()
+            && let Err(e) = self.audit.refund_approval(&id).await
+        {
+            tracing::warn!(attempt = %id, error = %e, "approval refund failed; it stays spent");
         }
         Ok(result)
+    }
+
+    /// Settle this principal's stranded submission records; see
+    /// [`crate::journal::settle_stranded`]. Failures are logged and leave
+    /// the record for an operator.
+    async fn settle_stranded(&self) {
+        use schwab_rs::execution::ExecutionStore;
+        let Ok(pending) = self.audit.unresolved_records(&self.principal.name).await else {
+            return;
+        };
+        let venue = self.inner.backend().trading().execution_store();
+        for record in pending {
+            if let Err(e) =
+                crate::journal::settle_stranded(&self.audit, venue.as_ref(), &record.attempt_id)
+                    .await
+            {
+                tracing::warn!(attempt = %record.attempt_id, error = %e, "could not settle a stranded dispatch");
+            }
+        }
     }
 
     /// The principal with a durable operator approval of the submission
@@ -1230,6 +1282,89 @@ mod tests {
             assert!(server.audit.is_approved("desk", &digest).await.unwrap());
         }
         assert_eq!(server.audit.records().await.unwrap().len(), 2);
+    }
+
+    /// A dispatch whose process died after the audit record but before the
+    /// venue journaled anything is settled from the venue's journal on the
+    /// next submission, its approval given back, instead of blocking the
+    /// principal until an operator steps in.
+    #[tokio::test]
+    async fn a_stranded_dispatch_is_settled_from_the_venue_journal() {
+        let server = authorized_as(
+            Switches {
+                trading: true,
+                cancel: false,
+            },
+            policy(),
+        );
+        let ctx = RequestContext::stdio();
+        let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
+        let digest = intent_digest("place_order", &args);
+        server
+            .audit
+            .approve(
+                "desk",
+                &digest,
+                "operator",
+                chrono::Utc::now().timestamp() + 600,
+            )
+            .await
+            .unwrap();
+        let stranded = server
+            .audit
+            .begin_once(
+                "desk",
+                "place_order",
+                serde_json::json!({
+                    "principal": "desk",
+                    "intentDigest": digest,
+                    "requestId": "lost",
+                    "arguments": tag_intent(args.clone(), &digest),
+                }),
+                Some(digest.clone()),
+            )
+            .await
+            .unwrap();
+        // Too recent to judge: its dispatcher may still be running, and it
+        // holds the one-use approval.
+        let blocked = server
+            .call_tool("place_order", args.clone(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            blocked.structured_content.unwrap()["error"]["code"],
+            "approval_required"
+        );
+        let id = stranded.clone();
+        server
+            .audit
+            .database()
+            .run(move |c| {
+                c.execute(
+                    "UPDATE submissions SET created_at=created_at-180000 WHERE id=?1",
+                    [id],
+                )
+                .map_err(|e| schwab_rs::Error::Storage(e.to_string()))
+            })
+            .await
+            .unwrap();
+        let retried = server
+            .call_tool("place_order", args.clone(), &ctx)
+            .await
+            .unwrap();
+        // The retry itself reached the tool (and failed there, for want of
+        // a Schwab session), so the stranded record no longer blocks it.
+        assert_eq!(
+            retried.structured_content.unwrap()["error"]["code"],
+            "unavailable"
+        );
+        let settled = server.audit.record(&stranded).await.unwrap().unwrap();
+        assert!(matches!(
+            settled.outcome,
+            Some(schwab_rs::execution::SubmissionOutcome::Reconciled { ref evidence })
+                if evidence.contains("nothing reached the venue")
+        ));
+        assert!(server.audit.is_approved("desk", &digest).await.unwrap());
     }
 
     /// The digest and approval bind the model's arguments; only the

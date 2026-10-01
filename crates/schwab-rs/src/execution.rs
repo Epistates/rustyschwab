@@ -20,20 +20,63 @@ const INSERT_CONSUMED_APPROVAL: &str = "INSERT INTO consumed_approvals VALUES(?1
 const INSERT_CONSUMED_APPROVAL_IF_NEW: &str = "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)";
 const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)";
 /// A rejected submission frees its tag: the broker holds no order for it, so
-/// the identical request may be retried under the same tag.
+/// the identical request may be retried under the same tag. A tag the broker
+/// is known to hold on some order stays spent whatever this intent's fate.
 const RELEASE_ORDER_TAG: &str = "DELETE FROM used_order_tags WHERE EXISTS(\
      SELECT 1 FROM submissions s WHERE s.id=?1 AND s.account=used_order_tags.account \
-       AND json_extract(s.request,'$.tag')=used_order_tags.tag)";
-const INSERT_SUBMISSION: &str = "INSERT INTO submissions VALUES(?1,?2,?3,?4,?5,NULL,?6)";
+       AND json_extract(s.request,'$.tag')=used_order_tags.tag) \
+     AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.account=used_order_tags.account \
+       AND json_extract(o.payload,'$.tag')=used_order_tags.tag)";
+const INSERT_SUBMISSION: &str = "INSERT INTO \
+     submissions(id,account,operation,created_at,request,outcome,dedup_key,armed) \
+     VALUES(?1,?2,?3,?4,?5,NULL,?6,0)";
 const RESOLVE_SUBMISSION: &str =
     "UPDATE submissions SET outcome=?1 WHERE id=?2 AND outcome IS NULL";
+/// Only an unresolved intent may be armed: one that recovery already
+/// resolved as never dispatched must not be sent.
+const ARM_SUBMISSION: &str = "UPDATE submissions SET armed=1 WHERE id=?1 AND outcome IS NULL";
+/// A resolution that says the broker holds no live order for the intent
+/// (refused, or settled by an operator) frees the exposure reserved for it.
+const RELEASE_RESERVATION: &str =
+    "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'";
 const SELECT_SUBMISSION_OUTCOME: &str = "SELECT outcome FROM submissions WHERE id=?1";
 const SELECT_SUBMISSION_DEDUP: &str =
     "SELECT dedup_key,outcome IS NOT NULL FROM submissions WHERE id=?1";
 const SELECT_APPROVAL_REVOKED: &str =
     "SELECT EXISTS(SELECT 1 FROM audit WHERE kind='approval_revoked' AND subject=?1)";
-const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,dedup_key \
-     FROM submissions ORDER BY created_at,id";
+const SELECT_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,outcome,\
+     dedup_key,armed FROM submissions ORDER BY created_at,id";
+/// Intents on `?1` that reconciliation must still place: unresolved, or
+/// accepted without the broker's order ID.
+const SELECT_UNRESOLVED_SUBMISSIONS: &str = "SELECT id,account,operation,created_at,request,\
+     outcome,dedup_key,armed FROM submissions WHERE account=?1 AND (outcome IS NULL \
+       OR (json_extract(outcome,'$.status')='accepted' \
+         AND json_extract(outcome,'$.order_id') IS NULL)) ORDER BY created_at,id";
+const SELECT_SUBMISSION_BY_TAG: &str = "SELECT id,account,operation,created_at,request,outcome,\
+     dedup_key,armed FROM submissions WHERE account=?1 AND json_extract(request,'$.tag')=?2 \
+     ORDER BY created_at DESC,id LIMIT 1";
+const SELECT_SUBMISSION: &str = "SELECT id,account,operation,created_at,request,outcome,\
+     dedup_key,armed FROM submissions WHERE id=?1";
+/// The order this store recorded only as a reference, never as the broker
+/// answered it (see [`ExecutionStore::forget_placeholder`]).
+const DELETE_ORDER_PLACEHOLDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2 \
+     AND json_extract(payload,'$.status')='UNKNOWN' AND json_extract(payload,'$.orderType') IS NULL";
+/// Terminal broker orders last observed before `?1` that no held
+/// reservation still refers to. Their tags stay spent in `used_order_tags`.
+const SELECT_PRUNABLE_ORDERS: &str = "SELECT account,order_id FROM orders WHERE observed_at<?1 \
+     AND json_extract(payload,'$.status') IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') \
+     AND NOT EXISTS(SELECT 1 FROM reservations r JOIN submissions s ON s.id=r.id \
+       WHERE r.state='held' AND s.account=orders.account \
+         AND json_extract(s.outcome,'$.order_id')=orders.order_id)";
+const DELETE_ORDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2";
+/// An order's observed activities are keyed `{order_id}:{digest}`; `;`
+/// sorts right after `:`, so this is exactly that order's range.
+const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
+     AND execution_id>=?2 || ':' AND execution_id<?2 || ';'";
+/// Released reservations whose submission is pruned or resolved before `?1`.
+const PRUNE_RELEASED_RESERVATIONS: &str = "DELETE FROM reservations WHERE state='released' \
+     AND NOT EXISTS(SELECT 1 FROM submissions s WHERE s.id=reservations.id \
+       AND (s.outcome IS NULL OR s.created_at>=?1))";
 const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
      WHERE sequence>?1 ORDER BY sequence LIMIT ?2";
 /// Resolved submissions older than `?1` whose audit trail is exported through
@@ -112,6 +155,60 @@ pub struct SubmissionRecord {
     pub outcome: Option<SubmissionOutcome>,
     #[serde(default)]
     pub dedup_key: Option<String>,
+    /// Whether the request may have left this host: set just before it is
+    /// transmitted. An unresolved intent that was never armed provably
+    /// reached no broker, and recovery resolves it as rejected; records
+    /// from before this marker existed read as armed.
+    #[serde(default = "armed_by_default")]
+    pub armed: bool,
+}
+fn armed_by_default() -> bool {
+    true
+}
+type SubmissionRow = (
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    bool,
+);
+fn submission_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubmissionRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+    ))
+}
+fn submission_record(row: SubmissionRow) -> Result<SubmissionRecord> {
+    let (attempt_id, account, operation, created_at, request, outcome, dedup_key, armed) = row;
+    Ok(SubmissionRecord {
+        attempt_id,
+        account,
+        operation,
+        created_at,
+        request: serde_json::from_str(&request)?,
+        outcome: outcome.map(|s| serde_json::from_str(&s)).transpose()?,
+        dedup_key,
+        armed,
+    })
+}
+fn query_submissions(
+    c: &rusqlite::Connection,
+    sql_text: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<SubmissionRecord>> {
+    let mut query = c.prepare(sql_text).map_err(sql)?;
+    let rows = query.query_map(params, submission_row).map_err(sql)?;
+    rows.map(|row| submission_record(row.map_err(sql)?))
+        .collect()
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -227,6 +324,7 @@ impl OrderJournal {
                     created_at: chrono::Utc::now().timestamp_millis(),
                     outcome: None,
                     dedup_key,
+                    armed: false,
                 };
                 tx.execute(
                     INSERT_SUBMISSION,
@@ -251,9 +349,13 @@ impl OrderJournal {
     }
     /// Resolve a pending submission. `Rejected` asserts the broker holds no
     /// order for it and releases its tag for a retry; `Accepted` and
-    /// `Reconciled` keep the tag consumed. `Accepted` also succeeds when
-    /// reconciliation already accepted the submission under the same order
-    /// ID (or this call has none).
+    /// `Reconciled` keep the tag consumed. `Rejected` and `Reconciled` also
+    /// release the risk reserved for it in the same transaction: no live
+    /// order is linked to the intent any more, and any order an operator
+    /// found is counted from the broker's own order list. `Accepted` also
+    /// succeeds when reconciliation already accepted the submission under
+    /// the same order ID (or this call has none), and `Rejected` when
+    /// recovery already resolved it as never dispatched.
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
             && evidence.trim().is_empty()
@@ -293,11 +395,17 @@ impl OrderJournal {
                             SubmissionOutcome::Accepted { order_id: Some(a) },
                             SubmissionOutcome::Accepted { order_id: b },
                         ) if b.as_ref().is_none_or(|b| b == a) => Ok(()),
+                        (SubmissionOutcome::Rejected, SubmissionOutcome::Rejected) => Ok(()),
                         _ => Err(Error::Duplicate("Submission is already resolved".into())),
                     };
                 }
                 if matches!(outcome, SubmissionOutcome::Rejected) {
                     tx.execute(RELEASE_ORDER_TAG, [&id]).map_err(sql)?;
+                }
+                if !matches!(outcome, SubmissionOutcome::Accepted { .. })
+                    && tx.execute(RELEASE_RESERVATION, [&id]).map_err(sql)? == 1
+                {
+                    audit(&tx, "risk_released", &id, &serde_json::json!({}))?;
                 }
                 audit(&tx, "outcome", &id, &serde_json::to_value(&outcome)?)?;
                 tx.commit().map_err(sql)?;
@@ -307,35 +415,78 @@ impl OrderJournal {
     }
     pub async fn records(&self) -> Result<Vec<SubmissionRecord>> {
         self.database
-            .run(|conn| {
-                let mut query = conn.prepare(SELECT_SUBMISSIONS).map_err(sql)?;
-                let rows = query
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, Option<String>>(5)?,
-                            r.get::<_, Option<String>>(6)?,
-                        ))
-                    })
+            .run(|conn| query_submissions(conn, SELECT_SUBMISSIONS, []))
+            .await
+    }
+    /// One submission by attempt ID.
+    pub async fn record(&self, id: &str) -> Result<Option<SubmissionRecord>> {
+        let id = id.to_owned();
+        self.database
+            .run(move |conn| Ok(query_submissions(conn, SELECT_SUBMISSION, [id])?.pop()))
+            .await
+    }
+    /// Mark the intent as possibly transmitted. Call it after every local
+    /// admission check and immediately before the request leaves: an
+    /// unresolved intent that was never armed is provably unsent, and
+    /// recovery resolves it as rejected. Fails without arming when the
+    /// intent is already resolved, so a recovered intent is never sent.
+    pub async fn arm(&self, id: &str) -> Result<()> {
+        let id = id.to_owned();
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                rows.map(|row| {
-                    let (attempt_id, account, operation, created_at, request, outcome, dedup_key) =
-                        row.map_err(sql)?;
-                    Ok(SubmissionRecord {
-                        attempt_id,
-                        account,
-                        operation,
-                        created_at,
-                        request: serde_json::from_str(&request)?,
-                        outcome: outcome.map(|s| serde_json::from_str(&s)).transpose()?,
-                        dedup_key,
+                if tx.execute(ARM_SUBMISSION, [&id]).map_err(sql)? != 1 {
+                    return Err(Error::Duplicate(
+                        "Submission was resolved before dispatch; it was not sent".into(),
+                    ));
+                }
+                audit(&tx, "armed", &id, &serde_json::json!({}))?;
+                tx.commit().map_err(sql)
+            })
+            .await
+    }
+    /// Delete terminal broker orders (and their observed activities) last
+    /// seen before `before` (ms since the epoch), and released risk
+    /// reservations of submissions resolved before it. The tags of pruned
+    /// orders stay spent; working orders, held reservations and audit
+    /// events are kept. Returns the number of orders removed.
+    pub async fn prune_history(&self, before: i64) -> Result<usize> {
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let orders = {
+                    let mut stmt = tx.prepare(SELECT_PRUNABLE_ORDERS).map_err(sql)?;
+                    stmt.query_map([before], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                     })
-                })
-                .collect()
+                    .map_err(sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql)?
+                };
+                for (account, order_id) in &orders {
+                    tx.execute(DELETE_ORDER, [account, order_id]).map_err(sql)?;
+                    tx.execute(DELETE_ORDER_EXECUTIONS, [account, order_id])
+                        .map_err(sql)?;
+                }
+                let reservations = tx
+                    .execute(PRUNE_RELEASED_RESERVATIONS, [before])
+                    .map_err(sql)?;
+                audit(
+                    &tx,
+                    "history_pruned",
+                    "state",
+                    &serde_json::json!({
+                        "before": before,
+                        "orders": orders.len(),
+                        "reservations": reservations,
+                    }),
+                )?;
+                tx.commit().map_err(sql)?;
+                Ok(orders.len())
             })
             .await
     }
@@ -374,11 +525,27 @@ impl OrderJournal {
     pub async fn prune_resolved(&self, before: i64, exported_through: i64) -> Result<usize> {
         self.database
             .run(move |conn| {
-                conn.execute(
-                    PRUNE_RESOLVED_SUBMISSIONS,
-                    rusqlite::params![before, exported_through],
-                )
-                .map_err(sql)
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let pruned = tx
+                    .execute(
+                        PRUNE_RESOLVED_SUBMISSIONS,
+                        rusqlite::params![before, exported_through],
+                    )
+                    .map_err(sql)?;
+                audit(
+                    &tx,
+                    "submissions_pruned",
+                    "state",
+                    &serde_json::json!({
+                        "before": before,
+                        "exported_through": exported_through,
+                        "submissions": pruned,
+                    }),
+                )?;
+                tx.commit().map_err(sql)?;
+                Ok(pruned)
             })
             .await
     }
@@ -565,7 +732,54 @@ pub trait ExecutionStore: Send + Sync {
         dedup_key: Option<String>,
     ) -> Result<String>;
     async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()>;
+    /// Mark an unresolved intent as possibly transmitted, immediately before
+    /// it leaves; fail, without arming, if it is already resolved. See
+    /// [`OrderJournal::arm`].
+    async fn arm(&self, id: &str) -> Result<()>;
     async fn records(&self) -> Result<Vec<SubmissionRecord>>;
+    /// The account's intents reconciliation must still place: unresolved,
+    /// or accepted without a broker order ID. The default filters
+    /// [`records`](Self::records); stores that can query should.
+    async fn unresolved_records(&self, account: &str) -> Result<Vec<SubmissionRecord>> {
+        Ok(self
+            .records()
+            .await?
+            .into_iter()
+            .filter(|r| {
+                r.account == account
+                    && matches!(
+                        r.outcome,
+                        None | Some(SubmissionOutcome::Accepted { order_id: None })
+                    )
+            })
+            .collect())
+    }
+    /// The latest submission on `account` whose request carried order tag
+    /// `tag`. The default scans [`records`](Self::records).
+    async fn submission_by_tag(
+        &self,
+        account: &str,
+        tag: &str,
+    ) -> Result<Option<SubmissionRecord>> {
+        Ok(self
+            .records()
+            .await?
+            .into_iter()
+            .filter(|r| {
+                r.account == account
+                    && r.request.get("tag").and_then(serde_json::Value::as_str) == Some(tag)
+            })
+            .max_by_key(|r| r.created_at))
+    }
+    /// Drop `order_id` if this store holds it only as a reference it never
+    /// saw the broker answer for (the broker then said it has no such
+    /// order). Returns whether one was dropped; an observed order is kept.
+    async fn forget_placeholder(&self, account: &str, order_id: &str) -> Result<bool>;
+    /// Whether order tag `tag` is spent on `account`: an accepted or
+    /// unresolved submission carries it, or the broker holds an order
+    /// under it. A tag that is not spent reached no venue through this
+    /// store.
+    async fn tag_spent(&self, account: &str, tag: &str) -> Result<bool>;
     async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()>;
     async fn account_state(
         &self,
@@ -690,8 +904,67 @@ impl ExecutionStore for OrderJournal {
     async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         OrderJournal::finish(self, id, outcome).await
     }
+    async fn arm(&self, id: &str) -> Result<()> {
+        OrderJournal::arm(self, id).await
+    }
     async fn records(&self) -> Result<Vec<SubmissionRecord>> {
         OrderJournal::records(self).await
+    }
+    async fn unresolved_records(&self, account: &str) -> Result<Vec<SubmissionRecord>> {
+        let account = account.to_owned();
+        self.database
+            .run(move |c| query_submissions(c, SELECT_UNRESOLVED_SUBMISSIONS, [account]))
+            .await
+    }
+    async fn submission_by_tag(
+        &self,
+        account: &str,
+        tag: &str,
+    ) -> Result<Option<SubmissionRecord>> {
+        let account = account.to_owned();
+        let tag = tag.to_owned();
+        self.database
+            .run(move |c| Ok(query_submissions(c, SELECT_SUBMISSION_BY_TAG, [account, tag])?.pop()))
+            .await
+    }
+    async fn tag_spent(&self, account: &str, tag: &str) -> Result<bool> {
+        let account = account.to_owned();
+        let tag = tag.to_owned();
+        self.database
+            .run(move |c| {
+                c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM used_order_tags WHERE account=?1 AND tag=?2)",
+                    [account, tag],
+                    |r| r.get(0),
+                )
+                .map_err(sql)
+            })
+            .await
+    }
+    async fn forget_placeholder(&self, account: &str, order_id: &str) -> Result<bool> {
+        let account = account.to_owned();
+        let order_id = order_id.to_owned();
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let dropped = tx
+                    .execute(DELETE_ORDER_PLACEHOLDER, [&account, &order_id])
+                    .map_err(sql)?
+                    == 1;
+                if dropped {
+                    audit(
+                        &tx,
+                        "order_placeholder_dropped",
+                        &order_id,
+                        &serde_json::json!({"account": account}),
+                    )?;
+                }
+                tx.commit().map_err(sql)?;
+                Ok(dropped)
+            })
+            .await
     }
     async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
         self.database.invalidate_account(account, generation).await

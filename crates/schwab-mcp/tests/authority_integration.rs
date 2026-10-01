@@ -188,8 +188,11 @@ async fn two_remote_clients_share_intents_quotas_and_fencing() {
     assert_eq!(envelope["kind"], "reconciliation_required", "{envelope}");
     assert_eq!(envelope["attempt_id"], id, "{envelope}");
     a.finish(&id, SubmissionOutcome::Rejected).await.unwrap();
+    // The same resolution again is no conflict; a different one is.
+    a.finish(&id, SubmissionOutcome::Rejected).await.unwrap();
     assert!(matches!(
-        a.finish(&id, SubmissionOutcome::Rejected).await,
+        a.finish(&id, SubmissionOutcome::Accepted { order_id: None })
+            .await,
         Err(schwab_rs::Error::Duplicate(_))
     ));
     let second = b

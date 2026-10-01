@@ -31,6 +31,7 @@
 //! | `schwab_baseline_age_seconds` | gauge | — | Age of the oldest required-account baseline, as of the last readiness probe. |
 //! | `schwab_trading_ready` | gauge | — | `1` when the last readiness probe found trading admissible, `0` otherwise. |
 //! | `schwab_recovery_ready` | gauge | — | `1` while the recovery worker has no accounts left to reconcile. |
+//! | `schwab_recovery_failures_total` | counter | — | Reconciliation passes the recovery worker could not complete; the account stays unready until one does. |
 //! | `schwab_stream_connects_total` | counter | `outcome` | `success` / `failure` per connection attempt. |
 //! | `schwab_stream_reconnects_total` | counter | — | One per reconnect the loop triggers. |
 //! | `schwab_stream_connected` | gauge | — | `1` while authenticated, `0` otherwise. |
@@ -65,6 +66,7 @@ pub const UNRECONCILED_ACCOUNTS: &str = "schwab_unreconciled_accounts";
 pub const BASELINE_AGE_SECONDS: &str = "schwab_baseline_age_seconds";
 pub const TRADING_READY: &str = "schwab_trading_ready";
 pub const RECOVERY_READY: &str = "schwab_recovery_ready";
+pub const RECOVERY_FAILURES_TOTAL: &str = "schwab_recovery_failures_total";
 
 /// Streaming WebSocket lifecycle and throughput.
 pub const STREAM_CONNECTS_TOTAL: &str = "schwab_stream_connects_total";
@@ -185,6 +187,10 @@ pub const CATALOG: &[Metric] = &[
         RECOVERY_READY,
         None,
         "1 while the recovery worker has no accounts left to reconcile",
+    ),
+    Metric::counter(
+        RECOVERY_FAILURES_TOTAL,
+        "Reconciliation passes the recovery worker could not complete",
     ),
     Metric::counter(
         STREAM_CONNECTS_TOTAL,

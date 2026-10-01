@@ -19,6 +19,7 @@ async fn legacy_migration_backup_restore_and_retention_preserve_safety() {
         created_at: 1,
         outcome: None,
         dedup_key: Some("once".into()),
+        armed: true,
     };
     schwab_rs::security::secure_file_write(
         &path,
@@ -98,10 +99,12 @@ async fn reconciliation_matches_tag_deduplicates_activity_and_rejects_old_genera
         0
     );
     db.invalidate_account("A", 2).await.unwrap();
+    // An older generation's pass writes nothing, and says so.
     assert!(
         db.reconcile_snapshot("A", 1, 103, json!({}), vec![])
             .await
-            .is_err()
+            .unwrap()
+            .superseded
     );
     assert!(!db.account_state("A").await.unwrap().unwrap().reconciled);
 }
@@ -717,8 +720,13 @@ async fn direct_child_lookup_wins_over_stale_embedded_parent_copy() {
         )
         .await
         .unwrap();
-    let report=journal.database().reconcile_snapshot("A",1,chrono::Utc::now().timestamp_millis(),json!({}),vec![json!({"orderId":100,"status":"FILLED"}),json!({"orderId":99,"status":"WORKING","childOrderStrategies":[{"orderId":100,"status":"WORKING"}]})]).await.unwrap();
-    assert!(report.terminal_attempts.contains(&id));
+    journal.database().reconcile_snapshot("A",1,chrono::Utc::now().timestamp_millis(),json!({}),vec![json!({"orderId":100,"status":"FILLED"}),json!({"orderId":99,"status":"WORKING","childOrderStrategies":[{"orderId":100,"status":"WORKING"}]})]).await.unwrap();
+    // The direct FILLED copy won: 100 is no longer a target, 99 still is.
+    use schwab_rs::execution::ExecutionStore;
+    assert_eq!(
+        journal.reconciliation_targets("A").await.unwrap(),
+        vec!["99"]
+    );
 }
 
 #[tokio::test]
@@ -827,9 +835,13 @@ async fn fresh_state_records_every_migration_and_refuses_newer_files() {
         .unwrap();
     assert_eq!(
         applied,
-        vec![(1, "baseline".to_string()), (2, "import_order_tags".into())]
+        vec![
+            (1, "baseline".to_string()),
+            (2, "import_order_tags".into()),
+            (3, "armed_intents_reservation_scope".into())
+        ]
     );
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("2"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("3"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     connection
         .execute("UPDATE meta SET value='99' WHERE key='schema'", [])
@@ -854,6 +866,14 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
         connection
             .execute_batch(
                 "DROP TABLE schema_migrations;
+                 DROP INDEX reservations_held;
+                 DROP INDEX submissions_order;
+                 DROP INDEX orders_status;
+                 DROP INDEX orders_tag;
+                 ALTER TABLE submissions DROP COLUMN armed;
+                 ALTER TABLE reservations DROP COLUMN symbol;
+                 ALTER TABLE reservations DROP COLUMN side;
+                 ALTER TABLE reservations DROP COLUMN replaces;
                  UPDATE meta SET value='1' WHERE key='schema';
                  INSERT INTO meta VALUES('tags_imported','1');
                  INSERT INTO submissions VALUES('a1','A','place_order',1,\
@@ -869,8 +889,10 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
             .await,
         Err(schwab_rs::Error::Duplicate(_))
     ));
+    // Rows written before the marker existed read as armed.
+    assert!(upgraded.records().await.unwrap()[0].armed);
     let connection = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("2"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("3"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     let history: Vec<u32> = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -879,7 +901,7 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(history, vec![2]);
+    assert_eq!(history, vec![2, 3]);
 }
 
 #[tokio::test]
@@ -923,7 +945,7 @@ async fn concurrent_first_use_initializes_once() {
     let migrations: i64 = connection
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(migrations, 2);
+    assert_eq!(migrations, 3);
 }
 
 /// A partial fill shrinks the order's held reservation to what can still

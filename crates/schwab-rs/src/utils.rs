@@ -24,6 +24,21 @@ pub fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// An account identifier (number or hash) for logs: its last four
+/// characters behind `…`, so operators can tell accounts apart without the
+/// log holding one.
+pub fn mask_account(account: &str) -> String {
+    let tail: String = account
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("…{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

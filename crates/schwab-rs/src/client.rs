@@ -368,7 +368,34 @@ impl SchwabClient {
     /// `Location` response header — Schwab returns 201 with an empty body
     /// for order placement/replacement, carrying the new order's URL in
     /// `Location`. See [`OrderSubmitResponse`].
+    ///
+    /// The submission runs on its own task. A caller that stops waiting (a
+    /// dropped future, a client that went away, a deadline above this one)
+    /// abandons only the answer: the journaled intent still reaches its
+    /// outcome, rather than being left unresolved with the account blocked
+    /// behind it.
     async fn submit_order_request(
+        &self,
+        op: &'static str,
+        method: Method,
+        path: &str,
+        order: &OrderRequest,
+        fence: Option<&crate::coordination::Lease>,
+    ) -> Result<OrderSubmitResponse> {
+        let client = self.clone();
+        let path = path.to_owned();
+        let order = order.clone();
+        let fence = fence.cloned();
+        tokio::spawn(async move {
+            client
+                .submit_detached(op, method, &path, &order, fence.as_ref())
+                .await
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("Submission task failed: {e}")))?
+    }
+
+    async fn submit_detached(
         &self,
         op: &'static str,
         method: Method,
@@ -384,13 +411,13 @@ impl SchwabClient {
         }
         let order = &tagged_order;
         let account = path.split('/').nth(4).unwrap_or_default();
-        if op == "replace_order" {
-            // Risk counts the order being replaced until Schwab replaces it,
-            // and one this client has not reconciled yet has no exposure it
-            // can judge: read it first. That also refuses, before anything
-            // is sent, a replacement of an order Schwab no longer has.
-            let order_id = path.rsplit('/').next().unwrap_or_default();
-            self.inner.execution.track_order(account, order_id).await?;
+        let replaces = (op == "replace_order").then(|| path.rsplit('/').next().unwrap_or_default());
+        if let Some(order_id) = replaces {
+            // Risk judges a replacement against the order it replaces, and
+            // one this client has not reconciled yet has no exposure it can
+            // judge: read it first. Nothing is recorded unless Schwab has
+            // it, so a replacement of an unknown order is refused before
+            // anything is sent and leaves no trace.
             let current = self.get_order(account, order_id).await?;
             self.inner
                 .execution
@@ -402,9 +429,15 @@ impl SchwabClient {
             .execution
             .begin_once(account, op, serde_json::to_value(order)?, None)
             .await?;
-        if let Some(risk) = &self.inner.risk
-            && let Err(error) = risk.reserve(account, &attempt_id, order).await
-        {
+        let reserved = match (&self.inner.risk, replaces) {
+            (None, _) => Ok(()),
+            (Some(risk), None) => risk.reserve(account, &attempt_id, order).await,
+            (Some(risk), Some(replaces)) => {
+                risk.reserve_replacement(account, &attempt_id, order, replaces)
+                    .await
+            }
+        };
+        if let Err(error) = reserved {
             self.inner
                 .execution
                 .finish(&attempt_id, crate::execution::SubmissionOutcome::Rejected)
@@ -522,6 +555,9 @@ impl SchwabClient {
                         {
                             return Err(Error::OwnershipLost);
                         }
+                        // Last step before the request leaves: from here
+                        // on the intent may have reached the broker.
+                        self.inner.execution.arm(attempt).await?;
                     }
                     sent.store(true, std::sync::atomic::Ordering::Relaxed);
                     call(token.clone()).await

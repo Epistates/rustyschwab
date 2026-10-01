@@ -14,7 +14,7 @@ const INVALIDATE_ACCOUNT: &str = "INSERT INTO accounts VALUES(?1,?2,0,0,'{}') \
 const SELECT_ACCOUNT_STATE: &str =
     "SELECT generation,observed_at,valid,snapshot FROM accounts WHERE account=?1";
 const SELECT_ACCOUNT_GENERATION: &str =
-    "SELECT generation,observed_at FROM accounts WHERE account=?1";
+    "SELECT generation,observed_at,valid FROM accounts WHERE account=?1";
 const UPSERT_ACCOUNT_SNAPSHOT: &str = "INSERT INTO accounts VALUES(?1,?2,?3,?4,?5) \
      ON CONFLICT(account) DO UPDATE SET generation=excluded.generation,\
      observed_at=excluded.observed_at,valid=excluded.valid,snapshot=excluded.snapshot";
@@ -24,18 +24,43 @@ const UPSERT_ORDER: &str = "INSERT INTO orders VALUES(?1,?2,?3,?4) \
 const UPDATE_ORDER_PAYLOAD: &str =
     "UPDATE orders SET payload=?1,observed_at=?2 WHERE account=?3 AND order_id=?4";
 const INSERT_EXECUTION_IF_NEW: &str = "INSERT OR IGNORE INTO executions VALUES(?1,?2,?3)";
-/// Submissions with no outcome yet, or accepted without a broker order ID.
-const SELECT_PENDING_SUBMISSIONS: &str = "SELECT id,request FROM submissions \
-     WHERE account=?1 AND (outcome IS NULL OR json_extract(outcome,'$.order_id') IS NULL \
-     AND json_extract(outcome,'$.status')='accepted')";
+/// Submissions with no outcome yet, or accepted without a broker order ID,
+/// with whether each was armed and when it began.
+const SELECT_PENDING_SUBMISSIONS: &str = "SELECT id,request,outcome IS NULL,armed,created_at \
+     FROM submissions WHERE account=?1 AND (outcome IS NULL \
+       OR (json_extract(outcome,'$.status')='accepted' \
+         AND json_extract(outcome,'$.order_id') IS NULL))";
 const RESOLVE_SUBMISSION_OUTCOME: &str = "UPDATE submissions SET outcome=?1 WHERE id=?2";
-/// Submissions whose linked broker order has reached a terminal status.
-const SELECT_TERMINAL_SUBMISSIONS: &str = "SELECT s.id FROM submissions s \
+/// Frees the tag of an intent resolved as never dispatched, as
+/// [`OrderJournal::finish`](crate::execution::OrderJournal::finish) does
+/// for any rejection.
+const RELEASE_NEVER_SENT_TAG: &str = "DELETE FROM used_order_tags WHERE account=?1 AND tag=?2 \
+     AND NOT EXISTS(SELECT 1 FROM orders o WHERE o.account=?1 \
+       AND json_extract(o.payload,'$.tag')=?2)";
+const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)";
+/// Submissions still holding a reservation whose linked broker order has
+/// reached a terminal status: what this pass releases.
+const SELECT_TERMINAL_SUBMISSIONS: &str = "SELECT s.id FROM reservations r \
+     JOIN submissions s ON s.id=r.id \
      JOIN orders o ON o.account=s.account AND o.order_id=json_extract(s.outcome,'$.order_id') \
-     WHERE s.account=?1 AND json_extract(o.payload,'$.status') \
+     WHERE r.state='held' AND r.account=?1 AND json_extract(o.payload,'$.status') \
      IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')";
 const RELEASE_HELD_RESERVATION: &str =
     "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'";
+/// Held reservations whose submission resolved without a live linked order
+/// (refused, or settled by an operator) before releases moved into
+/// `finish`: swept so they no longer count against the account.
+const RELEASE_ORPHANED_RESERVATIONS: &str = "UPDATE reservations SET state='released' \
+     WHERE state='held' AND account=?1 AND id IN (SELECT id FROM submissions \
+       WHERE account=?1 AND json_extract(outcome,'$.status') IN ('rejected','reconciled'))";
+/// How long an unarmed intent may stay unresolved before recovery decides it
+/// was never sent: longer than any submission's own deadline, so the task
+/// that began it has either armed it or given up. Arming is conditional on
+/// the intent being unresolved, so even a late dispatcher cannot send what
+/// recovery resolved.
+pub const NEVER_DISPATCHED_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+/// How far ahead of this store's clock a pass's start may be.
+const MAX_CLOCK_LEAD_MS: i64 = 5_000;
 /// Held reservations whose submission is linked to a broker order this store
 /// has observed, with that order's latest payload.
 const SELECT_LINKED_HELD_RESERVATIONS: &str = "SELECT r.id,r.quantity,r.notional,o.payload \
@@ -67,7 +92,18 @@ pub struct ReconciliationReport {
     pub resolved_attempts: Vec<String>,
     pub unresolved_attempts: Vec<String>,
     pub reconciled: bool,
+    /// Attempts whose reservation this pass released because their broker
+    /// order reached a terminal status.
     pub terminal_attempts: Vec<String>,
+    /// Unresolved intents this pass resolved as rejected because they were
+    /// never armed: nothing was sent (see
+    /// [`NEVER_DISPATCHED_AFTER`]).
+    #[serde(default)]
+    pub never_dispatched_attempts: Vec<String>,
+    /// A newer pass or invalidation committed first, so this one wrote
+    /// nothing; the stored account state is the newer one's.
+    #[serde(default)]
+    pub superseded: bool,
 }
 impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
@@ -101,7 +137,8 @@ impl StateDatabase {
         })
         .await
     }
-    /// Commit only if no newer invalidation or reconciliation superseded this read.
+    /// Commit only if no newer invalidation or reconciliation superseded this
+    /// read; a superseded pass writes nothing and says so in its report.
     pub async fn reconcile_snapshot(
         &self,
         account: &str,
@@ -115,17 +152,22 @@ impl StateDatabase {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            let current: Option<(i64, i64)> = tx
+            // The pass's start becomes the baseline's age. A start ahead of
+            // this store's clock (a skewed remote worker) would make the
+            // baseline look fresher than it is.
+            let now = chrono::Utc::now().timestamp_millis();
+            if started_at > now + MAX_CLOCK_LEAD_MS {
+                return Err(Error::Storage(
+                    "Reconciliation started ahead of the state store's clock".into(),
+                ));
+            }
+            let started_at = started_at.min(now);
+            let current: Option<(i64, i64, bool)> = tx
                 .query_row(SELECT_ACCOUNT_GENERATION, [&account], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                 })
                 .optional()
                 .map_err(sql)?;
-            if current.is_some_and(|(g, at)| g != generation as i64 || at > started_at) {
-                return Err(Error::Storage(
-                    "Reconciliation superseded by a newer account generation".into(),
-                ));
-            }
             let mut report = ReconciliationReport {
                 account: account.clone(),
                 generation,
@@ -136,7 +178,13 @@ impl StateDatabase {
                 unresolved_attempts: vec![],
                 reconciled: false,
                 terminal_attempts: vec![],
+                never_dispatched_attempts: vec![],
+                superseded: false,
             };
+            if current.is_some_and(|(g, at, _)| g != generation as i64 || at > started_at) {
+                report.superseded = true;
+                return Ok(report);
+            }
             for order in &orders {
                 persist_order(
                     &tx,
@@ -160,15 +208,44 @@ impl StateDatabase {
             let pending = {
                 let mut stmt = tx.prepare(SELECT_PENDING_SUBMISSIONS).map_err(sql)?;
                 stmt.query_map([&account], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, bool>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
                 })
                 .map_err(sql)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sql)?
             };
-            for (id, request) in pending {
+            let never_sent_before = started_at - NEVER_DISPATCHED_AFTER.num_milliseconds();
+            for (id, request, unresolved, armed, created_at) in pending {
                 let request: Value = serde_json::from_str(&request)?;
                 let tag = request.get("tag").and_then(Value::as_str);
+                if unresolved && !armed && created_at < never_sent_before {
+                    // Never armed, so never sent; arming now fails.
+                    let outcome = crate::execution::SubmissionOutcome::Rejected;
+                    tx.execute(
+                        RESOLVE_SUBMISSION_OUTCOME,
+                        params![serde_json::to_string(&outcome)?, id],
+                    )
+                    .map_err(sql)?;
+                    if let Some(tag) = tag {
+                        tx.execute(RELEASE_NEVER_SENT_TAG, params![account, tag])
+                            .map_err(sql)?;
+                    }
+                    tx.execute(RELEASE_HELD_RESERVATION, [&id]).map_err(sql)?;
+                    audit(
+                        &tx,
+                        "never_dispatched",
+                        &id,
+                        &serde_json::json!({"outcome": outcome}),
+                    )?;
+                    report.never_dispatched_attempts.push(id);
+                    continue;
+                }
                 let candidates: Vec<_> = orders
                     .iter()
                     .filter(|o| {
@@ -229,7 +306,10 @@ impl StateDatabase {
             for id in &report.terminal_attempts {
                 tx.execute(RELEASE_HELD_RESERVATION, [id]).map_err(sql)?;
             }
-            shrink_filled_reservations(&tx, &account)?;
+            let orphaned = tx
+                .execute(RELEASE_ORPHANED_RESERVATIONS, [&account])
+                .map_err(sql)?;
+            let shrunk = shrink_filled_reservations(&tx, &account)?;
             report.reconciled = report.unresolved_attempts.is_empty();
             tx.execute(
                 UPSERT_ACCOUNT_SNAPSHOT,
@@ -242,12 +322,24 @@ impl StateDatabase {
                 ],
             )
             .map_err(sql)?;
-            audit(
-                &tx,
-                "account_reconciled",
-                &account,
-                &serde_json::to_value(&report)?,
-            )?;
+            // A pass that changed nothing the journal tracks is not an
+            // event: auditing every pass would grow the trail by one row
+            // per account per interval forever.
+            let changed = !report.resolved_attempts.is_empty()
+                || !report.terminal_attempts.is_empty()
+                || !report.never_dispatched_attempts.is_empty()
+                || report.newly_observed_activities > 0
+                || orphaned > 0
+                || shrunk > 0
+                || current.is_none_or(|(_, _, valid)| valid != report.reconciled);
+            if changed {
+                audit(
+                    &tx,
+                    "account_reconciled",
+                    &account,
+                    &serde_json::to_value(&report)?,
+                )?;
+            }
             tx.commit().map_err(sql)?;
             let outcome = if report.reconciled {
                 "ready"
@@ -267,7 +359,7 @@ impl StateDatabase {
 /// reservation's price is its notional over its quantity, so the remainder is
 /// valued at the same limit. Unreadable or non-shrinking payloads are left
 /// alone: holding too much is the safe error.
-fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> Result<()> {
+fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> Result<usize> {
     use rust_decimal::Decimal;
     let rows = {
         let mut stmt = tx.prepare(SELECT_LINKED_HELD_RESERVATIONS).map_err(sql)?;
@@ -291,6 +383,7 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
         })
         .and_then(|s| s.parse::<Decimal>().ok())
     };
+    let mut shrunk = 0;
     for (id, quantity, notional, payload) in rows {
         let (Ok(quantity), Ok(notional), Ok(order)) = (
             quantity.parse::<Decimal>(),
@@ -326,8 +419,9 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
                 "notional": left.to_string(),
             }),
         )?;
+        shrunk += 1;
     }
-    Ok(())
+    Ok(shrunk)
 }
 pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
     value.and_then(|v| match v {
@@ -371,6 +465,12 @@ pub(crate) fn persist_order(
             params![account, id, at, serde_json::to_string(order)?],
         )
         .map_err(sql)?;
+        // The broker holds an order under this tag: no new intent may use
+        // it, even if this store lost the submission that did.
+        if let Some(tag) = order.get("tag").and_then(Value::as_str) {
+            c.execute(INSERT_USED_ORDER_TAG, params![account, tag])
+                .map_err(sql)?;
+        }
         if let Some(items) = order
             .get("orderActivityCollection")
             .and_then(Value::as_array)
@@ -469,19 +569,10 @@ impl SchwabClient {
                 .map_or(lookback, |since| (since - SINCE_OVERLAP).max(lookback));
             // An ambiguous older intent extends the history scan. Limits still
             // apply; we never silently drop an old unresolved submission.
-            for record in database.records().await? {
-                if record.account == account
-                    && matches!(
-                        record.outcome,
-                        None | Some(crate::execution::SubmissionOutcome::Accepted {
-                            order_id: None
-                        })
-                    )
-                {
-                    let at = chrono::DateTime::from_timestamp_millis(record.created_at)
-                        .ok_or_else(|| Error::Storage("Invalid intent timestamp".into()))?;
-                    from = from.min(at - chrono::Duration::seconds(1));
-                }
+            for record in database.unresolved_records(account).await? {
+                let at = chrono::DateTime::from_timestamp_millis(record.created_at)
+                    .ok_or_else(|| Error::Storage("Invalid intent timestamp".into()))?;
+                from = from.min(at - chrono::Duration::seconds(1));
             }
             let mut windows = vec![(from, started)];
             let mut orders = std::collections::BTreeMap::new();
@@ -547,13 +638,26 @@ impl SchwabClient {
                 if !id.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
                     return Err(Error::Storage("Invalid stored broker order ID".into()));
                 }
-                let order: Value = self
+                let order: Value = match self
                     .request(
                         "reconcile_order",
                         reqwest::Method::GET,
                         &crate::client::order_path(account, &id)?,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(order) => order,
+                    // The broker has no such order. That ends a reference
+                    // this store never saw answered; an order it did
+                    // observe vanishing still needs an operator.
+                    Err(error)
+                        if error.http_status() == Some(reqwest::StatusCode::NOT_FOUND)
+                            && database.forget_placeholder(account, &id).await? =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 if broker_id(order.get("orderId")).as_deref() != Some(&id) {
                     return Err(Error::Storage("Targeted broker order ID mismatch".into()));
                 }
@@ -590,7 +694,14 @@ impl SchwabClient {
             tokio::time::timeout(std::time::Duration::from_millis(options.timeout_ms), run)
                 .await
                 .unwrap_or_else(|_| Err(Error::Storage("Reconciliation deadline exceeded".into())));
-        if result.is_err() {
+        // A superseded pass wrote nothing and returned Ok: the newer state
+        // stands. A pass that could not finish invalidates the baseline,
+        // unless one that began after it has already replaced it.
+        if result.is_err()
+            && database.account_state(account).await?.is_none_or(|state| {
+                state.generation != generation || state.observed_at <= started.timestamp_millis()
+            })
+        {
             database.invalidate_account(account, generation).await?;
         }
         result
