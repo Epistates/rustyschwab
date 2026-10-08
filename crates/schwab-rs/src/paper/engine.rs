@@ -93,13 +93,11 @@ fn corrupt(message: &str) -> Error {
 fn venue_error(status: reqwest::StatusCode, title: &str, detail: &str) -> Error {
     Error::Broker {
         status,
-        details: vec![crate::error::ApiError {
-            id: None,
-            status: Some(status.as_u16().to_string()),
-            title: Some(title.into()),
-            detail: Some(detail.into()),
-            source: None,
-        }],
+        details: vec![crate::error::ApiError::new(
+            Some(status.as_u16().to_string()),
+            title,
+            Some(detail.to_owned()),
+        )],
         request_id: None,
     }
 }

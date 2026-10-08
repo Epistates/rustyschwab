@@ -1093,16 +1093,16 @@ impl SchwabClient {
         .await
     }
 
-    /// Preview an order without submitting it.
+    /// Preview an order without submitting it: Schwab's validation
+    /// findings, projected balances and fees.
     ///
-    /// Returns the raw JSON validation result (fees, buying-power impact,
-    /// warnings/rejects) — the shape varies by order type and account, so
-    /// it is not modeled as a fixed struct.
+    /// A preview Schwab would refuse still succeeds here; check
+    /// [`OrderPreview::is_rejected`](crate::types::trading::OrderPreview::is_rejected).
     pub async fn preview_order(
         &self,
         account_hash: &str,
         order: &OrderRequest,
-    ) -> Result<serde_json::Value> {
+    ) -> Result<crate::types::trading::OrderPreview> {
         order.validate()?;
         self.request_with_body(
             "preview_order",

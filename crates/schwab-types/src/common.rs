@@ -134,7 +134,8 @@ pub enum AssetMainType {
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+// A position or leg Schwab sends without a field must not fail the list.
+#[serde(rename_all = "camelCase", default)]
 #[non_exhaustive]
 pub struct AccountsInstrument {
     pub asset_type: AssetType,
@@ -208,6 +209,28 @@ pub struct PageInfo {
     pub page_number: i32,
     pub total_pages: i32,
     pub total_items: i32,
+}
+
+/// Rewrite every float in `value` that holds an exact integer (`100.0`) as
+/// that integer, so it decodes into an integer field; other numbers are
+/// untouched (an integer still decodes into a float field). Only values
+/// within ±2^53, where a float is exact, are rewritten.
+pub fn normalize_integral_numbers(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            if let Some(float) = number.as_f64()
+                && float.fract() == 0.0
+                && float.abs() <= EXACT
+            {
+                *value = Value::from(float as i64);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(normalize_integral_numbers),
+        Value::Object(fields) => fields.values_mut().for_each(normalize_integral_numbers),
+        _ => {}
+    }
 }
 
 /// Broker identifiers may be JSON integers or strings. Normalize losslessly.
@@ -316,6 +339,17 @@ pub mod exact_decimal {
         }
     }
 
+    /// Serialize as an exact decimal string (`"150.25"`), the form the SDK
+    /// sends prices in. Explicit, so a dependency enabling rust_decimal's
+    /// `serde-float` feature cannot turn prices into floats (and change
+    /// every intent digest over them).
+    pub fn serialize_string<S: serde::Serializer>(
+        value: &Decimal,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        s.collect_str(value)
+    }
+
     /// The same rules for an optional field; pair with `#[serde(default)]`.
     pub mod option {
         use rust_decimal::Decimal;
@@ -333,6 +367,16 @@ pub mod exact_decimal {
         ) -> Result<S::Ok, S::Error> {
             match value {
                 Some(value) => super::serialize_number(value, s),
+                None => s.serialize_none(),
+            }
+        }
+
+        pub fn serialize_string<S: Serializer>(
+            value: &Option<Decimal>,
+            s: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => super::serialize_string(value, s),
                 None => s.serialize_none(),
             }
         }
@@ -407,10 +451,30 @@ pub fn schwab_timestamp(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+/// Parse a time as Schwab reports it on orders and transactions
+/// (`2025-01-15T14:31:22+0000`, with or without a fraction), or as RFC 3339.
+pub fn parse_schwab_time(text: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%z")
+        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .or_else(|_| DateTime::parse_from_rfc3339(text))
+        .map(|at| at.with_timezone(&Utc))
+}
+
 /// `serialize_with` adapter for [`schwab_timestamp`].
 pub(crate) fn serialize_timestamp<S: serde::Serializer>(
     at: &DateTime<Utc>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&schwab_timestamp(*at))
+}
+
+/// [`serialize_timestamp`] for an optional field.
+pub(crate) fn serialize_optional_timestamp<S: serde::Serializer>(
+    at: &Option<DateTime<Utc>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match at {
+        Some(at) => serialize_timestamp(at, serializer),
+        None => serializer.serialize_none(),
+    }
 }

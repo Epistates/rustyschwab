@@ -399,35 +399,9 @@ pub enum StreamError {
     Protocol(String),
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ApiError {
-    pub id: Option<String>,
-    pub status: Option<String>,
-    pub title: Option<String>,
-    pub detail: Option<String>,
-    pub source: Option<ErrorSource>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ErrorSource {
-    pub pointer: Option<Vec<String>>,
-    pub parameter: Option<String>,
-    pub header: Option<String>,
-}
-
-impl fmt::Display for ApiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(title) = &self.title {
-            write!(f, "{}", title)?;
-        }
-        if let Some(detail) = &self.detail {
-            write!(f, ": {}", detail)?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for ApiError {}
+/// One error from a Schwab error body; see
+/// [`crate::types::market_data::ApiError`].
+pub use crate::types::market_data::{ApiError, ErrorSource};
 
 impl Error {
     /// Stable classification of this error, independent of its payload.
@@ -512,11 +486,35 @@ impl Error {
     }
 }
 
+/// Parse a Schwab error body. Two shapes are documented: the market data
+/// API's `{"errors":[{"status","title","detail",...}]}` and the trader
+/// API's `{"message":"...","errors":["..."]}`; either becomes
+/// [`Error::Broker`], so the reason reaches the caller. Anything else is
+/// [`Error::Http`] carrying the body.
 pub fn parse_api_error(status: reqwest::StatusCode, body: &str) -> Error {
-    if let Ok(api_errors) = serde_json::from_str::<ApiErrorResponse>(body) {
+    if let Ok(api_errors) = serde_json::from_str::<ApiErrorResponse>(body)
+        && !api_errors.errors.is_empty()
+    {
         return Error::Broker {
             status,
             details: api_errors.errors,
+            request_id: None,
+        };
+    }
+    if let Ok(trader) = serde_json::from_str::<TraderErrorResponse>(body)
+        && (trader.message.is_some() || !trader.errors.is_empty())
+    {
+        let title = trader
+            .message
+            .unwrap_or_else(|| status.canonical_reason().unwrap_or("Error").to_owned());
+        let detail = (!trader.errors.is_empty()).then(|| trader.errors.join("; "));
+        return Error::Broker {
+            status,
+            details: vec![ApiError::new(
+                Some(status.as_u16().to_string()),
+                title,
+                detail,
+            )],
             request_id: None,
         };
     }
@@ -530,6 +528,14 @@ pub fn parse_api_error(status: reqwest::StatusCode, body: &str) -> Error {
 #[derive(Debug, serde::Deserialize)]
 struct ApiErrorResponse {
     errors: Vec<ApiError>,
+}
+
+/// The trader API's error body.
+#[derive(Debug, serde::Deserialize)]
+struct TraderErrorResponse {
+    message: Option<String>,
+    #[serde(default)]
+    errors: Vec<String>,
 }
 
 /// Stable classification of an [`enum@Error`], independent of its payload.
@@ -856,6 +862,37 @@ mod tests {
         );
     }
 
+    /// Both documented error shapes, and a numeric `status`, become broker
+    /// errors that carry Schwab's reason.
+    #[test]
+    fn schwab_error_bodies_keep_their_reasons() {
+        let numeric = parse_api_error(
+            reqwest::StatusCode::NOT_FOUND,
+            r#"{"errors":[{"id":"x","status":404,"title":"Not Found","detail":"No such order"}]}"#,
+        );
+        let Error::Broker { details, .. } = &numeric else {
+            panic!("{numeric:?}");
+        };
+        assert_eq!(details[0].status.as_deref(), Some("404"));
+        assert_eq!(details[0].detail.as_deref(), Some("No such order"));
+        let trader = parse_api_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message":"Order rejected","errors":["Insufficient buying power"]}"#,
+        );
+        let Error::Broker { details, .. } = &trader else {
+            panic!("{trader:?}");
+        };
+        assert_eq!(details[0].title.as_deref(), Some("Order rejected"));
+        assert_eq!(
+            details[0].detail.as_deref(),
+            Some("Insufficient buying power")
+        );
+        assert!(matches!(
+            parse_api_error(reqwest::StatusCode::BAD_GATEWAY, "<html>"),
+            Error::Http { .. }
+        ));
+    }
+
     fn round_trip(error: Error) -> Error {
         let json = serde_json::to_string(&ErrorEnvelope::from(&error)).unwrap();
         Error::from(serde_json::from_str::<ErrorEnvelope>(&json).unwrap())
@@ -910,13 +947,7 @@ mod tests {
         assert!(matches!(
             round_trip(Error::Broker {
                 status: reqwest::StatusCode::BAD_REQUEST,
-                details: vec![ApiError {
-                    id: None,
-                    status: None,
-                    title: Some("secret".into()),
-                    detail: None,
-                    source: None,
-                }],
+                details: vec![ApiError::new(None, "secret", None)],
                 request_id: Some("r".into()),
             }),
             Error::Broker { status, details, request_id: None }

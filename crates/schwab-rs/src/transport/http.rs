@@ -161,9 +161,26 @@ impl HttpTransport {
             if bytes.is_empty() {
                 return serde_json::from_str("null").map_err(Error::from);
             }
-            serde_json::from_slice(&bytes).map_err(Error::from)
+            decode(&bytes)
         } else {
             Err(error_from_response(response).await)
+        }
+    }
+}
+
+/// Decode a response body. Schwab spells some integers as integral floats
+/// (`"openInterest": 12.0`, `"optionMultiplier": 100.0`) in places its
+/// schema types as integers; a body that fails to decode as is gets those
+/// normalized and one more try, and otherwise reports the first error.
+fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+                return Err(error.into());
+            };
+            crate::types::common::normalize_integral_numbers(&mut value);
+            serde_json::from_value(value).map_err(|_| error.into())
         }
     }
 }

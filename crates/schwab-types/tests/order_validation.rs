@@ -329,3 +329,112 @@ fn osi_symbols_parse_only_their_canonical_form() {
         assert!(padded.parse::<OptionSymbol>().is_err(), "{padded}");
     }
 }
+
+fn option_leg(instruction: &str, symbol: &str, quantity: u32) -> serde_json::Value {
+    json!({"quantity": quantity, "instruction": instruction,
+        "instrument": {"symbol": symbol, "assetType": "OPTION"}})
+}
+
+/// Rules over the legs together: what Schwab answers 400 for, refused with
+/// the field that is wrong.
+#[test]
+fn legs_are_judged_together() {
+    let call = |strike: &str| format!("AAPL  301218C00{strike}000");
+    let spread = |order_type: &str, legs: Vec<serde_json::Value>, strategy: &str| {
+        parse(json!({
+            "orderStrategyType": "SINGLE", "orderType": order_type, "session": "NORMAL",
+            "duration": "DAY", "price": "1.00", "complexOrderStrategyType": strategy,
+            "orderLegCollection": legs
+        }))
+        .unwrap()
+    };
+    let vertical = vec![
+        option_leg("BUY_TO_OPEN", &call("150"), 1),
+        option_leg("SELL_TO_OPEN", &call("160"), 1),
+    ];
+    spread("NET_DEBIT", vertical.clone(), "VERTICAL")
+        .validate()
+        .unwrap();
+    // Several legs are priced as one.
+    rejects(
+        &spread("LIMIT", vertical.clone(), "VERTICAL"),
+        "priced together",
+    );
+    // A named strategy has its number of legs, on one underlying.
+    let mut three = vertical.clone();
+    three.push(option_leg("SELL_TO_OPEN", &call("170"), 1));
+    rejects(&spread("NET_DEBIT", three, "VERTICAL"), "takes 2 legs");
+    let mixed = vec![
+        option_leg("BUY_TO_OPEN", &call("150"), 1),
+        option_leg("SELL_TO_OPEN", "MSFT  301218C00400000", 1),
+    ];
+    rejects(&spread("NET_DEBIT", mixed, "VERTICAL"), "one underlying");
+    // No leg repeats another.
+    let repeated = vec![
+        option_leg("BUY_TO_OPEN", &call("150"), 1),
+        option_leg("BUY_TO_OPEN", &call("150"), 1),
+    ];
+    let err = spread("NET_DEBIT", repeated, "CUSTOM")
+        .validate()
+        .unwrap_err();
+    assert_eq!(err.field(), Some("orderLegCollection[1]"));
+    // Options trade only in the regular session.
+    let single_option = parse(json!({
+        "orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "AM",
+        "duration": "DAY", "price": "1.00",
+        "orderLegCollection": [option_leg("BUY_TO_OPEN", &call("150"), 1)]
+    }))
+    .unwrap();
+    rejects(&single_option, "NORMAL session");
+}
+
+/// A trailing offset in ticks is a whole number of ticks.
+#[test]
+fn a_tick_offset_is_whole() {
+    let order = parse(json!({
+        "orderStrategyType": "SINGLE", "orderType": "TRAILING_STOP", "session": "NORMAL",
+        "duration": "DAY", "stopPriceLinkBasis": "LAST", "stopPriceLinkType": "TICK",
+        "stopPriceOffset": "2.5",
+        "orderLegCollection": [{"quantity": 1, "instruction": "SELL",
+            "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+    }))
+    .unwrap();
+    let err = order.validate().unwrap_err();
+    assert_eq!(err.kind(), ValidationErrorKind::NotWhole);
+    assert_eq!(err.field(), Some("stopPriceOffset"));
+}
+
+/// A stop entry's trigger is the price a bracket's exits must straddle.
+#[test]
+fn a_stop_entry_bracket_straddles_its_trigger() {
+    let entry = OrderRequest::stop(buy(1), d("155"));
+    assert!(entry.clone().bracket(d("160"), d("158")).is_err());
+    entry.bracket(d("160"), d("150")).unwrap();
+}
+
+/// A reported order becomes the request that would place it again, to
+/// edit for a replacement: Schwab's bookkeeping and the tag are left out.
+#[test]
+fn a_reported_order_becomes_its_request() {
+    let order: schwab_types::trading::Order = serde_json::from_value(json!({
+        "orderId": 77, "status": "WORKING", "tag": "rs-original",
+        "session": "NORMAL", "duration": "DAY", "orderType": "LIMIT",
+        "orderStrategyType": "SINGLE", "price": 150.25, "quantity": 10.0,
+        "filledQuantity": 0.0, "remainingQuantity": 10.0,
+        "releaseTime": "2030-01-02T14:30:00+0000",
+        "orderLegCollection": [{"orderLegType": "EQUITY", "legId": 1,
+            "instruction": "BUY", "quantity": 10.0,
+            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]
+    }))
+    .unwrap();
+    let mut request = OrderRequest::try_from(&order).unwrap();
+    assert_eq!(request.price, Some(d("150.25")));
+    assert_eq!(request.order_leg_collection[0].quantity, d("10"));
+    assert!(request.tag.is_none());
+    assert!(request.release_time.is_some());
+    request.validate().unwrap();
+    request.price = Some(d("149.50"));
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire["price"], "149.50");
+    assert_eq!(wire["releaseTime"], "2030-01-02T14:30:00.000Z");
+}

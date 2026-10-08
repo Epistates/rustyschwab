@@ -108,7 +108,10 @@ async fn main() -> Result<()> {
                     "1.00".parse()?,
                 );
                 match client.preview_order(&account.hash_value, &order).await {
-                    Ok(resp) => info!("Order preview: {}", resp),
+                    Ok(preview) if preview.is_rejected() => {
+                        info!("Schwab would reject it: {:?}", preview.rejection_reasons())
+                    }
+                    Ok(preview) => info!("Order preview: {preview:?}"),
                     Err(e) => warn!("Order preview failed: {}", e),
                 }
             }

@@ -118,7 +118,8 @@ pub struct Order {
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+// One leg Schwab sends without a field must not fail the whole order list.
+#[serde(rename_all = "camelCase", default)]
 #[non_exhaustive]
 pub struct OrderLeg {
     pub order_leg_type: OrderLegType,
@@ -521,6 +522,118 @@ pub enum RequestedDestination {
     Unknown,
 }
 
+/// The answer to `POST .../previewOrder`: Schwab's verdict on an order
+/// without placing it.
+///
+/// A preview Schwab would refuse still answers 200; read
+/// [`is_rejected`](Self::is_rejected) (and the `rejects`) rather than the
+/// HTTP status. Fields Schwab adds land in `extra`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
+pub struct OrderPreview {
+    #[serde(deserialize_with = "crate::common::optional_id")]
+    pub order_id: Option<String>,
+    pub order_strategy: Option<PreviewOrderStrategy>,
+    pub order_validation_result: OrderValidationResult,
+    /// Commission and fee legs, as Schwab reports them.
+    pub commission_and_fee: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl OrderPreview {
+    /// Whether Schwab would refuse the order: a `reject` finding, or the
+    /// previewed strategy's status `REJECTED`.
+    pub fn is_rejected(&self) -> bool {
+        !self.order_validation_result.rejects.is_empty()
+            || self
+                .order_strategy
+                .as_ref()
+                .is_some_and(|s| s.status == Some(OrderStatus::Rejected))
+    }
+    /// The reasons Schwab gave for refusing it.
+    pub fn rejection_reasons(&self) -> Vec<&str> {
+        self.order_validation_result
+            .rejects
+            .iter()
+            .filter_map(ValidationFinding::text)
+            .collect()
+    }
+}
+
+/// The order as Schwab previewed it: its status and projected balances;
+/// the rest of the strategy is in `extra`.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
+pub struct PreviewOrderStrategy {
+    #[serde(deserialize_with = "crate::common::lenient")]
+    pub status: Option<OrderStatus>,
+    pub order_balance: Option<PreviewOrderBalance>,
+    pub order_value: Option<f64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// What the order would do to the account's balances.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
+pub struct PreviewOrderBalance {
+    pub order_value: Option<f64>,
+    pub projected_available_fund: Option<f64>,
+    pub projected_buying_power: Option<f64>,
+    pub projected_commission: Option<f64>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Schwab's validation findings, by severity.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
+pub struct OrderValidationResult {
+    pub alerts: Vec<ValidationFinding>,
+    pub accepts: Vec<ValidationFinding>,
+    pub rejects: Vec<ValidationFinding>,
+    pub reviews: Vec<ValidationFinding>,
+    pub warns: Vec<ValidationFinding>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// One validation finding on a preview.
+#[skip_serializing_none]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase", default)]
+#[non_exhaustive]
+pub struct ValidationFinding {
+    pub validation_rule_name: Option<String>,
+    pub message: Option<String>,
+    pub activity_message: Option<String>,
+    pub original_severity: Option<String>,
+    pub override_name: Option<String>,
+    pub override_severity: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl ValidationFinding {
+    /// The finding's text: `activityMessage`, else `message`.
+    pub fn text(&self) -> Option<&str> {
+        self.activity_message.as_deref().or(self.message.as_deref())
+    }
+}
+
 /// Result of submitting an order via `POST .../orders` or `PUT .../orders/{id}`.
 ///
 /// Schwab returns **201 Created with an empty body**; the only payload is a
@@ -805,7 +918,7 @@ pub struct TransactionUser {
 #[skip_serializing_none]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 #[non_exhaustive]
 pub struct TransactionInstrument {
     pub asset_type: AssetType,
@@ -970,7 +1083,9 @@ pub struct OrderRequest {
     pub duration: Option<OrderDuration>,
     pub order_type: Option<OrderType>,
     pub complex_order_strategy_type: Option<ComplexOrderStrategyType>,
-    /// When present, must equal every leg's quantity. Sent as a JSON number.
+    /// The order's unit count, when present: a single leg trades exactly it,
+    /// and each leg of a multi-leg order a whole multiple of it (a 1x2
+    /// ratio of 5 has legs of 5 and 10). Sent as a JSON number.
     #[serde(
         default,
         deserialize_with = "crate::common::exact_decimal::option::deserialize",
@@ -983,7 +1098,8 @@ pub struct OrderRequest {
     pub quantity: Option<rust_decimal::Decimal>,
     #[serde(
         default,
-        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+        deserialize_with = "crate::common::exact_decimal::option::deserialize",
+        serialize_with = "crate::common::exact_decimal::option::serialize_string"
     )]
     #[cfg_attr(
         feature = "schemars",
@@ -992,7 +1108,8 @@ pub struct OrderRequest {
     pub price: Option<rust_decimal::Decimal>,
     #[serde(
         default,
-        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+        deserialize_with = "crate::common::exact_decimal::option::deserialize",
+        serialize_with = "crate::common::exact_decimal::option::serialize_string"
     )]
     #[cfg_attr(
         feature = "schemars",
@@ -1003,7 +1120,8 @@ pub struct OrderRequest {
     pub stop_price_link_type: Option<PriceLinkType>,
     #[serde(
         default,
-        deserialize_with = "crate::common::exact_decimal::option::deserialize"
+        deserialize_with = "crate::common::exact_decimal::option::deserialize",
+        serialize_with = "crate::common::exact_decimal::option::serialize_string"
     )]
     #[cfg_attr(
         feature = "schemars",
@@ -1017,6 +1135,30 @@ pub struct OrderRequest {
     pub tag: Option<String>,
     pub special_instruction: Option<SpecialInstruction>,
     pub requested_destination: Option<RequestedDestination>,
+    /// Hold the order until this time (Schwab reports it
+    /// `AWAITING_RELEASE_TIME` until then).
+    #[serde(
+        default,
+        serialize_with = "crate::common::serialize_optional_timestamp"
+    )]
+    pub release_time: Option<DateTime<Utc>>,
+    /// Cancel the order at this time if it has not filled.
+    #[serde(
+        default,
+        serialize_with = "crate::common::serialize_optional_timestamp"
+    )]
+    pub cancel_time: Option<DateTime<Utc>>,
+    /// The price at which a conditional order activates.
+    #[serde(
+        default,
+        deserialize_with = "crate::common::exact_decimal::option::deserialize",
+        serialize_with = "crate::common::exact_decimal::option::serialize_string"
+    )]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(with = "Option<crate::common::DecimalString>")
+    )]
+    pub activation_price: Option<rust_decimal::Decimal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub order_leg_collection: Vec<OrderRequestLeg>,
     pub order_strategy_type: OrderStrategyType,
@@ -1071,6 +1213,75 @@ pub enum DivCapGains {
 pub struct OrderRequestInstrument {
     pub symbol: String,
     pub asset_type: AssetType,
+}
+
+/// The request that would place `order` again, to edit for a replacement:
+/// its strategy, legs, prices and timing, without what Schwab assigned
+/// (ID, status, fills) and without its tag, which belongs to the original
+/// intent. Fails when a reported number has no exact decimal spelling.
+impl TryFrom<&Order> for OrderRequest {
+    type Error = ValidationError;
+
+    fn try_from(order: &Order) -> Result<Self, ValidationError> {
+        fn exact(field: &str, value: f64) -> Result<rust_decimal::Decimal, ValidationError> {
+            crate::common::exact_decimal::parse(&value.to_string())
+                .map_err(|e| VE::new(K::OutOfRange, Some(field), e))
+        }
+        let optional = |field: &str, value: Option<f64>| value.map(|v| exact(field, v)).transpose();
+        let mut legs = Vec::with_capacity(order.order_leg_collection.len());
+        for (i, leg) in order.order_leg_collection.iter().enumerate() {
+            legs.push(OrderRequestLeg {
+                instruction: leg.instruction,
+                quantity: exact("quantity", leg.quantity)
+                    .map_err(|e| e.within(&format!("orderLegCollection[{i}]")))?,
+                instrument: OrderRequestInstrument {
+                    symbol: leg.instrument.symbol.clone(),
+                    asset_type: leg.instrument.asset_type,
+                },
+                position_effect: leg.position_effect,
+                quantity_type: leg.quantity_type,
+                div_cap_gains: None,
+                to_symbol: None,
+            });
+        }
+        let mut children = Vec::with_capacity(order.child_order_strategies.len());
+        for (i, child) in order.child_order_strategies.iter().enumerate() {
+            children.push(
+                Self::try_from(child)
+                    .map_err(|e| e.within(&format!("childOrderStrategies[{i}]")))?,
+            );
+        }
+        let time = |value: &Option<String>| {
+            value
+                .as_deref()
+                .and_then(|t| crate::common::parse_schwab_time(t).ok())
+        };
+        Ok(Self {
+            session: order.session,
+            duration: order.duration,
+            order_type: order.order_type,
+            complex_order_strategy_type: order.complex_order_strategy_type,
+            quantity: optional("quantity", order.quantity)?,
+            price: optional("price", order.price)?,
+            stop_price: optional("stopPrice", order.stop_price)?,
+            stop_price_link_basis: order.stop_price_link_basis,
+            stop_price_link_type: order.stop_price_link_type,
+            stop_price_offset: optional("stopPriceOffset", order.stop_price_offset)?,
+            stop_type: order.stop_type,
+            price_link_basis: order.price_link_basis,
+            price_link_type: order.price_link_type,
+            tax_lot_method: order.tax_lot_method,
+            tag: None,
+            special_instruction: order.special_instruction,
+            requested_destination: order.requested_destination,
+            release_time: time(&order.release_time),
+            cancel_time: None,
+            activation_price: optional("activationPrice", order.activation_price)?,
+            order_leg_collection: legs,
+            order_strategy_type: order.order_strategy_type.unwrap_or_default(),
+            child_order_strategies: children,
+        })
+    }
 }
 
 crate::common::wire_enum!(
@@ -1208,6 +1419,7 @@ impl OrderRequest {
             ("price", self.price),
             ("stopPrice", self.stop_price),
             ("stopPriceOffset", self.stop_price_offset),
+            ("activationPrice", self.activation_price),
         ] {
             if value.is_some_and(|v| v <= rust_decimal::Decimal::ZERO) {
                 return Err(VE::new(
@@ -1216,6 +1428,15 @@ impl OrderRequest {
                     format!("{name} must be positive"),
                 ));
             }
+        }
+        if let (Some(release), Some(cancel)) = (self.release_time, self.cancel_time)
+            && cancel <= release
+        {
+            return Err(VE::new(
+                K::Structure,
+                Some("cancelTime"),
+                "cancelTime must be after releaseTime",
+            ));
         }
         match self.order_strategy_type {
             OrderStrategyType::Oco => self.validate_oco_parent()?,
@@ -1255,6 +1476,9 @@ impl OrderRequest {
             || self.tax_lot_method.is_some()
             || self.special_instruction.is_some()
             || self.requested_destination.is_some()
+            || self.release_time.is_some()
+            || self.cancel_time.is_some()
+            || self.activation_price.is_some()
             || !self.order_leg_collection.is_empty();
         if self.child_order_strategies.len() != 2 || executable {
             return Err(VE::new(
@@ -1408,6 +1632,7 @@ impl OrderRequest {
                 ));
             }
         }
+        self.validate_leg_set(kind, session)?;
         match (
             self.order_strategy_type,
             self.child_order_strategies.is_empty(),
@@ -1424,6 +1649,112 @@ impl OrderRequest {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Rules over the legs together, which Schwab enforces and answers 400
+    /// for: options trade only in the regular session; several legs are
+    /// priced as one (`NET_DEBIT`, `NET_CREDIT`, `NET_ZERO` or `MARKET`); no
+    /// leg repeats another; a named strategy has its number of legs, on one
+    /// underlying; a trailing offset in ticks is a whole number of ticks.
+    fn validate_leg_set(
+        &self,
+        kind: OrderType,
+        session: OrderSession,
+    ) -> Result<(), ValidationError> {
+        let legs = &self.order_leg_collection;
+        let options: Vec<OptionSymbol> = legs
+            .iter()
+            .filter(|leg| leg.instrument.asset_type == AssetType::Option)
+            .filter_map(|leg| leg.instrument.symbol.parse().ok())
+            .collect();
+        if !options.is_empty() && session != OrderSession::Normal {
+            return Err(VE::new(
+                K::Structure,
+                Some("session"),
+                "Options trade only in the NORMAL session",
+            ));
+        }
+        if legs.len() > 1
+            && !matches!(
+                kind,
+                OrderType::NetDebit | OrderType::NetCredit | OrderType::NetZero | OrderType::Market
+            )
+        {
+            return Err(VE::new(
+                K::Structure,
+                Some("orderType"),
+                "Several legs are priced together: NET_DEBIT, NET_CREDIT, NET_ZERO or MARKET",
+            ));
+        }
+        for (i, leg) in legs.iter().enumerate() {
+            if legs[..i].iter().any(|other| {
+                other.instrument.symbol == leg.instrument.symbol
+                    && other.instruction == leg.instruction
+            }) {
+                return Err(VE::new(
+                    K::Structure,
+                    Some(&format!("orderLegCollection[{i}]")),
+                    "A leg repeats another; trade the combined quantity on one leg",
+                ));
+            }
+        }
+        use ComplexOrderStrategyType as C;
+        if let Some(strategy) = self.complex_order_strategy_type {
+            let expected = match strategy {
+                C::Vertical
+                | C::BackRatio
+                | C::Calendar
+                | C::Diagonal
+                | C::Straddle
+                | C::Strangle
+                | C::CollarSynthetic
+                | C::Covered => Some(2),
+                C::Butterfly | C::UnbalancedButterfly | C::CollarWithStock => Some(3),
+                C::Condor
+                | C::IronCondor
+                | C::VerticalRoll
+                | C::DoubleDiagonal
+                | C::UnbalancedCondor
+                | C::UnbalancedIronCondor
+                | C::UnbalancedVerticalRoll => Some(4),
+                _ => None,
+            };
+            if expected.is_some_and(|n| n != legs.len()) {
+                return Err(VE::new(
+                    K::Structure,
+                    Some("orderLegCollection"),
+                    format!("{strategy:?} takes {} legs", expected.unwrap_or_default()),
+                ));
+            }
+            // A named strategy is on one underlying; a covered or collared
+            // position's stock is that underlying.
+            if expected.is_some() {
+                let mut underlyings = options.iter().map(OptionSymbol::underlying).chain(
+                    legs.iter()
+                        .filter(|leg| leg.instrument.asset_type != AssetType::Option)
+                        .map(|leg| leg.instrument.symbol.as_str()),
+                );
+                if let Some(first) = underlyings.next()
+                    && underlyings.any(|u| u != first)
+                {
+                    return Err(VE::new(
+                        K::Structure,
+                        Some("orderLegCollection"),
+                        format!("{strategy:?} legs must share one underlying"),
+                    ));
+                }
+            }
+        }
+        if self.stop_price_link_type == Some(PriceLinkType::Tick)
+            && self.stop_price_offset.is_some_and(|o| !o.fract().is_zero())
+        {
+            return Err(VE::new(
+                K::NotWhole,
+                Some("stopPriceOffset"),
+                "A trailing offset in ticks is a whole number of ticks",
+            ));
+        }
+        Ok(())
     }
 
     /// Enforce a caller-supplied broker/asset tick size on every price and

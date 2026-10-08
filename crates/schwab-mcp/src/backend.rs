@@ -291,7 +291,16 @@ impl Backend {
         order: &OrderRequest,
     ) -> Result<Value, ToolFailure> {
         match self {
-            Self::Live(client) => Ok(client.preview_order(account_hash, order).await?),
+            Self::Live(client) => {
+                let preview = client.preview_order(account_hash, order).await?;
+                let rejected = preview.is_rejected();
+                let mut value = serde_json::to_value(preview)
+                    .map_err(|e| ToolFailure::internal("Preview serialization", e))?;
+                // Schwab answers 200 for an order it would refuse: say so
+                // where a model reads first.
+                value["wouldBeRejected"] = rejected.into();
+                Ok(value)
+            }
             Self::Paper(_) => Err(Self::paper_unavailable(
                 "preview_order",
                 "check_order is the paper pre-flight",

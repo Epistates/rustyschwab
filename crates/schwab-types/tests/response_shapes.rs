@@ -960,3 +960,58 @@ fn stream_notifications_keep_what_they_do_not_model() {
     assert_eq!(admin.notify[0].heartbeat, None);
     assert_eq!(admin.notify[0].extra["content"]["code"], 30);
 }
+
+/// A preview Schwab would refuse answers 200; the typed preview says so.
+/// Shape from Schwabdev's documented live example.
+#[test]
+fn a_rejected_preview_says_so() {
+    use schwab_types::trading::OrderPreview;
+    let preview: OrderPreview = serde_json::from_value(serde_json::json!({
+        "orderId": 0,
+        "orderStrategy": {
+            "accountNumber": "XXXXXXXX", "orderStrategyType": "SINGLE",
+            "status": "REJECTED", "orderType": "LIMIT", "price": 10.0, "quantity": 1.0,
+            "orderBalance": {"orderValue": 10.0, "projectedAvailableFund": 0.0,
+                "projectedBuyingPower": 0.0, "projectedCommission": 0.0},
+            "orderLegs": [{"finalSymbol": "AMD", "legId": 1, "instruction": "BUY"}]
+        },
+        "orderValidationResult": {"rejects": [{
+            "activityMessage": "Your limit price is significantly away from the current market price. Please adjust your order.",
+            "originalSeverity": "REJECT"
+        }]},
+        "commissionAndFee": {"commission": {"commissionLegs": []}}
+    }))
+    .unwrap();
+    assert!(preview.is_rejected());
+    assert_eq!(preview.order_id.as_deref(), Some("0"));
+    assert!(preview.rejection_reasons()[0].starts_with("Your limit price"));
+    assert_eq!(
+        preview
+            .order_strategy
+            .as_ref()
+            .unwrap()
+            .order_balance
+            .as_ref()
+            .unwrap()
+            .order_value,
+        Some(10.0)
+    );
+    let accepted: OrderPreview = serde_json::from_value(serde_json::json!({
+        "orderStrategy": {"status": "ACCEPTED"},
+        "orderValidationResult": {"warns": [{"message": "Extended hours"}]}
+    }))
+    .unwrap();
+    assert!(!accepted.is_rejected());
+}
+
+/// Schwab spells some integers as integral floats; the SDK normalizes them
+/// before giving up on a body.
+#[test]
+fn integral_floats_normalize_to_integers() {
+    let mut value = serde_json::json!({"openInterest": 12.0, "mark": 1.5, "n": [100.0]});
+    schwab_types::common::normalize_integral_numbers(&mut value);
+    assert_eq!(
+        value,
+        serde_json::json!({"openInterest": 12, "mark": 1.5, "n": [100]})
+    );
+}

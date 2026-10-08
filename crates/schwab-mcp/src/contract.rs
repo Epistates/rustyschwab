@@ -521,13 +521,11 @@ mod tests {
     fn schwab_rejections_relay_their_reasons() {
         let rejected = schwab_rs::Error::Broker {
             status: reqwest::StatusCode::BAD_REQUEST,
-            details: vec![schwab_rs::error::ApiError {
-                id: None,
-                status: Some("400".into()),
-                title: Some("Bad Request".into()),
-                detail: Some("Order price is not in a valid increment".into()),
-                source: None,
-            }],
+            details: vec![schwab_rs::error::ApiError::new(
+                Some("400".into()),
+                "Bad Request",
+                Some("Order price is not in a valid increment".into()),
+            )],
             request_id: None,
         };
         let failure = ToolFailure::from(rejected);

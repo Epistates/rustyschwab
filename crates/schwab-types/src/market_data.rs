@@ -246,6 +246,14 @@ pub struct OptionChainResponse {
     pub is_delayed: Option<bool>,
     pub underlying: Option<UnderlyingQuote>,
     pub number_of_contracts: Option<i32>,
+    /// Schwab returned only part of the chain asked for: narrow the
+    /// request (strike count, range, dates) to see the rest.
+    pub is_chain_truncated: Option<bool>,
+    pub underlying_price: Option<f64>,
+    pub is_index: Option<bool>,
+    pub interest_rate: Option<f64>,
+    pub volatility: Option<f64>,
+    pub days_to_expiration: Option<f64>,
     pub call_exp_date_map: Option<ExpDateStrikeMap>,
     pub put_exp_date_map: Option<ExpDateStrikeMap>,
     #[serde(flatten)]
@@ -370,8 +378,11 @@ pub struct ExpirationChainResponse {
 #[non_exhaustive]
 pub struct ExpirationItem {
     pub expiration_date: NaiveDate,
+    #[serde(default)]
     pub days_to_expiration: i32,
+    #[serde(default)]
     pub expiration_type: String,
+    #[serde(default)]
     pub standard: bool,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -1021,6 +1032,8 @@ impl std::fmt::Display for Market {
 }
 
 /// Market-data entitlement of the requesting user, for option chains.
+///
+/// Schwab applies it only to retail tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -1036,10 +1049,8 @@ pub enum Entitlement {
     PayingPro,
 }
 
-/// Contract standardization filter for option chains.
-///
-/// Schwab only honours this for retail tokens with the
-/// [`Entitlement::PayingPro`] entitlement.
+/// Contract standardization filter for option chains: standard contracts,
+/// non-standard (adjusted after a corporate action) ones, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
@@ -1235,22 +1246,58 @@ impl OptionChainParams {
     }
 }
 
-/// API error response item.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One error from a Schwab error body (`{"errors":[...]}`).
+///
+/// Schwab's examples spell `status` as a string for some codes (`"400"`)
+/// and a number for others (`401`); both decode.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct ApiError {
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub id: Option<String>,
+    #[serde(default, deserialize_with = "crate::common::optional_id")]
     pub status: Option<String>,
     pub title: Option<String>,
     pub detail: Option<String>,
+    #[serde(default, deserialize_with = "crate::common::lenient")]
     pub source: Option<ErrorSource>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+impl ApiError {
+    /// An error with a status, title and detail.
+    pub fn new(
+        status: Option<String>,
+        title: impl Into<String>,
+        detail: impl Into<Option<String>>,
+    ) -> Self {
+        Self {
+            status,
+            title: Some(title.into()),
+            detail: detail.into(),
+            ..Self::default()
+        }
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(title) = &self.title {
+            write!(f, "{title}")?;
+        }
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ApiError {}
+
 /// Source location of an API error.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[non_exhaustive]
 pub struct ErrorSource {

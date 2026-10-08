@@ -35,7 +35,13 @@ submission and preview and never rounds a price. It checks:
   `BUY_TO_COVER` in whole shares, option legs the `*_TO_OPEN` / `*_TO_CLOSE`
   instructions on a canonical OSI symbol in whole contracts; symbols are
   upper case and unpadded;
-- a top-level `quantity`, if present, equals every leg's quantity;
+- a top-level `quantity`, if present, is the unit count: a single leg trades
+  exactly it, and each leg of a multi-leg order a whole multiple of it;
+- options trade only in the `NORMAL` session; several legs are priced
+  together (`NET_DEBIT`, `NET_CREDIT`, `NET_ZERO` or `MARKET`), no leg
+  repeats another, and a named strategy (`VERTICAL`, `IRON_CONDOR`, …) has
+  its number of legs on one underlying;
+- a trailing offset in ticks is a whole number of ticks;
 - trailing stops trail a real basis (not `MANUAL`), by less than 100%;
 - an `OCO` parent carries nothing executable, and strategies nest at most
   eight levels;

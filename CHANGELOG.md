@@ -72,6 +72,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Fixed — wire types (second diligence pass)
+
+- **One odd number no longer fails a whole response.** Schwab spells some
+  integers as integral floats (`openInterest: 12.0`, `optionMultiplier:
+  100.0`) where its schema says integer; a body that fails to decode is
+  retried with those normalized
+  (`common::normalize_integral_numbers`). Order legs, instruments and
+  expiration entries missing a non-key field decode with defaults instead
+  of failing the list.
+- **Schwab's error reasons reach the caller.** Error bodies whose `status`
+  is a number (Schwab's own 401/404/500 examples) and the trader API's
+  `{"message","errors":[...]}` shape both become `Error::Broker` with
+  the reason, instead of an opaque `Error::Http`. The SDK and the types
+  crate share one `ApiError` (with `ApiError::new`).
+- **A preview says when Schwab would refuse.** `preview_order` returns a
+  typed `OrderPreview` (`is_rejected`, `rejection_reasons`, validation
+  findings by severity, projected balances); Schwab answers 200 for an
+  order it would reject, so the raw JSON read as success. The MCP preview
+  carries `wouldBeRejected`.
+- **Truncated chains say so.** `OptionChainResponse` types
+  `isChainTruncated`, `underlyingPrice`, `isIndex`, `interestRate`,
+  `volatility` and `daysToExpiration`; the MCP chain header shows the
+  first two.
+- **Prices always go out as strings**, by an explicit serializer, so a
+  dependency enabling rust_decimal's `serde-float` cannot turn them into
+  floats (and change every intent digest).
+- **Validation catches what Schwab refuses:** options outside the
+  `NORMAL` session, several legs not priced together, repeated legs, a
+  named strategy with the wrong number of legs or more than one
+  underlying, and a fractional tick offset. A `STOP` entry's trigger is
+  what a bracket's exits must straddle.
+- **Orders carry `releaseTime`, `cancelTime` and `activationPrice`**
+  (scheduled orders could not be sent), and `OrderRequest::try_from(&Order)`
+  turns a reported order into the request that would place it again, to
+  edit for a replacement. `common::parse_schwab_time` parses Schwab's
+  `+0000` timestamps.
+- Docs: a top-level `quantity` is the unit count (not "every leg's
+  quantity"), and the entitlement note sits on `Entitlement`.
+
 ### Fixed — transport, auth and configuration (second diligence pass)
 
 - **A rate limit is reported as one.** A `Retry-After` longer than the

@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, Utc};
 use schwab_types::trading::{Order, OrderActivityType, OrderLeg, OrderStatus};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -103,11 +103,8 @@ pub(crate) fn leg(leg: &OrderLeg) -> Map<String, Value> {
 
 /// Schwab writes order times as `2025-01-15T14:31:22+0000`; accept the
 /// RFC 3339 spellings too.
-fn parse_time(text: &str) -> Option<DateTime<FixedOffset>> {
-    DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%z")
-        .or_else(|_| DateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f%z"))
-        .or_else(|_| DateTime::parse_from_rfc3339(text))
-        .ok()
+fn parse_time(text: &str) -> Option<DateTime<Utc>> {
+    schwab_types::common::parse_schwab_time(text).ok()
 }
 
 impl OrderStatusReport {

@@ -344,6 +344,13 @@ pub fn option_contracts(chain: OptionChainResponse) -> (Map<String, Value>, Vec<
     if let Some(delayed) = chain.is_delayed {
         header.insert("isDelayed".into(), json!(delayed));
     }
+    // A truncated chain must not read as complete.
+    if let Some(truncated) = chain.is_chain_truncated {
+        header.insert("isChainTruncated".into(), json!(truncated));
+    }
+    if let Some(price) = chain.underlying_price {
+        header.insert("underlyingPrice".into(), json!(price));
+    }
     if let Some(u) = chain.underlying {
         header.insert(
             "underlying".into(),

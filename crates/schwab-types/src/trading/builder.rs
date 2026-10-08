@@ -439,11 +439,11 @@ impl OrderRequest {
     /// Fails if the entry is not a single-leg `SINGLE` order, if its
     /// instruction does not open a position, or if the exits are on the
     /// wrong sides for the position's direction: of each other always, and
-    /// of the entry's limit price when it has one (`LIMIT`, `STOP_LIMIT`).
-    /// A long entry at 150 needs its stop below 150 and its target above;
-    /// otherwise an exit is marketable the moment the entry fills. Market
-    /// and stop entries have no price to compare, so only the ordering of
-    /// the exits is checked.
+    /// of the entry's price: its limit (`LIMIT`, `STOP_LIMIT`), or for a
+    /// `STOP` entry its trigger. A long entry at 150 needs its stop below
+    /// 150 and its target above; otherwise an exit is marketable the moment
+    /// the entry fills. A market entry has no price to compare, so only the
+    /// ordering of the exits is checked.
     pub fn bracket(self, take_profit: Decimal, stop_loss: Decimal) -> Result<Self, String> {
         if self.order_strategy_type != OrderStrategyType::Single
             || !self.child_order_strategies.is_empty()
@@ -467,7 +467,7 @@ impl OrderRequest {
                  take profit {take_profit}, stop loss {stop_loss}"
             ));
         }
-        if let Some(entry) = self.price {
+        if let Some(entry) = self.price.or(self.stop_price) {
             let (below, above) = if long {
                 (stop_loss, take_profit)
             } else {
