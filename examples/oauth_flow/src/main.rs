@@ -45,8 +45,9 @@ async fn main() -> Result<()> {
     // Create auth manager
     let auth_manager = AuthManager::new(config.oauth.clone())?;
 
-    // Check if we already have valid tokens
-    if auth_manager.has_valid_tokens() {
+    // Usable tokens, refreshing the 30-minute access token if needed: only
+    // a missing, expired or refused refresh token needs the browser.
+    if auth_manager.ensure_valid_tokens().await.is_ok() {
         info!("Found existing valid tokens, skipping OAuth flow");
     } else {
         info!("No valid tokens found, starting OAuth flow");

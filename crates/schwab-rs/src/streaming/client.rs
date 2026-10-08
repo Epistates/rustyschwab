@@ -481,6 +481,9 @@ impl StreamClient {
         auth_manager: AuthManager,
         identity: StreamerIdentity,
     ) -> Result<Self> {
+        // The LOGIN carries the access token: only to Schwab's streamer (or
+        // loopback), however the configuration was built.
+        crate::config::SchwabConfig::validate_url_domain(&config.websocket_url, "websocket_url")?;
         let transport = WebSocketTransport::new(&config.websocket_url)?;
 
         if config.heartbeat_interval.is_zero() || config.ping_timeout <= config.heartbeat_interval {

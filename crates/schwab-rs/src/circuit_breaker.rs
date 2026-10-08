@@ -175,6 +175,12 @@ impl CircuitBreaker {
         self.record(permit.generation, responded(&result), unhealthy(&result));
         result
     }
+    /// Count a request that was sent and never answered before the caller's
+    /// deadline (the deadline drops the call before the breaker sees it).
+    pub(crate) fn record_unanswered(&self) {
+        let generation = self.state.lock().generation;
+        self.record(generation, false, true);
+    }
     fn record(&self, generation: u64, success: bool, failure: bool) {
         if !self.config.enabled {
             return;

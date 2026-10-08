@@ -49,11 +49,35 @@ pub enum TokenNotification {
     SessionRecreated,
 }
 
+/// A token set's issue time and why the token endpoint refused it.
+type Refused = (DateTime<Utc>, String);
+
+/// A started authorization's state as another process can check it.
+#[derive(Serialize, Deserialize)]
+struct PendingState {
+    state_sha256: String,
+    created_at: i64,
+}
+fn state_digest(state: &str) -> String {
+    digest::digest(&digest::SHA256, state.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// How long an authorization started by [`AuthManager::authorize`] stays
+/// open: its state expires, and a capturing callback server stops waiting.
+const AUTHORIZATION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The redirect Schwab sends back: a `code`, or an `error` when the user
+/// declined or the request was refused (RFC 6749 §4.1.2.1).
 #[cfg(feature = "callback-server")]
 #[derive(Debug, Deserialize)]
 struct CallbackParams {
-    code: String,
+    code: Option<String>,
     state: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -241,6 +265,9 @@ pub struct AuthManager {
     /// notification for. Prevents spamming a 30 s-tick-based modulo check
     /// that misfired or double-fired depending on scheduling jitter.
     last_notified_rt_hour: Arc<RwLock<Option<i64>>>,
+    /// The token set the token endpoint refused (by issue time) and why:
+    /// no refresh is attempted for it again.
+    reauthorization: Arc<RwLock<Option<Refused>>>,
 }
 
 impl std::fmt::Debug for AuthManager {
@@ -363,6 +390,20 @@ async fn post_oauth_token_with_retry(
             break;
         }
 
+        // A refused refresh grant (`invalid_grant`: expired, revoked, or
+        // replaced by a newer authorization) is final until someone
+        // authorizes again.
+        if matches!(grant, OAuthGrant::Refresh)
+            && matches!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNAUTHORIZED
+            )
+        {
+            return Err(AuthError::ReauthorizationRequired(format!(
+                "Schwab refused the refresh token ({status}); it was revoked, replaced \
+                 by a newer authorization, or expired"
+            )));
+        }
         return Err(grant.wrap(format!("oauth token endpoint returned {status}")));
     }
 
@@ -414,6 +455,15 @@ impl AuthManager {
                 "App secret cannot be empty".to_string(),
             ));
         }
+        // The token endpoint receives the app secret: never somewhere else,
+        // or over plain HTTP, however the manager was built.
+        for (url, field) in [
+            (&config.token_url, "token_url"),
+            (&config.auth_url, "auth_url"),
+        ] {
+            crate::config::SchwabConfig::validate_url_domain(url, field)
+                .map_err(|e| AuthError::MissingConfig(e.to_string()))?;
+        }
 
         // Schwab issues several key/secret length variants, but they are
         // always even-length and at least 32 chars combined — the same
@@ -457,6 +507,7 @@ impl AuthManager {
             pkce_verifier: Arc::new(RwLock::new(None)),
             oauth_state: Arc::new(RwLock::new(None)),
             last_notified_rt_hour: Arc::new(RwLock::new(None)),
+            reauthorization: Arc::new(RwLock::new(None)),
             token_store: open_token_store(&config),
         };
 
@@ -465,10 +516,12 @@ impl AuthManager {
             Ok(tokens) => {
                 *manager.tokens.write() = Some(tokens);
             }
+            // A first run: nothing stored yet.
+            Err(e) if token_store::is_absent(&e) => {
+                info!("No stored tokens; authorization is required");
+            }
             Err(e) => {
-                warn!("Could not load tokens; authentication may be required");
-                let _ = e;
-                // Notify if token file was corrupted
+                warn!(error = %e, "Could not load stored tokens; authorization may be required");
                 if let Some(ref notify) = config.on_token_notification {
                     notify(TokenNotification::TokenFileCorrupted);
                 }
@@ -553,7 +606,16 @@ impl AuthManager {
                 *current = Some(stored);
             }
         }
-        let old = self.tokens.read().clone().ok_or(AuthError::TokenExpired)?;
+        let old = self.tokens.read().clone().ok_or_else(|| {
+            AuthError::ReauthorizationRequired("no tokens are stored; authorize first".into())
+        })?;
+        // The token endpoint already refused these tokens: do not ask again
+        // until they change (another process or `authorize` saved new ones).
+        if let Some((issued_at, reason)) = self.reauthorization.read().as_ref()
+            && *issued_at == old.issued_at
+        {
+            return Err(AuthError::ReauthorizationRequired(reason.clone()));
+        }
         if let Some(rejected) = rejected {
             if old.access_token()? != rejected && old.is_valid() {
                 return Ok(());
@@ -567,7 +629,9 @@ impl AuthManager {
             - Utc::now())
         .num_seconds();
         if remaining <= 0 {
-            return Err(AuthError::TokenExpired);
+            return Err(AuthError::ReauthorizationRequired(
+                "the refresh token expired (seven days after authorization)".into(),
+            ));
         }
         if remaining <= REFRESH_TOKEN_MIN_REMAINING_SECS {
             return Err(AuthError::RefreshTokenExpiring {
@@ -578,7 +642,14 @@ impl AuthManager {
         if refresh_token.is_empty() {
             return Err(AuthError::MissingRefreshToken);
         }
-        let mut new_tokens = self.refresh_tokens(&refresh_token).await?;
+        let mut new_tokens = match self.refresh_tokens(&refresh_token).await {
+            Ok(tokens) => tokens,
+            Err(AuthError::ReauthorizationRequired(reason)) => {
+                *self.reauthorization.write() = Some((old.issued_at, reason.clone()));
+                return Err(AuthError::ReauthorizationRequired(reason));
+            }
+            Err(error) => return Err(error),
+        };
         // Schwab's refresh grant does not extend the original authorization's
         // seven-day lifetime, even if the returned credential string changes.
         new_tokens.refresh_token_expires_at = Some(
@@ -595,6 +666,18 @@ impl AuthManager {
         // Using UUID v4 provides sufficient entropy for secure state tokens
         let state = uuid::Uuid::new_v4().to_string();
         *self.oauth_state.write() = Some((state.clone(), std::time::Instant::now()));
+        // Also on disk (a digest, private), so a redirect pasted into another
+        // process sharing this token file is still checked against it.
+        let pending = serde_json::to_vec(&PendingState {
+            state_sha256: state_digest(&state),
+            created_at: Utc::now().timestamp_millis(),
+        })
+        .map_err(|e| AuthError::OAuthFlow(e.to_string()))?;
+        let path = self.pending_state_path();
+        tokio::task::spawn_blocking(move || crate::security::secure_file_write(&path, &pending))
+            .await
+            .map_err(|e| AuthError::TokenStorage(std::io::Error::other(e)))?
+            .map_err(|e| AuthError::OAuthFlow(format!("Cannot record the OAuth state: {e}")))?;
         debug!("Generated OAuth state parameter for CSRF protection");
 
         let mut url = url::Url::parse(&self.config.auth_url)
@@ -663,20 +746,48 @@ impl AuthManager {
         self.exchange_code_for_tokens(&extracted_code).await
     }
 
+    /// Accept `supplied` as the state of the authorization this manager
+    /// (or, through the pending-state file, another process using the same
+    /// token file) started, once, within [`AUTHORIZATION_TTL`].
     fn consume_callback_state(&self, supplied: Option<&str>) -> AuthResult<()> {
-        let mut pending = self.oauth_state.write();
-        match pending.as_ref() {
-            Some((expected, created))
-                if supplied == Some(expected.as_str())
-                    && created.elapsed() < std::time::Duration::from_secs(300) =>
+        let refused = || {
+            AuthError::OAuthFlow(
+                "Missing, invalid, expired, or already consumed OAuth state".into(),
+            )
+        };
+        let supplied = supplied.ok_or_else(refused)?;
+        let path = self.pending_state_path();
+        {
+            let mut pending = self.oauth_state.write();
+            if let Some((expected, created)) = pending.as_ref()
+                && supplied == expected
+                && created.elapsed() < AUTHORIZATION_TTL
             {
                 *pending = None;
-                Ok(())
+                let _ = std::fs::remove_file(&path);
+                return Ok(());
             }
-            _ => Err(AuthError::OAuthFlow(
-                "Missing, invalid, expired, or already consumed OAuth state".into(),
-            )),
         }
+        // `authorize` ran in another process (a CLI that prints the URL and
+        // exits, then exchanges the pasted redirect): its state is on disk,
+        // as a digest.
+        let stored: PendingState = crate::security::read_private_file(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or_else(refused)?;
+        let age = Utc::now().timestamp_millis() - stored.created_at;
+        if stored.state_sha256 != state_digest(supplied)
+            || !(0..AUTHORIZATION_TTL.as_millis() as i64).contains(&age)
+        {
+            return Err(refused());
+        }
+        std::fs::remove_file(&path).map_err(|_| refused())?;
+        Ok(())
+    }
+
+    /// Where a started authorization's state waits, beside the token file.
+    fn pending_state_path(&self) -> PathBuf {
+        self.config.tokens_file.with_extension("oauth-state")
     }
 
     fn extract_code_from_callback_url(&self, url: &str) -> AuthResult<String> {
@@ -807,6 +918,9 @@ impl AuthManager {
         manager.refresh_task = Arc::new(RwLock::new(None));
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            // The last refresh failure logged, so a lasting one is logged
+            // once rather than every tick.
+            let mut failing: Option<String> = None;
             loop {
                 interval.tick().await;
                 let remaining = manager
@@ -816,7 +930,10 @@ impl AuthManager {
                     .and_then(|t| t.refresh_token_expires_at)
                     .map(|t| (t - Utc::now()).num_seconds());
                 if let Some(remaining) = remaining {
-                    let hour = (remaining / 3600).max(0);
+                    // Each hour of the last twelve notifies once; expiry is
+                    // its own bucket, so the last hour's notice does not
+                    // swallow the expiry one.
+                    let hour = if remaining <= 0 { -1 } else { remaining / 3600 };
                     let notify = {
                         let mut last = manager.last_notified_rt_hour.write();
                         let changed = remaining <= 43200 && *last != Some(hour);
@@ -830,15 +947,24 @@ impl AuthManager {
                             TokenNotification::RefreshTokenExpired
                         } else {
                             TokenNotification::RefreshTokenExpiring {
-                                hours_remaining: hour,
+                                hours_remaining: hour.max(0),
                             }
                         });
                     }
                 }
-                if manager.ensure_valid_tokens().await.is_err() {
-                    warn!(
-                        "Automatic token refresh failed; authentication may require intervention"
-                    );
+                match manager.ensure_valid_tokens().await {
+                    Ok(()) => failing = None,
+                    Err(error) => {
+                        let message = error.to_string();
+                        if failing.as_deref() != Some(message.as_str()) {
+                            if error.requires_reauthorization() {
+                                tracing::error!(%error, "Automatic token refresh needs a new authorization");
+                            } else {
+                                warn!(%error, "Automatic token refresh failed");
+                            }
+                            failing = Some(message);
+                        }
+                    }
                 }
             }
         });
@@ -866,15 +992,33 @@ impl AuthManager {
                     {
                         return Html("Invalid or expired authorization callback".to_string());
                     }
-                    // Extract code and add @ like Python reference does
-                    let code_with_at = if !params.code.ends_with('@') {
-                        format!("{}@", params.code)
-                    } else {
-                        params.code.clone()
+                    let outcome = match (params.code, params.error) {
+                        // Extract code and add @ like Python reference does
+                        (Some(code), None) if !code.is_empty() => Ok(if code.ends_with('@') {
+                            code
+                        } else {
+                            format!("{code}@")
+                        }),
+                        (_, Some(error)) if error == "access_denied" => {
+                            Err(AuthError::AuthorizationDenied)
+                        }
+                        (_, Some(error)) => Err(AuthError::OAuthFlow(format!(
+                            "Authorization failed: {}",
+                            error.chars().take(64).collect::<String>()
+                        ))),
+                        _ => Err(AuthError::OAuthFlow(
+                            "Authorization callback carried no code".into(),
+                        )),
                     };
-
+                    let succeeded = outcome.is_ok();
                     if let Some(tx) = tx.lock().await.take() {
-                        let _ = tx.send(code_with_at);
+                        let _ = tx.send(outcome);
+                    }
+                    if !succeeded {
+                        return Html(
+                            "Authorization was not granted; return to your application."
+                                .to_string(),
+                        );
                     }
 
                     Html(
@@ -954,18 +1098,25 @@ impl AuthManager {
             })?;
             let server = axum::serve(listener, app);
 
-            tokio::select! {
-                code = rx => {
-                    code.map_err(|_| {
+            let wait = async {
+                tokio::select! {
+                    code = rx => code.map_err(|_| {
                         AuthError::OAuthFlow("Failed to receive authorization code".to_string())
-                    })
-                }
-                result = server => {
-                    Err(AuthError::OAuthFlow(format!(
+                    })?,
+                    result = server => Err(AuthError::OAuthFlow(format!(
                         "Callback server stopped unexpectedly: {result:?}"
-                    )))
+                    ))),
                 }
-            }
+            };
+            // The authorization's state expires with it; waiting longer
+            // could never succeed.
+            tokio::time::timeout(AUTHORIZATION_TTL, wait)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AuthError::OAuthFlow(
+                        "Timed out waiting for the authorization callback".into(),
+                    ))
+                })
         } else {
             // Schwab requires an https:// callback URL, so the browser
             // opens a TLS connection straight to this server — a plain
@@ -1008,18 +1159,25 @@ impl AuthManager {
             let server =
                 axum_server::bind_rustls(addr, rustls_config).serve(app.into_make_service());
 
-            tokio::select! {
-                code = rx => {
-                    code.map_err(|_| {
+            let wait = async {
+                tokio::select! {
+                    code = rx => code.map_err(|_| {
                         AuthError::OAuthFlow("Failed to receive authorization code".to_string())
-                    })
-                }
-                result = server => {
-                    Err(AuthError::OAuthFlow(format!(
+                    })?,
+                    result = server => Err(AuthError::OAuthFlow(format!(
                         "Callback server stopped unexpectedly: {result:?}"
-                    )))
+                    ))),
                 }
-            }
+            };
+            // The authorization's state expires with it; waiting longer
+            // could never succeed.
+            tokio::time::timeout(AUTHORIZATION_TTL, wait)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AuthError::OAuthFlow(
+                        "Timed out waiting for the authorization callback".into(),
+                    ))
+                })
         }
     }
 
@@ -1058,6 +1216,10 @@ impl AuthManager {
         Ok(tokens)
     }
 
+    /// Whether the current access token is valid right now. It lasts 30
+    /// minutes; [`ensure_valid_tokens`](Self::ensure_valid_tokens) refreshes
+    /// it from the refresh token, which is what decides whether a new
+    /// authorization is needed.
     pub fn has_valid_tokens(&self) -> bool {
         self.tokens
             .read()

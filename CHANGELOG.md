@@ -72,6 +72,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Fixed — transport, auth and configuration (second diligence pass)
+
+- **A rate limit is reported as one.** A `Retry-After` longer than the
+  request's remaining deadline used to be slept into a `Timeout`; the
+  retry policy now stops at the deadline (`RetryPolicy::execute_until`)
+  and returns the `RateLimit`. A zero or past `Retry-After` still waits
+  100 ms.
+- **Cancels pass an open circuit breaker and are not retried.** One shared
+  breaker opened by read failures refused protective cancels; a retried
+  cancel that had already landed answered 4xx and hid it.
+- **The breaker counts timeouts.** A request in flight when the deadline
+  dropped it is recorded as a failure; before, a blackholed route never
+  opened the breaker.
+- **`AuthError::ReauthorizationRequired`** (and
+  `AuthError::requires_reauthorization`) says when only a new browser
+  authorization helps: the refresh token expired, Schwab refused it
+  (`invalid_grant`), or nothing is stored. A refused token set is not sent
+  to the token endpoint again until the stored tokens change, and the
+  refresh loop logs a lasting failure once instead of every 30 seconds.
+- **The "refresh token expired" notification fires.** The last hour's
+  `RefreshTokenExpiring` bucket swallowed it.
+- **First runs are not "corrupted".** A missing token file or keychain
+  entry no longer fires `TokenFileCorrupted`.
+- **The OAuth callback ends.** It waits at most the five minutes its state
+  lives, and a declined authorization (`?error=access_denied`) returns
+  `AuthorizationDenied` instead of hanging.
+- **OAuth state survives the CLI flow.** `authorize` also records the
+  state's digest privately beside the token file, so a redirect pasted
+  into another process is still checked, once.
+- **Requests cannot leave the API host.** A path that resolves to another
+  origin (`//host/x`) is refused before the bearer token is attached; the
+  base URL, token and authorization URLs and the streamer URL are checked
+  against the allowlist however the transport, `AuthManager` or
+  `StreamClient` was built.
+- **Configuration is checked whole.** Retry backoff, request timeout,
+  refresh buffer, rate limits, stream heartbeat and the callback URL are
+  validated; a boolean or number in a `SCHWAB_*` variable that does not
+  parse is an error instead of a silent default (booleans accept
+  true/false, 1/0, yes/no, on/off).
+- **Secret writes clean up.** A failed write removes its temp file, which
+  held the secret too.
+- **Windows private files check their owner** (this user, SYSTEM or
+  Administrators) and are checked on the open handle, not the path; an
+  existing lock file gets the same check.
+- `telemetry::init_*` no longer panics when the application installed a
+  subscriber, and `RUST_LOG=debug` is honoured. The unused
+  `derive_key_from_password` (PBKDF2) and reqwest's `cookies` feature are
+  gone. Keychain documentation states the Linux (keyutils, lost at
+  reboot) and Windows (2,560-byte limit) behaviour. The examples refresh
+  instead of re-authorizing when only the access token has expired.
+
 ### Fixed — streaming and the stream cache (second diligence pass)
 
 - **The stream says when it is over.** `StreamStatus::ended`

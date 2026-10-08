@@ -3,15 +3,17 @@
 //! Provides secure, pluggable token storage with multiple backend options:
 //! - **File**: Plain JSON files with 0600 permissions (basic)
 //! - **EncryptedFile**: ChaCha20Poly1305 encrypted files (recommended)
-//! - **Keychain**: Cross-platform secure credential storage (best)
+//! - **Keychain**: the OS credential store (the macOS default)
 //!
-//! ## Security Comparison
+//! ## Comparison
 //!
-//! | Backend | Encryption | Permissions | Cross-Platform | Security Level |
-//! |---------|------------|-------------|----------------|----------------|
-//! | File | ❌ No | ✅ 0600 (Unix) | ✅ Yes | ⭐⭐ Basic |
-//! | EncryptedFile | ✅ ChaCha20 | ✅ 0600 (Unix) | ✅ Yes | ⭐⭐⭐⭐ High |
-//! | Keychain | ✅ OS-native | ✅ OS-native | ✅ Yes | ⭐⭐⭐⭐⭐ Best |
+//! | Backend | Encryption | Access control | Survives reboot | Notes |
+//! |---------|------------|----------------|-----------------|-------|
+//! | File | none | 0600 file (Unix), owner-only ACL (Windows) | yes | basic |
+//! | EncryptedFile | ChaCha20-Poly1305 | as File, key in a 0600 file beside it | yes | default off macOS |
+//! | Keychain, macOS | OS keychain | login keychain | yes | default on macOS |
+//! | Keychain, Linux | kernel keyutils | the user's keyrings | **no** | lost at logout or reboot |
+//! | Keychain, Windows | Credential Manager | the user's vault | yes | a token set can exceed its 2,560-byte limit; prefer EncryptedFile |
 
 use crate::error::{AuthError, Error};
 use crate::security::{EncryptedToken, generate_random_key, read_private_file, secure_file_write};
@@ -27,8 +29,16 @@ pub type AuthResult<T> = std::result::Result<T, AuthError>;
 fn to_auth_result<T>(result: Result<T, Error>) -> AuthResult<T> {
     result.map_err(|e| match e {
         Error::Auth(auth_err) => auth_err,
+        // Absent is not corrupt: keep the kind so callers can tell them apart.
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => AuthError::TokenStorage(io),
         other => AuthError::TokenFileError(other.to_string()),
     })
+}
+
+/// Whether `error` only says no tokens are stored yet (a first run), as
+/// opposed to tokens that exist but cannot be read.
+pub(crate) fn is_absent(error: &AuthError) -> bool {
+    matches!(error, AuthError::TokenStorage(io) if io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Clock skew tolerance in seconds for token validation.
@@ -397,17 +407,13 @@ impl TokenStore for EncryptedFileTokenStore {
     }
 }
 
-/// Cross-platform keychain storage using the keyring crate.
+/// The OS credential store, through the `keyring` crate.
 ///
-/// # Security
-/// - ✅ OS-native secure storage
-/// - ✅ macOS: Keychain
-/// - ✅ Windows: Credential Manager
-/// - ✅ Linux: Secret Service (libsecret)
-/// - ✅ Encrypted by OS
-/// - ✅ Protected with user authentication
-///
-/// **Recommendation:** This is the most secure option.
+/// - macOS: the login Keychain (the default store there).
+/// - Linux: the kernel keyutils keyrings, which do not survive logout or
+///   reboot; use [`EncryptedFileTokenStore`] for a lasting store.
+/// - Windows: Credential Manager, whose 2,560-byte blob limit a token set
+///   can exceed; [`EncryptedFileTokenStore`] is the safer choice.
 pub struct KeychainTokenStore {
     service: String,
     account: String,
@@ -445,11 +451,13 @@ impl TokenStore for KeychainTokenStore {
         let entry = keyring::Entry::new(&self.service, &self.account)
             .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))?;
 
-        let json = Zeroizing::new(
-            entry
-                .get_password()
-                .map_err(|e| AuthError::KeyringError(format!("Failed to load: {}", e)))?,
-        );
+        let json = Zeroizing::new(entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => AuthError::TokenStorage(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no tokens in the keychain",
+            )),
+            e => AuthError::KeyringError(format!("Failed to load: {}", e)),
+        })?);
 
         let tokens: TokenSet = serde_json::from_str(&json)
             .map_err(|e| AuthError::KeyringError(format!("Failed to parse: {}", e)))?;
@@ -542,8 +550,12 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
     // Lock files hold no secret, but another account able to open one could
     // hold it and stall refreshes: create it owner-only on Windows as well.
     #[cfg(windows)]
-    if let Ok(file) = crate::security_windows::secure_create_new(path) {
-        return Ok(file);
+    {
+        if let Ok(file) = crate::security_windows::secure_create_new(path) {
+            return Ok(file);
+        }
+        // It exists: only an owner-only, non-reparse-point file will do.
+        return to_auth_result(crate::security_windows::open_private_file_rw(path));
     }
     #[cfg(unix)]
     {
@@ -567,7 +579,7 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
         }
         Ok(file)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     std::fs::OpenOptions::new()
         .create(true)
         .read(true)

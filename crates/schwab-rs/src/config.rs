@@ -244,7 +244,7 @@ impl SchwabConfig {
     }
 
     /// Checks if a URL's domain is in the allowed list and enforces secure schemes.
-    fn validate_url_domain(url_str: &str, field_name: &str) -> Result<()> {
+    pub(crate) fn validate_url_domain(url_str: &str, field_name: &str) -> Result<()> {
         let url = Url::parse(url_str)
             .map_err(|e| Error::Config(format!("Invalid URL for {}: {}", field_name, e)))?;
 
@@ -305,22 +305,14 @@ impl SchwabConfig {
             tokens_file: env::var("SCHWAB_TOKENS_FILE")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("schwab_tokens.json")),
-            capture_callback: env::var("SCHWAB_CAPTURE_CALLBACK")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
-            auto_refresh: env::var("SCHWAB_AUTO_REFRESH")
-                .map(|v| v.parse().unwrap_or(true))
-                .unwrap_or(true),
-            refresh_buffer_seconds: env::var("SCHWAB_REFRESH_BUFFER")
-                .map(|v| v.parse().unwrap_or(61))
-                .unwrap_or(61),
+            capture_callback: env_flag("SCHWAB_CAPTURE_CALLBACK", false)?,
+            auto_refresh: env_flag("SCHWAB_AUTO_REFRESH", true)?,
+            refresh_buffer_seconds: env_parse("SCHWAB_REFRESH_BUFFER", 61)?,
             // Schwab's public OAuth docs + the Schwabdev reference client
             // do NOT use PKCE. Match `OAuthConfig::default()` and default
             // to `false` — only opt in via env if the user has verified
             // Schwab accepts their `code_challenge`.
-            pkce_enabled: env::var("SCHWAB_PKCE_ENABLED")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
+            pkce_enabled: env_flag("SCHWAB_PKCE_ENABLED", false)?,
             token_store_kind: match env::var("SCHWAB_TOKEN_STORE").ok() {
                 // Unset → platform-appropriate default (Keychain on macOS,
                 // EncryptedFile elsewhere). Setting this env var to an
@@ -341,9 +333,7 @@ impl SchwabConfig {
                     }
                 },
             },
-            allow_external_callback: env::var("SCHWAB_ALLOW_EXTERNAL_CALLBACK")
-                .map(|v| v.parse().unwrap_or(false))
-                .unwrap_or(false),
+            allow_external_callback: env_flag("SCHWAB_ALLOW_EXTERNAL_CALLBACK", false)?,
             on_token_notification: None,
         };
 
@@ -353,10 +343,7 @@ impl SchwabConfig {
             ..ClientConfig::default()
         };
 
-        let streaming = if env::var("SCHWAB_STREAMING_ENABLED")
-            .map(|v| v.parse().unwrap_or(true))
-            .unwrap_or(true)
-        {
+        let streaming = if env_flag("SCHWAB_STREAMING_ENABLED", true)? {
             Some(StreamConfig {
                 websocket_url: env::var("SCHWAB_WEBSOCKET_URL")
                     .unwrap_or_else(|_| DEFAULT_STREAMER_URL.to_string()),
@@ -431,6 +418,55 @@ impl SchwabConfig {
                 "Rate limit should not exceed 500 requests per second".to_string(),
             ));
         }
+        let rate = &self.client.rate_limit;
+        if rate.enabled && (rate.requests_per_second == 0 || rate.burst_size == 0) {
+            return Err(Error::Config(
+                "Rate limit and burst must be positive when rate limiting is enabled".into(),
+            ));
+        }
+        let retry = &self.client.retry;
+        if !retry.backoff_multiplier.is_finite()
+            || retry.backoff_multiplier < 1.0
+            || retry.initial_backoff.is_zero()
+            || retry.max_backoff < retry.initial_backoff
+        {
+            return Err(Error::Config(
+                "Retry backoff needs a positive initial delay, a maximum at least as long, \
+                 and a finite multiplier of at least 1"
+                    .into(),
+            ));
+        }
+        if self.client.timeout.is_zero() || self.client.timeout > Duration::from_secs(300) {
+            return Err(Error::Config(
+                "Request timeout must be positive and at most 300 seconds".into(),
+            ));
+        }
+        if !(30..=1800).contains(&self.oauth.refresh_buffer_seconds) {
+            return Err(Error::Config(
+                "Token refresh buffer must be between 30 and 1800 seconds".into(),
+            ));
+        }
+        if let Some(stream) = &self.streaming
+            && (stream.heartbeat_interval.is_zero()
+                || stream.ping_timeout <= stream.heartbeat_interval)
+        {
+            return Err(Error::Config(
+                "Stream heartbeat interval must be positive and shorter than the ping timeout"
+                    .into(),
+            ));
+        }
+        if self.oauth.capture_callback || !self.oauth.callback_url.is_empty() {
+            let callback = Url::parse(&self.oauth.callback_url)
+                .map_err(|e| Error::Config(format!("Invalid callback_url: {e}")))?;
+            let loopback = callback
+                .host_str()
+                .is_some_and(|host| LOOPBACK_HOSTS.contains(&host));
+            if callback.scheme() != "https" && !(loopback && callback.scheme() == "http") {
+                return Err(Error::Config(
+                    "callback_url must use https (http only on loopback)".into(),
+                ));
+            }
+        }
 
         // SSRF prevention applies regardless of how the config was built
         // — previously only `from_env`/`from_file` enforced the domain
@@ -438,6 +474,40 @@ impl SchwabConfig {
         self.validate_urls()?;
 
         Ok(())
+    }
+}
+
+/// An environment variable parsed as `T`, `default` when unset. A value
+/// that does not parse is an error, not a silent default: a typo in
+/// `SCHWAB_AUTO_REFRESH` should not quietly change behaviour.
+fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> Result<T> {
+    match env::var(name) {
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(Error::Config(format!("{name} is not valid UTF-8")))
+        }
+        Ok(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| Error::Config(format!("{name}={raw:?} is not a valid value"))),
+    }
+}
+
+/// A boolean environment variable: `true`/`false`, `1`/`0`, `yes`/`no` or
+/// `on`/`off` in any case; `default` when unset; an error otherwise.
+fn env_flag(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(Error::Config(format!("{name} is not valid UTF-8")))
+        }
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(true),
+            "false" | "0" | "no" | "off" => Ok(false),
+            _ => Err(Error::Config(format!(
+                "{name}={raw:?} is not a boolean (true/false, 1/0, yes/no, on/off)"
+            ))),
+        },
     }
 }
 

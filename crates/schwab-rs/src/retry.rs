@@ -48,7 +48,10 @@ use tracing::debug;
 /// # let _ = result;
 /// # }
 /// ```
-#[derive(Clone)]
+/// The least wait before honoring a `Retry-After` of zero or a past date.
+const MIN_RETRY_AFTER: Duration = Duration::from_millis(100);
+
+#[derive(Clone, Debug)]
 pub struct RetryPolicy {
     config: RetryConfig,
 }
@@ -69,7 +72,24 @@ impl RetryPolicy {
     /// # Returns
     /// * `Ok(T)` - If operation succeeds
     /// * `Err(Error)` - If all retries exhausted or error is non-retryable
-    pub async fn execute<F, Fut, T>(&self, mut f: F) -> Result<T>
+    pub async fn execute<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.execute_until(None, f).await
+    }
+
+    /// As [`execute`](Self::execute), but never waits past `deadline`: a
+    /// retry that could not start before it returns the error that asked
+    /// for it. A rate limit whose `Retry-After` outlasts the caller's
+    /// deadline is then reported as the rate limit it is, not as the
+    /// timeout the wait would have become.
+    pub async fn execute_until<F, Fut, T>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        mut f: F,
+    ) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -108,7 +128,9 @@ impl RetryPolicy {
                         return Err(error);
                     }
 
-                    // Check for explicit Retry-After header (takes precedence)
+                    // Check for explicit Retry-After header (takes precedence).
+                    // A zero or past value still waits a moment, so a
+                    // server that says "now" cannot be hammered.
                     let delay = if let Some(retry_after) = error.retry_after() {
                         debug!(
                             "Rate limited by server, waiting {}s (attempt {}/{})",
@@ -116,7 +138,7 @@ impl RetryPolicy {
                             retries + 1,
                             self.config.max_retries
                         );
-                        retry_after
+                        retry_after.max(MIN_RETRY_AFTER)
                     } else {
                         let delay = self.calculate_backoff(retries);
                         debug!(
@@ -128,6 +150,10 @@ impl RetryPolicy {
                         delay
                     };
 
+                    if deadline.is_some_and(|d| tokio::time::Instant::now() + delay >= d) {
+                        debug!("Retry would outlast the caller's deadline; giving up");
+                        return Err(error);
+                    }
                     tokio::time::sleep(delay).await;
                     retries += 1;
                 }

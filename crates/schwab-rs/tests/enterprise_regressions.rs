@@ -334,8 +334,10 @@ async fn cancelled_half_open_probe_releases_slot() {
     assert_eq!(breaker.state(), CircuitState::Closed);
 }
 
+/// A `Retry-After` that outlasts the request deadline is not waited out
+/// into a timeout: the caller hears the rate limit, at once.
 #[tokio::test]
-async fn request_deadline_includes_retry_backoff() {
+async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "60"))
@@ -353,11 +355,15 @@ async fn request_deadline_includes_retry_backoff() {
     config.client.timeout = Duration::from_millis(80);
     config.streaming = None;
     let client = SchwabClient::new(config).unwrap();
+    // Had it waited, the 80 ms deadline would have made it a timeout.
     let error = tokio::time::timeout(Duration::from_secs(1), client.get_account_numbers())
         .await
         .unwrap()
         .unwrap_err();
-    assert!(matches!(error, Error::Timeout { .. }));
+    assert!(
+        matches!(error, Error::RateLimit { retry_after: 60 }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -985,5 +991,36 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
     let mut other = limit_order();
     other.tag = Some("after-refusal".into());
     client.place_order("hash", &other).await.unwrap();
+    server.verify().await;
+}
+
+/// A cancel only reduces risk: read traffic that tripped the breaker does
+/// not refuse it, and it is sent once (a retried cancel that already landed
+/// would answer 4xx and hide it).
+#[tokio::test]
+async fn a_cancel_is_sent_through_an_open_breaker_and_never_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/trader/v1/accounts/hash/orders/42"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (client, _dir, _) = common::mock_client_with(&server, false, |config| {
+        config.client.circuit_breaker.failure_threshold = 1;
+        config.client.retry.max_retries = 0;
+    });
+    assert!(client.get_account_numbers().await.is_err());
+    assert_eq!(client.circuit_state(), CircuitState::Open);
+    assert!(matches!(
+        client.get_account_numbers().await,
+        Err(Error::CircuitOpen)
+    ));
+    let error = client.cancel_order("hash", "42").await.unwrap_err();
+    assert!(!matches!(error, Error::CircuitOpen), "{error:?}");
     server.verify().await;
 }

@@ -523,7 +523,12 @@ impl SchwabClient {
     ) -> Result<T> {
         self.ensure_live_state().await?;
         let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + self.inner.config.timeout;
         let submission = matches!(op, "place_order" | "replace_order");
+        // A cancel only ever reduces risk: it must not be refused because
+        // read traffic tripped the breaker, and it is never retried, since
+        // a retry after a cancel that landed answers 4xx and hides it.
+        let protective = op == "cancel_order";
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let sent = std::sync::atomic::AtomicBool::new(false);
         let operation = async {
@@ -562,17 +567,23 @@ impl SchwabClient {
                     sent.store(true, std::sync::atomic::Ordering::Relaxed);
                     call(token.clone()).await
                 };
-                let result = self
-                    .inner
-                    .circuit_breaker
-                    .call(|| async {
-                        if submission {
-                            attempt().await
-                        } else {
-                            self.inner.retry_policy.execute(attempt).await
-                        }
-                    })
-                    .await;
+                let result = if protective {
+                    attempt().await
+                } else {
+                    self.inner
+                        .circuit_breaker
+                        .call(|| async {
+                            if submission {
+                                attempt().await
+                            } else {
+                                self.inner
+                                    .retry_policy
+                                    .execute_until(Some(deadline), attempt)
+                                    .await
+                            }
+                        })
+                        .await
+                };
                 // A write never replays, even on 401. Caller can reconcile and
                 // explicitly submit a new intent after credentials recover.
                 if !submission
@@ -608,9 +619,15 @@ impl SchwabClient {
                 operation.await
             }
         };
-        let result = tokio::time::timeout(self.inner.config.timeout, guarded)
+        let result = tokio::time::timeout_at(deadline, guarded)
             .await
             .unwrap_or_else(|_| {
+                // A request in flight when the deadline fell went
+                // unanswered: that is the breaker's business, though the
+                // dropped call never told it.
+                if sent.load(std::sync::atomic::Ordering::Relaxed) && !protective {
+                    self.inner.circuit_breaker.record_unanswered();
+                }
                 Err(Error::Timeout {
                     duration: self.inner.config.timeout.as_secs(),
                 })

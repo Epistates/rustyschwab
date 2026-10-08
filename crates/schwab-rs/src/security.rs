@@ -24,7 +24,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
-use secrecy::{ExposeSecret, SecretBox, SecretString};
+use secrecy::{SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -133,43 +133,6 @@ impl EncryptedToken {
     }
 }
 
-/// Derives a 32-byte encryption key from a password using PBKDF2-HMAC-SHA256
-///
-/// # Security
-///
-/// - Uses 600,000 iterations (OWASP 2023 recommendation)
-/// - Salted with machine-specific data to prevent rainbow tables
-/// - **WARNING**: User must provide a strong password (16+ chars recommended)
-///
-/// # Arguments
-///
-/// * `password` - User-provided password (will be zeroized)
-/// * `salt` - Application-specific salt (should include machine ID)
-///
-/// # Returns
-///
-/// Returns a 32-byte key suitable for ChaCha20Poly1305
-pub fn derive_key_from_password(password: &SecretString, salt: &[u8]) -> Zeroizing<[u8; KEY_SIZE]> {
-    use ring::pbkdf2;
-    use std::num::NonZeroU32;
-
-    const ITERATIONS: u32 = 600_000; // OWASP 2023 recommendation
-    // SAFETY: ITERATIONS is a non-zero constant, so this will never panic
-    let iterations =
-        NonZeroU32::new(ITERATIONS).expect("ITERATIONS constant is non-zero and will never panic");
-
-    let mut key = Zeroizing::new([0u8; KEY_SIZE]);
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        salt,
-        password.expose_secret().as_bytes(),
-        &mut *key,
-    );
-
-    key
-}
-
 /// Generates a cryptographically secure random key for ChaCha20Poly1305
 ///
 /// # Security
@@ -241,19 +204,23 @@ pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
         .open(&temp_path)
         .map_err(|e| AuthError::TokenFileError(format!("Failed to create temp file: {}", e)))?;
 
-    file.write_all(data)
-        .map_err(|e| AuthError::TokenFileError(format!("Failed to write data: {}", e)))?;
-
-    // Sync to disk before rename (ensures data is written)
-    file.sync_all()
-        .map_err(|e| AuthError::TokenFileError(format!("Failed to sync file: {}", e)))?;
-
-    // Drop file handle before rename
-    drop(file);
-
-    // Atomic rename
-    std::fs::rename(&temp_path, path)
-        .map_err(|e| AuthError::TokenFileError(format!("Failed to rename temp file: {}", e)))?;
+    let written = (|| {
+        file.write_all(data)
+            .map_err(|e| AuthError::TokenFileError(format!("Failed to write data: {}", e)))?;
+        // Sync to disk before rename (ensures data is written; on Apple
+        // platforms `sync_all` is `F_FULLFSYNC`).
+        file.sync_all()
+            .map_err(|e| AuthError::TokenFileError(format!("Failed to sync file: {}", e)))?;
+        drop(file);
+        // Atomic rename
+        std::fs::rename(&temp_path, path)
+            .map_err(|e| AuthError::TokenFileError(format!("Failed to rename temp file: {}", e)))
+    })();
+    if let Err(error) = written {
+        // The temp file holds the secret too: never leave it behind.
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
 
     // Persist the directory entry, including the replacement, before reporting success.
     let parent = path
@@ -399,6 +366,7 @@ pub fn read_secret_file(path: &Path) -> Result<SecretString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
@@ -438,35 +406,6 @@ mod tests {
 
         let result = encrypted.decrypt(&key);
         assert!(result.is_err(), "Decryption of tampered data should fail");
-    }
-
-    #[test]
-    fn test_key_derivation_deterministic() {
-        let password = SecretString::from("strong_password_123");
-        let salt = b"application_salt";
-
-        let key1 = derive_key_from_password(&password, salt);
-        let key2 = derive_key_from_password(&password, salt);
-
-        assert_eq!(
-            &*key1, &*key2,
-            "Same password + salt should produce same key"
-        );
-    }
-
-    #[test]
-    fn test_key_derivation_different_passwords() {
-        let password1 = SecretString::from("password1");
-        let password2 = SecretString::from("password2");
-        let salt = b"salt";
-
-        let key1 = derive_key_from_password(&password1, salt);
-        let key2 = derive_key_from_password(&password2, salt);
-
-        assert_ne!(
-            &*key1, &*key2,
-            "Different passwords should produce different keys"
-        );
     }
 
     #[test]

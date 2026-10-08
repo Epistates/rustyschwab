@@ -28,8 +28,12 @@ impl HttpTransport {
         timeout: Duration,
         user_agent: impl Into<String>,
     ) -> Result<Self> {
-        let base_url = Url::parse(&base_url.into())
-            .map_err(|e| Error::Config(format!("Invalid base URL: {}", e)))?;
+        let base_url = base_url.into();
+        // Checked here as well as in `SchwabConfig::validate`, so a transport
+        // built directly cannot send the bearer token anywhere else.
+        crate::config::SchwabConfig::validate_url_domain(&base_url, "base_url")?;
+        let base_url =
+            Url::parse(&base_url).map_err(|e| Error::Config(format!("Invalid base URL: {}", e)))?;
 
         let client = Client::builder()
             .timeout(timeout)
@@ -56,7 +60,7 @@ impl HttpTransport {
     where
         T: DeserializeOwned,
     {
-        let url = self.base_url.join(path)?;
+        let url = self.url(path)?;
 
         let mut request = self.client.request(method, url);
 
@@ -93,7 +97,7 @@ impl HttpTransport {
         headers: Vec<(String, String)>,
         body: Option<&(impl Serialize + ?Sized)>,
     ) -> Result<Option<String>> {
-        let url = self.base_url.join(path)?;
+        let url = self.url(path)?;
 
         let mut request = self.client.request(method, url);
         for (key, value) in headers {
@@ -115,6 +119,19 @@ impl HttpTransport {
         } else {
             Err(error_from_response(response).await)
         }
+    }
+
+    /// `path` resolved against the base URL, which it may not leave: a
+    /// scheme-relative path (`//host/x`) would carry the bearer token to
+    /// another host.
+    fn url(&self, path: &str) -> Result<Url> {
+        let url = self.base_url.join(path)?;
+        if url.origin() != self.base_url.origin() {
+            return Err(Error::InvalidParameter(
+                "Request path must stay on the API host".into(),
+            ));
+        }
+        Ok(url)
     }
 
     async fn handle_response<T>(&self, response: Response) -> Result<T>

@@ -17,7 +17,7 @@ pub async fn stream_client(
     let client = SchwabClient::new(schwab)?;
 
     let auth = client.auth_manager();
-    if !auth.has_valid_tokens() {
+    if auth.ensure_valid_tokens().await.is_err() {
         let (url, code) = auth.authorize().await?;
         if code.is_empty() {
             return Err(format!(

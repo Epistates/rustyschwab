@@ -342,6 +342,26 @@ pub enum AuthError {
 
     #[error("Keyring error: {0}")]
     KeyringError(String),
+
+    /// Only a new authorization (the browser flow) can restore access: the
+    /// refresh token expired, Schwab refused it (revoked, or replaced by a
+    /// newer authorization), or no tokens are stored. Retrying will not
+    /// help, and the manager does not ask Schwab again until the stored
+    /// tokens change.
+    #[error("Re-authorization required: {0}")]
+    ReauthorizationRequired(String),
+}
+
+impl AuthError {
+    /// Whether only a new authorization can restore access, as opposed to a
+    /// failure that may pass (a network error, a 5xx from the token
+    /// endpoint) or one about to need it ([`AuthError::RefreshTokenExpiring`]).
+    pub fn requires_reauthorization(&self) -> bool {
+        matches!(
+            self,
+            Self::ReauthorizationRequired(_) | Self::MissingRefreshToken
+        )
+    }
 }
 
 #[derive(Error, Debug)]

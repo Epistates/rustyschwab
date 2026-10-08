@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     let client = SchwabClient::new(config)?;
     let auth_manager = client.auth_manager();
 
-    if !auth_manager.has_valid_tokens() {
+    if auth_manager.ensure_valid_tokens().await.is_err() {
         info!("Starting OAuth flow...");
         let (auth_url, captured_code) = auth_manager.authorize().await?;
 

@@ -5,7 +5,9 @@
 //!
 //! - Structured, contextual logging
 //! - Span-based performance tracking
-//! - Integration with OpenTelemetry for distributed tracing
+//!
+//! Applications that export traces (OpenTelemetry or otherwise) install
+//! their own subscriber instead; these helpers then leave it in place.
 //!
 //! # Basic Usage
 //!
@@ -30,17 +32,19 @@
 //! RUST_LOG=schwab_rs=debug,info cargo run
 //! ```
 
-use std::sync::Once;
-
-static INIT: Once = Once::new();
+/// `RUST_LOG` when set and valid, else `default`.
+fn filter(default: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default))
+}
 
 /// Initialize tracing with default settings.
 ///
 /// Respects the `RUST_LOG` environment variable for filtering.
 /// If not set, defaults to `info` level.
 ///
-/// This function is idempotent - calling it multiple times has no effect
-/// after the first call.
+/// Idempotent, and harmless when the application already installed a
+/// global subscriber: that one is kept.
 ///
 /// # Example
 ///
@@ -48,18 +52,7 @@ static INIT: Once = Once::new();
 /// schwab_rs::telemetry::init_tracing();
 /// ```
 pub fn init_tracing() {
-    INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .with_target(true)
-            .with_thread_ids(false)
-            .with_file(false)
-            .with_line_number(false)
-            .init();
-    });
+    init_tracing_with_level("info");
 }
 
 /// Initialize tracing with a specific default log level.
@@ -77,18 +70,13 @@ pub fn init_tracing() {
 /// schwab_rs::telemetry::init_tracing_with_level("debug");
 /// ```
 pub fn init_tracing_with_level(default_level: &str) {
-    INIT.call_once(|| {
-        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
-
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(true)
-            .with_thread_ids(false)
-            .with_file(false)
-            .with_line_number(false)
-            .init();
-    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter(default_level))
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .try_init();
 }
 
 /// Initialize tracing with JSON output format.
@@ -102,15 +90,10 @@ pub fn init_tracing_with_level(default_level: &str) {
 /// schwab_rs::telemetry::init_tracing_json();
 /// ```
 pub fn init_tracing_json() {
-    INIT.call_once(|| {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .json()
-            .with_target(true)
-            .with_current_span(true)
-            .init();
-    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter("info"))
+        .json()
+        .with_target(true)
+        .with_current_span(true)
+        .try_init();
 }

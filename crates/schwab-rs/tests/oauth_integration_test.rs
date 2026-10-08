@@ -205,3 +205,72 @@ async fn test_authorization_header_format() {
         .unwrap_err();
     assert!(!error.to_string().contains("secret-marker"));
 }
+
+/// `authorize` in one process and the pasted redirect exchanged in another
+/// (the CLI flow) is still checked against the state, once.
+#[tokio::test]
+async fn a_redirect_exchanged_in_another_process_is_checked_against_its_state() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access", "refresh_token": "refresh",
+            "token_type": "Bearer", "expires_in": 1800
+        })))
+        .mount(&mock_server)
+        .await;
+    let mut config = create_test_config(&mock_server.uri());
+    config.oauth.pkce_enabled = false;
+    let starter = AuthManager::new(config.oauth.clone()).unwrap();
+    let (url, _) = starter.authorize().await.unwrap();
+    let state = url::Url::parse(&url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let other = AuthManager::new(config.oauth.clone()).unwrap();
+    let redirect = format!("https://127.0.0.1:8080/callback?code=ABCDEFGHIJKL&state={state}");
+    other.exchange_code(redirect.clone()).await.unwrap();
+    // Consumed: the same redirect, or a forged state, is refused.
+    assert!(other.exchange_code(redirect).await.is_err());
+    let _ = std::fs::remove_file(&config.oauth.tokens_file);
+}
+
+/// A refresh token Schwab refuses means only a new authorization helps:
+/// the error says so, and the endpoint is not asked again for the same
+/// tokens.
+#[tokio::test]
+async fn a_refused_refresh_token_requires_reauthorization_and_is_not_retried() {
+    use schwab_rs::auth::{FileTokenStore, TokenSet, TokenStore};
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": "invalid_grant"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let config = create_test_config(&mock_server.uri());
+    // An access token already past its life, with a valid refresh token.
+    FileTokenStore::new(config.oauth.tokens_file.clone())
+        .save(&TokenSet::new(
+            "stale".into(),
+            "refresh".into(),
+            "".into(),
+            "Bearer".into(),
+            0,
+            "".into(),
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        ))
+        .unwrap();
+    let manager = AuthManager::new(config.oauth.clone()).unwrap();
+    for _ in 0..2 {
+        let error = manager.ensure_valid_tokens().await.unwrap_err();
+        assert!(error.requires_reauthorization(), "{error}");
+    }
+    mock_server.verify().await;
+    let _ = std::fs::remove_file(&config.oauth.tokens_file);
+}
