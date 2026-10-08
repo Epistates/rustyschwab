@@ -1351,6 +1351,7 @@ async fn synthetic_candle_quotes_drive_a_replay_venue_and_fill_within_the_bar() 
         candle_ms: 60_000,
         spread_bps: d("10"),
         participation_bps: d("1000"),
+        regular_hours_only: true,
     }
     .events(
         &[serde_json::from_value::<PriceHistoryResponse>(json!({
@@ -1399,4 +1400,38 @@ async fn synthetic_candle_quotes_drive_a_replay_venue_and_fill_within_the_bar() 
     assert_eq!(snapshot.at_ms, open + 120_000);
     assert_eq!(snapshot.ledger.positions["ABC"].quantity, d("5"));
     assert_eq!(snapshot.ledger.cash, d("950.90"));
+}
+
+/// A gap at the open counts: a session is measured from the previous
+/// session's close, as the live venue measures from its start-of-day value.
+#[tokio::test]
+async fn an_overnight_gap_counts_toward_the_daily_loss() {
+    let mut cfg = config();
+    cfg.accounts
+        .get_mut("paper-test")
+        .unwrap()
+        .limits
+        .max_daily_loss = Some(d("5"));
+    let (_dir, b) = configured_setup(cfg).await;
+    b.place_order("paper-test", &order("buy", "BUY", "10", "11"))
+        .await
+        .unwrap();
+    b.apply(quote(3, 200, "10", "10.01", "10")).await.unwrap();
+    assert!(b.operator_halt().await.unwrap().is_none());
+    b.apply(PaperEvent {
+        sequence: 4,
+        at_ms: 300,
+        kind: PaperEventKind::Session {
+            session_id: "session-2".into(),
+            open: true,
+        },
+    })
+    .await
+    .unwrap();
+    // The next session opens a dollar lower: ten dollars down from the close.
+    b.apply(quote(5, 400, "9", "9.01", "10")).await.unwrap();
+    let snapshot = b.snapshot("paper-test").await.unwrap();
+    assert_eq!(snapshot.ledger.session_mark.unwrap().equity, d("999.80"));
+    assert_eq!(snapshot.daily_loss, Some(d("10.00")));
+    assert!(b.operator_halt().await.unwrap().is_some());
 }

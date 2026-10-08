@@ -50,6 +50,9 @@ struct ClientInner {
     circuit_breaker: Arc<CircuitBreaker>,
     /// Wakes a [`RecoveryWorker`](crate::recovery::RecoveryWorker) early.
     reconciliation_wanted: Arc<tokio::sync::Notify>,
+    /// Each account's net cash transfers for the trading day, as last read.
+    pub(crate) day_transfers:
+        parking_lot::Mutex<std::collections::HashMap<String, crate::reconciliation::DayTransfers>>,
 }
 
 impl SchwabClient {
@@ -100,6 +103,7 @@ impl SchwabClient {
                 retry_policy,
                 circuit_breaker,
                 reconciliation_wanted: Arc::new(tokio::sync::Notify::new()),
+                day_transfers: parking_lot::Mutex::new(std::collections::HashMap::new()),
             }),
         })
     }
@@ -202,6 +206,12 @@ impl SchwabClient {
             .ok_or_else(|| Error::Config("Configure risk before cloning the client".into()))?
             .risk = Some(risk);
         Ok(self)
+    }
+    pub(crate) fn day_transfers(
+        &self,
+    ) -> &parking_lot::Mutex<std::collections::HashMap<String, crate::reconciliation::DayTransfers>>
+    {
+        &self.inner.day_transfers
     }
     pub(crate) fn risk_provider(&self) -> Option<Arc<dyn crate::risk::RiskProvider>> {
         self.inner.risk.clone()

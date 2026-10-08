@@ -203,12 +203,21 @@ impl SchwabPaperFeed {
             .await?;
             return Ok(());
         }
+        // One symbol's bad quote (absent, crossed, stale, under a dollar)
+        // costs that symbol its update, not every symbol its quotes: the
+        // venue keeps judging the rest, and the skipped one ages out.
         for symbol in &self.symbols {
-            let item = quotes
-                .quotes
-                .get(symbol)
-                .ok_or_else(|| Error::InvalidParameter("Requested paper quote absent".into()))?;
-            let event = normalize_quote(symbol, item, self.size_multiplier)?;
+            let Some(item) = quotes.quotes.get(symbol) else {
+                tracing::warn!(%symbol, "paper feed: Schwab returned no quote; skipped");
+                continue;
+            };
+            let event = match normalize_quote(symbol, item, self.size_multiplier) {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(%symbol, %error, "paper feed: unusable quote; skipped");
+                    continue;
+                }
+            };
             if let PaperEventKind::Quote { source_at_ms, .. } = &event
                 && self
                     .paper
@@ -218,7 +227,14 @@ impl SchwabPaperFeed {
             {
                 continue;
             }
-            self.publish(event).await?;
+            match self.publish(event).await {
+                Ok(_) => {}
+                // The venue's own state failing is the feed failing.
+                Err(error @ (Error::Storage(_) | Error::Io(_))) => return Err(error),
+                Err(error) => {
+                    tracing::warn!(%symbol, %error, "paper feed: the venue refused a quote; skipped");
+                }
+            }
         }
         Ok(())
     }

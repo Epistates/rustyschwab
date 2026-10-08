@@ -462,8 +462,11 @@ account or order is `not_found`, as Schwab's would be.
 Everything else is unchanged: principal policy, approval, the intent digest
 and its default tag (which the venue requires), the audit journal (kept
 beside the venue's state), the trading and cancel switches, and the operator
-halt all gate paper orders exactly as they gate live ones, so a model
-evaluated in paper mode meets the same denials it would meet live.
+halt all gate paper orders exactly as they gate live ones, and the venue's
+account limits mean what the live risk provider's do, so a model evaluated
+in paper mode meets the same denials it would meet live. What paper cannot
+reproduce is Schwab's own refusals (buying power rules, symbol
+restrictions); `preview_order` is live-only.
 
 The server does not ingest market events; a separate process drives the
 venue. For a backtest that process is `schwab-paper --commands events.jsonl

@@ -416,7 +416,7 @@ pub async fn collect(
     principal: &str,
     request: Request,
 ) -> Result<Page, ToolFailure> {
-    let now = Utc::now();
+    let now = backend.now().await?;
     let since = request
         .since
         .as_ref()

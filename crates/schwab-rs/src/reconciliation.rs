@@ -516,6 +516,31 @@ pub struct ReconciliationOptions {
 /// Margin on an incremental window, for clock skew between this host and
 /// Schwab's `enteredTime`.
 pub const SINCE_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
+/// An account's net cash transfers into it on one trading day, as read.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DayTransfers {
+    date: chrono::NaiveDate,
+    read_at: std::time::Instant,
+    net: rust_decimal::Decimal,
+}
+/// How long a reading of the day's transfers is reused: they are rare, and
+/// each reading costs one request per transfer type.
+const DAY_TRANSFERS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+/// The transaction types that move cash into or out of an account.
+const TRANSFER_TYPES: [crate::types::trading::TransactionType; 8] = {
+    use crate::types::trading::TransactionType as T;
+    [
+        T::AchReceipt,
+        T::AchDisbursement,
+        T::CashReceipt,
+        T::CashDisbursement,
+        T::ElectronicFund,
+        T::WireIn,
+        T::WireOut,
+        T::Journal,
+    ]
+};
+
 impl Default for ReconciliationOptions {
     fn default() -> Self {
         Self {
@@ -528,6 +553,53 @@ impl Default for ReconciliationOptions {
     }
 }
 impl SchwabClient {
+    /// The account's net cash transfers in (deposits less withdrawals) since
+    /// the start of the New York trading day, reused for
+    /// [`DAY_TRANSFERS_TTL`]. A failed read falls back to the day's last
+    /// reading; `None` when there is none.
+    async fn day_net_transfers(&self, account: &str) -> Option<rust_decimal::Decimal> {
+        let now = chrono::Utc::now();
+        let today = crate::paper::feed::trading_date(now);
+        let cached = self.day_transfers().lock().get(account).copied();
+        if let Some(cached) = cached
+            && cached.date == today
+            && cached.read_at.elapsed() < DAY_TRANSFERS_TTL
+        {
+            return Some(cached.net);
+        }
+        let read = async {
+            let midnight = today
+                .and_hms_opt(0, 0, 0)?
+                .and_local_timezone(chrono_tz::America::New_York)
+                .earliest()?
+                .with_timezone(&chrono::Utc);
+            let mut net = rust_decimal::Decimal::ZERO;
+            // One type per request: Schwab documents `types` as a single value.
+            for kind in TRANSFER_TYPES {
+                let params = crate::types::trading::TransactionsParams::new(midnight, now, [kind]);
+                for transaction in self.get_transactions(account, &params).await.ok()? {
+                    let amount = transaction.net_amount.unwrap_or(0.0);
+                    net = net.checked_add(rust_decimal::Decimal::try_from(amount).ok()?)?;
+                }
+            }
+            Some(net)
+        };
+        match read.await {
+            Some(net) => {
+                self.day_transfers().lock().insert(
+                    account.to_owned(),
+                    DayTransfers {
+                        date: today,
+                        read_at: std::time::Instant::now(),
+                        net,
+                    },
+                );
+                Some(net)
+            }
+            None => cached.filter(|c| c.date == today).map(|c| c.net),
+        }
+    }
+
     pub async fn reconcile_account(
         &self,
         account: &str,
@@ -665,7 +737,7 @@ impl SchwabClient {
             }
             // Read positions after orders to reduce the stale pre-fill snapshot
             // window. Broker reads are still not an atomic account snapshot.
-            let snapshot: Value = self
+            let mut snapshot: Value = self
                 .request_with_query(
                     "reconcile_account",
                     reqwest::Method::GET,
@@ -673,6 +745,17 @@ impl SchwabClient {
                     &[("fields", "positions")],
                 )
                 .await?;
+            if self
+                .risk_provider()
+                .is_some_and(|risk| risk.needs_day_transfers(account))
+                && let Some(net) = self.day_net_transfers(account).await
+                && let Some(fields) = snapshot.as_object_mut()
+            {
+                fields.insert(
+                    crate::risk::DAY_TRANSFERS_KEY.into(),
+                    Value::String(net.to_string()),
+                );
+            }
             let report = database
                 .reconcile_snapshot(
                     account,

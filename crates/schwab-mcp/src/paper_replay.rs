@@ -98,6 +98,19 @@ pub async fn verify_backup(
         }
         for event in page {
             cursor = event.sequence;
+            // Operator halts and their clearing are not captured commands,
+            // but they decide what the next command meets: mirror them in
+            // order. A halt the daily-loss control trips is re-created by
+            // the replayed events themselves.
+            if event.kind == "operator_halt_changed" {
+                use schwab_rs::broker::TradingBackend;
+                match event.payload.get("reason").and_then(|r| r.as_str()) {
+                    None => replay.clear_operator_halt(&event.subject).await?,
+                    Some(_) if event.subject == schwab_rs::risk::DAILY_LOSS_CONTROL => {}
+                    Some(reason) => replay.halt_submissions(reason, &event.subject).await?,
+                }
+                continue;
+            }
             if event.kind != "paper_command" {
                 continue;
             }

@@ -149,6 +149,26 @@ pub async fn evaluate(
     if let Err(halted) = backend.submission_admission().await {
         reasons.push(halted);
     }
+    // The account's own limits (funds, open orders, positions, daily loss),
+    // judged without reserving anything, for a sound order on an account
+    // the caller may act on.
+    let permitted = !reasons
+        .iter()
+        .any(|r| r.code == crate::contract::FailureCode::NotPermitted);
+    if permitted
+        && let Ok(order) = policy::order_request(args)
+        && let Some(account) = args.get("account_hash").and_then(Value::as_str)
+        && let Err(error) = backend
+            .trading()
+            .check_risk(
+                account,
+                &order,
+                args.get("order_id").and_then(Value::as_str),
+            )
+            .await
+    {
+        reasons.push(error.into());
+    }
     Ok(Verdict {
         allowed: reasons.is_empty(),
         reasons,

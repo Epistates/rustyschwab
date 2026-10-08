@@ -493,3 +493,59 @@ async fn a_restore_invalidates_every_baseline() {
             .reconciled
     );
 }
+
+/// A deposit does not hide a trading loss: the day's net transfers come out
+/// of the current value before it is compared with the start of the day.
+#[tokio::test]
+async fn a_deposit_does_not_hide_a_daily_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let account = |transfers: &str| {
+        json!({
+            "securitiesAccount": {
+                "initialBalances": {"liquidationValue": 50000},
+                "currentBalances": {"liquidationValue": 51000, "availableFunds": 1000},
+                "positions": []
+            },
+            "_dayNetTransfers": transfers
+        })
+    };
+    let risk = risk(
+        &journal,
+        PortfolioLimits {
+            max_daily_loss: Some(500.into()),
+            ..limits()
+        },
+    );
+    // Without the deposit the account looks a thousand up.
+    journal
+        .database()
+        .reconcile_snapshot(
+            "A",
+            1,
+            chrono::Utc::now().timestamp_millis(),
+            account("0"),
+            vec![],
+        )
+        .await
+        .unwrap();
+    risk.reserve("A", "fine", &order("BUY", "AAPL", 1, "10"))
+        .await
+        .unwrap();
+    // With a 10,000 deposit it is 9,000 down: halted.
+    journal
+        .database()
+        .reconcile_snapshot(
+            "A",
+            1,
+            chrono::Utc::now().timestamp_millis(),
+            account("10000"),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.reserve("A", "halted", &order("BUY", "AAPL", 1, "10")).await,
+        Err(schwab_rs::Error::Halted(reason)) if reason.contains("Daily loss 9000")
+    ));
+}

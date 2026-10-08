@@ -170,14 +170,18 @@ pub struct PaperAccount {
     pub positions: BTreeMap<String, PaperPosition>,
     #[serde(default)]
     pub pending_cash: Vec<PendingCash>,
-    /// Where the daily-loss control measures the session from; absent until
-    /// the account's holdings could first be marked in it.
+    /// Where the daily-loss control measures the session from: the last
+    /// complete mark of the session before (its close), so a gap at the
+    /// open counts; the first mark of the account's first session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_mark: Option<SessionMark>,
+    /// The latest complete mark: what the next session opens against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_mark: Option<SessionMark>,
 }
 
-/// The account's equity at the first event of a session at which every held
-/// position had a fresh quote.
+/// The account's equity at an event at which every held position had a
+/// fresh quote, in a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMark {
     pub session_id: String,

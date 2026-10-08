@@ -772,7 +772,7 @@ impl SchwabMcp {
         contract::run("get_account_orders", async {
             let params = params
                 .unwrap_or_default()
-                .into_params(chrono::Utc::now())
+                .into_params(self.backend.now().await?)
                 .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.backend.account_orders(&account_hash, &params).await?;
             Ok(contract::envelope(self.backend.source(), resp))
@@ -795,7 +795,7 @@ impl SchwabMcp {
         contract::run("get_all_orders", async {
             let params = params
                 .unwrap_or_default()
-                .into_params(chrono::Utc::now())
+                .into_params(self.backend.now().await?)
                 .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.backend.all_orders(&params).await?;
             Ok(contract::envelope(self.backend.source(), resp))
@@ -865,7 +865,7 @@ impl SchwabMcp {
         contract::run("get_transactions", async {
             let params = params
                 .unwrap_or_default()
-                .into_params(chrono::Utc::now())
+                .into_params(self.backend.now().await?)
                 .map_err(ToolFailure::invalid_arguments)?;
             let resp = self.backend.transactions(&account_hash, &params).await?;
             Ok(contract::rest(resp))

@@ -57,6 +57,24 @@ pub struct SyntheticBbo {
     /// Share of a candle's volume offered on each side across its marks, as
     /// basis points, 0 to 10000.
     pub participation_bps: Decimal,
+    /// Keep only candles that open in New York's regular session (09:30 to
+    /// 16:00), so pre- and post-market bars are not replayed as regular-hours
+    /// quotes that `NORMAL` orders would fill against. Early closes are not
+    /// known to the model.
+    #[serde(default)]
+    pub regular_hours_only: bool,
+}
+
+/// Whether `at_ms` falls in New York's regular equity session.
+fn regular_hours(at_ms: i64) -> bool {
+    use chrono::Timelike;
+    New_York
+        .timestamp_millis_opt(at_ms)
+        .single()
+        .is_some_and(|at| {
+            let minute = at.hour() * 60 + at.minute();
+            (9 * 60 + 30..16 * 60).contains(&minute)
+        })
 }
 
 struct Item<'a> {
@@ -115,6 +133,9 @@ impl SyntheticBbo {
             }
             let mut previous_open = None;
             for candle in &history.candles {
+                if self.regular_hours_only && !regular_hours(candle.datetime) {
+                    continue;
+                }
                 self.check(symbol, candle, previous_open)?;
                 previous_open = Some(candle.datetime);
                 let date = New_York
@@ -314,6 +335,7 @@ mod tests {
             candle_ms: 60_000,
             spread_bps: d("10"),
             participation_bps: d("1000"),
+            regular_hours_only: false,
         }
     }
     fn quotes(events: &[PaperEvent]) -> Vec<(i64, &str, Decimal, Decimal, Decimal)> {
@@ -406,6 +428,7 @@ mod tests {
             candle_ms: 1000,
             spread_bps: Decimal::ZERO,
             participation_bps: d("2500"),
+            regular_hours_only: false,
         };
         let events = model
             .events(
@@ -421,6 +444,33 @@ mod tests {
             assert_eq!((bid, ask, size), (d("10.00"), d("10.01"), Decimal::ZERO));
             assert!((OPEN..OPEN + 1000).contains(&at));
         }
+    }
+
+    /// With `regular_hours_only`, a pre-market bar is dropped rather than
+    /// replayed as regular-session quotes.
+    #[test]
+    fn regular_hours_only_drops_extended_bars() {
+        // 2024-01-08 04:00 EST (pre-market) and 09:30 EST (the open).
+        let pre_market = 1_704_704_400_000;
+        let open = 1_704_724_200_000;
+        let model = SyntheticBbo {
+            regular_hours_only: true,
+            ..model()
+        };
+        let events = model
+            .events(
+                &[history(
+                    "ABC",
+                    vec![
+                        candle(pre_market, 11.0, 11.0, 11.0, 11.0, 400),
+                        candle(open, 12.0, 12.0, 12.0, 12.0, 400),
+                    ],
+                )],
+                1,
+            )
+            .unwrap();
+        assert!(quotes(&events).iter().all(|(at, ..)| *at >= open));
+        assert!(!quotes(&events).is_empty());
     }
 
     #[test]

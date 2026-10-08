@@ -61,6 +61,16 @@ impl Backend {
         self.trading().mode()
     }
 
+    /// "Now" for this venue: the wall clock live, the venue's clock in
+    /// paper mode, so default windows (recent orders, the journal) cover a
+    /// backtest's own past rather than today.
+    pub async fn now(&self) -> Result<chrono::DateTime<chrono::Utc>, ToolFailure> {
+        match self {
+            Self::Live(_) => Ok(chrono::Utc::now()),
+            Self::Paper(paper) => Ok(paper.broker.venue_time().await?),
+        }
+    }
+
     pub fn trading(&self) -> &dyn TradingBackend {
         match self {
             Self::Live(client) => client.as_ref(),

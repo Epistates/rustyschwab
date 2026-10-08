@@ -49,6 +49,18 @@ pub trait TradingBackend: Send + Sync {
     async fn operator_halt(&self) -> Result<Option<String>> {
         self.execution_store().operator_halt().await
     }
+    /// The account-level risk check a submission of `order` (replacing
+    /// `replaces`, if any) would meet, without reserving anything: an
+    /// advisory pre-flight. The default (and the paper venue, which judges
+    /// its limits at submission) finds nothing to object to.
+    async fn check_risk(
+        &self,
+        _account: &str,
+        _order: &OrderRequest,
+        _replaces: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Local admission for a new submission, for a gateway to check before
     /// it consumes a one-use approval. Advisory: each submission checks
     /// again inside its own transaction.
@@ -107,6 +119,17 @@ impl TradingBackend for SchwabClient {
     }
     async fn submission_admission(&self) -> Result<()> {
         self.submission_admission().await
+    }
+    async fn check_risk(
+        &self,
+        account: &str,
+        order: &OrderRequest,
+        replaces: Option<&str>,
+    ) -> Result<()> {
+        match self.risk_provider() {
+            Some(risk) => risk.check(account, order, replaces).await,
+            None => Ok(()),
+        }
     }
 }
 #[async_trait::async_trait]

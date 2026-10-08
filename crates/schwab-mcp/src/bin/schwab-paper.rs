@@ -48,6 +48,10 @@ struct Args {
     participation_bps: Option<rust_decimal::Decimal>,
     #[arg(long, default_value_t = 1, requires = "synthesize")]
     first_sequence: u64,
+    /// Keep pre- and post-market candles too; by default only candles in
+    /// New York's regular session become quotes.
+    #[arg(long, requires = "synthesize")]
+    extended_hours: bool,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
             participation_bps: args
                 .participation_bps
                 .ok_or_else(|| required("Participation"))?,
+            regular_hours_only: !args.extended_hours,
         };
         let histories = args
             .synthesize

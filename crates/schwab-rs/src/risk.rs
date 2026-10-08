@@ -68,6 +68,25 @@ pub trait RiskProvider: Send + Sync {
     async fn observe_baseline(&self, _account: &str) -> Result<()> {
         Ok(())
     }
+    /// Judge `order` (replacing broker order `replaces`, if any) as
+    /// [`reserve`](Self::reserve) would, without reserving anything or
+    /// tripping any control: an advisory pre-flight. The default finds
+    /// nothing to object to.
+    async fn check(
+        &self,
+        _account: &str,
+        _order: &OrderRequest,
+        _replaces: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Whether reconciliation should record the account's net cash
+    /// transfers for the day (deposits less withdrawals) with its baseline,
+    /// for a daily-loss control that must not read a deposit as a gain or a
+    /// withdrawal as a loss. The default asks for none.
+    fn needs_day_transfers(&self, _account: &str) -> bool {
+        false
+    }
     /// Recheck the held reservation and current risk baseline after all admission
     /// waits, immediately before transmission. Fail closed if unsupported.
     async fn revalidate(
@@ -138,16 +157,25 @@ fn decimal(value: Option<&serde_json::Value>) -> Option<Decimal> {
         })
         .and_then(|v| v.parse().ok())
 }
-/// The account's loss for the day, read from the reconciled `securitiesAccount`:
-/// its start-of-day liquidation value less the current one. `None` when the
-/// venue omitted either value.
-fn daily_loss(account: &serde_json::Value) -> Option<DailyLoss> {
+/// Where reconciliation records the day's net cash transfers into the
+/// account (deposits less withdrawals) beside Schwab's snapshot.
+pub(crate) const DAY_TRANSFERS_KEY: &str = "_dayNetTransfers";
+
+/// The account's loss for the day, read from the reconciled snapshot: its
+/// start-of-day liquidation value less the current one, with the day's net
+/// transfers taken back out of the current value, so a deposit does not
+/// hide a loss and a withdrawal does not fake one. `None` when the venue
+/// omitted either value.
+fn daily_loss(snapshot: &serde_json::Value) -> Option<DailyLoss> {
+    let account = &snapshot["securitiesAccount"];
     let start = decimal(account.pointer("/initialBalances/liquidationValue"))?;
     let current = decimal(account.pointer("/currentBalances/liquidationValue"))?;
+    let transfers = decimal(snapshot.get(DAY_TRANSFERS_KEY)).unwrap_or(Decimal::ZERO);
+    let traded = current.checked_sub(transfers)?;
     Some(DailyLoss {
         start,
-        current,
-        loss: start.checked_sub(current)?,
+        current: traded,
+        loss: start.checked_sub(traded)?,
     })
 }
 struct DailyLoss {
@@ -314,7 +342,8 @@ impl PortfolioRisk {
                 let (at, valid, body) =
                     state.ok_or_else(|| stale("Account requires reconciliation before trading"))?;
                 let now = chrono::Utc::now().timestamp_millis();
-                let revalidate = !matches!(check, Check::Reserve { .. });
+                let revalidate = matches!(check, Check::Revalidate { .. });
+                let dry_run = matches!(check, Check::DryRun { .. });
                 if revalidate {
                     ensure_not_halted(&tx)?;
                     if let Check::Revalidate { fence: Some(lease) } = &check
@@ -330,10 +359,11 @@ impl PortfolioRisk {
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
                 let account_value = &snapshot["securitiesAccount"];
                 if let Some(cap) = limits.max_daily_loss {
-                    let day = daily_loss(account_value)
+                    let day = daily_loss(&snapshot)
                         .ok_or_else(|| stale("Liquidation values missing from risk baseline"))?;
                     if day.loss > cap {
-                        // The halt outlives this denial: commit it, then fail closed.
+                        // The halt outlives this denial: commit it, then fail
+                        // closed. A dry run only reports it.
                         let reason = daily_loss_reason(
                             &account,
                             "liquidation value",
@@ -342,8 +372,10 @@ impl PortfolioRisk {
                             day.loss,
                             cap,
                         );
-                        trip_halt(&tx, &reason, DAILY_LOSS_CONTROL)?;
-                        tx.commit().map_err(sql)?;
+                        if !dry_run {
+                            trip_halt(&tx, &reason, DAILY_LOSS_CONTROL)?;
+                            tx.commit().map_err(sql)?;
+                        }
                         return Err(Error::Halted(reason));
                     }
                 }
@@ -364,7 +396,7 @@ impl PortfolioRisk {
                             .ok_or_else(|| stale("Position arithmetic overflow"))
                     })?;
                 let replaces = match &check {
-                    Check::Reserve { replaces } => replaces.clone(),
+                    Check::Reserve { replaces } | Check::DryRun { replaces } => replaces.clone(),
                     Check::Revalidate { .. } => {
                         let held: Option<(String, String, Option<String>)> = tx
                             .query_row(
@@ -471,6 +503,9 @@ impl PortfolioRisk {
                         return denied("Position quantity");
                     }
                 }
+                if dry_run {
+                    return Ok(());
+                }
                 if !revalidate {
                     tx.execute(
                         INSERT_HELD_RESERVATION,
@@ -509,6 +544,8 @@ enum Check {
     /// Reserve a new order's exposure, replacing broker order `replaces`
     /// if set.
     Reserve { replaces: Option<String> },
+    /// Judge it as `Reserve` would, changing nothing.
+    DryRun { replaces: Option<String> },
     /// Recheck the held reservation just before transmission, inside the
     /// dispatch fence if one is given.
     Revalidate { fence: Option<Lease> },
@@ -563,7 +600,7 @@ impl RiskProvider for PortfolioRisk {
                     return Ok(());
                 };
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
-                if let Some(day) = daily_loss(&snapshot["securitiesAccount"])
+                if let Some(day) = daily_loss(&snapshot)
                     && day.loss > cap
                 {
                     let reason = daily_loss_reason(
@@ -604,6 +641,21 @@ impl RiskProvider for PortfolioRisk {
         let fence = Some(lease.clone());
         self.validate_and_reserve(account, attempt_id, order, Check::Revalidate { fence })
             .await
+    }
+    async fn check(
+        &self,
+        account: &str,
+        order: &OrderRequest,
+        replaces: Option<&str>,
+    ) -> Result<()> {
+        let replaces = replaces.map(str::to_owned);
+        self.validate_and_reserve(account, "dry-run", order, Check::DryRun { replaces })
+            .await
+    }
+    fn needs_day_transfers(&self, account: &str) -> bool {
+        self.accounts
+            .get(account)
+            .is_some_and(|limits| limits.max_daily_loss.is_some())
     }
     async fn release(&self, attempt_id: &str) -> Result<()> {
         let id = attempt_id.to_owned();

@@ -12,7 +12,7 @@
 use std::fmt::{self, Display};
 use std::str::FromStr;
 
-use chrono::{Duration, Utc};
+use chrono::Duration;
 use schwab_types::accounts::{Balance, Position, SecuritiesAccount};
 use schwab_types::trading::{Order, OrdersParams};
 use serde::Serialize;
@@ -246,7 +246,7 @@ pub async fn collect(
     backend: &Backend,
     account_hash: &str,
 ) -> Result<PortfolioSummary, ToolFailure> {
-    let now = Utc::now();
+    let now = backend.now().await?;
     let since = now - Duration::days(ORDER_LOOKBACK_DAYS);
     let budget = projection::budget() / 2;
     let mut warnings = Vec::new();

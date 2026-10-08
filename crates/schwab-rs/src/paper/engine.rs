@@ -314,11 +314,13 @@ fn session_loss(
         .map(|(mark, equity)| sub(mark.equity, equity))
         .transpose()
 }
-/// The daily-loss control. Each capped account is marked at every event: the
-/// session's first complete mark is kept, and once equity has fallen further
-/// below it than the cap the halt trips, in this transaction. Clearing the
-/// halt does not reset the day; the next event trips it again until a new
-/// session sets a new mark.
+/// The daily-loss control. Each capped account is marked at every event. A
+/// session is measured from the previous session's last complete mark (its
+/// close), so a gap at the open counts as the live venue's start-of-day
+/// value would; the account's first session starts from its first mark.
+/// Once equity has fallen further below that than the cap, the halt trips,
+/// in this transaction. Clearing the halt does not reset the day; the next
+/// event trips it again until a new session sets a new mark.
 fn enforce_daily_loss(tx: &Connection, config: &PaperConfig, clock: &Clock) -> Result<()> {
     for (name, settings) in &config.accounts {
         let Some(cap) = settings.limits.max_daily_loss else {
@@ -329,25 +331,37 @@ fn enforce_daily_loss(tx: &Connection, config: &PaperConfig, clock: &Clock) -> R
         let Some(equity) = equity(&ledger, market)? else {
             continue;
         };
-        match ledger
+        let opened = match ledger
             .session_mark
             .as_ref()
             .filter(|mark| mark.session_id == clock.session_id)
         {
-            Some(mark) => {
-                let loss = sub(mark.equity, equity)?;
-                if loss > cap {
-                    let reason = daily_loss_reason(name, "equity", mark.equity, equity, loss, cap);
-                    trip_halt(tx, &reason, DAILY_LOSS_CONTROL)?;
-                }
-            }
+            Some(mark) => mark.equity,
             None => {
+                let opening = ledger
+                    .last_mark
+                    .as_ref()
+                    .filter(|mark| mark.session_id != clock.session_id)
+                    .map_or(equity, |mark| mark.equity);
                 ledger.session_mark = Some(SessionMark {
                     session_id: clock.session_id.clone(),
-                    equity,
+                    equity: opening,
                 });
-                save_ledger(tx, name, &ledger)?;
+                opening
             }
+        };
+        let current = SessionMark {
+            session_id: clock.session_id.clone(),
+            equity,
+        };
+        if ledger.last_mark.as_ref() != Some(&current) {
+            ledger.last_mark = Some(current);
+            save_ledger(tx, name, &ledger)?;
+        }
+        let loss = sub(opened, equity)?;
+        if loss > cap {
+            let reason = daily_loss_reason(name, "equity", opened, equity, loss, cap);
+            trip_halt(tx, &reason, DAILY_LOSS_CONTROL)?;
         }
     }
     Ok(())
@@ -771,26 +785,37 @@ impl PaperBroker {
                         "Paper working-order capacity reached".into(),
                     ));
                 }
+                // The live risk provider's rules (`PortfolioLimits`): the
+                // open caps bound what working buys could still add, the
+                // position cap one symbol, and a sell only what the account
+                // holds less its other working sells of the symbol.
                 let mut held_cash = order.reserved_cash;
-                let mut open_q = order.remaining_quantity;
-                let mut open_n = mul(order.remaining_quantity, price_bound)?;
-                let mut buys = if is_buy {
-                    order.remaining_quantity
+                let (mut open_q, mut open_n, mut symbol_buys, mut sells) = if is_buy {
+                    let n = mul(order.remaining_quantity, price_bound)?;
+                    (
+                        order.remaining_quantity,
+                        n,
+                        order.remaining_quantity,
+                        Decimal::ZERO,
+                    )
                 } else {
-                    Decimal::ZERO
-                };
-                let mut sells = if is_buy {
-                    Decimal::ZERO
-                } else {
-                    order.remaining_quantity
+                    (
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        Decimal::ZERO,
+                        order.remaining_quantity,
+                    )
                 };
                 for other in open.iter().filter(|o| o.account == account) {
                     held_cash = add(held_cash, other.reserved_cash)?;
-                    open_q = add(open_q, other.remaining_quantity)?;
-                    open_n = add(open_n, mul(other.remaining_quantity, other.price_bound)?)?;
+                    let same = symbol(other) == symbol(&order);
                     if buy(other) {
-                        buys = add(buys, other.remaining_quantity)?;
-                    } else if symbol(other) == symbol(&order) {
+                        open_q = add(open_q, other.remaining_quantity)?;
+                        open_n = add(open_n, mul(other.remaining_quantity, other.price_bound)?)?;
+                        if same {
+                            symbol_buys = add(symbol_buys, other.remaining_quantity)?;
+                        }
+                    } else if same {
                         sells = add(sells, other.remaining_quantity)?;
                     }
                 }
@@ -798,16 +823,11 @@ impl PaperBroker {
                     .positions
                     .get(symbol(&order))
                     .map_or(Decimal::ZERO, |p| p.quantity);
-                let total_positions = account_state
-                    .positions
-                    .values()
-                    .try_fold(Decimal::ZERO, |sum, p| add(sum, p.quantity))?;
-                if held_cash > account_state.cash
-                    || sells > position
-                    || add(total_positions, buys)? > limits.max_position_quantity
-                    || open_q > limits.max_open_quantity
-                    || open_n > limits.max_open_notional
-                {
+                let buy_exceeds = is_buy
+                    && (add(position, symbol_buys)? > limits.max_position_quantity
+                        || open_q > limits.max_open_quantity
+                        || open_n > limits.max_open_notional);
+                if held_cash > account_state.cash || sells > position || buy_exceeds {
                     return Err(Error::RiskDenied(
                         "Paper cash, inventory or portfolio limit exceeded".into(),
                     ));
@@ -1108,6 +1128,18 @@ impl PaperBroker {
                 )
             })
             .await
+    }
+    /// The venue's time: the wall clock in wall mode, the replayed clock in
+    /// replay mode (a backtest lives in its own past).
+    pub async fn venue_time(&self) -> Result<chrono::DateTime<chrono::Utc>> {
+        let config = self.config.clone();
+        let at_ms = self
+            .journal
+            .database()
+            .run(move |c| Ok(effective_clock(get(c, "paper_clock")?, &config)?.at_ms))
+            .await?;
+        chrono::DateTime::from_timestamp_millis(at_ms)
+            .ok_or_else(|| corrupt("Venue clock out of range"))
     }
     pub async fn market_session(&self) -> Result<(String, bool)> {
         self.journal
@@ -1594,6 +1626,7 @@ fn initialize(c: &mut Connection, config: &PaperConfig) -> Result<()> {
                 positions: BTreeMap::new(),
                 pending_cash: Vec::new(),
                 session_mark: None,
+                last_mark: None,
             };
             tx.execute(
                 "INSERT INTO paper_accounts VALUES(?1,?2)",

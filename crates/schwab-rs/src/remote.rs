@@ -133,6 +133,11 @@ pub enum BackendRequest {
     ReleaseRisk {
         attempt_id: String,
     },
+    CheckRisk {
+        account: String,
+        order: OrderRequest,
+        replaces: Option<String>,
+    },
     ObserveBaseline {
         account: String,
     },
@@ -259,6 +264,11 @@ impl BackendRequest {
             Self::ReleaseRisk { attempt_id } => {
                 serde_json::to_value(risk.release(&attempt_id).await?)?
             }
+            Self::CheckRisk {
+                account,
+                order,
+                replaces,
+            } => serde_json::to_value(risk.check(&account, &order, replaces.as_deref()).await?)?,
             Self::ObserveBaseline { account } => {
                 serde_json::to_value(risk.observe_baseline(&account).await?)?
             }
@@ -640,11 +650,29 @@ impl RiskProvider for RemoteBackend {
         })
         .await
     }
+    async fn check(
+        &self,
+        account: &str,
+        order: &OrderRequest,
+        replaces: Option<&str>,
+    ) -> Result<()> {
+        self.call(&BackendRequest::CheckRisk {
+            account: account.to_owned(),
+            order: order.clone(),
+            replaces: replaces.map(str::to_owned),
+        })
+        .await
+    }
     async fn release(&self, attempt_id: &str) -> Result<()> {
         self.call(&BackendRequest::ReleaseRisk {
             attempt_id: attempt_id.to_owned(),
         })
         .await
+    }
+    /// The authority's limits are not visible here; record transfers for
+    /// every account, since one with a daily-loss cap needs them.
+    fn needs_day_transfers(&self, _account: &str) -> bool {
+        true
     }
     async fn observe_baseline(&self, account: &str) -> Result<()> {
         self.call(&BackendRequest::ObserveBaseline {

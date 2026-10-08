@@ -272,3 +272,80 @@ async fn backup_replay_reproduces_committed_rejection_and_lost_acknowledgement()
         .unwrap();
     assert_eq!(report["verified_captured_commands"], 10);
 }
+
+/// A halt the daily-loss control tripped and an operator cleared is part of
+/// the history a backup replays: the orders placed after the clear still
+/// verify.
+#[tokio::test]
+async fn backup_replay_follows_a_cleared_daily_loss_halt() {
+    use schwab_rs::broker::TradingBackend;
+    use schwab_rs::paper::*;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config: PaperConfig =
+        serde_json::from_str(include_str!("../../../ops/paper/config.json")).unwrap();
+    config
+        .accounts
+        .get_mut("paper-demo")
+        .unwrap()
+        .limits
+        .max_daily_loss = Some("5".parse().unwrap());
+    let broker = PaperBroker::open(dir.path().join("state/run.sqlite3"), config)
+        .await
+        .unwrap();
+    let quote = |sequence, at_ms, bid: &str, ask: &str| PaperEvent {
+        sequence,
+        at_ms,
+        kind: PaperEventKind::Quote {
+            symbol: "ABC".into(),
+            source_at_ms: at_ms,
+            bid: bid.parse().unwrap(),
+            ask: ask.parse().unwrap(),
+            bid_size: "100".parse().unwrap(),
+            ask_size: "100".parse().unwrap(),
+        },
+    };
+    let order = |tag: &str| -> schwab_rs::types::trading::OrderRequest {
+        serde_json::from_value(serde_json::json!({
+            "tag": tag, "orderStrategyType": "SINGLE", "orderType": "LIMIT",
+            "session": "NORMAL", "duration": "DAY", "price": "101",
+            "orderLegCollection": [{"quantity": "10", "instruction": "BUY",
+                "instrument": {"symbol": "ABC", "assetType": "EQUITY"}}]
+        }))
+        .unwrap()
+    };
+    broker
+        .apply(PaperEvent {
+            sequence: 1,
+            at_ms: 100,
+            kind: PaperEventKind::Session {
+                session_id: "day-1".into(),
+                open: true,
+            },
+        })
+        .await
+        .unwrap();
+    broker.apply(quote(2, 110, "100", "100.01")).await.unwrap();
+    broker
+        .place_order("paper-demo", &order("first"))
+        .await
+        .unwrap();
+    broker.apply(quote(3, 200, "100", "100.01")).await.unwrap();
+    // Ten shares down a dollar each: past the five-dollar cap.
+    broker.apply(quote(4, 300, "99", "99.01")).await.unwrap();
+    assert!(broker.operator_halt().await.unwrap().is_some());
+    broker.clear_operator_halt("desk").await.unwrap();
+    broker
+        .place_order("paper-demo", &order("second"))
+        .await
+        .unwrap();
+    let backup = dir.path().join("backup/run.sqlite3");
+    broker
+        .order_journal()
+        .database()
+        .backup(backup.clone())
+        .await
+        .unwrap();
+    schwab_mcp::paper_replay::verify_backup(broker.config().clone(), backup)
+        .await
+        .unwrap();
+}

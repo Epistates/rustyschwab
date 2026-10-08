@@ -72,6 +72,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Fixed — risk and the paper venue (second diligence pass)
+
+- **Deposits and withdrawals are not profit and loss.** The daily-loss
+  control compared start-of-day and current liquidation value, so a
+  deposit hid a loss and a withdrawal (or outgoing transfer) faked one,
+  halting every account. Reconciliation now records the day's net cash
+  transfers (`_dayNetTransfers`, read at most every five minutes, one
+  request per transfer type) for accounts with a cap
+  (`RiskProvider::needs_day_transfers`), and they come out of the current
+  value first.
+- **`check_order` runs the account risk check.** A dry run
+  (`RiskProvider::check`, `TradingBackend::check_risk`) reports funds,
+  open-order, position and daily-loss refusals without reserving anything
+  or tripping a halt; before, it reported `allowed: true` for the most
+  likely refusals.
+- **Paper limits mean what live limits mean.** Open quantity and notional
+  bound working buys, the position cap one symbol, and a sell what the
+  symbol's position allows; the venue counted every order and every symbol
+  together.
+- **Paper daily loss counts the overnight gap**: a session is measured from
+  the previous session's close, not from its own first mark.
+- **Backtests see their own working orders.** In paper mode, default
+  windows (recent orders, the trade journal, the portfolio summary) end at
+  the venue's clock (`PaperBroker::venue_time`, `Backend::now`), not today.
+- **One bad quote no longer blanks the paper venue.** The wall-clock feed
+  skips an absent, crossed, stale or sub-dollar quote for that symbol
+  instead of disconnecting every symbol.
+- **Backup verification follows halts.** A daily-loss halt an operator
+  cleared made every later captured order fail on replay; operator halts
+  and clears are now mirrored in order.
+- **Synthetic backtests can drop extended hours**
+  (`SyntheticBbo::regular_hours_only`, the CLI default; `--extended-hours`
+  keeps them). The paper docs now state that a stop gapping past its
+  collar is rejected rather than filled.
+
 ### Fixed — wire types (second diligence pass)
 
 - **One odd number no longer fails a whole response.** Schwab spells some
