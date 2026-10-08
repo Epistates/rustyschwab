@@ -127,6 +127,35 @@ pub fn recovery_accounts() -> Vec<String> {
         .collect()
 }
 
+/// The process's streaming state: the Schwab login's one stream, its
+/// snapshot cache and the task feeding it.
+///
+/// Every server built over the same backend shares one hub, so a policy
+/// reload that rebuilds the per-principal servers keeps the live stream
+/// (and its lease on the login's streamer slot) rather than orphaning it,
+/// and every principal's status reports the same stream.
+#[derive(Clone, Default)]
+pub struct StreamHub {
+    stream: Arc<AsyncRwLock<Option<StreamClient>>>,
+    cache: StreamCache,
+    feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
+}
+impl StreamHub {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Disconnect the stream and stop its feeder. Idempotent.
+    pub async fn shutdown(&self) {
+        if let Some(client) = self.stream.write().await.take() {
+            client.disconnect().await;
+        }
+        if let Some(handle) = self.feeder.write().await.take() {
+            handle.abort();
+        }
+        self.cache.clear();
+    }
+}
+
 /// MCP server over an execution [`Backend`].
 ///
 /// Holds optional streaming state — a `StreamClient` is built lazily on the
@@ -159,14 +188,26 @@ impl SchwabMcp {
     /// the websocket URL via `SCHWAB_WEBSOCKET_URL` in the env before
     /// constructing the client if needed.
     pub fn new(backend: Backend, switches: Switches) -> Self {
+        Self::with_stream_hub(backend, switches, StreamHub::new())
+    }
+    /// A server sharing `hub`'s stream with every other server built on it.
+    pub fn with_stream_hub(backend: Backend, switches: Switches, hub: StreamHub) -> Self {
         Self {
             backend,
             switches,
-            stream: Arc::new(AsyncRwLock::new(None)),
-            cache: StreamCache::new(),
-            feeder: Arc::new(AsyncRwLock::new(None)),
+            stream: hub.stream,
+            cache: hub.cache,
+            feeder: hub.feeder,
             stream_config: StreamConfig::default(),
             calendar: SessionCalendar::default(),
+        }
+    }
+    /// The streaming state this server shares.
+    pub fn stream_hub(&self) -> StreamHub {
+        StreamHub {
+            stream: self.stream.clone(),
+            cache: self.cache.clone(),
+            feeder: self.feeder.clone(),
         }
     }
     /// The stream's health as `stream_status` and the status tool report it.
@@ -1107,8 +1148,6 @@ impl SchwabMcp {
     )]
     async fn stream_disconnect(&self) -> McpResult<ToolResult> {
         contract::run("stream_disconnect", async {
-            self.backend
-                .suspend_submissions("Required stream disconnected");
             // Take the client out of the slot first and call its explicit
             // `disconnect()` so the reconnect loop stops and the inner
             // tokio tasks are aborted — previously we just dropped the
@@ -1154,8 +1193,6 @@ impl SchwabMcp {
                      does not have; read paper orders with get_account_orders",
                 ));
             }
-            self.backend
-                .suspend_submissions("Subscription baseline is recovering");
             if self.stream.read().await.is_none() {
                 self.connect_stream().await?;
             }
@@ -1263,7 +1300,7 @@ impl SchwabMcp {
     ) -> McpResult<ToolResult> {
         contract::run("stream_snapshot", async {
             if let Some(client) = self.stream.read().await.as_ref() {
-                self.cache.update_status(client.status());
+                self.cache.observe_live(&client.status());
             }
             if matches!(service, StreamService::AcctActivity) {
                 return Ok(contract::envelope(Source::StreamCache, self.cache.events()));
@@ -1385,8 +1422,6 @@ impl SchwabMcp {
         if guard.as_ref().is_some_and(|s| s.is_running()) {
             return Ok(());
         }
-        self.backend
-            .suspend_submissions("Required stream is connecting");
         if let Some(old) = guard.take() {
             old.disconnect().await;
         }

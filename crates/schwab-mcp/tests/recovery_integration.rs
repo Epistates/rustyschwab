@@ -15,8 +15,12 @@ use std::{
     time::Duration,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+/// Stream recovery seeds quote baselines and reconciles accounts without
+/// ever gating order submission (the risk check reads the recovery
+/// worker's baselines, not the stream), and a stream that ends ends its
+/// feeder.
 #[tokio::test]
-async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_together() {
+async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
     let dir = tempfile::tempdir().unwrap();
     let rest = MockServer::start().await;
     let healthy = Arc::new(AtomicBool::new(false));
@@ -139,16 +143,19 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
         },
     );
     tokio::time::sleep(Duration::from_millis(160)).await;
-    assert!(client.submissions_suspended());
+    assert!(!client.submissions_suspended());
     // The delta is cached but cannot be fresh until the REST baseline lands.
+    let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+    assert_eq!(snapshot["AAPL"]["fresh"], false);
     assert_eq!(
-        cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["fresh"],
-        false
+        snapshot["AAPL"]["staleReason"],
+        "REST baseline not applied yet"
     );
     healthy.store(true, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if !client.submissions_suspended() && cache.events()["reconciliationRequired"] == false
+            if cache.events()["reconciliationRequired"] == false
+                && cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["restBaseline"].is_object()
             {
                 break;
             }
@@ -157,6 +164,7 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
     })
     .await
     .unwrap();
+    assert!(!client.submissions_suspended());
     let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
     assert_eq!(snapshot["AAPL"]["fresh"], true);
     // Snapshots carry field names, not numbers; the stream delta wins over
@@ -189,14 +197,12 @@ async fn rest_deadline_keeps_trading_closed_then_quotes_and_accounts_recover_tog
         "automatic recovery must preserve the operator halt"
     );
     stream.disconnect().await;
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !client.submissions_suspended() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // The receiver ends with the stream, so the feeder finishes on its own.
+    tokio::time::timeout(Duration::from_secs(1), feeder)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(cache.snapshot("LEVELONE_EQUITIES", None).is_empty());
-    feeder.abort();
+    assert!(!client.submissions_suspended());
     server.abort();
 }

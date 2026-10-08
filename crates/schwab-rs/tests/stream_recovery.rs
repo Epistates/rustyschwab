@@ -290,3 +290,242 @@ async fn view_changes_fields_of_live_subscriptions() {
     assert_eq!(sent["parameters"]["fields"], "0,1,2");
     assert!(sent["parameters"].get("keys").is_none());
 }
+
+/// A stream client whose token refreshes go to `token_url` and which
+/// reconnects a few times.
+fn refreshing_client(url: String, token_url: String) -> (StreamClient, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokens.json");
+    FileTokenStore::new(path.clone())
+        .save(&TokenSet::new(
+            "old_access".into(),
+            "refresh".into(),
+            "".into(),
+            "Bearer".into(),
+            1800,
+            "".into(),
+            chrono::Utc::now(),
+        ))
+        .unwrap();
+    let auth = AuthManager::new(OAuthConfig {
+        app_key: "k".repeat(32),
+        app_secret: "s".repeat(16),
+        tokens_file: path,
+        token_store_kind: TokenStoreKind::File,
+        token_url,
+        auto_refresh: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut config = StreamConfig {
+        websocket_url: url,
+        ..Default::default()
+    };
+    config.reconnect.initial_backoff = Duration::from_millis(10);
+    config.reconnect.max_backoff = Duration::from_millis(20);
+    config.reconnect.max_retries = Some(5);
+    (
+        StreamClient::new(config, auth, StreamerIdentity::new("customer", "correl")).unwrap(),
+        dir,
+    )
+}
+
+/// Schwab answers a stale token with login code 3 and asks for a new one:
+/// the client refreshes exactly that token and logs in again, rather than
+/// ending a stream that was healthy for hours.
+#[tokio::test]
+async fn a_login_denied_on_reconnect_is_retried_with_a_refreshed_token() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    let tokens = MockServer::start().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new_access", "refresh_token": "refresh",
+            "token_type": "Bearer", "expires_in": 1800
+        })))
+        .expect(1)
+        .mount(&tokens)
+        .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = refreshing_client(
+        format!("ws://{}", listener.local_addr().unwrap()),
+        format!("{}/oauth/token", tokens.uri()),
+    );
+    let server = tokio::spawn(async move {
+        // Healthy, then dropped.
+        drop(login(&listener).await);
+        // Denied with the old token.
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let req = request(&mut ws).await;
+        assert_eq!(
+            req["requests"][0]["parameters"]["Authorization"],
+            "old_access"
+        );
+        ws.send(Message::Text(
+            json!({"response":[ack(&req,3)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        drop(ws);
+        // Accepted with the refreshed one.
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let req = request(&mut ws).await;
+        assert_eq!(
+            req["requests"][0]["parameters"]["Authorization"],
+            "new_access"
+        );
+        ws.send(Message::Text(
+            json!({"response":[ack(&req,0)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+    client.connect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = client.status();
+            if status.ready && status.generation >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(client.status().ended.is_none());
+    client.disconnect().await;
+    server.await.unwrap();
+    tokens.verify().await;
+}
+
+/// On a new session, data that arrives while subscriptions replay is the
+/// first full snapshot of each key: it is delivered once the session is
+/// ready. A service Schwab refuses on replay is dropped from the tracker,
+/// and its refusal delivered, instead of failing every reconnect.
+#[tokio::test]
+async fn replay_delivers_its_snapshots_and_drops_a_refused_service() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 64);
+    let server = tokio::spawn(async move {
+        let mut ws = login(&listener).await;
+        for _ in 0..2 {
+            let req = request(&mut ws).await;
+            ws.send(Message::Text(
+                json!({"response":[ack(&req,0)]}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        }
+        drop(ws);
+        let mut ws = login(&listener).await;
+        // One service at a time, in a stable order.
+        let chart = request(&mut ws).await;
+        assert_eq!(chart["requests"][0]["service"], "CHART_EQUITY");
+        ws.send(Message::Text(
+            json!({"response":[ack(&chart,24)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let quotes = request(&mut ws).await;
+        assert_eq!(quotes["requests"][0]["service"], "LEVELONE_EQUITIES");
+        // The snapshot can precede the acknowledgement.
+        ws.send(Message::Text(
+            json!({"data":[{"service":"LEVELONE_EQUITIES","timestamp":1,"command":"ADD",
+                "content":[{"key":"AAPL","1":150.25}]}]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        ws.send(Message::Text(
+            json!({"response":[ack(&quotes,0)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+    client.connect().await.unwrap();
+    let mut rx = client.get_receiver().unwrap();
+    client
+        .subscribe(StreamService::LeveloneEquities, vec!["AAPL".into()])
+        .await
+        .unwrap();
+    client
+        .subscribe(StreamService::ChartEquity, vec!["AAPL".into()])
+        .await
+        .unwrap();
+    let mut snapshot = false;
+    let mut refusal = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !(snapshot && refusal) {
+            match rx.recv().await.unwrap() {
+                StreamMessage::Data(data) => {
+                    snapshot |= data.data.iter().any(|d| d.service == "LEVELONE_EQUITIES")
+                }
+                StreamMessage::Response(response) => {
+                    refusal |= response
+                        .response
+                        .iter()
+                        .any(|r| r.service == "CHART_EQUITY" && r.content.code == 24)
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !client
+            .confirmed_subscriptions()
+            .contains_key("CHART_EQUITY")
+    );
+    assert!(client.status().ready);
+    client.disconnect().await;
+    server.await.unwrap();
+}
+
+/// Schwab says why before it closes a session normally; the stream ends
+/// with that reason and its receiver ends after reporting it.
+#[tokio::test]
+async fn a_replaced_session_ends_the_stream_and_its_receiver() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let server = tokio::spawn(async move {
+        let mut ws = login(&listener).await;
+        ws.send(Message::Text(
+            json!({"response":[{"service":"ADMIN","command":"LOGIN","requestid":"0",
+                "SchwabClientCorrelId":"correl","timestamp":1,
+                "content":{"code":12,"msg":"another session took over"}}]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        ws.close(None).await.unwrap();
+    });
+    client.connect().await.unwrap();
+    let mut rx = client.get_receiver().unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(StreamMessage::State(status)) if status.ended.is_some() => {
+                    return status.ended.unwrap();
+                }
+                Some(_) => continue,
+                None => panic!("the end is reported before the receiver ends"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended, schwab_rs::types::streaming::StreamEnd::Replaced);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    server.await.unwrap();
+}

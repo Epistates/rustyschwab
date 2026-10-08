@@ -64,7 +64,7 @@ A failure is a tool result with `isError: true` whose text and
 | `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest`; `wait_ms` holds the submission for it ([pre-flight](#pre-flight)) |
 | `halted`, `internal` | `ask_operator` | false | Operator or daily-loss halt (`get_server_status` carries the reason), or a fault logged under the reference id in `message` |
 | `duplicate_intent`, `reconciliation_required` | `reconcile` | false | Read the order state first; never resubmit. `attemptId` names the uncertain submission |
-| `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay. Includes submissions suspended while stream data recovers or the server drains |
+| `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay. Includes submissions refused while the server drains |
 
 An unauthenticated Schwab session is `unavailable` with `ask_operator`, since
 only the operator can re-run OAuth. Policy denials from the principal wrapper

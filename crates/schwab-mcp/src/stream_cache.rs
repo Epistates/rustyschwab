@@ -6,9 +6,16 @@
 //!
 //! A snapshot is `fresh` when the cache is authoritative for the key *and*
 //! recent: the stream is ready on the generation that produced the entry,
-//! the REST baseline has landed when one is required, and the last delta
-//! both reached the cache within [`FRESH_WINDOW_MS`] of the broker stamping
-//! it and arrived within [`FRESH_WINDOW_MS`] of now. Level-one deltas carry
+//! the REST baseline has landed for a service that has one (level-one
+//! equities and options), and the last delta both reached the cache within
+//! [`FRESH_WINDOW_MS`] of the broker stamping it and arrived within
+//! [`FRESH_WINDOW_MS`] of now.
+//!
+//! The generation is the feeder's: the cache moves to a new one only when
+//! the feeder delivers the `State` that reports it, after every frame of
+//! the old one. A reader that sees the live stream ahead of the feeder only
+//! marks the cache not ready, so frames from before a gap are never filed
+//! under the generation after it. Level-one deltas carry
 //! only changed fields, so freshness is judged per key, never per field;
 //! `fieldUpdatedAt` reports the per-field times for callers that care.
 //! `staleReason` names the first failed condition so a consumer can tell
@@ -35,9 +42,34 @@ struct CacheState {
     snapshots: HashMap<(String, String), Entry>,
     events: VecDeque<Value>,
     events_evicted: u64,
+    /// Account-activity messages already logged, by their content digest,
+    /// so one Schwab resends after a reconnect is not logged twice.
+    event_digests: HashMap<String, ()>,
     baseline_required: bool,
     baselines: HashMap<(String, String), Value>,
+    /// Keys Schwab's REST quotes did not return in this generation (an
+    /// unknown or expired symbol): no baseline will ever land for them.
+    baseline_missing: std::collections::HashSet<(String, String)>,
     reconciled_generation: Option<u64>,
+    /// The least `received - broker` seen this generation. Negative means
+    /// this host's clock is behind Schwab's by at least that much, which
+    /// would understate every lag; lags are judged with it added back.
+    least_lag: Option<i64>,
+}
+impl CacheState {
+    /// Delivery lag of `entry`'s last delta, corrected for this host's clock
+    /// running behind Schwab's.
+    fn lag(&self, entry: &Entry) -> i64 {
+        let behind = self.least_lag.unwrap_or(0).min(0);
+        entry
+            .received
+            .saturating_sub(entry.broker)
+            .saturating_sub(behind)
+    }
+}
+/// Services whose snapshots start from a REST quote baseline.
+fn has_rest_baseline(service: &str) -> bool {
+    matches!(service, "LEVELONE_EQUITIES" | "LEVELONE_OPTIONS")
 }
 struct Entry {
     value: Value,
@@ -51,16 +83,30 @@ struct Entry {
 impl CacheState {
     /// The first freshness condition an entry fails, or `None` when fresh.
     /// Ordered from "the stream is unusable" to "the key is merely quiet".
-    fn stale_reason(&self, entry: &Entry, has_baseline: bool, now: i64) -> Option<&'static str> {
+    fn stale_reason(
+        &self,
+        service: &str,
+        key: &str,
+        entry: &Entry,
+        has_baseline: bool,
+        now: i64,
+    ) -> Option<&'static str> {
         if !self.status.ready {
             Some("stream not ready")
         } else if entry.generation != self.status.generation {
             Some("stream restarted since this update")
-        } else if self.baseline_required && !has_baseline {
-            Some("REST baseline not applied yet")
+        } else if self.baseline_required && has_rest_baseline(service) && !has_baseline {
+            if self
+                .baseline_missing
+                .contains(&(service.to_owned(), key.to_owned()))
+            {
+                Some("Schwab returned no REST quote for this key")
+            } else {
+                Some("REST baseline not applied yet")
+            }
         } else if entry.broker <= 0 {
             Some("no broker timestamp")
-        } else if entry.received.saturating_sub(entry.broker) > FRESH_WINDOW_MS {
+        } else if self.lag(entry) > FRESH_WINDOW_MS {
             Some("delivered late relative to the broker timestamp")
         } else if now.saturating_sub(entry.received) > FRESH_WINDOW_MS {
             Some("no update within the freshness window")
@@ -68,6 +114,14 @@ impl CacheState {
             None
         }
     }
+}
+/// A stable digest of an activity message's content.
+fn schwab_mcp_digest(value: &Value) -> String {
+    crate::policy::digest(
+        serde_json::to_string(&schwab_rs::utils::canonical_json(value))
+            .unwrap_or_default()
+            .as_bytes(),
+    )
 }
 /// Keys kept across all non-activity services before the oldest are evicted.
 const MAX_SNAPSHOTS: usize = 10_000;
@@ -80,25 +134,49 @@ impl StreamCache {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Adopt the stream status the feeder just received: the only way the
+    /// cache moves to a new generation.
     pub fn update_status(&self, status: StreamStatus) {
         let mut cache = self.inner.write();
         if !status.ready || status.generation != cache.status.generation {
             cache.snapshots.clear();
             cache.baselines.clear();
+            cache.baseline_missing.clear();
             cache.reconciled_generation = None;
+            cache.least_lag = None;
         }
         cache.status = status;
+    }
+    /// A reader saw the live stream: if it is not ready, or already past
+    /// the feeder's generation, nothing cached is current. The cache stays
+    /// on the feeder's generation; the feeder's next `State` moves it.
+    pub fn observe_live(&self, live: &StreamStatus) {
+        let mut cache = self.inner.write();
+        if !live.ready || live.generation != cache.status.generation {
+            cache.status.ready = false;
+        }
     }
     fn put(&self, service: String, key: String, value: Value, broker: i64) {
         let mut cache = self.inner.write();
         let now = chrono::Utc::now().timestamp_millis();
         let generation = cache.status.generation;
         if service == "ACCT_ACTIVITY" {
+            // Schwab may resend activity after a reconnect; the same
+            // message is logged once.
+            let digest = schwab_mcp_digest(&value);
+            if cache.event_digests.insert(digest.clone(), ()).is_some() {
+                return;
+            }
             if cache.events.len() == 1024 {
-                cache.events.pop_front();
+                if let Some(evicted) = cache.events.pop_front()
+                    && let Some(old) = evicted.get("digest").and_then(Value::as_str)
+                {
+                    cache.event_digests.remove(old);
+                }
                 cache.events_evicted += 1;
             }
             cache.events.push_back(json!({
+                "digest": digest,
                 "receivedAt": now,
                 "brokerTimestamp": broker,
                 "generation": generation,
@@ -124,6 +202,10 @@ impl StreamCache {
             for (_, stale) in by_age.into_iter().take(evict) {
                 cache.snapshots.remove(&stale);
             }
+        }
+        if broker > 0 {
+            let lag = now.saturating_sub(broker);
+            cache.least_lag = Some(cache.least_lag.map_or(lag, |least| least.min(lag)));
         }
         let merge = service.starts_with("LEVELONE_");
         let entry = cache
@@ -164,14 +246,14 @@ impl StreamCache {
             .map(|((_, key), entry)| {
                 let age = now.saturating_sub(entry.received).max(0);
                 let baseline = cache.baselines.get(&(service.to_owned(), key.clone()));
-                let stale_reason = cache.stale_reason(entry, baseline.is_some(), now);
+                let stale_reason = cache.stale_reason(service, key, entry, baseline.is_some(), now);
                 let snapshot = json!({
                     "content": entry.value,
                     "receivedAt": entry.received,
                     "brokerTimestamp": entry.broker,
                     "generation": entry.generation,
                     "ageMs": age,
-                    "lagMs": entry.received.saturating_sub(entry.broker),
+                    "lagMs": cache.lag(entry),
                     "fresh": stale_reason.is_none(),
                     "staleReason": stale_reason,
                     "fieldUpdatedAt": entry.field_times,
@@ -222,9 +304,11 @@ impl StreamCache {
         }) {
             return false;
         }
+        // An old quote time is a quiet key, not a bad baseline: the entry's
+        // age and lag report it. A time ahead of this host is not trusted.
         let now = chrono::Utc::now().timestamp_millis();
         let broker = prices.get("quoteTime").and_then(Value::as_i64).unwrap_or(0);
-        if broker <= 0 || now < broker || now - broker > FRESH_WINDOW_MS {
+        if broker <= 0 || broker > now + FRESH_WINDOW_MS {
             return false;
         }
         // `extended` is left out: it reuses `quoteTime`/`totalVolume` for the
@@ -260,6 +344,23 @@ impl StreamCache {
         }
         cache.baselines.insert((service.into(), key.into()), quote);
         true
+    }
+    /// Record that Schwab's REST quotes have no entry for `key`.
+    pub fn baseline_unavailable(&self, generation: u64, service: &str, key: &str) {
+        let mut cache = self.inner.write();
+        if cache.status.generation == generation {
+            cache
+                .baseline_missing
+                .insert((service.to_owned(), key.to_owned()));
+        }
+    }
+    /// Whether `key` still needs a REST baseline in `generation`.
+    fn needs_baseline(&self, generation: u64, service: &str, key: &str) -> bool {
+        let cache = self.inner.read();
+        let id = (service.to_owned(), key.to_owned());
+        cache.status.generation == generation
+            && !cache.baselines.contains_key(&id)
+            && !cache.baseline_missing.contains(&id)
     }
     pub fn mark_accounts_reconciled(&self, generation: u64) {
         let mut cache = self.inner.write();
@@ -308,11 +409,21 @@ impl StreamCache {
         cache.snapshots.clear();
         cache.status.ready = false;
         cache.baselines.clear();
+        cache.baseline_missing.clear();
         cache.reconciled_generation = None;
     }
 }
 /// Feeds deltas continuously while REST recovery runs independently. A new
 /// generation cancels its predecessor; late baselines cannot mark new data ready.
+///
+/// Recovery seeds each level-one key's REST baseline once per stream
+/// generation and, when account activity is subscribed, reconciles the
+/// linked accounts so the activity log can vouch for the generation. It
+/// retries every `interval` until both are done, each attempt bounded by
+/// `deadline`. It never gates order submission: the risk check reads the
+/// reconciled account baselines, which the recovery worker keeps, not the
+/// stream, and a snapshot's `fresh` flag tells a reader whether its quote
+/// can be relied on.
 #[derive(Clone, Copy)]
 pub struct RecoveryPolicy {
     pub deadline: std::time::Duration,
@@ -358,7 +469,6 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                     if let Some(task) = recovery.0.take() {
                         task.abort();
                     }
-                    client.suspend_submissions("Required stream is recovering");
                     cache.update_status(status.clone());
                     if status.ready {
                         let cache = cache.clone();
@@ -367,69 +477,9 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                         recovery.0 = Some(tokio::spawn(async move {
                             loop {
                                 let started = std::time::Instant::now();
-                                let recover = async {
-                                    let mut recovered = true;
-                                    let subscriptions = stream.confirmed_subscriptions();
-                                    for (service, keys) in &subscriptions {
-                                        if !matches!(
-                                            service.as_str(),
-                                            "LEVELONE_EQUITIES" | "LEVELONE_OPTIONS"
-                                        ) {
-                                            continue;
-                                        }
-                                        for chunk in keys.chunks(100) {
-                                            let refs: Vec<_> =
-                                                chunk.iter().map(String::as_str).collect();
-                                            if let Ok(quotes) = client.get_quotes(&refs).await {
-                                                if quotes.quotes.len() != chunk.len() {
-                                                    recovered = false;
-                                                }
-                                                for (key, quote) in quotes.quotes {
-                                                    if let Ok(value) = serde_json::to_value(quote) {
-                                                        recovered &= cache.apply_baseline(
-                                                            status.generation,
-                                                            service,
-                                                            &key,
-                                                            value,
-                                                        );
-                                                    } else {
-                                                        recovered = false;
-                                                    }
-                                                }
-                                            } else {
-                                                recovered = false;
-                                            }
-                                        }
-                                    }
-                                    if subscriptions.contains_key("ACCT_ACTIVITY") {
-                                        let mut ready = true;
-                                        match client.get_account_numbers().await {
-                                            Ok(accounts) => {
-                                                for account in accounts {
-                                                    if !client
-                                                        .reconcile_account(
-                                                            &account.hash_value,
-                                                            status.generation,
-                                                        )
-                                                        .await
-                                                        .is_ok_and(|r| r.reconciled)
-                                                    {
-                                                        ready = false;
-                                                    }
-                                                }
-                                            }
-                                            Err(_) => ready = false,
-                                        }
-                                        recovered &= ready;
-                                        if ready {
-                                            cache.mark_accounts_reconciled(status.generation);
-                                        }
-                                    }
-                                    recovered
-                                };
                                 let recovered = tokio::time::timeout(
                                     policy.deadline.max(std::time::Duration::from_millis(1)),
-                                    recover,
+                                    recover(&cache, &client, &stream, status.generation),
                                 )
                                 .await
                                 .unwrap_or(false);
@@ -437,14 +487,8 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                                     .record(started.elapsed().as_secs_f64());
                                 metrics::gauge!(crate::metrics::STREAM_RECOVERY_READY)
                                     .set(if recovered { 1.0 } else { 0.0 });
-                                let current = stream.status();
-                                if recovered
-                                    && current.ready
-                                    && current.generation == status.generation
-                                {
-                                    client.resume_submissions();
-                                } else {
-                                    client.suspend_submissions("REST baseline recovery incomplete");
+                                if recovered {
+                                    break;
                                 }
                                 tokio::time::sleep(
                                     policy.interval.max(std::time::Duration::from_millis(10)),
@@ -475,9 +519,90 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                 _ => {}
             }
         }
-        client.suspend_submissions("Stream delivery stopped");
+        // The stream ended (its last `State` says why) or its client is
+        // gone: nothing cached is current any more.
         cache.clear();
     })
+}
+
+/// One recovery attempt for `generation`: seed the level-one keys still
+/// missing a REST baseline, and with account activity subscribed reconcile
+/// every linked account. True once nothing is left to do.
+async fn recover(
+    cache: &StreamCache,
+    client: &schwab_rs::SchwabClient,
+    stream: &schwab_rs::StreamClient,
+    generation: u64,
+) -> bool {
+    let mut recovered = true;
+    let subscriptions = stream.confirmed_subscriptions();
+    for (service, keys) in &subscriptions {
+        if !has_rest_baseline(service) {
+            continue;
+        }
+        let wanted: Vec<&str> = keys
+            .iter()
+            .filter(|key| cache.needs_baseline(generation, service, key))
+            .map(String::as_str)
+            .collect();
+        for chunk in wanted.chunks(100) {
+            let Ok(quotes) = client.get_quotes(chunk).await else {
+                recovered = false;
+                continue;
+            };
+            for key in chunk {
+                let applied = quotes
+                    .quotes
+                    .get(*key)
+                    .and_then(|quote| serde_json::to_value(quote).ok())
+                    .is_some_and(|quote| cache.apply_baseline(generation, service, key, quote));
+                // A key Schwab returns nothing usable for will not get a
+                // baseline by asking again.
+                if !applied {
+                    cache.baseline_unavailable(generation, service, key);
+                }
+            }
+        }
+    }
+    if subscriptions.contains_key("ACCT_ACTIVITY") {
+        let reconciled = match client.get_account_numbers().await {
+            Ok(accounts) => {
+                let store = client.execution_store();
+                let mut all = true;
+                for account in accounts {
+                    // The account's own durable generation: a stream gap
+                    // changes nothing about which baseline is current, and
+                    // reconciling under the stream's generation would
+                    // invalidate the recovery worker's.
+                    let durable = store
+                        .account_state(&account.hash_value)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map_or(0, |state| state.generation);
+                    let current = match client.reconcile_account(&account.hash_value, durable).await
+                    {
+                        Ok(report) if report.superseded => store
+                            .account_state(&account.hash_value)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|state| state.reconciled),
+                        Ok(report) => report.reconciled,
+                        Err(_) => false,
+                    };
+                    all &= current;
+                }
+                all
+            }
+            Err(_) => false,
+        };
+        if reconciled {
+            cache.mark_accounts_reconciled(generation);
+        }
+        recovered &= reconciled;
+    }
+    recovered
 }
 
 #[cfg(test)]
@@ -490,6 +615,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         for i in 0..MAX_SNAPSHOTS {
@@ -511,6 +637,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         cache.put(
@@ -541,6 +668,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         cache.put(
@@ -573,6 +701,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         cache.put(
@@ -623,6 +752,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         cache.put(
@@ -643,13 +773,14 @@ mod tests {
         assert_eq!(reason(&cache), "stream not ready");
     }
     #[test]
-    fn recovery_rejects_stale_generations_and_old_broker_quotes() {
+    fn recovery_rejects_stale_generations_and_future_broker_quotes() {
         let cache = StreamCache::new();
         cache.require_baseline();
         cache.update_status(StreamStatus {
             ready: true,
             generation: 2,
             lost_messages: 1,
+            ..Default::default()
         });
         let now = chrono::Utc::now().timestamp_millis();
         cache.put(
@@ -670,11 +801,13 @@ mod tests {
             "extended": {"quoteTime":1}
         });
         assert!(!cache.apply_baseline(1, "LEVELONE_EQUITIES", "AAPL", quote.clone()));
+        // A quote time ahead of this host is not trusted; an old one is a
+        // quiet key and seeds the baseline (its age is reported).
         assert!(!cache.apply_baseline(
             2,
             "LEVELONE_EQUITIES",
             "AAPL",
-            json!({"quote":{"bidPrice":10,"askPrice":11,"quoteTime":now-3000}})
+            json!({"quote":{"bidPrice":10,"askPrice":11,"quoteTime":now+60_000}})
         ));
         assert!(cache.apply_baseline(2, "LEVELONE_EQUITIES", "AAPL", quote));
         let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
@@ -697,6 +830,7 @@ mod tests {
             ready: false,
             generation: 2,
             lost_messages: 2,
+            ..Default::default()
         });
         assert!(cache.snapshot("LEVELONE_EQUITIES", None).is_empty());
     }
@@ -707,6 +841,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         cache.put(
             "LEVELONE_EQUITIES".into(),
@@ -735,9 +870,95 @@ mod tests {
             ready: false,
             generation: 1,
             lost_messages: 1,
+            ..Default::default()
         });
         assert!(cache.snapshot("LEVELONE_EQUITIES", None).is_empty());
     }
+    /// A reader that sees the live stream past the feeder's generation only
+    /// marks the cache not ready; frames the feeder still delivers from
+    /// before the gap are never filed as the new generation's.
+    #[test]
+    fn a_reader_ahead_of_the_feeder_cannot_make_pre_gap_frames_fresh() {
+        let cache = StreamCache::new();
+        let ready = |generation| StreamStatus {
+            ready: true,
+            generation,
+            ..Default::default()
+        };
+        cache.update_status(ready(1));
+        cache.observe_live(&ready(2));
+        let now = chrono::Utc::now().timestamp_millis();
+        cache.put(
+            "LEVELONE_EQUITIES".into(),
+            "AAPL".into(),
+            json!({"bidPrice":10}),
+            now,
+        );
+        let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
+        assert_eq!(snapshot["AAPL"]["generation"], 1);
+        assert_eq!(snapshot["AAPL"]["staleReason"], "stream not ready");
+        // The feeder's own State moves the cache on and drops the old entry.
+        cache.update_status(ready(2));
+        assert!(cache.snapshot("LEVELONE_EQUITIES", None).is_empty());
+    }
+
+    /// Only services that have a REST baseline wait for one; a key Schwab
+    /// has no quote for says so instead of waiting forever.
+    #[test]
+    fn baselines_are_required_per_service() {
+        let cache = StreamCache::new();
+        cache.require_baseline();
+        cache.update_status(StreamStatus {
+            ready: true,
+            generation: 1,
+            ..Default::default()
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        cache.put(
+            "LEVELONE_FUTURES".into(),
+            "/ES".into(),
+            json!({"bidPrice":1}),
+            now,
+        );
+        assert_eq!(
+            cache.snapshot("LEVELONE_FUTURES", None)["/ES"]["fresh"],
+            true
+        );
+        cache.put(
+            "LEVELONE_EQUITIES".into(),
+            "ZZZZ".into(),
+            json!({"bidPrice":1}),
+            now,
+        );
+        cache.baseline_unavailable(1, "LEVELONE_EQUITIES", "ZZZZ");
+        assert_eq!(
+            cache.snapshot("LEVELONE_EQUITIES", None)["ZZZZ"]["staleReason"],
+            "Schwab returned no REST quote for this key"
+        );
+        assert!(!cache.needs_baseline(1, "LEVELONE_EQUITIES", "ZZZZ"));
+    }
+
+    /// Activity Schwab resends after a reconnect is logged once.
+    #[test]
+    fn resent_activity_is_logged_once() {
+        let cache = StreamCache::new();
+        for _ in 0..2 {
+            cache.put(
+                "ACCT_ACTIVITY".into(),
+                "Account Activity".into(),
+                json!({"seq":7,"messageType":"OrderFill"}),
+                1,
+            );
+        }
+        cache.put(
+            "ACCT_ACTIVITY".into(),
+            "Account Activity".into(),
+            json!({"seq":8,"messageType":"OrderFill"}),
+            2,
+        );
+        assert_eq!(cache.events()["events"].as_array().unwrap().len(), 2);
+    }
+
     #[test]
     fn activity_is_a_bounded_event_history_with_explicit_eviction() {
         let cache = StreamCache::new();

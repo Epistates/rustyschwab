@@ -72,6 +72,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Fixed — streaming and the stream cache (second diligence pass)
+
+- **The stream says when it is over.** `StreamStatus::ended`
+  (`StreamEnd`: `Disconnected`, `Replaced`, `Idle`, `ServerClosed`,
+  `LoginDenied`, `ConnectFailed`, `ReconnectExhausted`) is reported when
+  the stream stops for good, and the receiver then returns `None`. Before,
+  it reported `ready: false` and waited forever. Schwab's code 12 (another
+  session took the slot) and 30 (nothing subscribed) end the stream
+  instead of reconnecting into a fight with the session that replaced it.
+- **A denied login is retried with a fresh token.** Code 3 after the
+  stream was healthy refreshes exactly the token the login carried and
+  logs in again, as Schwab's docs ask; only a fresh token denied too is
+  final. It used to end the stream on the first denial.
+- **Overflow during resubscription no longer strands the session.**
+  Readiness after an overflow follows the session, not the moment the gap
+  began, so a gap that started during replay resumes ready once drained.
+- **Replay keeps its data and survives a refusal.** Subscriptions replay
+  one service at a time; the first snapshot each returns is delivered
+  once the session is ready instead of discarded, success codes 26–29
+  count as success, unparseable frames are skipped, and a service Schwab
+  refuses is dropped from the tracker (its refusal delivered) instead of
+  failing every reconnect.
+- **A stale acknowledgement cannot kill the next session**: an ack timeout
+  tears down only the session it was sent on. The outgoing queue is
+  bounded; the heartbeat clock starts after login and replay, and the
+  ping timeout must exceed the interval.
+- **Account activity uses `SUBS`/`UNSUBS`**, as Schwab documents, and
+  `view` refuses it.
+- **The MCP stream cache cannot show pre-gap data as fresh.** The feeder
+  owns the cache's generation; `stream_snapshot` only marks it not ready
+  when the live stream is ahead. Activity Schwab resends after a reconnect
+  is logged once. Lag is corrected for a host clock behind Schwab's.
+- **Stream recovery no longer gates trading.** A quiet, illiquid or
+  after-hours symbol kept live submissions suspended, and a principal
+  holding only stream tools could suspend trading for everyone by
+  disconnecting. The risk check reads the recovery worker's account
+  baselines, not the stream, so stream recovery now seeds quote baselines
+  once per generation (an old quote is a quiet key; a key Schwab has no
+  quote for is reported, not waited on) and reconciles accounts under
+  their durable generation instead of the stream's, which had invalidated
+  the recovery worker's baselines after every restart. Baselines are
+  required only for the services that have them, so futures, books and
+  charts can be fresh.
+- **One stream per login, shared.** Servers built over one backend share
+  a `StreamHub`, so a policy reload keeps the live stream and its lease
+  instead of orphaning them, every principal's status reports the same
+  stream (with why it ended), and removing the controlling principal stops
+  it. Stream control is audited as `stream_control`.
+
 ### Changed — remaining review items
 
 - **Stream delivery.** Messages queued before an overflow or a reconnect

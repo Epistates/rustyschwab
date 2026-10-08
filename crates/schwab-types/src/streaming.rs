@@ -336,10 +336,41 @@ impl StreamResponseCode {
 /// for account activity. A new session does not recover missed executions.
 /// It counts exactly the frames dropped at a full queue. Frames queued
 /// before a gap are delivered ahead of the status that reports it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// `ended` is set when the stream stopped for good: no reconnect follows
+/// until the caller connects again. A receiver reports that status, then
+/// ends once nothing is left to deliver.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct StreamStatus {
     pub ready: bool,
     pub generation: u64,
     pub lost_messages: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<StreamEnd>,
+}
+
+/// Why a stream stopped for good.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
+#[serde(tag = "reason", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum StreamEnd {
+    /// The caller disconnected.
+    Disconnected,
+    /// Another session took over this login's streamer slot (response code
+    /// 12, `CLOSE_CONNECTION`); Schwab allows one per user.
+    Replaced,
+    /// Schwab stopped streaming to a session with no subscriptions
+    /// (response code 30, `STOP_STREAMING`).
+    Idle,
+    /// The server closed the socket normally without saying why.
+    ServerClosed,
+    /// Schwab refused the login, even with a freshly refreshed token.
+    LoginDenied { message: String },
+    /// The first connection never got as far as a login.
+    ConnectFailed { message: String },
+    /// The connection was lost and reconnecting is disabled or out of
+    /// attempts.
+    ReconnectExhausted,
 }

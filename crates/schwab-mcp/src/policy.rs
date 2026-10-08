@@ -72,7 +72,8 @@ impl PrincipalPolicy {
         }
         Ok(())
     }
-    fn owns_streaming(&self) -> bool {
+    /// Whether this principal may control the stream (any `stream_*` tool).
+    pub fn owns_streaming(&self) -> bool {
         self.tools.iter().any(|t| t.starts_with("stream_"))
     }
     /// Whether this principal may act on `account`.
@@ -421,13 +422,23 @@ impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
     /// the backend's own state under the principal's name digest.
     pub fn new(backend: Backend, switches: Switches, policy: PrincipalPolicy) -> Self {
+        Self::with_stream_hub(backend, switches, policy, crate::server::StreamHub::new())
+    }
+    /// As [`new`](Self::new), sharing `hub`'s stream with the other
+    /// principals' servers (only one principal may control it).
+    pub fn with_stream_hub(
+        backend: Backend,
+        switches: Switches,
+        policy: PrincipalPolicy,
+        hub: crate::server::StreamHub,
+    ) -> Self {
         let audit = OrderJournal::new(
             backend
                 .trading()
                 .principal_journal_path(&digest(policy.name.as_bytes())),
         );
         Self {
-            inner: SchwabMcp::new(backend, switches),
+            inner: SchwabMcp::with_stream_hub(backend, switches, hub),
             principal: Arc::new(policy),
             audit,
         }
@@ -607,11 +618,37 @@ impl AuthorizedServer {
             None
         };
         let Some(audit_id) = audit_id else {
-            return Ok(self
+            let stream_control = matches!(
+                name,
+                "stream_connect"
+                    | "stream_disconnect"
+                    | "stream_subscribe"
+                    | "stream_unsubscribe"
+                    | "stream_set_service_fields"
+            );
+            let audited = stream_control.then(|| args.clone());
+            let result = self
                 .inner
                 .call_tool(name, args, ctx)
                 .await
-                .map(crate::contract::normalize));
+                .map(crate::contract::normalize);
+            // The stream is shared by the whole server: who changed it, and
+            // how, belongs in the audit trail.
+            if let Some(arguments) = audited {
+                let outcome = crate::journal::Dispatch::of(&result).evidence();
+                if let Err(e) = self
+                    .audit
+                    .record_event(
+                        "stream_control",
+                        &self.principal.name,
+                        serde_json::json!({"tool": name, "arguments": arguments, "outcome": outcome}),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %e, tool = name, "stream control was not audited");
+                }
+            }
+            return Ok(result);
         };
         // From the audit record on, the dispatch runs on its own task: a
         // client that cancels, disconnects or times out abandons only the

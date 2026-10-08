@@ -165,9 +165,17 @@ async fn main() -> anyhow::Result<()> {
         &policies,
         transport != "stdio" && identity_file.is_none(),
     )?;
+    let hub = schwab_mcp::server::StreamHub::new();
     let servers: Vec<_> = policies
         .into_iter()
-        .map(|policy| schwab_mcp::policy::AuthorizedServer::new(backend.clone(), switches, policy))
+        .map(|policy| {
+            schwab_mcp::policy::AuthorizedServer::with_stream_hub(
+                backend.clone(),
+                switches,
+                policy,
+                hub.clone(),
+            )
+        })
         .collect();
     if transport == "stdio" {
         let principal = std::env::var("SCHWAB_MCP_PRINCIPAL")

@@ -4,10 +4,11 @@ The Schwab Rust SDK provides a robust WebSocket client for streaming real-time m
 
 ## Features
 
-- **Reconnection Logic**: Automatically reconnects with exponential backoff if the connection is lost.
-- **Subscription Persistence**: Automatically re-subscribes to your active services upon reconnection.
-- **Heartbeat Monitoring**: Monitors the connection with a 20s heartbeat and 30s timeout.
-- **Backpressure Control**: Choose between Bounded and Unbounded channels for receiving data.
+- **Reconnection Logic**: Automatically reconnects with jittered exponential backoff if the connection is lost. A login Schwab denies after the stream was healthy is retried once with a refreshed token.
+- **Subscription Persistence**: Re-subscribes to your active services upon reconnection, one service at a time, and delivers the first snapshot each one returns.
+- **Heartbeat Monitoring**: Monitors the connection with a 20s heartbeat and 30s timeout (the timeout must exceed the interval).
+- **Backpressure Control**: A bounded queue (4,096 messages by default; `ChannelKind::Unbounded` is capped at 65,536) with counted, visible loss.
+- **A visible end**: when the stream stops for good, the receiver reports why and then ends.
 
 ## Getting Started
 
@@ -82,6 +83,15 @@ if let Some(mut receiver) = stream_client.get_receiver() {
             StreamMessage::Notify(hb) => {
                 // Heartbeat notification
             }
+            StreamMessage::State(status) => {
+                // A gap (reconnect or overflow) or the end of the stream:
+                // re-baseline from REST before trusting derived state.
+                if let Some(reason) = status.ended {
+                    eprintln!("stream ended: {reason:?}");
+                }
+            }
+            // `StreamMessage` is non-exhaustive.
+            _ => {}
         }
     }
 }
@@ -97,11 +107,15 @@ when you want to keep working with JSON.
 
 You can subscribe to various services using the `StreamService` enum:
 
-- `LeveloneEquities`: Real-time quotes for stocks.
-- `LeveloneOptions`: Real-time quotes for options.
-- `LeveloneFutures`: Real-time quotes for futures.
-- `ChartEquity`: Real-time chart data (OHLC).
-- `AcctActivity`: Real-time notifications for account activity (orders, fills).
+- `LeveloneEquities`, `LeveloneOptions`, `LeveloneFutures`,
+  `LeveloneFuturesOptions`, `LeveloneForex`: level-one quotes (deltas carry
+  only the fields that changed).
+- `NyseBook`, `NasdaqBook`, `OptionsBook`: level-two books (each frame is a
+  whole book).
+- `ChartEquity`, `ChartFutures`: one-minute bars.
+- `ScreenerEquity`, `ScreenerOption`: movers by screener key.
+- `AcctActivity`: account activity (orders, fills) under one fixed key.
+  Subscribed with `SUBS` as Schwab documents; it has no `VIEW`.
 
 ## Best Practices
 
@@ -137,8 +151,29 @@ Once your consumer has drained half the queue, delivery resumes under a new
 `generation`; the dropped frames are never delivered. Treat any generation
 change as a gap: re-read a REST baseline before trusting derived state.
 
+### Reconnects and replay
+A new session is not ready until every tracked subscription has been
+replayed and acknowledged. Data that arrives meanwhile (the first full
+snapshot of each key) is held and delivered once the session is ready. A
+service Schwab refuses on replay is dropped from the tracker and its
+refusal delivered as a `StreamMessage::Response`, so one bad subscription
+cannot fail every reconnect.
+
 ### Resource Management
 Ensure the receiver loop is running in a spawned task if your main thread needs to perform other work. The `StreamClient` will continue to run in the background as long as it's not dropped.
 
 ### Error Handling
-The receiver will return `None` if the sender is dropped or the connection is permanently closed. Check for this to exit your processing loop gracefully.
+When the stream stops for good, the receiver delivers a `StreamMessage::State`
+whose `ended` says why, then returns `None`:
+
+| `StreamEnd` | Cause |
+|---|---|
+| `Disconnected` | You called `disconnect()` (or dropped the client). |
+| `Replaced` | Another session took over this login's streamer slot (code 12). Schwab allows one per user. |
+| `Idle` | Schwab stopped streaming to a session with no subscriptions (code 30). |
+| `ServerClosed` | The server closed the socket normally without saying why. |
+| `LoginDenied` | Schwab refused the login, even after a token refresh. |
+| `ConnectFailed` | The first connection never got as far as a login. |
+| `ReconnectExhausted` | The connection was lost and reconnecting is disabled or out of attempts. |
+
+A later `connect()` starts a new session the same receiver can keep reading.

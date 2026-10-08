@@ -418,6 +418,20 @@ impl OrderJournal {
             .run(|conn| query_submissions(conn, SELECT_SUBMISSIONS, []))
             .await
     }
+    /// Append an operator-visible event to the audit trail (for actions the
+    /// journal does not otherwise record, such as stream control).
+    pub async fn record_event(
+        &self,
+        kind: &str,
+        subject: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        let kind = kind.to_owned();
+        let subject = subject.to_owned();
+        self.database
+            .run(move |c| audit(c, &kind, &subject, &payload))
+            .await
+    }
     /// One submission by attempt ID.
     pub async fn record(&self, id: &str) -> Result<Option<SubmissionRecord>> {
         let id = id.to_owned();

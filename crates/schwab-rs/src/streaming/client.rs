@@ -48,13 +48,13 @@ pub(crate) struct Queued {
 pub(crate) struct MessageSender {
     tx: mpsc::Sender<Queued>,
     state: tokio::sync::watch::Sender<StreamStatus>,
-    overflow: std::sync::atomic::AtomicU8,
+    /// Frames are being dropped until the consumer drains half the queue.
+    overflowed: AtomicBool,
+    /// The current session has logged in and replayed its subscriptions.
+    /// An overflow that drains resumes ready only if it is; a session that
+    /// becomes ready during an overflow is reported ready once it drains.
+    session_ready: AtomicBool,
 }
-
-/// [`MessageSender::overflow`] states.
-const FLOWING: u8 = 0;
-const OVERFLOWED_WHILE_READY: u8 = 1;
-const OVERFLOWED_WHILE_UNREADY: u8 = 2;
 
 impl MessageSender {
     pub(crate) fn new(
@@ -64,7 +64,8 @@ impl MessageSender {
         Self {
             tx,
             state,
-            overflow: std::sync::atomic::AtomicU8::new(FLOWING),
+            overflowed: AtomicBool::new(false),
+            session_ready: AtomicBool::new(false),
         }
     }
 
@@ -73,18 +74,18 @@ impl MessageSender {
     ///
     /// Returns `Err` only if the receiver has been dropped.
     pub(crate) fn send(&self, msg: StreamMessage) -> std::result::Result<(), String> {
-        let overflow = self.overflow.load(Ordering::Acquire);
-        if overflow != FLOWING {
+        if self.overflowed.load(Ordering::Acquire) {
             if self.tx.capacity() * 2 < self.tx.max_capacity() {
                 self.record_loss();
                 return Ok(());
             }
-            // Drained: what follows starts a new generation, and it is ready
-            // only if the stream was ready when the gap began.
-            self.overflow.store(FLOWING, Ordering::Release);
+            // Drained: what follows starts a new generation, ready if the
+            // session is.
+            self.overflowed.store(false, Ordering::Release);
+            let ready = self.session_ready.load(Ordering::Acquire);
             self.state.send_modify(|s| {
                 s.generation += 1;
-                s.ready = overflow == OVERFLOWED_WHILE_READY;
+                s.ready = ready;
             });
         }
         let (generation, ready) = {
@@ -99,14 +100,7 @@ impl MessageSender {
         match self.tx.try_send(queued) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.overflow.store(
-                    if ready {
-                        OVERFLOWED_WHILE_READY
-                    } else {
-                        OVERFLOWED_WHILE_UNREADY
-                    },
-                    Ordering::Release,
-                );
+                self.overflowed.store(true, Ordering::Release);
                 self.record_loss();
                 Ok(())
             }
@@ -117,9 +111,44 @@ impl MessageSender {
         }
     }
 
-    /// A new connection starts clean: any gap belongs to the old generation.
-    pub(crate) fn reset_overflow(&self) {
-        self.overflow.store(FLOWING, Ordering::Release);
+    /// A new connection starts clean and not ready, under a new generation:
+    /// any gap belongs to the old one.
+    pub(crate) fn begin_session(&self) {
+        self.session_ready.store(false, Ordering::Release);
+        self.overflowed.store(false, Ordering::Release);
+        self.state.send_modify(|s| {
+            s.generation += 1;
+            s.ready = false;
+            s.ended = None;
+        });
+    }
+
+    /// The session logged in and replayed its subscriptions. During an
+    /// overflow the stream turns ready when the queue drains.
+    pub(crate) fn session_ready(&self) {
+        self.session_ready.store(true, Ordering::Release);
+        if !self.overflowed.load(Ordering::Acquire) {
+            self.state.send_modify(|s| s.ready = true);
+        }
+    }
+
+    /// The session is gone (for now): nothing is ready until the next one.
+    pub(crate) fn session_lost(&self) {
+        self.session_ready.store(false, Ordering::Release);
+        self.state.send_modify(|s| s.ready = false);
+    }
+
+    /// The stream stopped for good; receivers end once drained.
+    pub(crate) fn end(&self, reason: StreamEnd) {
+        self.session_ready.store(false, Ordering::Release);
+        self.state.send_modify(|s| {
+            s.ready = false;
+            s.ended = Some(reason);
+        });
+    }
+
+    pub(crate) fn record_dropped(&self) {
+        self.record_loss();
     }
 
     fn record_loss(&self) {
@@ -170,8 +199,11 @@ impl MessageReceiver {
 
     /// Receive the next deliverable message.
     ///
-    /// Returns `None` when the stream client has been dropped and all
-    /// messages have been received.
+    /// Returns `None` once the stream has ended (a [`StreamMessage::State`]
+    /// with [`StreamStatus::ended`] set has been delivered) or the client
+    /// has been dropped, and everything deliverable has been received. A
+    /// later [`StreamClient::connect`] starts a new session this receiver
+    /// can keep reading.
     pub async fn recv(&mut self) -> Option<StreamMessage> {
         loop {
             let next = self.pending.take().or_else(|| self.rx.try_recv().ok());
@@ -191,6 +223,9 @@ impl MessageReceiver {
             }
             if self.changed() {
                 return Some(self.report());
+            }
+            if self.reported.ended.is_some() {
+                return None;
             }
             let Self {
                 rx,
@@ -241,6 +276,26 @@ impl MessageReceiver {
 }
 
 pub type StreamMessage = crate::types::streaming::StreamMessage;
+
+/// Frames a session may have waiting for the socket: requests are
+/// acknowledged one at a time and pings are periodic, so a full queue
+/// means the writer has stalled and the session is broken.
+const OUTGOING_CAPACITY: usize = 1024;
+
+/// Frames held while subscriptions replay on a new session, delivered once
+/// it is ready; beyond this they are dropped and counted as lost.
+const REPLAY_HOLD_LIMIT: usize = 4096;
+
+/// The command that subscribes `service`'s keys. `ADD` is additive (`SUBS`
+/// would replace the service's key list server-side); account activity has
+/// one fixed key and Schwab documents only `SUBS`/`UNSUBS` for it.
+fn subscribe_command(service: &str) -> StreamCommand {
+    if service == StreamService::AcctActivity.as_str() {
+        StreamCommand::Subs
+    } else {
+        StreamCommand::Add
+    }
+}
 
 /// Streamer login identity, sourced from `GET /userPreference`.
 ///
@@ -298,6 +353,7 @@ impl Drop for StreamOwner {
                 task.abort();
             }
             inner.cleanup();
+            inner.message_tx.end(StreamEnd::Disconnected);
         }
     }
 }
@@ -320,7 +376,7 @@ struct StreamClientInner {
     /// Exponential backoff delay (starts at 2s, caps at 128s)
     backoff_delay: Arc<RwLock<Duration>>,
     /// Sender for outgoing WebSocket messages (text and ping) - swapped on each connection
-    outgoing_tx: Arc<RwLock<Option<mpsc::UnboundedSender<OutgoingMessage>>>>,
+    outgoing_tx: Arc<RwLock<Option<mpsc::Sender<OutgoingMessage>>>>,
     /// Writer task handle to allow clean abort on disconnect
     writer_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Pending acks keyed by request id
@@ -341,6 +397,15 @@ struct StreamClientInner {
     /// distinguish "never got in" (terminal — bad credentials or socket
     /// URL) from "was healthy, then dropped" (retry with backoff).
     authenticated_once: AtomicBool,
+    /// The access token the last LOGIN carried, so a login Schwab denies
+    /// can be answered with a refresh of exactly that token.
+    login_token: parking_lot::Mutex<Option<secrecy::SecretString>>,
+    /// Why the server is about to close the session, when it said so
+    /// (response code 12 or 30) before closing it normally.
+    closing: parking_lot::Mutex<Option<StreamEnd>>,
+    /// Counts sessions, so an acknowledgement that times out can only tear
+    /// down the session it was sent on.
+    session: std::sync::atomic::AtomicU64,
     /// Handle for the outer connection loop task (one per `connect()`
     /// call), so `disconnect()` can abort it cleanly instead of leaking
     /// the task for the lifetime of the process.
@@ -383,19 +448,29 @@ impl Drop for ConnectCancellation<'_> {
                 task.abort();
             }
             self.inner.cleanup();
+            if self.inner.health.borrow().ended.is_none() {
+                self.inner.message_tx.end(StreamEnd::ConnectFailed {
+                    message: "connect() did not complete".into(),
+                });
+            }
         }
     }
 }
 struct AckGuard<'a> {
     inner: &'a StreamClientInner,
     id: String,
+    /// The session the request was sent on.
+    session: u64,
     confirmed: bool,
 }
 impl Drop for AckGuard<'_> {
     fn drop(&mut self) {
         self.inner.pending_acks.write().remove(&self.id);
-        if !self.confirmed {
-            self.inner.reconnect_requested.notify_one();
+        // An unanswered request means the session is broken, but only that
+        // session: `notify_waiters` stores no permit, so a request that
+        // outlived its session cannot tear down the next one.
+        if !self.confirmed && self.inner.session.load(Ordering::SeqCst) == self.session {
+            self.inner.reconnect_requested.notify_waiters();
         }
     }
 }
@@ -408,9 +483,10 @@ impl StreamClient {
     ) -> Result<Self> {
         let transport = WebSocketTransport::new(&config.websocket_url)?;
 
-        if config.heartbeat_interval.is_zero() || config.ping_timeout.is_zero() {
+        if config.heartbeat_interval.is_zero() || config.ping_timeout <= config.heartbeat_interval {
             return Err(Error::Config(
-                "Stream heartbeat durations must be positive".into(),
+                "Stream heartbeat interval must be positive and shorter than the ping timeout"
+                    .into(),
             ));
         }
         let capacity = match config.channel_kind {
@@ -458,6 +534,9 @@ impl StreamClient {
             initial_auth_tx: Arc::new(RwLock::new(None)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             authenticated_once: AtomicBool::new(false),
+            login_token: parking_lot::Mutex::new(None),
+            closing: parking_lot::Mutex::new(None),
+            session: std::sync::atomic::AtomicU64::new(0),
             connection_task: Arc::new(RwLock::new(None)),
         });
         Ok(Self {
@@ -644,7 +723,14 @@ impl StreamClient {
     /// (Schwab's `VIEW` command), and for later subscriptions and
     /// reconnects. With nothing subscribed on the service this only records
     /// the fields, like [`StreamClient::set_service_fields`].
+    ///
+    /// Account activity has a fixed field set and no `VIEW`; it is refused.
     pub async fn view(&self, service: StreamService, fields_csv: String) -> Result<()> {
+        if service == StreamService::AcctActivity {
+            return Err(Error::InvalidParameter(
+                "Account activity streams a fixed field set; VIEW does not apply".into(),
+            ));
+        }
         let _subscription = self.inner.subscription_lock.lock().await;
         let valid = !fields_csv.is_empty()
             && fields_csv
@@ -765,19 +851,10 @@ impl StreamClient {
                     schwab_client_function_id: None,
                 },
             );
-            let queued = {
-                let guard = self.inner.outgoing_tx.read();
-                if let (Some(sender), Ok(json)) = (
-                    guard.as_ref(),
-                    serde_json::to_string(&StreamRequests {
-                        requests: vec![logout],
-                    }),
-                ) {
-                    sender.send(OutgoingMessage::Text(json)).is_ok()
-                } else {
-                    false
-                }
-            };
+            let queued = serde_json::to_string(&StreamRequests {
+                requests: vec![logout],
+            })
+            .is_ok_and(|json| self.inner.queue(OutgoingMessage::Text(json)).is_ok());
             if queued {
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
@@ -791,6 +868,7 @@ impl StreamClient {
         }
         *self.inner.outgoing_tx.write() = None;
         self.inner.cleanup();
+        self.inner.message_tx.end(StreamEnd::Disconnected);
     }
 
     /// Subscribe to `service` for the given keys.
@@ -798,7 +876,8 @@ impl StreamClient {
     /// Uses the streamer `ADD` command (additive), matching the reference
     /// client — `SUBS` would *replace* the service's entire key list
     /// server-side, silently dropping earlier subscriptions while the
-    /// local tracker still believed they were active.
+    /// local tracker still believed they were active. Account activity,
+    /// which has one fixed key, uses `SUBS` as Schwab documents.
     pub async fn subscribe(&self, service: StreamService, mut symbols: Vec<String>) -> Result<()> {
         let _subscription = self.inner.subscription_lock.lock().await;
         symbols.sort();
@@ -837,7 +916,7 @@ impl StreamClient {
             .unwrap_or_else(|| service.default_fields());
 
         let request = self.inner.build_request(
-            StreamCommand::Add,
+            subscribe_command(service.as_str()),
             &service,
             StreamParameters {
                 keys: Some(symbols.join(",")),
@@ -909,24 +988,16 @@ impl StreamClient {
         let mut ack_guard = AckGuard {
             inner: &self.inner,
             id: request_id.clone(),
+            session: self.inner.session.load(Ordering::SeqCst),
             confirmed: false,
         };
         let json = serde_json::to_string(&StreamRequests {
             requests: vec![request],
         })?;
-        if let Some(sender) = self.inner.outgoing_tx.read().clone() {
-            if let Err(e) = sender.send(OutgoingMessage::Text(json)) {
-                self.inner.pending_acks.write().remove(&request_id);
-                return Err(Error::Stream(StreamError::ConnectionFailed(format!(
-                    "Failed to queue request: {}",
-                    e
-                ))));
-            }
-        } else {
-            self.inner.pending_acks.write().remove(&request_id);
-            return Err(Error::Stream(StreamError::ConnectionFailed(
-                "No active connection".to_string(),
-            )));
+        if let Err(error) = self.inner.queue(OutgoingMessage::Text(json)) {
+            // Never sent, so no answer is owed: not a broken session.
+            ack_guard.confirmed = true;
+            return Err(error);
         }
         // Wait briefly for ack (non-blocking long-term; fast-fail only)
         let timeout = Duration::from_secs(5);
@@ -1060,18 +1131,23 @@ impl StreamClientInner {
         *self.outgoing_tx.write() = None;
         self.pending_acks.write().clear();
         *self.connection_state.write() = ConnectionState::Disconnected;
-        self.health.send_modify(|s| s.ready = false);
+        self.message_tx.session_lost();
         metrics::gauge!(crate::metrics::STREAM_CONNECTED).set(0.0);
     }
 
     async fn connection_loop(&self) -> Result<()> {
         let mut retry_count = 0;
         let mut is_reconnect = false;
+        // A login denied after the stream was healthy is answered once with
+        // a refresh of the token it carried (Schwab's docs: reconnect and
+        // log in with a new token); a fresh token denied too is final.
+        let mut login_retried = false;
         self.authenticated_once.store(false, Ordering::SeqCst);
 
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
                 info!("Stream shutdown requested; exiting reconnect loop");
+                self.message_tx.end(StreamEnd::Disconnected);
                 return Ok(());
             }
 
@@ -1097,39 +1173,73 @@ impl StreamClientInner {
                 Err(error) => Err(error),
             };
             self.cleanup();
+            if self.authenticated_once.load(Ordering::SeqCst) && result.is_ok() {
+                login_retried = false;
+            }
+            // Schwab said it is ending the session (another login took the
+            // streamer slot, or nothing is subscribed): reconnecting would
+            // only fight the session that replaced this one.
+            if let Some(reason) = self.closing.lock().take() {
+                info!(?reason, "Streamer ended the session; not reconnecting");
+                self.message_tx.end(reason);
+                return Ok(());
+            }
             match result {
                 Ok(_) => {
                     // Server closed the socket with a normal-closure frame
                     // (code 1000). Matches the reference client: a graceful
                     // close is an instruction to stop, not a fault to retry
                     // — e.g. Schwab tears the session down when another
-                    // login takes over the streamer slot.
+                    // login takes over the streamer slot (code 12).
                     info!("Stream connection closed gracefully; not reconnecting");
+                    self.message_tx.end(StreamEnd::ServerClosed);
                     return Ok(());
                 }
                 Err(e) => {
-                    error!("Stream connection error");
+                    error!(error = %e, "Stream connection error");
 
-                    // A definitive login rejection never resolves by
-                    // retrying with the same credentials.
-                    let auth_rejected =
-                        matches!(&e, Error::Stream(StreamError::AuthenticationFailed(_)));
-
+                    let denied = match &e {
+                        Error::Stream(StreamError::AuthenticationFailed(message)) => {
+                            Some(message.clone())
+                        }
+                        _ => None,
+                    };
                     // Never got in at all (bad socket URL, unreachable
                     // host, rejected login): retrying is pointless and
                     // `connect()` should fail fast.
                     let never_authenticated = !self.authenticated_once.load(Ordering::SeqCst);
-
-                    if auth_rejected || never_authenticated {
-                        // Drop the auth signal so `connect()` unblocks
-                        // with an AuthenticationFailed error instead of
-                        // hanging until the 10 s timeout.
+                    if never_authenticated {
                         drop(self.initial_auth_tx.write().take());
+                        self.message_tx.end(match denied {
+                            Some(message) => StreamEnd::LoginDenied { message },
+                            None => StreamEnd::ConnectFailed {
+                                message: e.to_string(),
+                            },
+                        });
                         return Err(e);
+                    }
+                    if let Some(message) = denied {
+                        let token = self.login_token.lock().take();
+                        let refreshed = match token {
+                            Some(token) if !login_retried => self
+                                .auth_manager
+                                .refresh_rejected_token(secrecy::ExposeSecret::expose_secret(
+                                    &token,
+                                ))
+                                .await
+                                .is_ok(),
+                            _ => false,
+                        };
+                        if !refreshed {
+                            self.message_tx.end(StreamEnd::LoginDenied { message });
+                            return Err(e);
+                        }
+                        warn!("Streamer denied the login; retrying with a refreshed token");
+                        login_retried = true;
                     }
 
                     if !self.config.reconnect.enabled {
-                        drop(self.initial_auth_tx.write().take());
+                        self.message_tx.end(StreamEnd::ReconnectExhausted);
                         return Err(e);
                     }
 
@@ -1137,7 +1247,7 @@ impl StreamClientInner {
                         && retry_count >= max_retries
                     {
                         error!("Maximum reconnection attempts reached");
-                        drop(self.initial_auth_tx.write().take());
+                        self.message_tx.end(StreamEnd::ReconnectExhausted);
                         return Err(Error::Stream(StreamError::ConnectionFailed(
                             "Maximum reconnection attempts exceeded".to_string(),
                         )));
@@ -1167,11 +1277,9 @@ impl StreamClientInner {
 
     async fn connect_and_run(&self) -> Result<()> {
         *self.connection_state.write() = ConnectionState::Connecting;
-        self.health.send_modify(|s| {
-            s.generation += 1;
-            s.ready = false;
-        });
-        self.message_tx.reset_overflow();
+        self.session.fetch_add(1, Ordering::SeqCst);
+        *self.closing.lock() = None;
+        self.message_tx.begin_session();
 
         let ws_stream = tokio::time::timeout(Duration::from_secs(5), self.transport.connect())
             .await
@@ -1188,7 +1296,7 @@ impl StreamClientInner {
         *self.last_pong.write() = Instant::now();
 
         // Create a writer task that forwards messages from a channel to the socket
-        let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingMessage>();
+        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(OUTGOING_CAPACITY);
         *self.outgoing_tx.write() = Some(tx);
 
         let (mut write_half, mut read_half) = ws_stream.split();
@@ -1238,9 +1346,16 @@ impl StreamClientInner {
                 return Err(e);
             }
         }
-        self.resubscribe_via_channel(&mut read_half).await?;
+        let replayed = self.resubscribe_via_channel(&mut read_half).await?;
         *self.connection_state.write() = ConnectionState::Authenticated;
-        self.health.send_modify(|s| s.ready = true);
+        self.message_tx.session_ready();
+        // What arrived during the replay belongs to this session: the first
+        // full snapshot of each key, and any replay refusal.
+        for message in replayed {
+            if self.message_tx.send(message).is_err() {
+                return Err(Error::ConnectionClosed);
+            }
+        }
         self.authenticated_once.store(true, Ordering::SeqCst);
         // Login succeeded — the connection is healthy, so the next failure
         // starts from a fresh backoff schedule (the reference client resets
@@ -1254,13 +1369,12 @@ impl StreamClientInner {
             let _ = tx.send(());
         }
 
-        // Resubscribe to existing subscriptions using channel
-
         // Run the read loop and the heartbeat watchdog side by side.
         // The watchdog task completes when the ping timeout elapses (or
         // the writer dies), and the select! tears the connection down —
         // without this, a silently dead TCP connection would leave the
         // read loop blocked indefinitely with no reconnect.
+        let reconnect = self.reconnect_requested.notified();
         let mut heartbeat_task = self.start_heartbeat();
         let _heartbeat_guard = AbortTask(heartbeat_task.abort_handle());
         let result = tokio::select! {
@@ -1269,7 +1383,7 @@ impl StreamClientInner {
                 Ok(LoopExit::StreamEnded) => Err(Error::ConnectionClosed),
                 Err(e) => Err(e),
             },
-            _ = self.reconnect_requested.notified() => Err(Error::ConnectionClosed),
+            _ = reconnect => Err(Error::ConnectionClosed),
             _ = &mut heartbeat_task => {
                 Err(Error::Stream(StreamError::HeartbeatTimeout))
             }
@@ -1294,6 +1408,7 @@ impl StreamClientInner {
             .get_access_token()
             .await
             .map_err(Error::Auth)?;
+        *self.login_token.lock() = Some(secrecy::SecretString::from(access_token.clone()));
 
         let login_request = self.build_request(
             StreamCommand::Login,
@@ -1307,23 +1422,10 @@ impl StreamClientInner {
             },
         );
 
-        if let Some(sender) = self.outgoing_tx.read().clone() {
-            let request_json = serde_json::to_string(&StreamRequests {
-                requests: vec![login_request],
-            })?;
-            sender
-                .send(OutgoingMessage::Text(request_json))
-                .map_err(|e| {
-                    Error::Stream(StreamError::ConnectionFailed(format!(
-                        "Failed to send login: {}",
-                        e
-                    )))
-                })?;
-        } else {
-            return Err(Error::Stream(StreamError::ConnectionFailed(
-                "No active writer".to_string(),
-            )));
-        }
+        let request_json = serde_json::to_string(&StreamRequests {
+            requests: vec![login_request],
+        })?;
+        self.queue(OutgoingMessage::Text(request_json))?;
 
         // Wait for login response on read half
         let timeout = Duration::from_secs(5);
@@ -1365,14 +1467,41 @@ impl StreamClientInner {
         )))
     }
 
-    async fn resubscribe_via_channel(&self, read_half: &mut SplitStream<WsStream>) -> Result<()> {
+    /// Queue a frame for the writer task.
+    fn queue(&self, message: OutgoingMessage) -> Result<()> {
+        let sender = self.outgoing_tx.read().clone().ok_or_else(|| {
+            Error::Stream(StreamError::ConnectionFailed(
+                "No active connection".to_string(),
+            ))
+        })?;
+        sender.try_send(message).map_err(|e| {
+            Error::Stream(StreamError::ConnectionFailed(format!(
+                "Failed to queue request: {e}"
+            )))
+        })
+    }
+
+    /// Replay every tracked subscription on a fresh session, one service at
+    /// a time as the reference client does: Schwab can fail one of several
+    /// commands processed in parallel (code 22). Returns what arrived in
+    /// the meantime, to be delivered once the session is ready: the first
+    /// full snapshot of each replayed key, and the response for a service
+    /// Schwab refused, which is also dropped from the tracker rather than
+    /// failing every reconnect.
+    async fn resubscribe_via_channel(
+        &self,
+        read_half: &mut SplitStream<WsStream>,
+    ) -> Result<Vec<StreamMessage>> {
         let _subscription = self.subscription_lock.lock().await;
-        let subscriptions = self.subscriptions.get_all_subscriptions();
-        let mut requests = Vec::new();
-        for (service, symbols) in subscriptions {
-            if symbols.is_empty() {
-                continue;
-            }
+        let mut held = Vec::new();
+        let mut services: Vec<_> = self
+            .subscriptions
+            .get_all_subscriptions()
+            .into_iter()
+            .filter(|(_, symbols)| !symbols.is_empty())
+            .collect();
+        services.sort();
+        for (service, symbols) in services {
             let fields = self
                 .subscriptions
                 .get_service_fields(&service)
@@ -1381,9 +1510,7 @@ impl StreamClientInner {
             let request = StreamRequest {
                 requestid: Uuid::new_v4().to_string(),
                 service: service.clone(),
-                // ADD is additive and safe on a fresh session; SUBS would
-                // also work here but ADD matches the reference client.
-                command: StreamCommand::Add,
+                command: subscribe_command(&service),
                 schwab_client_customer_id: self.identity.customer_id.clone(),
                 schwab_client_correl_id: self.identity.correl_id.clone(),
                 parameters: StreamParameters {
@@ -1394,59 +1521,72 @@ impl StreamClientInner {
                     schwab_client_function_id: None,
                 },
             };
-            requests.push(request);
-        }
-        let mut outstanding: std::collections::HashSet<String> =
-            requests.iter().map(|r| r.requestid.clone()).collect();
-        if !requests.is_empty()
-            && let Some(sender) = self.outgoing_tx.read().clone()
-        {
-            let request_json = serde_json::to_string(&StreamRequests { requests })?;
-            sender
-                .send(OutgoingMessage::Text(request_json))
-                .map_err(|e| {
-                    Error::Stream(StreamError::ConnectionFailed(format!(
-                        "Failed to send resubscribe: {}",
-                        e
-                    )))
-                })?;
-        }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !outstanding.is_empty() {
-                match read_half.next().await {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                        let message: StreamMessage = serde_json::from_str(text.as_ref())?;
-                        if let StreamMessage::Response(response) = &message {
-                            for item in &response.response {
-                                if outstanding.remove(&item.requestid) && item.content.code != 0 {
-                                    return Err(Error::Stream(StreamError::SubscriptionFailed {
-                                        service: item.service.clone(),
-                                        code: item.content.code,
-                                        message: "Replay rejected".into(),
-                                    }));
+            let id = request.requestid.clone();
+            self.queue(OutgoingMessage::Text(serde_json::to_string(
+                &StreamRequests {
+                    requests: vec![request],
+                },
+            )?))?;
+            let answer = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match read_half.next().await {
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                            let Ok(message) = serde_json::from_str::<StreamMessage>(text.as_ref())
+                            else {
+                                warn!(
+                                    frame_bytes = text.len(),
+                                    "dropping unparseable stream frame"
+                                );
+                                continue;
+                            };
+                            let code = match &message {
+                                StreamMessage::Response(response) => response
+                                    .response
+                                    .iter()
+                                    .find(|item| item.requestid == id)
+                                    .map(|item| item.content.code),
+                                _ => None,
+                            };
+                            // The replay's own acknowledgement is not news;
+                            // its refusal is.
+                            let succeeded = code
+                                .and_then(StreamResponseCode::from_code)
+                                .is_some_and(|c| c.is_success());
+                            if !succeeded {
+                                if held.len() < REPLAY_HOLD_LIMIT {
+                                    held.push(message);
+                                } else {
+                                    self.message_tx.record_dropped();
                                 }
                             }
-                        } else {
-                            self.message_tx
-                                .send(message)
-                                .map_err(|_| Error::ConnectionClosed)?;
+                            if let Some(code) = code {
+                                return Ok(code);
+                            }
                         }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {
+                            *self.last_pong.write() = Instant::now()
+                        }
+                        Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_))) => {}
+                        _ => return Err(Error::ConnectionClosed),
                     }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Pong(_))) => {
-                        *self.last_pong.write() = Instant::now()
-                    }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(_))) => {}
-                    _ => return Err(Error::ConnectionClosed),
                 }
+            })
+            .await
+            .map_err(|_| {
+                Error::Stream(StreamError::ConnectionFailed(
+                    "Subscription replay timeout".into(),
+                ))
+            })??;
+            if !StreamResponseCode::from_code(answer).is_some_and(|c| c.is_success()) {
+                warn!(
+                    service = %service,
+                    code = answer,
+                    "Streamer refused a replayed subscription; dropping it"
+                );
+                self.subscriptions.clear_service(&service);
             }
-            Ok(())
-        })
-        .await
-        .map_err(|_| {
-            Error::Stream(StreamError::ConnectionFailed(
-                "Subscription replay timeout".into(),
-            ))
-        })?
+        }
+        Ok(held)
     }
 
     async fn message_loop_read(&self, read_half: &mut SplitStream<WsStream>) -> Result<LoopExit> {
@@ -1458,6 +1598,17 @@ impl StreamClientInner {
                             // Resolve acks for response frames
                             if let StreamMessage::Response(resp) = &stream_msg {
                                 for item in &resp.response {
+                                    // Schwab says why before it closes a
+                                    // session normally.
+                                    match StreamResponseCode::from_code(item.content.code) {
+                                        Some(StreamResponseCode::CloseConnection) => {
+                                            *self.closing.lock() = Some(StreamEnd::Replaced)
+                                        }
+                                        Some(StreamResponseCode::StopStreaming) => {
+                                            *self.closing.lock() = Some(StreamEnd::Idle)
+                                        }
+                                        _ => {}
+                                    }
                                     let req_id = item.requestid.clone();
                                     if let Some(tx) = self.pending_acks.write().remove(&req_id) {
                                         let outcome = if let Some(code) =
@@ -1551,6 +1702,9 @@ impl StreamClientInner {
         let outgoing_tx = self.outgoing_tx.clone();
         let last_pong = self.last_pong.clone();
 
+        // The clock starts now, not at the handshake: login and replay must
+        // not count against the first ping.
+        *last_pong.write() = Instant::now();
         tokio::spawn(async move {
             let mut heartbeat = interval(interval_duration);
             heartbeat.tick().await; // Skip first immediate tick
@@ -1571,7 +1725,7 @@ impl StreamClientInner {
 
                 // Send ping via writer channel
                 if let Some(sender) = outgoing_tx.read().clone() {
-                    if let Err(e) = sender.send(OutgoingMessage::Ping) {
+                    if let Err(e) = sender.try_send(OutgoingMessage::Ping) {
                         warn!("Failed to send ping (connection likely closed): {}", e);
                         break;
                     }
@@ -1730,9 +1884,11 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         let (tx, mut rx) = mpsc::channel(2);
         let sender = MessageSender::new(tx, health.clone());
+        sender.session_ready();
         let beat = || serde_json::from_str::<StreamMessage>(r#"{"notify":[]}"#).unwrap();
         sender.send(beat()).unwrap();
         sender.send(beat()).unwrap();
@@ -1755,6 +1911,47 @@ mod tests {
         // A dropped receiver is the only error.
         drop(rx);
         assert!(sender.send(beat()).is_err());
+    }
+
+    /// An overflow that begins while a new session replays its
+    /// subscriptions, and drains after the session turned ready, resumes
+    /// ready: readiness follows the session, not the moment the gap began.
+    #[test]
+    fn an_overflow_during_replay_resumes_ready_once_the_session_is() {
+        let (health, _status) = tokio::sync::watch::channel(StreamStatus::default());
+        let (tx, mut rx) = mpsc::channel(2);
+        let sender = MessageSender::new(tx, health.clone());
+        sender.begin_session();
+        let beat = || serde_json::from_str::<StreamMessage>(r#"{"notify":[]}"#).unwrap();
+        for _ in 0..3 {
+            sender.send(beat()).unwrap();
+        }
+        // Ready while overflowed: reported once the queue drains.
+        sender.session_ready();
+        assert!(!health.borrow().ready);
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+        sender.send(beat()).unwrap();
+        let status = health.borrow().clone();
+        assert!(status.ready);
+        let delivered = rx.try_recv().unwrap();
+        assert!(delivered.ready);
+        assert_eq!(delivered.generation, status.generation);
+    }
+
+    /// A stream that ends says why, and its receiver then ends too.
+    #[tokio::test]
+    async fn an_ended_stream_ends_its_receiver() {
+        let (health, status) = tokio::sync::watch::channel(StreamStatus::default());
+        let (tx, rx) = mpsc::channel(4);
+        let sender = MessageSender::new(tx, health);
+        let mut receiver = MessageReceiver::new(rx, status);
+        sender.end(StreamEnd::Replaced);
+        let Some(StreamMessage::State(state)) = receiver.recv().await else {
+            panic!("the end is reported first");
+        };
+        assert_eq!(state.ended, Some(StreamEnd::Replaced));
+        assert!(receiver.recv().await.is_none());
     }
 
     #[test]
@@ -2015,6 +2212,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         };
         let (_tx, status, mut receiver) = tracked_receiver(1, ready);
         let waiting = tokio::spawn(async move { receiver.recv().await });
@@ -2036,6 +2234,7 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         };
         let (tx, status, mut receiver) = tracked_receiver(4, ready);
         tx.send(queued(1, true, heartbeat("a"))).await.unwrap();
@@ -2093,6 +2292,7 @@ mod tests {
             ready: true,
             generation: 2,
             lost_messages: 0,
+            ..Default::default()
         };
         let (tx, _status, mut receiver) = tracked_receiver(10, ready);
         tx.send(queued(1, true, heartbeat("stale"))).await.unwrap();
@@ -2124,6 +2324,7 @@ mod tests {
                 ready: false,
                 generation: 1,
                 lost_messages: 0,
+                ..Default::default()
             },
         );
         let message = || {
@@ -2131,6 +2332,7 @@ mod tests {
                 ready: true,
                 generation: 2,
                 lost_messages: 0,
+                ..Default::default()
             })
         };
         tx.send(queued(1, false, message())).await.unwrap();
@@ -2140,6 +2342,7 @@ mod tests {
                 ready: true,
                 generation: 2,
                 lost_messages: 1,
+                ..Default::default()
             })
             .unwrap();
         assert!(

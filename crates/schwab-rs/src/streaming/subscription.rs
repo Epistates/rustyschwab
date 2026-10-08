@@ -74,6 +74,11 @@ impl SubscriptionManager {
         self.subscriptions.write().clear();
     }
 
+    /// Forget every key of `service`.
+    pub fn clear_service(&self, service: &str) {
+        self.subscriptions.write().remove(service);
+    }
+
     pub fn is_subscribed(&self, service: &str, symbol: &str) -> bool {
         self.subscriptions
             .read()

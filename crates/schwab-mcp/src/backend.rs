@@ -353,14 +353,6 @@ impl Backend {
         }
     }
 
-    /// Suspend live submissions while a required stream recovers. The paper
-    /// venue takes no stream, so it has nothing to suspend.
-    pub fn suspend_submissions(&self, reason: &str) {
-        if let Self::Live(client) = self {
-            client.suspend_submissions(reason);
-        }
-    }
-
     pub fn submissions_suspended(&self) -> bool {
         match self {
             Self::Live(client) => client.submissions_suspended(),

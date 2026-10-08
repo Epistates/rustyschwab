@@ -67,17 +67,23 @@ pub fn router_reloadable(
     identity: Option<Arc<crate::identity::JwtVerifier>>,
     policy_path: Option<std::path::PathBuf>,
 ) -> Router {
-    // Reloaded principals share the first server's backend and switches.
-    let shared = servers
-        .first()
-        .map(|s| (s.inner.backend().clone(), s.inner.switches()));
+    // Reloaded principals share the first server's backend, switches and
+    // stream: rebuilding a principal's server must not orphan the live
+    // stream or its lease on the login's streamer slot.
+    let shared = servers.first().map(|s| {
+        (
+            s.inner.backend().clone(),
+            s.inner.switches(),
+            s.inner.stream_hub(),
+        )
+    });
     let (revoked, _) = tokio::sync::watch::channel(0);
     let state = Arc::new(NetworkState {
         entries: parking_lot::RwLock::new(entries(servers, websocket)),
         identity,
         revoked,
     });
-    if let (Some(path), Some((backend, switches))) = (policy_path, shared) {
+    if let (Some(path), Some((backend, switches, hub))) = (policy_path, shared) {
         let weak = Arc::downgrade(&state);
         let initial = std::fs::read(&path).ok();
         tokio::spawn(async move {
@@ -102,11 +108,23 @@ pub fn router_reloadable(
                         validate_policies(policies, state.identity.is_none()).is_ok()
                     });
                 let valid = policies.is_some();
+                let policies = policies.unwrap_or_default();
+                // With no principal left to control it, nobody can see or
+                // stop the stream: stop it now.
+                if !policies.iter().any(PrincipalPolicy::owns_streaming) {
+                    hub.shutdown().await;
+                }
                 *state.entries.write() = entries(
                     policies
-                        .unwrap_or_default()
                         .into_iter()
-                        .map(|policy| AuthorizedServer::new(backend.clone(), switches, policy))
+                        .map(|policy| {
+                            AuthorizedServer::with_stream_hub(
+                                backend.clone(),
+                                switches,
+                                policy,
+                                hub.clone(),
+                            )
+                        })
                         .collect(),
                     websocket,
                 );

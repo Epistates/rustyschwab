@@ -242,8 +242,8 @@ pub struct Trading {
     /// [`HALT_WITHHELD`] from a principal that is not granted every
     /// account; see [`ServerStatus::scope_to`].
     pub operator_halt: Option<String>,
-    /// Submissions are suspended while a required stream recovers or the
-    /// process drains; cancellations and reads continue.
+    /// Submissions are suspended while the process drains or the embedding
+    /// application has suspended them; cancellations and reads continue.
     pub submissions_suspended: bool,
     pub circuit: CircuitState,
     /// A submission would pass the trading switch and local admission
@@ -262,6 +262,10 @@ pub struct Stream {
     /// Cached snapshots may have missed updates: the stream reconnected or
     /// dropped messages since it was first connected.
     pub reconciliation_required: bool,
+    /// Why the stream stopped for good, when it has: `stream_connect`
+    /// starts it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended: Option<schwab_rs::types::streaming::StreamEnd>,
 }
 
 impl From<StreamStatus> for Stream {
@@ -271,6 +275,7 @@ impl From<StreamStatus> for Stream {
             generation: status.generation,
             lost_messages: status.lost_messages,
             reconciliation_required: status.lost_messages > 0 || status.generation > 1,
+            ended: status.ended,
         }
     }
 }
@@ -672,12 +677,14 @@ mod tests {
             ready: true,
             generation: 1,
             lost_messages: 0,
+            ..Default::default()
         });
         assert!(fresh.connected && !fresh.reconciliation_required);
         let reconnected = Stream::from(StreamStatus {
             ready: true,
             generation: 2,
             lost_messages: 0,
+            ..Default::default()
         });
         assert!(reconnected.reconciliation_required);
     }
