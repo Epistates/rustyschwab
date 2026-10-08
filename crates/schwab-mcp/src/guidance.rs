@@ -33,7 +33,7 @@ const ORDER_TOOLS: [&str; 5] = [
 
 /// Who a prompt or resource is rendered for: the tools the caller can run
 /// on this transport, and the execution mode.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Audience<'a> {
     /// The principal's tool allowlist; none on the local stdio transport,
     /// where every tool is listed.

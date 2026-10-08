@@ -255,6 +255,7 @@ pub trait TokenStore: Send + Sync {
 /// - ❌ Plaintext JSON
 ///
 /// **Recommendation:** Use [`EncryptedFileTokenStore`] or [`KeychainTokenStore`] instead.
+#[derive(Debug)]
 pub struct FileTokenStore {
     path: PathBuf,
 }
@@ -309,6 +310,7 @@ impl TokenStore for FileTokenStore {
 /// - Key file: `{tokens_file}.key`
 /// - Key is generated once and reused
 /// - Key is protected with 0600 permissions
+#[derive(Debug)]
 pub struct EncryptedFileTokenStore {
     path: PathBuf,
     key_path: PathBuf,
@@ -414,6 +416,7 @@ impl TokenStore for EncryptedFileTokenStore {
 ///   reboot; use [`EncryptedFileTokenStore`] for a lasting store.
 /// - Windows: Credential Manager, whose 2,560-byte blob limit a token set
 ///   can exceed; [`EncryptedFileTokenStore`] is the safer choice.
+#[derive(Debug)]
 pub struct KeychainTokenStore {
     service: String,
     account: String,

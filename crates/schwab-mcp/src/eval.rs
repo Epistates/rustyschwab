@@ -321,6 +321,7 @@ fn limit_order(instruction: &str, quantity: &str, price: &str, tag: &str) -> Val
 }
 
 /// A scenario's venue and server, in `dir`, ready for the first call.
+#[derive(Debug)]
 pub struct Fixture {
     pub scenario: Scenario,
     pub server: AuthorizedServer,
@@ -419,6 +420,14 @@ fn order_id(response: schwab_types::trading::OrderSubmitResponse) -> anyhow::Res
 pub struct Recording {
     inner: AuthorizedServer,
     sink: Arc<Mutex<Box<dyn Write + Send>>>,
+}
+
+impl std::fmt::Debug for Recording {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recording")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Recording {

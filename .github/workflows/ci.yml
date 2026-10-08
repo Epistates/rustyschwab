@@ -83,6 +83,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ matrix.toolchain }}
+      # rust-toolchain.toml pins the release toolchain; the MSRV row must
+      # really build with its own.
+      - if: matrix.toolchain != 'stable'
+        run: echo "RUSTUP_TOOLCHAIN=${{ matrix.toolchain }}" >> "$GITHUB_ENV"
+        shell: bash
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets --locked
       - run: cargo test --workspace --all-targets --all-features --locked
@@ -103,6 +108,11 @@ jobs:
       - run: cargo check -p schwab-rs --no-default-features --features native-tls --locked
       - run: cargo check -p schwab-rs --no-default-features --features callback-server --locked
       - run: cargo check -p schwab-types --no-default-features --locked
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-hack
+      # Every feature on its own, not only the combinations above.
+      - run: cargo hack check -p schwab-rs -p schwab-types --each-feature --no-dev-deps --locked
       # Choosing native-tls must actually drop rustls from the SDK.
       - name: native-tls build carries no rustls
         run: |
@@ -110,6 +120,57 @@ jobs:
             echo "::error::native-tls build still depends on rustls"
             exit 1
           fi
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      # For the toolchain rust-toolchain.toml pins, which cargo runs.
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-llvm-cov
+      # A floor, raised as coverage grows; the report is kept either way.
+      - run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info --fail-under-lines 75
+      - if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  dependencies:
+    name: unused dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-machete
+      - run: cargo machete
+
+  fuzz:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-fuzz
+      # Short runs on every change; the scheduled workflow runs them long.
+      - name: Run each target briefly
+        working-directory: fuzz
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$target" -- -max_total_time=30
+          done
 
   package:
     name: publishable crates

@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityConfig {
     pub issuer: String,
@@ -30,7 +30,7 @@ pub struct IdentityConfig {
 fn default_lifetime() -> u64 {
     900
 }
-#[derive(Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Claims {
     pub sub: String,
     pub exp: u64,
@@ -78,6 +78,14 @@ pub struct JwtVerifier {
     keys: parking_lot::RwLock<KeyCache>,
     /// One fetch at a time; waiters reuse its result.
     refreshing: tokio::sync::Mutex<()>,
+}
+impl std::fmt::Debug for JwtVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtVerifier")
+            .field("issuer", &self.config.issuer)
+            .field("audience", &self.config.audience)
+            .finish_non_exhaustive()
+    }
 }
 impl JwtVerifier {
     pub async fn new(config: IdentityConfig) -> anyhow::Result<Arc<Self>> {

@@ -309,7 +309,7 @@ SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
 ```
 
 Register that exact string in the Schwab Developer Portal, enable the
-built-in callback server (`cargo run --features callback-server`),
+built-in callback server (`cargo run -p oauth-flow`; the example enables it),
 click through your browser's self-signed-cert warning on first run,
 and you're done. No tunnel, no external binary, no rotating URL.
 
@@ -348,8 +348,7 @@ happy path.
 
 ```bash
 # Run the auth test example
-cd examples/auth_test
-cargo run -- --app-key YOUR_KEY --app-secret YOUR_SECRET status
+cargo run -p auth_test -- --app-key YOUR_KEY --app-secret YOUR_SECRET status
 ```
 
 ## Environment Variables

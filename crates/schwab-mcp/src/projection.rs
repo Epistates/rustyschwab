@@ -45,6 +45,7 @@ fn parse_budget(raw: Option<&str>) -> usize {
 }
 
 /// One projected row with the key that orders it and resumes after it.
+#[derive(Debug)]
 pub struct Row<K> {
     pub key: K,
     pub value: Value,

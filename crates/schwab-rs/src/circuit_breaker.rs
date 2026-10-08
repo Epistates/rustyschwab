@@ -95,6 +95,15 @@ impl Drop for Permit<'_> {
     }
 }
 
+impl std::fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("state", &self.state())
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
 impl CircuitBreaker {
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {

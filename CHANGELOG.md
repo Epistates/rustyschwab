@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — engineering infrastructure
+
+- **Fewer dependencies.** Unused dependencies are gone (`hyper`,
+  `serde_urlencoded`, `oauth2`, `pin-project`, `bytes`, `headers`,
+  `once_cell`, `config`, and `secrecy` from schwab-mcp), and CI keeps it
+  that way with `cargo machete`. `tracing-subscriber` is optional behind a
+  new default `telemetry` feature; `schwab_rs::telemetry` needs it.
+- **Every public type implements `Debug`**, by hand where it holds a
+  secret or a connection, and the workspace warns on one that does not.
+  Builders and `RecoveryWorker` are `#[must_use]`.
+- **docs.rs** builds every crate with all features and marks
+  feature-gated items.
+- **CI** checks each SDK feature alone (`cargo hack`), holds line coverage
+  at 75% (`cargo llvm-cov`), and runs each fuzz target for 30 s. New
+  workflows: `security.yml` (RustSec daily, verified-secret scan, CodeQL,
+  OpenSSF Scorecard), `scheduled.yml` (ten-minute fuzzing, mutation testing
+  of risk, execution and reconciliation, minimal dependency versions) and
+  `publish.yml` (crates.io trusted publishing in dependency order, behind
+  an environment approval). Releases are drafted on GitHub with the
+  binaries, SBOM and attestation. `rust-toolchain.toml` pins the build
+  toolchain; the MSRV row still tests 1.89.
+- **Fuzz targets** (`fuzz/`) for stream frames, order requests and broker
+  responses.
+- **Recovery worker tests** cover readiness, failure, incremental scans
+  and activity-triggered passes; a test checks the shipped alerts and
+  dashboard query only declared metrics.
+- Issue and pull-request templates; the README's example commands run.
+
 ### Fixed — execution safety (second diligence pass)
 
 - **Abandoned submissions finish.** An order submission runs on its own

@@ -28,7 +28,7 @@ use crate::contract::{Source, ToolFailure};
 use crate::server;
 
 /// Where orders go and where account state comes from.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Backend {
     Live(Arc<SchwabClient>),
     Paper(Paper),
@@ -37,7 +37,7 @@ pub enum Backend {
 /// The paper venue, with Schwab market data when the operator configured
 /// credentials for it. Without market data the venue's own quotes are the
 /// only prices, and the market-data tools beyond quotes are unavailable.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Paper {
     pub broker: Arc<PaperBroker>,
     pub market_data: Option<Arc<SchwabClient>>,

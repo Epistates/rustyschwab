@@ -13,6 +13,11 @@ description = "MCP server exposing the Schwab Trading + Market Data SDK as tools
 [lints]
 workspace = true
 
+# docs.rs documents every feature, marking feature-gated items as such.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 name = "schwab_mcp"
 path = "src/lib.rs"
@@ -24,7 +29,6 @@ path = "src/main.rs"
 [dependencies]
 tempfile = { workspace = true }
 async-trait = { workspace = true }
-secrecy = { workspace = true }
 clap = { workspace = true }
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
 reqwest = { workspace = true, features = ["rustls"] }

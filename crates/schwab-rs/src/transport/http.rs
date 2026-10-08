@@ -22,6 +22,14 @@ pub struct HttpTransport {
     base_url: Url,
 }
 
+impl std::fmt::Debug for HttpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpTransport")
+            .field("base_url", &self.base_url.as_str())
+            .finish_non_exhaustive()
+    }
+}
+
 impl HttpTransport {
     pub fn new(
         base_url: impl Into<String>,

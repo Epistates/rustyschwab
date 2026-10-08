@@ -16,9 +16,17 @@ pub struct RecoveryStatus {
     pub pending_accounts: Vec<String>,
     pub last_success: Option<i64>,
 }
+#[must_use = "dropping the worker stops recovery"]
 pub struct RecoveryWorker {
     status: tokio::sync::watch::Receiver<RecoveryStatus>,
     task: tokio::task::JoinHandle<()>,
+}
+impl std::fmt::Debug for RecoveryWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryWorker")
+            .field("status", &*self.status.borrow())
+            .finish_non_exhaustive()
+    }
 }
 impl RecoveryWorker {
     /// Reconcile `accounts` every `interval` (at least a second), or sooner

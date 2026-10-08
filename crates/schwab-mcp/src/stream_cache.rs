@@ -130,6 +130,16 @@ const MAX_SNAPSHOTS: usize = 10_000;
 pub struct StreamCache {
     inner: Arc<RwLock<CacheState>>,
 }
+impl std::fmt::Debug for StreamCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache = self.inner.read();
+        f.debug_struct("StreamCache")
+            .field("status", &cache.status)
+            .field("snapshots", &cache.snapshots.len())
+            .field("events", &cache.events.len())
+            .finish_non_exhaustive()
+    }
+}
 impl StreamCache {
     pub fn new() -> Self {
         Self::default()
@@ -424,7 +434,7 @@ impl StreamCache {
 /// reconciled account baselines, which the recovery worker keeps, not the
 /// stream, and a snapshot's `fresh` flag tells a reader whether its quote
 /// can be relied on.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct RecoveryPolicy {
     pub deadline: std::time::Duration,
     pub interval: std::time::Duration,

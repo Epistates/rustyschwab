@@ -1,0 +1,22 @@
+name: Feature request
+description: Something the project should do that it does not.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do, and what stops you today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would solve it
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety
+      description: >
+        For anything that touches order submission: how it keeps the
+        never-replay rule, approvals and risk limits intact.

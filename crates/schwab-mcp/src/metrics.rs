@@ -62,6 +62,7 @@ pub fn describe() {
 /// (including a `ToolFailure` turned into an `isError` result) is
 /// classified without branching at each site. `contract::run` is the one
 /// caller; tools never start a timer themselves.
+#[derive(Debug)]
 pub struct ToolTimer {
     tool: &'static str,
     start: Instant,

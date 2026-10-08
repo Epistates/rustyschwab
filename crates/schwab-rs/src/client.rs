@@ -55,6 +55,17 @@ struct ClientInner {
         parking_lot::Mutex<std::collections::HashMap<String, crate::reconciliation::DayTransfers>>,
 }
 
+impl std::fmt::Debug for SchwabClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchwabClient")
+            .field("base_url", &self.inner.config.base_url)
+            .field("journal", &self.inner.journal.path())
+            .field("circuit", &self.inner.circuit_breaker.state())
+            .field("submissions_suspended", &self.submissions_suspended())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SchwabClient {
     pub fn new(config: SchwabConfig) -> Result<Self> {
         config.validate()?;
@@ -1271,6 +1282,7 @@ fn method_label(method: &Method) -> &'static str {
 }
 
 #[derive(Debug, Clone)]
+#[must_use = "a builder does nothing until `build` is called"]
 pub struct SchwabClientBuilder {
     config: Option<SchwabConfig>,
 }

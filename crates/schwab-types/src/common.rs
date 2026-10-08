@@ -386,6 +386,7 @@ pub mod exact_decimal {
 /// JSON schema for a request decimal: a string of digits with an optional
 /// fraction, the only spelling [`exact_decimal`] guarantees is exact.
 #[cfg(feature = "schemars")]
+#[derive(Debug)]
 pub struct DecimalString;
 
 #[cfg(feature = "schemars")]
@@ -410,6 +411,7 @@ impl schemars::JsonSchema for DecimalString {
 /// JSON schema for an order quantity: Schwab's wire form is a JSON number
 /// ([`exact_decimal::serialize_number`]), and a decimal string reads the same.
 #[cfg(feature = "schemars")]
+#[derive(Debug)]
 pub struct QuantityNumber;
 
 #[cfg(feature = "schemars")]

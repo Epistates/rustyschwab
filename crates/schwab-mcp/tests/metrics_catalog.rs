@@ -173,3 +173,35 @@ fn catalog_constants_are_catalogued_and_documented() {
 fn describe_is_a_no_op_without_a_recorder() {
     schwab_mcp::metrics::describe();
 }
+
+/// Every metric the shipped alert rules and dashboard query exists in a
+/// catalog, so a rename cannot silently blind them.
+#[test]
+fn alerts_and_dashboard_query_only_declared_metrics() {
+    let declared: std::collections::HashSet<&str> = crates()
+        .iter()
+        .flat_map(|(_, catalog)| catalog.iter().map(|metric| metric.name))
+        .collect();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops");
+    for file in ["alerts.yml", "dashboard.json"] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("schwab_") {
+            let name: String = rest[at..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            rest = &rest[at + name.len()..];
+            // Prometheus derives these series from a histogram.
+            let base = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|suffix| name.strip_suffix(suffix))
+                .filter(|base| declared.contains(base))
+                .unwrap_or(&name);
+            assert!(
+                declared.contains(base),
+                "{file} queries {name}, which no catalog declares"
+            );
+        }
+    }
+}

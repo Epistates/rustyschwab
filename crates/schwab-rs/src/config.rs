@@ -512,6 +512,7 @@ fn env_flag(name: &str, default: bool) -> Result<bool> {
 }
 
 #[derive(Debug, Clone)]
+#[must_use = "a builder does nothing until `build` is called"]
 pub struct ConfigBuilder {
     config: SchwabConfig,
 }

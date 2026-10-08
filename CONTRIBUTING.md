@@ -14,8 +14,9 @@ problems privately rather than in a public issue.
 
 ## Development setup
 
-Rust 1.89 or newer (edition 2024). No other toolchain is needed; SQLite is
-bundled.
+Rust 1.89 or newer (edition 2024; the MSRV). `rust-toolchain.toml` pins the
+toolchain CI and releases build with, and rustup installs it on first use.
+SQLite is bundled. Fuzzing needs a nightly toolchain and `cargo-fuzz`.
 
 ```bash
 git clone <repository-url>
@@ -50,14 +51,31 @@ cargo check -p schwab-rs --no-default-features --features callback-server --lock
 cargo check -p schwab-types --no-default-features --locked
 cargo package -p schwab-types -p schwab-rs -p schwab-mcp --locked
 cargo deny check advisories bans licenses sources
+cargo machete                                     # unused dependencies
 actionlint   # when you change .github/workflows
 ```
 
+Untrusted-input decoders have fuzz targets (`fuzz/`): run one with
+`cd fuzz && cargo +nightly fuzz run order_request -- -max_total_time=60`
+when you change a decoder or validator, and add a target for a new one.
+
 The two `cargo test` lines are both needed: `--all-targets` skips doctests.
-CI additionally tests on the MSRV, checks that a `native-tls` build carries
-no rustls, compares the public API against the base branch with
-`cargo-semver-checks`, and runs the stream soak harness. Intentional
-public-API breaks need a CHANGELOG entry with migration notes.
+CI additionally tests on the MSRV, checks every SDK feature on its own
+(`cargo hack`), checks that a `native-tls` build carries no rustls, holds
+line coverage at or above its floor (`cargo llvm-cov`), runs each fuzz
+target briefly, compares the public API against the base branch with
+`cargo-semver-checks`, and runs the stream soak harness. The security
+workflow scans for advisories daily, for verified secrets and with CodeQL
+on every change, and records an OpenSSF Scorecard; a weekly workflow fuzzes
+for longer, runs mutation testing over risk, execution and reconciliation,
+and builds against minimal dependency versions. Intentional public-API
+breaks need a CHANGELOG entry with migration notes.
+
+Protect `main` by requiring the CI and Security checks to pass before a
+merge (the `rustfmt`, `clippy`, `rustdoc`, `test`, `SDK feature
+combinations`, `coverage`, `unused dependencies`, `fuzz smoke`,
+`publishable crates`, `cargo deny` and `workflow lint` jobs, plus `secret
+scan` and `CodeQL`).
 
 Then:
 
@@ -113,7 +131,12 @@ explains why, not what.
 1. Bump `version` in the workspace `Cargo.toml`.
 2. Move the `[Unreleased]` section in `CHANGELOG.md` to a dated version.
 3. Tag `vX.Y.Z` and push the tag. `release.yml` builds the binaries, an
-   SBOM and a provenance attestation.
-4. Publish `schwab-types`, then `schwab-rs`, then `schwab-mcp`.
+   SBOM and a provenance attestation, and drafts a GitHub Release with
+   them; review and publish it. Verify an artifact with
+   `gh attestation verify <file> --repo Epistates/rustyschwab`.
+4. Run `publish.yml` for the tag. It publishes `schwab-types`, then
+   `schwab-rs`, then `schwab-mcp` through crates.io trusted publishing,
+   after approval in the `crates-io` environment (configure the trusted
+   publisher on crates.io and the environment's reviewers first).
 
 See [docs/SUPPORT.md](docs/SUPPORT.md) for the compatibility policy.

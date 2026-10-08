@@ -427,10 +427,10 @@ fn timeout(what: &str) -> ToolFailure {
 /// looked up once the day's sessions are over, kept while it can still
 /// answer: the day's schedule does not change, so only a date roll, a
 /// predicted opening arriving, or having nothing ahead re-reads it.
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionCalendar(Arc<Mutex<Option<CalendarEntry>>>);
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct CalendarEntry {
     today: MarketHours,
     /// The first boundary on a later day, found by looking ahead when

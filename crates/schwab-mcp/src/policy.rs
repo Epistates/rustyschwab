@@ -20,7 +20,7 @@ use std::{
 };
 use turbomcp::prelude::*;
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrincipalPolicy {
     pub name: String,
@@ -468,6 +468,14 @@ impl AuthorizedServer {
             audit,
             calls,
         }
+    }
+}
+impl std::fmt::Debug for AuthorizedServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedServer")
+            .field("principal", &self.principal.name)
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
     }
 }
 impl McpHandler for AuthorizedServer {

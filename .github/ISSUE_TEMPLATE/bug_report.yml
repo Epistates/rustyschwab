@@ -1,0 +1,38 @@
+name: Bug report
+description: Something the SDK, the MCP server or the authority does wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Redact account numbers and hashes, tokens, app keys and order IDs
+        you consider sensitive. Report security problems privately (see
+        SECURITY.md), not here.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce
+      description: The smallest steps, code or tool call that shows it.
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Rust version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Redacted.
+      render: text

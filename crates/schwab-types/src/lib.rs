@@ -50,6 +50,8 @@
 //! assert_eq!(serde_json::to_value(&same).unwrap(), serde_json::to_value(&order).unwrap());
 //! ```
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 /// Market data types including quotes, price history, and market hours.
 pub mod market_data;
 

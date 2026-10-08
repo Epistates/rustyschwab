@@ -1742,6 +1742,8 @@ impl StreamClientInner {
     }
 }
 
+#[derive(Debug)]
+#[must_use = "a builder does nothing until `build` is called"]
 pub struct StreamClientBuilder {
     config: Option<StreamConfig>,
     auth_manager: Option<AuthManager>,

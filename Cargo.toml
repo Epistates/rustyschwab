@@ -5,6 +5,8 @@ members = [
     "crates/schwab-mcp",
     "examples/*",
 ]
+# cargo-fuzz targets build on their own (nightly, sanitizers).
+exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
@@ -35,9 +37,7 @@ async-trait = "0.1"
 
 # HTTP and networking
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "charset", "http2", "system-proxy"] }
-hyper = "1.9"
 url = "2.5"
-headers = "0.4"
 axum = "0.8"
 # TLS for the local OAuth callback server (Schwab requires an https
 # callback URL, so the capture server must terminate TLS itself).
@@ -48,11 +48,9 @@ urlencoding = "2.1"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_urlencoded = "0.7"
 serde_with = "3.17"
 
-# OAuth2
-oauth2 = "5.0"
+# Encoding
 base64 = "0.22"
 
 # Error handling
@@ -76,10 +74,7 @@ chrono-tz = "0.10"
 humantime-serde = "1.1"
 
 # Utilities
-once_cell = "1.21"
 parking_lot = "0.12"
-pin-project = "1.1"
-bytes = "1.11"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 
 # Rate limiting
@@ -108,7 +103,6 @@ rustix = { version = "1.1", default-features = false, features = ["std", "fs", "
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
-config = "0.15"
 dotenvy = "0.15"
 
 # Testing
@@ -129,6 +123,10 @@ schemars = { version = "1.0", features = ["chrono04"] }
 # The one FFI module (Windows file security) allows it locally.
 unsafe_code = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }
+# Every public type can be printed (with secrets redacted by hand).
+missing_debug_implementations = "warn"
+# `docsrs` is set by docs.rs (see each crate's `package.metadata.docs.rs`).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(docsrs)"] }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"

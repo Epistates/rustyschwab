@@ -144,6 +144,7 @@ pub struct PortfolioLimits {
 fn max_age() -> i64 {
     5000
 }
+#[derive(Debug)]
 pub struct PortfolioRisk {
     pub database: StateDatabase,
     pub accounts: HashMap<String, PortfolioLimits>,

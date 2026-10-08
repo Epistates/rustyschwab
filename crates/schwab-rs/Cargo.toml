@@ -16,6 +16,11 @@ description = "Production-grade Rust SDK for Charles Schwab Trading and Market D
 [lints]
 workspace = true
 
+# docs.rs documents every feature, marking feature-gated items as such.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
@@ -33,7 +38,6 @@ async-trait = { workspace = true }
 # HTTP and networking
 reqwest = { workspace = true }
 url = { workspace = true }
-headers = { workspace = true }
 axum = { workspace = true, optional = true }
 axum-server = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
@@ -49,9 +53,9 @@ base64 = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
-# Tracing
+# Tracing (the subscriber only for the optional `telemetry` helpers)
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 # Metrics facade — no-op when no recorder is installed, so this doesn't
 # force any runtime overhead on SDK-only consumers.
@@ -63,7 +67,6 @@ chrono-tz = { workspace = true }
 humantime-serde = { workspace = true }
 
 # Utilities
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 
@@ -76,8 +79,6 @@ keyring = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 
-# Configuration
-config = { workspace = true }
 
 # Rate limiting and retry
 governor = { workspace = true }
@@ -91,7 +92,10 @@ tempfile = { workspace = true }
 dotenvy = { workspace = true }
 
 [features]
-default = ["rustls"]
+default = ["rustls", "telemetry"]
+# `schwab_rs::telemetry`: ready-made tracing-subscriber setups. Off, the SDK
+# only emits `tracing` events and the application installs its subscriber.
+telemetry = ["dep:tracing-subscriber"]
 # The streamer's WebSocket gets an explicit rustls configuration (ring
 # provider, platform verifier): both ring and aws-lc-rs are in the tree, so
 # rustls cannot pick a process-level provider on its own. The tungstenite
@@ -108,7 +112,7 @@ callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls"]
 # OptionChainParams, OrderRequest, ...) so the schwab-mcp crate can expose them
 # as strongly-typed MCP tool arguments.
 schemars = ["schwab-types/schemars"]
-full = ["rustls", "callback-server", "schemars"]
+full = ["rustls", "callback-server", "schemars", "telemetry"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

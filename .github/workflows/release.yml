@@ -89,3 +89,31 @@ jobs:
         with:
           name: ${{ matrix.target }}-release-evidence
           path: dist/
+
+  # A tag's evidence becomes a draft GitHub Release, which does not expire
+  # as workflow artifacts do; a maintainer reviews and publishes it.
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: dist
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p assets
+          for dir in dist/*-release-evidence; do
+            target=${dir#dist/}
+            target=${target%-release-evidence}
+            for file in "$dir"/*; do
+              cp "$file" "assets/$target-$(basename "$file")"
+            done
+          done
+          gh release create "$TAG" assets/* --repo "$GITHUB_REPOSITORY" --draft --verify-tag --generate-notes
+

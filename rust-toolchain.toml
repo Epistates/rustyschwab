@@ -1,0 +1,6 @@
+# The toolchain releases and CI build with, so a release is reproducible.
+# The MSRV job overrides it (RUSTUP_TOOLCHAIN) to prove `rust-version`.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

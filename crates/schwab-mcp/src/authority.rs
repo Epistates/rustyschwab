@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ServiceIdentity {
     pub subject: String,
     pub expires_at: u64,
@@ -55,7 +55,7 @@ pub enum Role {
     PaperCorporateActions,
     PaperFault,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub subject: String,
@@ -74,6 +74,15 @@ pub struct Authority {
     /// traffic (or unauthenticated noise) holds every general slot.
     operator_capacity: Arc<tokio::sync::Semaphore>,
     pub required_accounts: Vec<String>,
+}
+impl std::fmt::Debug for Authority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Authority")
+            .field("mode", &self.client.mode())
+            .field("policy_file", &self.policy_file)
+            .field("required_accounts", &self.required_accounts.len())
+            .finish_non_exhaustive()
+    }
 }
 impl Authority {
     pub fn new(
@@ -390,7 +399,7 @@ async fn backend(
         .await,
     )
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperatorRequest {
     Approve {
@@ -545,7 +554,7 @@ async fn operator(
         .await,
     )
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LeaseRequest {
     Acquire,
@@ -595,7 +604,7 @@ fn check_owner(lease: &Lease, identity: &ServiceIdentity) -> Result<(), StatusCo
     }
     Ok(())
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayRequest {
     pub request_id: String,
@@ -603,7 +612,7 @@ pub struct GatewayRequest {
     pub action: GatewayAction,
     pub lease: Option<Lease>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayAction {
     Place {

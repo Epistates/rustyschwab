@@ -1,0 +1,45 @@
+name: Publish crates
+
+# Run by hand for a release tag that `release.yml` has verified. Publishing
+# needs approval in the `crates-io` environment and uses crates.io trusted
+# publishing (OIDC), so no long-lived registry token exists.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - name: Tag matches the crate version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "schwab-rs") | .version')
+          [ "${TAG#v}" = "$version" ] || { echo "::error::tag $TAG is not v$version"; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      # Dependency order; each publish waits for the index to see the last.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          for crate in schwab-types schwab-rs schwab-mcp; do
+            cargo publish -p "$crate" --locked
+          done

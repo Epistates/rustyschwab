@@ -140,6 +140,11 @@ pub struct StreamHub {
     cache: StreamCache,
     feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
+impl std::fmt::Debug for StreamHub {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamHub").finish_non_exhaustive()
+    }
+}
 impl StreamHub {
     pub fn new() -> Self {
         Self::default()
@@ -170,6 +175,15 @@ pub struct SchwabMcp {
     feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
     stream_config: StreamConfig,
     calendar: SessionCalendar,
+}
+
+impl std::fmt::Debug for SchwabMcp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchwabMcp")
+            .field("backend", &self.backend)
+            .field("switches", &self.switches)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SchwabMcp {

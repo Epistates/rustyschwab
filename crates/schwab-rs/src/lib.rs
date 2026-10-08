@@ -1,3 +1,4 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 
 /// Library version string in the format `schwab-rs X.Y.Z`.
@@ -33,6 +34,7 @@ pub mod security;
 mod security_windows;
 pub mod storage;
 pub mod streaming;
+#[cfg(feature = "telemetry")]
 pub mod telemetry;
 pub mod transport;
 pub mod utils;

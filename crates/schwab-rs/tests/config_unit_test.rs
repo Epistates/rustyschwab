@@ -5,13 +5,12 @@
 // ENV_MUTEX, so no two tests touch the environment at once.
 #![allow(unsafe_code)]
 
-use once_cell::sync::Lazy;
 use schwab_rs::config::SchwabConfig;
 use std::env;
 use std::sync::Mutex;
 
 // Mutex to ensure tests that modify environment variables run sequentially
-static ENV_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+static ENV_MUTEX: std::sync::LazyLock<Mutex<()>> = std::sync::LazyLock::new(|| Mutex::new(()));
 
 /// The streamer URL Schwab's preferences name is accepted; loopback is
 /// matched exactly, so no `*.localhost` name inherits its plain `ws://`.
