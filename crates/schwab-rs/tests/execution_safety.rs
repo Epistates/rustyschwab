@@ -549,3 +549,41 @@ async fn a_deposit_does_not_hide_a_daily_loss() {
         Err(schwab_rs::Error::Halted(reason)) if reason.contains("Daily loss 9000")
     ));
 }
+
+/// A lapsed, unused approval can be granted again; a live, spent or
+/// revoked one cannot.
+#[tokio::test]
+async fn only_a_lapsed_approval_can_be_granted_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "a".repeat(64);
+    let later = || chrono::Utc::now().timestamp() + 600;
+    journal
+        .approve("desk", &digest, "operator", later())
+        .await
+        .unwrap();
+    assert!(matches!(
+        journal.approve("desk", &digest, "operator", later()).await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
+    let lapse = digest.clone();
+    journal
+        .database()
+        .run(move |c| {
+            c.execute("UPDATE approvals SET expires_at=1 WHERE digest=?1", [lapse])
+                .map_err(|e| schwab_rs::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    assert!(!journal.is_approved("desk", &digest).await.unwrap());
+    journal
+        .approve("desk", &digest, "operator", later())
+        .await
+        .unwrap();
+    assert!(journal.is_approved("desk", &digest).await.unwrap());
+    journal.revoke_approval(&digest, "operator").await.unwrap();
+    assert!(matches!(
+        journal.approve("desk", &digest, "operator", later()).await,
+        Err(schwab_rs::Error::Duplicate(_))
+    ));
+}

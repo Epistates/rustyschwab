@@ -83,6 +83,8 @@ config = { workspace = true }
 governor = { workspace = true }
 
 [dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`).
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 tempfile = { workspace = true }
 # Live conformance harness loads `.env` like the binaries do.

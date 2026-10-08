@@ -324,6 +324,71 @@ pub fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     Ok(contents)
 }
 
+/// Read a configuration file that decides authorization (an MCP policy,
+/// grants, identity or risk file), at most `limit` bytes.
+///
+/// Unlike a secret it may be world-readable, and it may be a symlink (a
+/// Kubernetes ConfigMap mounts files through two of them), but on Unix the
+/// file it resolves to, and that file's directory, must be owned by this
+/// account or root and writable by no one else: a file another local user
+/// can edit could grant that user trading. Non-blocking, so a planted FIFO
+/// cannot hang the read. Elsewhere it is read as is, within `limit`.
+pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        use std::os::unix::fs::MetadataExt;
+        let resolved = std::fs::canonicalize(path)?;
+        let trusted = |metadata: &std::fs::Metadata| {
+            let owner = metadata.uid();
+            (owner == rustix::process::geteuid().as_raw() || owner == 0)
+                && metadata.permissions().mode() & 0o022 == 0
+        };
+        if let Some(parent) = resolved.parent()
+            && !trusted(&std::fs::metadata(parent)?)
+        {
+            return Err(untrusted(
+                path,
+                "is in a directory another account can write",
+            ));
+        }
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let file = std::fs::File::from(
+            rustix::fs::open(&resolved, flags, Mode::empty()).map_err(std::io::Error::from)?,
+        );
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_file() {
+            return Err(untrusted(path, "is not a regular file"));
+        }
+        if !trusted(&metadata) {
+            return Err(untrusted(
+                path,
+                "must be owned by this account or root and writable by no one else",
+            ));
+        }
+        file
+    };
+    #[cfg(not(unix))]
+    let file = std::fs::File::open(path)?;
+    let mut contents = Vec::new();
+    file.take(limit + 1).read_to_end(&mut contents)?;
+    if contents.len() as u64 > limit {
+        return Err(Error::Config(format!(
+            "Configuration file exceeds {limit} bytes"
+        )));
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn untrusted(path: &Path, why: &str) -> Error {
+    tracing::error!(?path, "configuration file {why}");
+    Error::Config(format!(
+        "A configuration file {why}; see server logs for the path"
+    ))
+}
+
 /// Create a private directory before any database or auxiliary file is opened.
 ///
 /// A directory created here is 0700; an existing one must already be a
@@ -441,6 +506,30 @@ mod tests {
 
         let missing = read_private_file(&dir.path().join("missing")).unwrap_err();
         assert!(matches!(missing, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+    }
+
+    /// An authorization file may be world-readable and reached through a
+    /// symlink (a ConfigMap mount), but not writable by anyone else, and not
+    /// larger than its limit.
+    #[cfg(unix)]
+    #[test]
+    fn trusted_files_refuse_other_writers_and_oversize() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("policy.json");
+        std::fs::write(&policy, b"[]").unwrap();
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_trusted_file(&policy, 16).unwrap(), b"[]");
+        let link = dir.path().join("current");
+        std::os::unix::fs::symlink(&policy, &link).unwrap();
+        assert_eq!(read_trusted_file(&link, 16).unwrap(), b"[]");
+        assert!(read_trusted_file(&policy, 1).is_err());
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_trusted_file(&link, 16).is_err());
+        std::fs::set_permissions(&policy, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(read_trusted_file(&policy, 16).is_err());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(unix)]

@@ -85,7 +85,7 @@ pub fn router_reloadable(
     });
     if let (Some(path), Some((backend, switches, hub))) = (policy_path, shared) {
         let weak = Arc::downgrade(&state);
-        let initial = std::fs::read(&path).ok();
+        let initial = crate::read_config(&path).ok();
         tokio::spawn(async move {
             let mut previous = initial;
             loop {
@@ -93,9 +93,13 @@ pub fn router_reloadable(
                 let Some(state) = weak.upgrade() else {
                     break;
                 };
-                let current = std::fs::read(&path)
+                // Off the async workers: a slow or odd file must not stall
+                // the server, and the same ownership checks as at startup.
+                let read = path.clone();
+                let current = tokio::task::spawn_blocking(move || crate::read_config(read).ok())
+                    .await
                     .ok()
-                    .filter(|bytes| bytes.len() <= 1024 * 1024);
+                    .flatten();
                 if current == previous {
                     continue;
                 }

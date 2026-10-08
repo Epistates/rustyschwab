@@ -539,6 +539,15 @@ impl SchwabClient {
         // read traffic tripped the breaker, and it is never retried, since
         // a retry after a cancel that landed answers 4xx and hides it.
         let protective = op == "cancel_order";
+        // Writes and the reconciliation that keeps the risk baseline fresh
+        // keep a share of the request budget reads cannot take.
+        let priority = if submission || protective {
+            crate::request_budget::Priority::Critical
+        } else if op.starts_with("reconcile_") {
+            crate::request_budget::Priority::Recovery
+        } else {
+            crate::request_budget::Priority::Normal
+        };
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let sent = std::sync::atomic::AtomicBool::new(false);
         let operation = async {
@@ -552,7 +561,9 @@ impl SchwabClient {
                     .map_err(Error::Auth)?;
                 let attempt = || async {
                     if let Some(budget) = &self.inner.rate_limiter {
-                        budget.admit(self.inner.coordinator.as_ref()).await?;
+                        budget
+                            .admit(self.inner.coordinator.as_ref(), priority)
+                            .await?;
                     }
                     if submission {
                         self.submission_admission().await?;

@@ -76,6 +76,11 @@ const DROP_FIELDS: &[&str] = &[
 /// `ACCT_ACTIVITY` streamer frames (`messageData`).
 const MASK_ACCOUNT_FIELDS: &[&str] = &["accountNumber", "AccountNumber"];
 
+/// Free-text fields that can name another account (a transfer's
+/// description, a journal's memo): 8- and 9-digit runs in them are masked
+/// as in error prose (see [`mask_accounts_in_text`]).
+const MASK_TEXT_FIELDS: &[&str] = &["description", "memo"];
+
 /// Whether account-number masking is on (the `SCHWAB_MCP_REDACT_PII`
 /// env var).
 ///
@@ -130,6 +135,11 @@ fn redact_object(map: &mut Map<String, Value>, mask_accounts: bool) {
         for field in MASK_ACCOUNT_FIELDS {
             if let Some(Value::String(s)) = map.get_mut(*field) {
                 *s = mask_account(s);
+            }
+        }
+        for field in MASK_TEXT_FIELDS {
+            if let Some(Value::String(s)) = map.get_mut(*field) {
+                *s = mask_digit_runs(s);
             }
         }
     }
@@ -392,6 +402,27 @@ mod tests {
         redact_stream_content("LEVELONE_EQUITIES", &mut v);
         assert_eq!(v["bidPrice"], 228.14);
         assert_eq!(v["messageData"], "{\"a\":1 }");
+    }
+
+    /// A transfer's description can name the other account; an order or
+    /// activity ID (longer) and a price or quantity (shorter) stay readable.
+    #[test]
+    fn masks_account_numbers_in_descriptions() {
+        let mut v = json!({"transactions": [{
+            "description": "ELECTRONIC FUNDING RECEIPT FROM 123456789",
+            "orderId": 1004538521,
+            "memo": "Journal 87654321 qty 100 at 12.50 order 1004538521"
+        }]});
+        redact(&mut v);
+        assert_eq!(
+            v["transactions"][0]["description"],
+            "ELECTRONIC FUNDING RECEIPT FROM ***6789"
+        );
+        assert_eq!(
+            v["transactions"][0]["memo"],
+            "Journal ***4321 qty 100 at 12.50 order 1004538521"
+        );
+        assert_eq!(v["transactions"][0]["orderId"], 1004538521);
     }
 
     #[test]

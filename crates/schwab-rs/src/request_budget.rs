@@ -35,6 +35,36 @@ pub struct RequestBudgetUsage {
     pub remaining: usize,
 }
 
+/// Who a request is for, so ordinary reads cannot use up the budget that
+/// protective writes and reconciliation depend on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Priority {
+    /// Reads and everything else: up to [`NORMAL_SHARE`] of the minute.
+    Normal,
+    /// Reconciliation, which keeps the risk baseline fresh: up to
+    /// [`RECOVERY_SHARE`].
+    Recovery,
+    /// Order submissions and cancels: the whole budget.
+    Critical,
+}
+/// Share of each trailing minute's budget reads may use.
+const NORMAL_SHARE: f64 = 0.75;
+/// Share reconciliation may use; the rest is for submissions and cancels.
+const RECOVERY_SHARE: f64 = 0.9;
+
+impl Priority {
+    /// The admissions in the trailing minute below which a request of this
+    /// priority may go, out of `per_minute`.
+    fn ceiling(self, per_minute: usize) -> usize {
+        let share = match self {
+            Self::Normal => NORMAL_SHARE,
+            Self::Recovery => RECOVERY_SHARE,
+            Self::Critical => 1.0,
+        };
+        ((per_minute as f64 * share).floor() as usize).max(1)
+    }
+}
+
 pub(crate) struct RequestBudget {
     key: String,
     limiter: Limiter,
@@ -73,8 +103,8 @@ impl RequestBudget {
     /// Wait for the in-process budget, then for the durable quota the
     /// coordinator shares with every other process on this credential. Both
     /// count the attempt only once it is admitted.
-    pub async fn admit(&self, coordinator: &dyn Coordinator) -> Result<()> {
-        self.acquire().await;
+    pub async fn admit(&self, coordinator: &dyn Coordinator, priority: Priority) -> Result<()> {
+        self.acquire(priority).await;
         let (rps, burst) = self.configuration;
         loop {
             let wait = coordinator.quota(&self.key, rps, burst).await?;
@@ -94,20 +124,36 @@ impl RequestBudget {
             remaining: self.per_minute.saturating_sub(recent.len()),
         }
     }
-    async fn acquire(&self) {
-        self.limiter.until_ready().await;
+    async fn acquire(&self, priority: Priority) {
+        let ceiling = priority.ceiling(self.per_minute);
         loop {
             let wake = {
                 let now = Instant::now();
                 let mut recent = self.recent.lock();
                 prune(&mut recent, now);
-                if recent.len() < self.per_minute {
-                    recent.push_back(now);
-                    return;
+                if recent.len() < ceiling {
+                    None
+                } else {
+                    // The admission whose expiry brings the count under
+                    // this priority's ceiling.
+                    Some(recent[recent.len() - ceiling] + Duration::from_secs(60))
                 }
-                *recent.front().unwrap() + Duration::from_secs(60)
             };
-            tokio::time::sleep_until(wake).await;
+            match wake {
+                Some(wake) => tokio::time::sleep_until(wake).await,
+                None => {
+                    self.limiter.until_ready().await;
+                    let now = Instant::now();
+                    let mut recent = self.recent.lock();
+                    prune(&mut recent, now);
+                    // Re-checked: others may have been admitted while this
+                    // one waited on the per-second limiter.
+                    if recent.len() < ceiling {
+                        recent.push_back(now);
+                        return;
+                    }
+                }
+            }
         }
     }
 }
@@ -144,11 +190,11 @@ mod tests {
                 remaining: 60
             }
         );
-        a.acquire().await;
+        a.acquire(Priority::Critical).await;
         assert_eq!(b.usage().used_last_minute, 1);
         assert_eq!(b.usage().remaining, 59);
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), b.acquire())
+            tokio::time::timeout(Duration::from_millis(20), b.acquire(Priority::Critical))
                 .await
                 .is_err()
         );
@@ -157,5 +203,35 @@ mod tests {
             ..config
         };
         assert!(RequestBudget::shared(key, &changed).is_err());
+    }
+
+    /// Reads stop at their share of the minute; reconciliation and then
+    /// writes keep the rest.
+    #[tokio::test]
+    async fn reads_leave_room_for_reconciliation_and_writes() {
+        // 60 a minute, with a burst large enough that only the minute binds:
+        // reads get 45, reconciliation up to 54, writes all 60.
+        let config = RateLimitConfig {
+            requests_per_second: 1,
+            burst_size: 100,
+            ..Default::default()
+        };
+        let budget = RequestBudget::shared(uuid::Uuid::new_v4().to_string(), &config).unwrap();
+        for _ in 0..Priority::Normal.ceiling(60) {
+            budget.acquire(Priority::Normal).await;
+        }
+        let short = Duration::from_millis(50);
+        assert!(
+            tokio::time::timeout(short, budget.acquire(Priority::Normal))
+                .await
+                .is_err(),
+            "reads are at their share"
+        );
+        tokio::time::timeout(short, budget.acquire(Priority::Recovery))
+            .await
+            .expect("reconciliation still goes");
+        tokio::time::timeout(short, budget.acquire(Priority::Critical))
+            .await
+            .expect("writes still go");
     }
 }

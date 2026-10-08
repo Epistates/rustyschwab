@@ -152,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     let transport = std::env::var("SCHWAB_MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into());
     let policies: Vec<schwab_mcp::policy::PrincipalPolicy> =
         match std::env::var("SCHWAB_MCP_POLICY_FILE") {
-            Ok(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+            Ok(path) => serde_json::from_slice(&schwab_mcp::read_config(path)?)?,
             Err(_) if transport == "stdio" && switches == Switches::default() => {
                 let inner = SchwabMcp::new(backend, switches);
                 inner.run_stdio().await?;
@@ -195,9 +195,9 @@ async fn main() -> anyhow::Result<()> {
         guard_network_bind(&transport, addr, remote_bind_allowed())?;
         let identity = match identity_file {
             Some(path) => Some(
-                schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(&std::fs::read(
-                    path,
-                )?)?)
+                schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(
+                    &schwab_mcp::read_config(path)?,
+                )?)
                 .await?,
             ),
             None => None,
@@ -256,7 +256,7 @@ async fn live_backend(
     let mut client = SchwabClient::new(config).context("failed to construct SchwabClient")?;
     match std::env::var("SCHWAB_RISK_POLICY_FILE") {
         Ok(path) => {
-            let accounts = serde_json::from_slice(&std::fs::read(path)?)?;
+            let accounts = serde_json::from_slice(&schwab_mcp::read_config(path)?)?;
             schwab_mcp::status::check_risk_freshness(
                 recovery_interval,
                 baseline_max_age,
@@ -321,10 +321,8 @@ async fn paper_backend(config: PathBuf) -> anyhow::Result<Backend> {
     let state = std::env::var_os(PAPER_STATE_ENV)
         .map(PathBuf::from)
         .with_context(|| format!("{PAPER_CONFIG_ENV} requires {PAPER_STATE_ENV}"))?;
-    let config: PaperConfig = serde_json::from_slice(
-        &std::fs::read(&config).with_context(|| format!("failed to read {}", config.display()))?,
-    )
-    .context("invalid paper configuration")?;
+    let config: PaperConfig = serde_json::from_slice(&schwab_mcp::read_config(&config)?)
+        .context("invalid paper configuration")?;
     let broker = Arc::new(
         PaperBroker::open(state, config)
             .await

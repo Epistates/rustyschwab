@@ -14,6 +14,18 @@ pub struct IdentityConfig {
     /// Maximum accepted token lifetime, independently of issuer expiry.
     #[serde(default = "default_lifetime")]
     pub max_lifetime_seconds: u64,
+    /// When set, the token's `typ` header must be this (RFC 9068 access
+    /// tokens are `at+jwt`), so an ID token for the same audience is refused.
+    #[serde(default)]
+    pub token_type: Option<String>,
+    /// When non-empty, the token's `azp` (or `client_id`) must be one of
+    /// these: only the named clients may act for a user, not every OAuth
+    /// client that can get a token for this audience.
+    #[serde(default)]
+    pub authorized_parties: Vec<String>,
+    /// Scopes every token must carry (`scope`, space-separated, or `scp`).
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
 }
 fn default_lifetime() -> u64 {
     900
@@ -25,11 +37,47 @@ pub struct Claims {
     pub iat: u64,
     pub iss: String,
     pub aud: serde_json::Value,
+    #[serde(default)]
+    pub azp: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub scp: Option<Vec<String>>,
 }
+impl Claims {
+    fn scopes(&self) -> impl Iterator<Item = &str> {
+        self.scope
+            .iter()
+            .flat_map(|s| s.split_whitespace())
+            .chain(self.scp.iter().flatten().map(String::as_str))
+    }
+}
+
+/// Keys are refreshed after this long.
+const REFRESH_AFTER: Duration = Duration::from_secs(60);
+/// The last good keys keep verifying this long past a failed refresh, so a
+/// brief JWKS outage does not refuse every request; after it, verification
+/// fails closed.
+const STALE_GRACE: Duration = Duration::from_secs(600);
+/// The least time between fetches, however many unknown key IDs arrive.
+const MIN_FETCH_INTERVAL: Duration = Duration::from_secs(10);
+
+struct KeyCache {
+    set: JwkSet,
+    /// When `set` was fetched.
+    fetched: Instant,
+    /// When a fetch was last tried, successful or not.
+    attempted: Instant,
+}
+
 pub struct JwtVerifier {
     config: IdentityConfig,
     http: reqwest::Client,
-    keys: tokio::sync::Mutex<(Instant, JwkSet)>,
+    keys: parking_lot::RwLock<KeyCache>,
+    /// One fetch at a time; waiters reuse its result.
+    refreshing: tokio::sync::Mutex<()>,
 }
 impl JwtVerifier {
     pub async fn new(config: IdentityConfig) -> anyhow::Result<Arc<Self>> {
@@ -52,18 +100,31 @@ impl JwtVerifier {
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let keys = fetch(&http, &config.jwks_uri).await?;
-        Ok(Arc::new(Self {
+        Ok(Arc::new(Self::with_keys(config, http, keys)))
+    }
+    fn with_keys(config: IdentityConfig, http: reqwest::Client, set: JwkSet) -> Self {
+        let now = Instant::now();
+        Self {
             config,
             http,
-            keys: tokio::sync::Mutex::new((Instant::now(), keys)),
-        }))
+            keys: parking_lot::RwLock::new(KeyCache {
+                set,
+                fetched: now,
+                attempted: now,
+            }),
+            refreshing: tokio::sync::Mutex::new(()),
+        }
     }
     pub fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut metadata = serde_json::json!({
             "resource": self.config.audience,
             "authorization_servers": [self.config.issuer],
             "bearer_methods_supported": ["header"],
-        })
+        });
+        if !self.config.required_scopes.is_empty() {
+            metadata["scopes_supported"] = serde_json::json!(self.config.required_scopes);
+        }
+        metadata
     }
     pub fn challenge(&self) -> String {
         let mut resource =
@@ -73,31 +134,67 @@ impl JwtVerifier {
         resource.set_fragment(None);
         format!("Bearer resource_metadata=\"{resource}\"")
     }
+    /// The key `kid` names, refreshing the set when it is due, or once
+    /// (rate limited) when the key is unknown, as after a rotation. Fetches
+    /// happen outside the cache lock and one at a time.
+    async fn key(&self, kid: &str) -> anyhow::Result<DecodingKey> {
+        let lookup = |cache: &KeyCache| cache.set.find(kid).map(DecodingKey::from_jwk);
+        let due = {
+            let cache = self.keys.read();
+            let may_fetch = cache.attempted.elapsed() >= MIN_FETCH_INTERVAL;
+            may_fetch && (cache.fetched.elapsed() > REFRESH_AFTER || cache.set.find(kid).is_none())
+        };
+        if due {
+            let _single = self.refreshing.lock().await;
+            // Someone else may have just refreshed.
+            let still_due = {
+                let cache = self.keys.read();
+                cache.attempted.elapsed() >= MIN_FETCH_INTERVAL
+            };
+            if still_due {
+                let fetched = fetch(&self.http, &self.config.jwks_uri).await;
+                let mut cache = self.keys.write();
+                cache.attempted = Instant::now();
+                match fetched {
+                    Ok(set) => {
+                        cache.set = set;
+                        cache.fetched = Instant::now();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "JWKS refresh failed; keeping the last good keys")
+                    }
+                }
+            }
+        }
+        let cache = self.keys.read();
+        anyhow::ensure!(
+            cache.fetched.elapsed() <= STALE_GRACE,
+            "Signing key service unavailable"
+        );
+        match lookup(&cache) {
+            Some(key) => Ok(key?),
+            None => anyhow::bail!("Unknown signing key"),
+        }
+    }
     pub async fn verify(&self, token: &str) -> anyhow::Result<Claims> {
         let header = decode_header(token)?;
         anyhow::ensure!(
             header.alg == Algorithm::RS256,
             "Unsupported signing algorithm"
         );
+        if let Some(expected) = &self.config.token_type {
+            anyhow::ensure!(
+                header
+                    .typ
+                    .as_deref()
+                    .is_some_and(|typ| typ.eq_ignore_ascii_case(expected)),
+                "Token type is not an access token for this resource"
+            );
+        }
         let kid = header
             .kid
             .ok_or_else(|| anyhow::anyhow!("Token key ID is required"))?;
-        let mut keys = self.keys.lock().await;
-        // Bound key fetches even under unknown-kid traffic. Reject stale cache if
-        // refresh fails; do not retain revoked keys indefinitely.
-        if keys.0.elapsed() > Duration::from_secs(60) {
-            let fetched = fetch(&self.http, &self.config.jwks_uri).await;
-            *keys = (
-                Instant::now(),
-                fetched.unwrap_or(JwkSet { keys: Vec::new() }),
-            );
-            anyhow::ensure!(!keys.1.keys.is_empty(), "Signing key service unavailable");
-        }
-        let key = keys
-            .1
-            .find(&kid)
-            .ok_or_else(|| anyhow::anyhow!("Unknown signing key"))?;
-        let key = DecodingKey::from_jwk(key)?;
+        let key = self.key(&kid).await?;
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_audience(&[&self.config.audience]);
         validation.set_issuer(&[&self.config.issuer]);
@@ -113,6 +210,20 @@ impl JwtVerifier {
                 && claims.exp > claims.iat
                 && claims.exp - claims.iat <= self.config.max_lifetime_seconds,
             "Invalid token lifetime"
+        );
+        if !self.config.authorized_parties.is_empty() {
+            let party = claims.azp.as_deref().or(claims.client_id.as_deref());
+            anyhow::ensure!(
+                party.is_some_and(|p| self.config.authorized_parties.iter().any(|a| a == p)),
+                "Token was issued to a client this resource does not accept"
+            );
+        }
+        anyhow::ensure!(
+            self.config
+                .required_scopes
+                .iter()
+                .all(|required| claims.scopes().any(|s| s == required)),
+            "Token lacks a required scope"
         );
         Ok(claims)
     }
@@ -138,21 +249,29 @@ async fn fetch(http: &reqwest::Client, url: &str) -> anyhow::Result<JwkSet> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn verifier() -> JwtVerifier {
-        JwtVerifier {
-            config: IdentityConfig {
-                issuer: "https://issuer.example".into(),
-                audience: "https://mcp.example".into(),
-                jwks_uri: "https://issuer.example/keys".into(),
-                max_lifetime_seconds: 900,
-            },
-            http: reqwest::Client::new(),
-            keys: tokio::sync::Mutex::new((
-                Instant::now(),
-                serde_json::from_str(include_str!("../tests/fixtures/test-only-jwks.json"))
-                    .unwrap(),
-            )),
+    fn config() -> IdentityConfig {
+        IdentityConfig {
+            issuer: "https://issuer.example".into(),
+            audience: "https://mcp.example".into(),
+            jwks_uri: "https://issuer.example/keys".into(),
+            max_lifetime_seconds: 900,
+            token_type: None,
+            authorized_parties: Vec::new(),
+            required_scopes: Vec::new(),
         }
+    }
+    fn verifier_with(config: IdentityConfig) -> JwtVerifier {
+        let verifier = JwtVerifier::with_keys(
+            config,
+            reqwest::Client::new(),
+            serde_json::from_str(include_str!("../tests/fixtures/test-only-jwks.json")).unwrap(),
+        );
+        // No fetch is due within a test.
+        verifier.keys.write().attempted = Instant::now();
+        verifier
+    }
+    fn verifier() -> JwtVerifier {
+        verifier_with(config())
     }
     fn token(claims: &serde_json::Value, kid: &str) -> String {
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
@@ -195,5 +314,48 @@ mod tests {
         )
         .unwrap();
         assert!(verifier.verify(&wrong_algorithm).await.is_err());
+    }
+
+    /// A deployment can require access tokens (not ID tokens), from named
+    /// clients, with named scopes.
+    #[tokio::test]
+    async fn identity_binds_token_type_client_and_scope() {
+        let verifier = verifier_with(IdentityConfig {
+            token_type: Some("at+jwt".into()),
+            authorized_parties: vec!["desk-app".into()],
+            required_scopes: vec!["trade".into()],
+            ..config()
+        });
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({"sub":"desk","iss":"https://issuer.example",
+            "aud":"https://mcp.example","iat":now,"exp":now+600,
+            "azp":"desk-app","scope":"read trade"});
+        let typed = |claims: &serde_json::Value, typ: &str| {
+            let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
+            header.kid = Some("test".into());
+            header.typ = Some(typ.into());
+            jsonwebtoken::encode(
+                &header,
+                claims,
+                &jsonwebtoken::EncodingKey::from_rsa_pem(include_bytes!(
+                    "../tests/fixtures/test-only-signing-key.pem"
+                ))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        verifier.verify(&typed(&claims, "at+jwt")).await.unwrap();
+        assert!(verifier.verify(&typed(&claims, "JWT")).await.is_err());
+        let mut other_client = claims.clone();
+        other_client["azp"] = "someone-else".into();
+        assert!(
+            verifier
+                .verify(&typed(&other_client, "at+jwt"))
+                .await
+                .is_err()
+        );
+        let mut no_scope = claims.clone();
+        no_scope["scope"] = "read".into();
+        assert!(verifier.verify(&typed(&no_scope, "at+jwt")).await.is_err());
     }
 }

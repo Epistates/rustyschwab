@@ -46,6 +46,11 @@ pub struct PrincipalPolicy {
     pub require_approval: bool,
     #[serde(default)]
     pub approved_intents: HashSet<String>,
+    /// Tool calls this principal may make per minute (bursting to a tenth
+    /// of it); absent, unlimited. Every principal shares one Schwab request
+    /// budget, so this keeps one from crowding out the others.
+    #[serde(default)]
+    pub max_calls_per_minute: Option<std::num::NonZeroU32>,
 }
 impl PrincipalPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -165,6 +170,16 @@ impl PrincipalPolicy {
         }
         review
     }
+}
+
+/// The first top-level argument `tool`'s input schema does not declare.
+fn undeclared_argument(tool: &turbomcp::Tool, args: &Value) -> Option<String> {
+    let schema = serde_json::to_value(&tool.input_schema).ok()?;
+    let declared = schema.get("properties")?.as_object()?;
+    args.as_object()?
+        .keys()
+        .find(|key| !declared.contains_key(*key))
+        .cloned()
 }
 
 /// Outcome of [`PrincipalPolicy::review`].
@@ -412,11 +427,14 @@ pub fn tag_intent(mut args: Value, digest: &str) -> Value {
     args
 }
 
+type CallLimiter = governor::DefaultDirectRateLimiter;
+
 #[derive(Clone)]
 pub struct AuthorizedServer {
     pub inner: SchwabMcp,
     pub principal: Arc<PrincipalPolicy>,
     pub audit: OrderJournal,
+    calls: Option<Arc<CallLimiter>>,
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
@@ -437,10 +455,18 @@ impl AuthorizedServer {
                 .trading()
                 .principal_journal_path(&digest(policy.name.as_bytes())),
         );
+        let calls = policy.max_calls_per_minute.map(|per_minute| {
+            let burst = std::num::NonZeroU32::new(per_minute.get().div_ceil(10))
+                .unwrap_or(std::num::NonZeroU32::MIN);
+            Arc::new(governor::RateLimiter::direct(
+                governor::Quota::per_minute(per_minute).allow_burst(burst),
+            ))
+        });
         Self {
             inner: SchwabMcp::with_stream_hub(backend, switches, hub),
             principal: Arc::new(policy),
             audit,
+            calls,
         }
     }
 }
@@ -486,6 +512,37 @@ impl McpHandler for AuthorizedServer {
         args: Value,
         ctx: &'a RequestContext,
     ) -> McpResult<ToolResult> {
+        // A tool that does not exist is a protocol error, as on the
+        // unauthorized transport and per the MCP spec; one that exists but
+        // is not granted is a `not_permitted` result the model can read.
+        let Some(tool) = self
+            .inner
+            .list_tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+        else {
+            return Err(McpError::tool_not_found(name));
+        };
+        if let Some(calls) = &self.calls
+            && calls.check().is_err()
+        {
+            return Ok(ToolFailure::new(
+                FailureCode::RateLimited,
+                "This principal's tool-call rate limit is reached; call again shortly",
+            )
+            .into_result());
+        }
+        // A write's arguments are digested and journaled as sent: one its
+        // schema does not declare would change the digest (and defeat the
+        // duplicate check) while the tool ignores it.
+        if matches!(name, "place_order" | "replace_order" | "cancel_order")
+            && let Some(unknown) = undeclared_argument(&tool, &args)
+        {
+            return Ok(ToolFailure::invalid_arguments(format!(
+                "{name} takes no argument `{unknown}`"
+            ))
+            .into_result());
+        }
         match self.dispatch(name, args, ctx).await {
             Ok(result) => result,
             Err(failure) => Ok(failure.into_result()),
@@ -1282,7 +1339,35 @@ mod tests {
                 .await,
         );
         assert_eq!(malformed["code"], "invalid_arguments");
+        // A write's undeclared argument would change its digest unseen.
+        let mut padded = args.clone();
+        padded["nonce"] = "x".into();
+        let padded = error(server.call_tool("place_order", padded, &ctx).await);
+        assert_eq!(padded["code"], "invalid_arguments");
+        // A tool that does not exist at all is a protocol error.
+        assert!(
+            server
+                .call_tool("no_such_tool", serde_json::json!({}), &ctx)
+                .await
+                .is_err()
+        );
     }
+    /// A principal with a call limit is told to slow down, not refused.
+    #[tokio::test]
+    async fn a_principal_call_limit_answers_rate_limited() {
+        let mut limited = policy();
+        limited.max_calls_per_minute = std::num::NonZeroU32::new(1);
+        let server = authorized_as(Switches::default(), limited);
+        let ctx = RequestContext::stdio();
+        let args = serde_json::json!({"symbol": "AAPL"});
+        let _ = server.call_tool("get_quote", args.clone(), &ctx).await;
+        let second = server.call_tool("get_quote", args, &ctx).await.unwrap();
+        assert_eq!(
+            second.structured_content.unwrap()["error"]["code"],
+            "rate_limited"
+        );
+    }
+
     /// An approved submission that fails before reaching the broker (here,
     /// for want of a Schwab session) keeps its approval for the retry.
     #[tokio::test]

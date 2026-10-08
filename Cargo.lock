@@ -3418,6 +3418,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures-util",
+ "governor",
  "jsonwebtoken",
  "metrics",
  "metrics-exporter-prometheus",

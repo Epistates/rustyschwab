@@ -162,11 +162,7 @@ impl Authority {
 /// Read and check the grants file: bounded, one grant per subject, and a
 /// validated trading policy on every trader and on no one else.
 fn load_grants(path: &std::path::Path) -> anyhow::Result<Vec<Grant>> {
-    let file = std::fs::File::open(path)?;
-    use std::io::Read;
-    let mut bytes = Vec::new();
-    file.take(1048577).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= 1048576, "Policy exceeds limit");
+    let bytes = crate::read_config(path)?;
     let grants: Vec<Grant> = serde_json::from_slice(&bytes)?;
     let mut subjects = std::collections::HashSet::new();
     let mut names = std::collections::HashSet::new();

@@ -14,8 +14,13 @@ const SELECT_APPROVAL_LIVE: &str = "SELECT EXISTS(SELECT 1 FROM approvals \
      WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0)";
 const CONSUME_APPROVAL: &str = "UPDATE approvals SET consumed=1 \
      WHERE digest=?1 AND principal=?2 AND expires_at>?3 AND consumed=0";
-const INSERT_APPROVAL: &str =
-    "INSERT INTO approvals(digest,principal,expires_at,operator) VALUES(?1,?2,?3,?4)";
+/// A digest is approved once at a time: a new grant may replace only one
+/// that lapsed unused. A live, spent or revoked approval stays as it is.
+const INSERT_APPROVAL: &str = "INSERT INTO approvals(digest,principal,expires_at,operator) \
+     VALUES(?1,?2,?3,?4) ON CONFLICT(digest) DO UPDATE SET principal=excluded.principal,\
+     expires_at=excluded.expires_at,operator=excluded.operator \
+     WHERE approvals.consumed=0 AND approvals.expires_at<=?5 \
+       AND NOT EXISTS(SELECT 1 FROM consumed_approvals WHERE key=approvals.digest)";
 const INSERT_CONSUMED_APPROVAL: &str = "INSERT INTO consumed_approvals VALUES(?1)";
 const INSERT_CONSUMED_APPROVAL_IF_NEW: &str = "INSERT OR IGNORE INTO consumed_approvals VALUES(?1)";
 const INSERT_USED_ORDER_TAG: &str = "INSERT OR IGNORE INTO used_order_tags VALUES(?1,?2)";
@@ -604,11 +609,21 @@ impl OrderJournal {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
-                tx.execute(
-                    INSERT_APPROVAL,
-                    rusqlite::params![digest, principal, expires_at, operator],
-                )
-                .map_err(sql)?;
+                let now = chrono::Utc::now().timestamp();
+                if tx
+                    .execute(
+                        INSERT_APPROVAL,
+                        rusqlite::params![digest, principal, expires_at, operator, now],
+                    )
+                    .map_err(sql)?
+                    != 1
+                {
+                    return Err(Error::Duplicate(
+                        "This intent is already approved, was spent on an order, or was \
+                         revoked; only a lapsed approval can be granted again"
+                            .into(),
+                    ));
+                }
                 audit(
                     &tx,
                     "approval_granted",

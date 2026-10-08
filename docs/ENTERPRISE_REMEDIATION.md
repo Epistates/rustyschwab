@@ -53,10 +53,15 @@ Example policy (replace the digest with the SHA-256 of a random bearer secret of
     "max_quantity": "10",
     "max_notional": "1000",
     "require_approval": true,
-    "approved_intents": []
+    "approved_intents": [],
+    "max_calls_per_minute": 120
   }
 ]
 ```
+
+`max_calls_per_minute` (optional) caps this principal's tool calls, bursting to a tenth of the cap; a call over it is `rate_limited`. Every principal shares one Schwab request budget, of which reads may use 75% and reconciliation 90%, so writes and baselines always keep headroom; the per-principal cap keeps one principal from crowding out the others' reads. A write tool's arguments must be ones its schema declares (an extra key would change the intent digest unseen), and a tool that does not exist is a JSON-RPC error, while one the principal is not granted is a `not_permitted` result.
+
+Policy, grants, identity, risk and paper configuration files are read through a trusted-file check: on Unix the file (followed through symlinks, so ConfigMap mounts work) and its directory must be owned by the server's account or root and writable by no one else. Reloads read the policy off the async workers with the same check.
 
 Send `Authorization: Bearer <secret>` on every HTTP request or WebSocket handshake. HTTP session stores are principal-specific; a session ID cannot cross identities. WebSocket connections allow at most 32 concurrent calls, 1 MiB frames/messages and 128 connections per process; calls have a 120-second timeout. Native WebSocket clients are supported; browser Origin headers are rejected. Bind to loopback behind a TLS proxy for remote use, with gateway connection/rate limits. Non-loopback binding requires `SCHWAB_MCP_ALLOW_REMOTE=1` as well as bearer policy. The HTTP transport retains its Origin validation.
 

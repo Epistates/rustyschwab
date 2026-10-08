@@ -30,6 +30,7 @@ jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
 reqwest = { workspace = true, features = ["rustls"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 turbomcp = { workspace = true, features = ["stdio", "http", "websocket"] }
+governor = { workspace = true }
 schwab-rs = { path = "../schwab-rs", version = "0.2.0", features = ["schemars"] }
 schwab-types = { path = "../schwab-types", version = "0.2.0", features = ["schemars"] }
 

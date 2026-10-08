@@ -32,15 +32,15 @@ async fn main() -> anyhow::Result<()> {
         args.bind.ip().is_loopback(),
         "Authority binds loopback; terminate external HTTPS in a same-host/pod proxy"
     );
-    let identity = schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(&std::fs::read(
-        &args.identity,
-    )?)?)
+    let identity = schwab_mcp::identity::JwtVerifier::new(serde_json::from_slice(
+        &schwab_mcp::read_config(&args.identity)?,
+    )?)
     .await?;
     let client: Arc<dyn TradingBackend>;
     let authority;
     let _recovery;
     if let Some(path) = args.paper {
-        let paper_config: PaperConfig = serde_json::from_slice(&std::fs::read(path)?)?;
+        let paper_config: PaperConfig = serde_json::from_slice(&schwab_mcp::read_config(path)?)?;
         let paper = Arc::new(
             PaperBroker::open(
                 args.paper_state
@@ -61,10 +61,11 @@ async fn main() -> anyhow::Result<()> {
         let (interval, baseline_max_age) =
             schwab_mcp::status::freshness_from_env().map_err(anyhow::Error::msg)?;
         let live = SchwabClient::new(config)?;
-        let limits: HashMap<String, PortfolioLimits> = serde_json::from_slice(&std::fs::read(
-            args.risk
-                .ok_or_else(|| anyhow::anyhow!("Risk configuration required"))?,
-        )?)?;
+        let limits: HashMap<String, PortfolioLimits> =
+            serde_json::from_slice(&schwab_mcp::read_config(
+                args.risk
+                    .ok_or_else(|| anyhow::anyhow!("Risk configuration required"))?,
+            )?)?;
         anyhow::ensure!(
             !limits.is_empty(),
             "Required recovery accounts/risk limits must be configured"

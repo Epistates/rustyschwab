@@ -72,6 +72,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Security — MCP server hardening (second diligence pass)
+
+- **Authorization files are checked before they are trusted.** Policy,
+  grants, identity, risk and paper configuration files are read through
+  `security::read_trusted_file` (`schwab_mcp::read_config`): on Unix the
+  file, followed through symlinks so ConfigMap mounts work, and its
+  directory must be owned by this account or root and writable by no one
+  else. Another local user who could edit the policy could otherwise grant
+  themselves trading within two seconds of the next reload. Reloads read
+  off the async workers.
+- **JWT key handling survives rotations and outages.** The JWKS refreshes
+  each minute and, rate limited, when a token names an unknown key; a
+  failed refresh keeps the last good keys for ten minutes instead of
+  refusing every request for a minute; fetches run one at a time outside
+  the cache lock. Identity configuration can require the access-token
+  `typ` (`at+jwt`), named `azp`/`client_id` values and scopes (advertised
+  as `scopes_supported`).
+- **Reads cannot starve writes.** The shared Schwab request budget gives
+  reads 75% of each minute and reconciliation 90%, so submissions, cancels
+  and baseline refreshes always have headroom; a principal can also be
+  capped (`max_calls_per_minute`).
+- **A lapsed approval can be granted again.** Approving a digest a second
+  time failed with a raw SQLite error forever; a lapsed, unused approval
+  can now be renewed, while a live, spent or revoked one cannot
+  (`Error::Duplicate`).
+- **Write tools refuse undeclared arguments**, which changed the intent
+  digest (and defeated the duplicate check) while the tool ignored them. A
+  tool that does not exist is now a JSON-RPC error, as on stdio; one not
+  granted stays a `not_permitted` result.
+- **Account numbers in free text are masked**: `description` and `memo`
+  fields (a transfer can name the other account) mask 8- and 9-digit runs.
+- The trade journal's `rationale` is described to the model as a record of
+  intent, never instructions.
+
 ### Fixed — risk and the paper venue (second diligence pass)
 
 - **Deposits and withdrawals are not profit and loss.** The daily-loss

@@ -19,6 +19,19 @@ pub mod projection;
 pub mod query;
 pub mod redact;
 pub mod server;
+
+/// The largest authorization file (policy, grants, identity, risk or paper
+/// configuration) the server reads.
+pub const CONFIG_FILE_LIMIT: u64 = 1024 * 1024;
+
+/// Read an authorization file through [`schwab_rs::security::read_trusted_file`]:
+/// on Unix it must be owned by this account or root and writable by no one
+/// else, since whoever can edit it decides who may trade.
+pub fn read_config(path: impl AsRef<std::path::Path>) -> anyhow::Result<Vec<u8>> {
+    let path = path.as_ref();
+    schwab_rs::security::read_trusted_file(path, CONFIG_FILE_LIMIT)
+        .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+}
 pub mod status;
 pub mod stream_cache;
 
