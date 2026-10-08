@@ -412,6 +412,21 @@ pub enum OperatorRequest {
         evidence: String,
     },
     Status,
+    /// Intents `principal` asked for in the last `hours` that await
+    /// approval, each described as the order it binds.
+    Pending {
+        principal: String,
+        #[serde(default = "default_pending_hours")]
+        hours: i64,
+    },
+    /// Halt submissions, then cancel every working order on the accounts
+    /// this authority serves.
+    Kill {
+        reason: String,
+    },
+}
+fn default_pending_hours() -> i64 {
+    24
 }
 async fn operator(
     State(state): State<Arc<Authority>>,
@@ -475,6 +490,50 @@ async fn operator(
                             "operator_halt": halted,
                             "pending_submissions": pending,
                         }));
+                    }
+                    OperatorRequest::Pending { principal, hours } => {
+                        let since = chrono::Utc::now().timestamp_millis()
+                            - hours.clamp(1, 24 * 30) * 3_600_000;
+                        let intents: Vec<_> = journal(&principal)?
+                            .intents(None, since, 500)
+                            .await?
+                            .into_iter()
+                            .filter(|i| i.state == schwab_rs::execution::IntentState::Awaiting)
+                            .map(|i| {
+                                json!({
+                                    "digest": i.digest,
+                                    "tool": i.tool,
+                                    "order": crate::approvals::describe(&i.tool, &i.arguments),
+                                    "rationale": i.arguments.get("rationale"),
+                                    "lastSeen": i.last_seen,
+                                    "seen": i.seen,
+                                })
+                            })
+                            .collect();
+                        return Ok(json!({ "intents": intents }));
+                    }
+                    OperatorRequest::Kill { reason } => {
+                        state
+                            .client
+                            .halt_submissions(&reason, &identity.subject)
+                            .await?;
+                        let mut report = Vec::new();
+                        for account in &state.required_accounts {
+                            let orders = match state.client.cancel_working_orders(account).await {
+                                Ok(outcomes) => outcomes
+                                    .into_iter()
+                                    .map(|(id, outcome)| {
+                                        json!({"orderId": id, "cancelled": outcome.is_ok()})
+                                    })
+                                    .collect::<Vec<_>>(),
+                                Err(error) => {
+                                    tracing::warn!(%error, "kill switch could not list orders");
+                                    vec![json!({"error": "could not list working orders"})]
+                                }
+                            };
+                            report.push(json!({"orders": orders}));
+                        }
+                        return Ok(json!({"halted": true, "accounts": report}));
                     }
                 }
                 Ok(json!({"ok":true}))
@@ -638,9 +697,20 @@ async fn order(
                     principal.approved_intents.insert(digest.clone());
                 }
             }
-            principal
-                .authorize(tool, &args)
-                .map_err(|_| StatusCode::FORBIDDEN)?;
+            if let Err(failure) = principal.authorize(tool, &args) {
+                // Recorded for review, as on the MCP path: the operator
+                // approves an order, not a digest.
+                if failure.code == crate::contract::FailureCode::ApprovalRequired {
+                    let dispatched = crate::policy::tag_intent(args.clone(), &digest);
+                    if let Err(e) = audit
+                        .record_intent(&principal.name, &digest, tool, &dispatched)
+                        .await
+                    {
+                        tracing::warn!(error = %e, "could not record an intent awaiting approval");
+                    }
+                }
+                return Err(StatusCode::FORBIDDEN.into());
+            }
             // As on the MCP path: an untagged order is tagged with its intent
             // digest, so resubmitting the identical order under a fresh
             // request_id is a duplicate at the SDK's tag check, not a second

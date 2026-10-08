@@ -587,3 +587,54 @@ async fn only_a_lapsed_approval_can_be_granted_again() {
         Err(schwab_rs::Error::Duplicate(_))
     ));
 }
+
+/// An intent awaiting approval is recorded with its arguments, and its
+/// state follows the approval through grant, use and lapse.
+#[tokio::test]
+async fn intents_awaiting_approval_are_recorded_with_their_state() {
+    use schwab_rs::execution::IntentState;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "b".repeat(64);
+    let args = json!({"account_hash": "A", "order": {"tag": "mcp-x"}});
+    for _ in 0..2 {
+        journal
+            .record_intent("desk", &digest, "place_order", &args)
+            .await
+            .unwrap();
+    }
+    let state = |journal: &OrderJournal| {
+        let journal = journal.clone();
+        let digest = digest.clone();
+        async move {
+            journal
+                .intents(Some(&digest), 0, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+        }
+    };
+    let intent = state(&journal).await;
+    assert_eq!(intent.seen, 2);
+    assert_eq!(intent.state, IntentState::Awaiting);
+    assert_eq!(intent.arguments, args);
+    journal
+        .approve(
+            "desk",
+            &digest,
+            "operator",
+            chrono::Utc::now().timestamp() + 600,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        state(&journal).await.state,
+        IntentState::Approved { ref operator, .. } if operator == "operator"
+    ));
+    journal
+        .begin_once("desk", "place_order", args.clone(), Some(digest.clone()))
+        .await
+        .unwrap();
+    assert_eq!(state(&journal).await.state, IntentState::Spent);
+}

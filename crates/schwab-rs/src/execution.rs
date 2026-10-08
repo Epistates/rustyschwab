@@ -569,6 +569,50 @@ impl OrderJournal {
             .await
     }
 }
+/// An intent a principal asked for that needed an operator's approval, as
+/// the operator reviews it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct IntentRecord {
+    pub digest: String,
+    pub principal: String,
+    /// The tool (`place_order` or `replace_order`).
+    pub tool: String,
+    /// The arguments as last sent, rationale included.
+    pub arguments: serde_json::Value,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    /// How many times it was asked for.
+    pub seen: i64,
+    pub state: IntentState,
+}
+
+/// Where an intent stands with the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum IntentState {
+    /// Not approved yet.
+    Awaiting,
+    /// Approved, usable until `expires_at` (Unix seconds).
+    Approved { operator: String, expires_at: i64 },
+    /// Its approval was used on an order.
+    Spent,
+    /// Its approval was revoked.
+    Revoked,
+    /// Its approval lapsed unused; it can be approved again.
+    Lapsed,
+}
+
+const UPSERT_INTENT: &str = "INSERT INTO intents(digest,principal,tool,arguments,first_seen,last_seen) \
+     VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(digest) DO UPDATE SET \
+     arguments=excluded.arguments,last_seen=excluded.last_seen,seen=intents.seen+1";
+const SELECT_INTENTS: &str = "SELECT i.digest,i.principal,i.tool,i.arguments,i.first_seen,\
+     i.last_seen,i.seen,a.operator,a.expires_at,a.consumed,\
+     EXISTS(SELECT 1 FROM audit WHERE kind='approval_revoked' AND subject=i.digest) \
+     FROM intents i LEFT JOIN approvals a ON a.digest=i.digest \
+     WHERE (?1 IS NULL OR i.digest=?1) AND i.last_seen>=?2 ORDER BY i.last_seen DESC LIMIT ?3";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     pub sequence: i64,
@@ -636,6 +680,110 @@ impl OrderJournal {
                 )?;
                 tx.commit().map_err(sql)?;
                 Ok(())
+            })
+            .await
+    }
+    /// Note that `principal` asked for intent `digest` (`tool` with
+    /// `arguments`) and it needs an operator's approval, so the operator
+    /// can review what it is: see [`intents`](Self::intents).
+    pub async fn record_intent(
+        &self,
+        principal: &str,
+        digest: &str,
+        tool: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<()> {
+        let values = (
+            digest.to_owned(),
+            principal.to_owned(),
+            tool.to_owned(),
+            serde_json::to_string(arguments)?,
+        );
+        self.database
+            .run(move |c| {
+                c.execute(
+                    UPSERT_INTENT,
+                    rusqlite::params![
+                        values.0,
+                        values.1,
+                        values.2,
+                        values.3,
+                        chrono::Utc::now().timestamp_millis()
+                    ],
+                )
+                .map_err(sql)?;
+                Ok(())
+            })
+            .await
+    }
+    /// Intents asked for since `since` (ms since the epoch), newest first,
+    /// at most `limit`, each with where it stands; only `digest` if given.
+    pub async fn intents(
+        &self,
+        digest: Option<&str>,
+        since: i64,
+        limit: u32,
+    ) -> Result<Vec<IntentRecord>> {
+        let digest = digest.map(str::to_owned);
+        self.database
+            .run(move |c| {
+                let now = chrono::Utc::now().timestamp();
+                let mut stmt = c.prepare(SELECT_INTENTS).map_err(sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![digest, since, limit], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, i64>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<i64>>(8)?,
+                            r.get::<_, Option<bool>>(9)?,
+                            r.get::<_, bool>(10)?,
+                        ))
+                    })
+                    .map_err(sql)?;
+                rows.map(|row| {
+                    let (
+                        digest,
+                        principal,
+                        tool,
+                        arguments,
+                        first_seen,
+                        last_seen,
+                        seen,
+                        operator,
+                        expires_at,
+                        consumed,
+                        revoked,
+                    ) = row.map_err(sql)?;
+                    let state = match (operator, expires_at, consumed) {
+                        _ if revoked => IntentState::Revoked,
+                        (Some(_), Some(_), Some(true)) => IntentState::Spent,
+                        (Some(operator), Some(expires_at), _) if expires_at > now => {
+                            IntentState::Approved {
+                                operator,
+                                expires_at,
+                            }
+                        }
+                        (Some(_), Some(_), _) => IntentState::Lapsed,
+                        _ => IntentState::Awaiting,
+                    };
+                    Ok(IntentRecord {
+                        digest,
+                        principal,
+                        tool,
+                        arguments: serde_json::from_str(&arguments)?,
+                        first_seen,
+                        last_seen,
+                        seen,
+                        state,
+                    })
+                })
+                .collect()
             })
             .await
     }
@@ -717,6 +865,61 @@ impl OrderJournal {
                     "approval_refunded",
                     &id,
                     &serde_json::json!({"digest": digest, "revoked": revoked}),
+                )?;
+                tx.commit().map_err(sql)
+            })
+            .await
+    }
+    /// Release the risk reserved for resolved submission `id`, on an
+    /// operator's evidence (its broker order is gone from view, say).
+    /// Refused while the submission is unresolved: its order may be live.
+    /// Audited as `risk_released_by_operator`.
+    pub async fn release_reservation(
+        &self,
+        id: &str,
+        operator: &str,
+        evidence: &str,
+    ) -> Result<()> {
+        if operator.trim().is_empty() || evidence.trim().is_empty() {
+            return Err(Error::InvalidParameter(
+                "Operator and evidence are required".into(),
+            ));
+        }
+        let (id, operator, evidence) = (id.to_owned(), operator.to_owned(), evidence.to_owned());
+        self.database
+            .run(move |c| {
+                use rusqlite::OptionalExtension;
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let resolved: Option<bool> = tx
+                    .query_row(
+                        "SELECT outcome IS NOT NULL FROM submissions WHERE id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(sql)?;
+                match resolved {
+                    None => return Err(Error::InvalidParameter("Submission is unknown".into())),
+                    Some(false) => {
+                        return Err(Error::InvalidParameter(
+                            "Submission is unresolved; its order may be live. Reconcile it first"
+                                .into(),
+                        ));
+                    }
+                    Some(true) => {}
+                }
+                if tx.execute(RELEASE_RESERVATION, [&id]).map_err(sql)? != 1 {
+                    return Err(Error::InvalidParameter(
+                        "Submission holds no reservation".into(),
+                    ));
+                }
+                audit(
+                    &tx,
+                    "risk_released_by_operator",
+                    &id,
+                    &serde_json::json!({"operator": operator, "evidence": evidence}),
                 )?;
                 tx.commit().map_err(sql)
             })

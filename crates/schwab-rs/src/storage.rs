@@ -94,6 +94,14 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS orders_tag ON orders(account,json_extract(payload,'$.tag'));
             INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(payload,'$.tag') FROM orders WHERE json_type(payload,'$.tag')='text';",
     },
+    // Intents a principal asked for that need an operator's approval, so
+    // the operator approves an order they can read, not a bare digest.
+    Migration {
+        version: 4,
+        name: "pending_intents",
+        sql: "CREATE TABLE IF NOT EXISTS intents(digest TEXT PRIMARY KEY, principal TEXT NOT NULL, tool TEXT NOT NULL, arguments TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 1);
+            CREATE INDEX IF NOT EXISTS intents_recent ON intents(principal,last_seen);",
+    },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 

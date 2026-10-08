@@ -64,10 +64,16 @@ For approval, use the principal's audit database, not the SDK order database. It
 
 
 ```text
-schwab-admin --state <principal-audit> digest place_order arguments.json
+schwab-admin --state <principal-audit> pending
+schwab-admin --state <principal-audit> show <digest>
 schwab-admin --state <principal-audit> approve desk <digest> --operator supervisor --expires-at <unix-seconds>
 schwab-admin --state <principal-audit> revoke <digest> --operator supervisor
+schwab-admin --state <principal-audit> digest place_order arguments.json
 ```
+
+Approve what you can read. Every intent that needs approval is recorded when it is asked for (`place_order`, `replace_order` or `check_order`, on MCP or the authority gateway), with its arguments. `pending` lists those awaiting approval as orders (`PLACE on account …1234: BUY 10 AAPL LIMIT @ 150.25 DAY NORMAL (tag mcp-…)`), with the model's rationale shown apart as its words; `show` prints one. `approve` prints the order its digest binds and asks for confirmation (or `--yes`); it refuses an intent asked for by a different principal, and one the journal has never seen needs `--yes` after checking it with `digest`. A model that shows the user one order while asking for another's digest therefore cannot get the wrong order approved unseen. The authority's operator API offers the same as `{"action":"pending","principal":"desk"}`. A lapsed, unused approval can be granted again; a live, spent or revoked one cannot.
+
+The kill switch halts submissions and then cancels every working order: `schwab-admin --state <sdk-state> kill --reason ... --operator ... [--account HASH ...]` (broker credentials configured as for `reconcile`; all linked accounts when none are named), or `{"action":"kill","reason":"..."}` on the authority's operator API for the accounts it serves. It reports each order's outcome; clear the halt with `resume` once the book is safe. `release-reservation <attempt> --operator ... --evidence ...` frees the risk reserved for a resolved submission whose order is gone, audited as `risk_released_by_operator`.
 
 Approvals last at most one hour, bind a principal and exact tool arguments, require a distinct operator identity string, and are consumed transactionally with dispatch intent. An approval is spent once an order reaches Schwab, whatever Schwab answers; a submission refused before anything was sent (halted, suspended, over a risk limit, rate-limited, unavailable, timed out before sending) gives it back, audited as `approval_refunded`, so the same intent can go once the refusal clears. A switch, halt or suspension known before dispatch never consumes it at all. A desk may be holding a submission open while you approve: `place_order` and `replace_order` accept `wait_ms` (at most 45 seconds), which polls this store and submits the moment the digest is granted, so approving promptly completes a trade rather than only unblocking the next retry. Waiting grants nothing — the approval is still yours — and a hold that ends unapproved dispatches nothing. The local CLI trusts filesystem access and the supplied operator attribution; deployments requiring verified two-person approval must wrap it with enterprise identity and audit controls. Durable revocation tombstones also override approval digests supplied in legacy static policy.
 

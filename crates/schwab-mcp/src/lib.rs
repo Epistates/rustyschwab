@@ -1,6 +1,7 @@
 //! Library surface for `schwab-mcp` — consumed by the binary (`main.rs`)
 //! and integration tests.
 
+pub mod approvals;
 pub mod authority;
 pub mod backend;
 pub mod contract;
@@ -19,6 +20,10 @@ pub mod projection;
 pub mod query;
 pub mod redact;
 pub mod server;
+pub mod status;
+pub mod stream_cache;
+
+pub use server::SchwabMcp;
 
 /// The largest authorization file (policy, grants, identity, risk or paper
 /// configuration) the server reads.
@@ -32,7 +37,3 @@ pub fn read_config(path: impl AsRef<std::path::Path>) -> anyhow::Result<Vec<u8>>
     schwab_rs::security::read_trusted_file(path, CONFIG_FILE_LIMIT)
         .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
 }
-pub mod status;
-pub mod stream_cache;
-
-pub use server::SchwabMcp;

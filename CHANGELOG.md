@@ -72,6 +72,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passes and counts failures (`schwab_recovery_failures_total`).
 - State schema 3 adds the armed marker, reservation scope and indexes.
 
+### Added — operator tooling
+
+- **Approve what you can read.** Every intent that needs approval is
+  recorded with its arguments when it is asked for (`place_order`,
+  `replace_order`, `check_order`, the authority gateway), in a new
+  `intents` table (state schema 4; `OrderJournal::record_intent`,
+  `intents`, `IntentRecord`, `IntentState`). `schwab-admin pending` and
+  `show` list them as orders (`schwab_mcp::approvals::describe`), with the
+  model's rationale apart; `approve` prints the order and asks for
+  confirmation (or `--yes`), refuses an intent another principal asked
+  for, and needs `--yes` for one it has never seen. The authority's
+  operator API adds `pending`. Before, an operator approved a bare digest,
+  so a model could show the user one order and get another approved.
+- **Kill switch.** `schwab-admin kill` and the authority's `kill` action
+  halt submissions and then cancel every working order, reporting each
+  (`TradingBackend::working_orders`, `cancel_working_orders`).
+- **`release-reservation`** frees the risk held for a resolved submission
+  whose order is gone, on an operator's evidence
+  (`OrderJournal::release_reservation`, audited
+  `risk_released_by_operator`).
+
 ### Security — MCP server hardening (second diligence pass)
 
 - **Authorization files are checked before they are trusted.** Policy,

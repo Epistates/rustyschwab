@@ -36,6 +36,20 @@ pub trait TradingBackend: Send + Sync {
         lease: &Lease,
     ) -> Result<OrderSubmitResponse>;
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()>;
+    /// IDs of the orders on `account` that are still working (not filled,
+    /// cancelled, rejected, expired or replaced), parents and children.
+    async fn working_orders(&self, account: &str) -> Result<Vec<String>>;
+    /// The kill switch's second half: cancel every working order on
+    /// `account`, one by one, and say how each went. Halting first (so
+    /// nothing new is placed meanwhile) is the caller's part.
+    async fn cancel_working_orders(&self, account: &str) -> Result<Vec<(String, Result<()>)>> {
+        let mut outcomes = Vec::new();
+        for id in self.working_orders(account).await? {
+            let outcome = self.cancel_order(account, &id).await;
+            outcomes.push((id, outcome));
+        }
+        Ok(outcomes)
+    }
     async fn halt_submissions(&self, reason: &str, operator: &str) -> Result<()> {
         self.execution_store()
             .set_operator_halt(Some(reason.to_owned()), operator)
@@ -117,6 +131,27 @@ impl TradingBackend for SchwabClient {
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()> {
         self.cancel_order(account, id).await
     }
+    async fn working_orders(&self, account: &str) -> Result<Vec<String>> {
+        let now = chrono::Utc::now();
+        let params =
+            crate::types::trading::OrdersParams::new(now - chrono::Duration::days(59), now);
+        fn collect(order: &crate::types::trading::Order, ids: &mut Vec<String>) {
+            if !order.status.is_some_and(|s| s.is_terminal())
+                && order.cancelable != Some(false)
+                && let Some(id) = &order.order_id
+            {
+                ids.push(id.clone());
+            }
+            for child in &order.child_order_strategies {
+                collect(child, ids);
+            }
+        }
+        let mut ids = Vec::new();
+        for order in self.get_account_orders(account, &params).await? {
+            collect(&order, &mut ids);
+        }
+        Ok(ids)
+    }
     async fn submission_admission(&self) -> Result<()> {
         self.submission_admission().await
     }
@@ -197,5 +232,24 @@ impl TradingBackend for PaperBroker {
     }
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()> {
         self.cancel_order(account, id).await
+    }
+    async fn working_orders(&self, account: &str) -> Result<Vec<String>> {
+        let mut ids = Vec::new();
+        let mut after = 0;
+        loop {
+            let page = self.orders(account, after, 1000).await?;
+            let Some(last) = page.last() else {
+                return Ok(ids);
+            };
+            after = last
+                .order_id
+                .parse()
+                .map_err(|_| crate::Error::Storage("Invalid paper order ID".into()))?;
+            ids.extend(
+                page.iter()
+                    .filter(|order| order.status.is_open())
+                    .map(|order| order.order_id.clone()),
+            );
+        }
     }
 }

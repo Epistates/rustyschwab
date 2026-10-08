@@ -1435,3 +1435,19 @@ async fn an_overnight_gap_counts_toward_the_daily_loss() {
     assert_eq!(snapshot.daily_loss, Some(d("10.00")));
     assert!(b.operator_halt().await.unwrap().is_some());
 }
+
+/// The kill switch's cancel half finds every working order and cancels it.
+#[tokio::test]
+async fn cancel_working_orders_cancels_every_working_order() {
+    use schwab_rs::broker::TradingBackend;
+    let (_dir, b) = setup().await;
+    for tag in ["one", "two"] {
+        b.place_order("paper-test", &order(tag, "BUY", "1", "11"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(b.working_orders("paper-test").await.unwrap().len(), 2);
+    let outcomes = b.cancel_working_orders("paper-test").await.unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|(_, outcome)| outcome.is_ok()));
+}

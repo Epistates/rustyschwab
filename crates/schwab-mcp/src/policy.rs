@@ -619,6 +619,9 @@ impl AuthorizedServer {
         let waited = match effective.authorize(name, &args) {
             Ok(()) => None,
             Err(failure) => {
+                if failure.code == FailureCode::ApprovalRequired {
+                    self.note_intent(name, &digest, &args).await;
+                }
                 let waitable =
                     submission && wait.is_some() && failure.code == FailureCode::ApprovalRequired;
                 if !waitable {
@@ -761,6 +764,20 @@ impl AuthorizedServer {
         Ok(result)
     }
 
+    /// Record an intent that needs the operator's approval, as it would be
+    /// dispatched (with its default tag), so the operator can review the
+    /// order rather than a bare digest (see [`crate::approvals`]).
+    async fn note_intent(&self, name: &str, digest: &str, args: &Value) {
+        let dispatched = tag_intent(args.clone(), digest);
+        if let Err(e) = self
+            .audit
+            .record_intent(&self.principal.name, digest, name, &dispatched)
+            .await
+        {
+            tracing::warn!(error = %e, "could not record an intent awaiting approval");
+        }
+    }
+
     /// Settle this principal's stranded submission records; see
     /// [`crate::journal::settle_stranded`]. Failures are logged and leave
     /// the record for an operator.
@@ -819,6 +836,13 @@ impl AuthorizedServer {
                 &args,
             )
             .await?;
+            if verdict
+                .reasons
+                .iter()
+                .any(|r| r.code == FailureCode::ApprovalRequired)
+            {
+                self.note_intent(name, &digest, &args).await;
+            }
             Ok(crate::contract::local(verdict.into_payload()?))
         })
         .await)
@@ -1328,6 +1352,14 @@ mod tests {
         assert_eq!(pending["code"], "approval_required");
         assert_eq!(pending["disposition"], "ask_operator");
         assert_eq!(pending["intentDigest"], intent_digest("place_order", &args));
+        // Recorded so the operator can review the order, not a bare digest.
+        let awaiting = server.audit.intents(None, 0, 10).await.unwrap();
+        assert_eq!(awaiting.len(), 1);
+        assert_eq!(awaiting[0].digest, intent_digest("place_order", &args));
+        assert!(
+            crate::approvals::describe(&awaiting[0].tool, &awaiting[0].arguments)
+                .contains("BUY 2 AAPL LIMIT @ 50")
+        );
         // Arguments the macro cannot extract are normalized into the contract.
         let malformed = error(
             server
