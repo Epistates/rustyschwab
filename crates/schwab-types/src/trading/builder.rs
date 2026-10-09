@@ -221,6 +221,20 @@ impl OrderInstruction {
             _ => None,
         }
     }
+
+    /// Whether this instruction buys (`true`) or sells (`false`), opening
+    /// or closing alike; `None` for `EXCHANGE` and unknown instructions.
+    pub fn buys(self) -> Option<bool> {
+        match self {
+            Self::Buy | Self::BuyToCover | Self::BuyToOpen | Self::BuyToClose => Some(true),
+            Self::Sell
+            | Self::SellShort
+            | Self::SellShortExempt
+            | Self::SellToOpen
+            | Self::SellToClose => Some(false),
+            Self::Exchange | Self::Unknown => None,
+        }
+    }
 }
 
 impl OrderRequestInstrument {

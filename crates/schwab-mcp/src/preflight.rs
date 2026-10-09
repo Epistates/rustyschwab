@@ -6,10 +6,12 @@
 //! advisory.
 use crate::backend::Backend;
 use crate::contract::ToolFailure;
+use crate::guardrails::{self, DailyBudget};
 use crate::journal;
 use crate::policy::{self, PrincipalPolicy};
 use crate::server::Switches;
 use rust_decimal::Decimal;
+use schwab_rs::execution::OrderJournal;
 use schwab_types::trading::OrderRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +29,10 @@ pub struct Verdict {
     pub exposure: Option<Exposure>,
     /// The principal's risk limits; absent without a principal policy.
     pub limits: Option<Limits>,
+    /// The principal's daily budget and what it has used today, when it
+    /// sets one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_budget: Option<DailyBudget>,
     pub requires_approval: bool,
     /// The intent digest is approved, whether by policy or durably.
     pub approved: bool,
@@ -55,6 +61,8 @@ pub struct Exposure {
 pub struct Limits {
     pub max_quantity: Decimal,
     pub max_notional: Decimal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_collar_bps: Option<u32>,
 }
 
 /// `check_order` arguments, the shape of the tool's signature, so the
@@ -97,11 +105,12 @@ impl Request {
 }
 
 /// Evaluate the intent `name` (`place_order` or `replace_order`) with
-/// `args` under `policy`, or without one on the unauthorized transport.
-/// `policy` must already carry any durable approvals.
+/// `args` under a principal's policy and audit journal, or without one on
+/// the unauthorized transport. The policy must already carry any durable
+/// approvals.
 pub async fn evaluate(
     backend: &Backend,
-    policy: Option<&PrincipalPolicy>,
+    principal: Option<(&PrincipalPolicy, &OrderJournal)>,
     switches: Switches,
     name: &str,
     args: &Value,
@@ -111,13 +120,40 @@ pub async fn evaluate(
         .as_str()
         .map_or_else(|| policy::intent_tag(&intent_digest), str::to_owned);
     let mut reasons = Vec::new();
-    let (exposure, limits, requires_approval, approved) = match policy {
-        Some(policy) => {
+    let mut daily_budget = None;
+    let (exposure, limits, requires_approval, approved) = match principal {
+        Some((policy, audit)) => {
             let review = policy.review(name, args);
+            // As a dispatch judges them: the collar once the policy passes
+            // (but for an approval), the budget once the audit opens.
+            let passes = review
+                .denials
+                .iter()
+                .all(|r| r.code == crate::contract::FailureCode::ApprovalRequired);
             reasons.extend(review.denials);
+            if passes
+                && let Err(error) = guardrails::check_collar(policy, backend.trading(), args).await
+            {
+                reasons.push(error.into());
+            }
+            if guardrails::has_budget(policy) {
+                let used = guardrails::day_usage(audit, policy, None)
+                    .await
+                    .map_err(|e| ToolFailure::internal("Audit journal unavailable", e))?;
+                let notional = review.exposure.map_or(Decimal::ZERO, |(_, n)| n);
+                if let Err(error) = guardrails::within_budget(policy, used, notional) {
+                    reasons.push(error.into());
+                }
+                daily_budget = Some(DailyBudget {
+                    max_orders: policy.max_daily_orders.map(|v| v.get()),
+                    max_notional: policy.max_daily_notional,
+                    used,
+                });
+            }
             let limits = Limits {
                 max_quantity: policy.max_quantity.unwrap_or_default(),
                 max_notional: policy.max_notional.unwrap_or_default(),
+                price_collar_bps: policy.price_collar_bps.map(|v| v.get()),
             };
             let approved = policy.approved_intents.contains(&intent_digest);
             (
@@ -174,6 +210,7 @@ pub async fn evaluate(
         reasons,
         exposure: exposure.map(|(quantity, notional)| Exposure { quantity, notional }),
         limits,
+        daily_budget,
         requires_approval,
         approved,
         intent_digest,

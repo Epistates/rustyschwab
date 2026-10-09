@@ -524,3 +524,81 @@ async fn paper_gateway_uses_verified_approvals_and_isolates_market_ingestion() {
         schwab_rs::paper::PaperOrderStatus::Filled
     );
 }
+
+/// The principal's guardrails hold at the gateway as on the MCP path: a
+/// limit priced through the collar is refused before any approval is
+/// spent, and the day's order budget refuses the next submission once the
+/// audit record opens, giving its approval back.
+#[tokio::test]
+async fn gateway_enforces_the_price_collar_and_the_daily_budget() {
+    let s = setup().await;
+    let mut roles = grants();
+    roles[2]["policy"]["price_collar_bps"] = json!(100);
+    roles[2]["policy"]["max_daily_orders"] = json!(1);
+    std::fs::write(&s.policy, roles.to_string()).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/AAPL/quotes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "AAPL": {"symbol": "AAPL", "quote": {"bidPrice": 9.9, "askPrice": 10.0}}
+        })))
+        .mount(&s.broker)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/A/orders"))
+        .respond_with(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://api.schwabapi.com/trader/v1/accounts/A/orders/7",
+        ))
+        .expect(1)
+        .mount(&s.broker)
+        .await;
+    let lease: Value = post(&s, "/v1/lease", 't', json!({"action":"acquire"}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let submit = |order: &Value| {
+        json!({"request_id":uuid::Uuid::new_v4().to_string(),"account_hash":"A",
+               "action":{"kind":"place","order":order},"lease":lease})
+    };
+
+    // 10.20 is two percent through the 10.00 ask; the collar allows one.
+    let mut through = order("gateway-through");
+    through["price"] = json!("10.2");
+    approve(&s, &through).await;
+    let response = post(&s, "/v1/orders", 't', submit(&through)).await;
+    assert_eq!(response.status(), 422);
+    let refused: Value = response.json().await.unwrap();
+    assert_eq!(refused["kind"], "risk_denied", "{refused}");
+    assert!(
+        refused["message"].as_str().unwrap().contains("bps through"),
+        "{refused}"
+    );
+
+    let first = order("gateway-first");
+    approve(&s, &first).await;
+    let accepted: Value = post(&s, "/v1/orders", 't', submit(&first))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(accepted["status"], "accepted", "{accepted}");
+
+    let second = order("gateway-second");
+    approve(&s, &second).await;
+    let over: Value = post(&s, "/v1/orders", 't', submit(&second))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(over["status"], "rejected", "{over}");
+    assert_eq!(over["error"]["kind"], "risk_denied", "{over}");
+    assert!(
+        over["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("orders for the trading day"),
+        "{over}"
+    );
+    s.broker.verify().await;
+}

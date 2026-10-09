@@ -204,6 +204,17 @@ pub struct Principal {
     pub max_quantity: Option<Decimal>,
     pub max_notional: Option<Decimal>,
     pub require_approval: bool,
+    /// Empty: any symbol the other limits allow.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub denied_symbols: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_collar_bps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_daily_orders: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_daily_notional: Option<Decimal>,
 }
 
 impl From<&PrincipalPolicy> for Principal {
@@ -221,6 +232,11 @@ impl From<&PrincipalPolicy> for Principal {
             max_quantity: policy.max_quantity,
             max_notional: policy.max_notional,
             require_approval: policy.require_approval,
+            allowed_symbols: sorted(&policy.allowed_symbols),
+            denied_symbols: sorted(&policy.denied_symbols),
+            price_collar_bps: policy.price_collar_bps.map(|v| v.get()),
+            max_daily_orders: policy.max_daily_orders.map(|v| v.get()),
+            max_daily_notional: policy.max_daily_notional,
         }
     }
 }

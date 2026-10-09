@@ -568,11 +568,7 @@ impl SchwabClient {
             return Some(cached.net);
         }
         let read = async {
-            let midnight = today
-                .and_hms_opt(0, 0, 0)?
-                .and_local_timezone(chrono_tz::America::New_York)
-                .earliest()?
-                .with_timezone(&chrono::Utc);
+            let midnight = crate::paper::feed::trading_day_start(now);
             let mut net = rust_decimal::Decimal::ZERO;
             // One type per request: Schwab documents `types` as a single value.
             for kind in TRANSFER_TYPES {

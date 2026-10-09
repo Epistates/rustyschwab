@@ -51,6 +51,23 @@ pub struct PrincipalPolicy {
     /// budget, so this keeps one from crowding out the others.
     #[serde(default)]
     pub max_calls_per_minute: Option<std::num::NonZeroU32>,
+    /// Symbols this principal may trade; empty, any. An option matches by
+    /// its underlying or its own symbol (see [`crate::guardrails`]).
+    #[serde(default)]
+    pub allowed_symbols: HashSet<String>,
+    /// Symbols this principal may not trade, over any allowance.
+    #[serde(default)]
+    pub denied_symbols: HashSet<String>,
+    /// Refuse a limit order priced more than this many basis points through
+    /// the far side of the market; absent, no collar.
+    #[serde(default)]
+    pub price_collar_bps: Option<std::num::NonZeroU32>,
+    /// Submissions this principal may start in a New York trading day.
+    #[serde(default)]
+    pub max_daily_orders: Option<std::num::NonZeroU32>,
+    /// Bounded notional this principal may submit in a trading day.
+    #[serde(default)]
+    pub max_daily_notional: Option<rust_decimal::Decimal>,
 }
 impl PrincipalPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -75,6 +92,17 @@ impl PrincipalPolicy {
                 "Trading principals require positive finite quantity/notional limits"
             );
         }
+        crate::guardrails::validate_symbols("allowed_symbols", &self.allowed_symbols)?;
+        crate::guardrails::validate_symbols("denied_symbols", &self.denied_symbols)?;
+        anyhow::ensure!(
+            self.price_collar_bps.is_none_or(|bps| bps.get() < 10_000),
+            "price_collar_bps must be under 10000 (100%)"
+        );
+        anyhow::ensure!(
+            self.max_daily_notional
+                .is_none_or(|v| v > rust_decimal::Decimal::ZERO),
+            "max_daily_notional must be positive"
+        );
         Ok(())
     }
     /// Whether this principal may control the stream (any `stream_*` tool).
@@ -135,6 +163,9 @@ impl PrincipalPolicy {
                     return review;
                 }
             };
+            if let Some(denial) = crate::guardrails::symbol_denial(self, &order) {
+                review.denials.push(denial);
+            }
             match exposure(&order, &self.option_multipliers) {
                 Ok((quantity, notional)) => {
                     review.exposure = Some((quantity, notional));
@@ -624,7 +655,19 @@ impl AuthorizedServer {
         let digest = intent_digest(name, &args);
         let wait = approval_wait(&args)?;
         let effective = self.effective_policy(name, &digest).await?;
-        let waited = match effective.authorize(name, &args) {
+        let authorized = effective.authorize(name, &args);
+        // The price collar reads the market, so it is judged once the
+        // policy passes (an approval aside): an operator is never asked to
+        // approve an order the collar refuses.
+        if submission
+            && authorized
+                .as_ref()
+                .err()
+                .is_none_or(|f| f.code == FailureCode::ApprovalRequired)
+        {
+            self.check_collar(&args).await?;
+        }
+        let waited = match authorized {
             Ok(()) => None,
             Err(failure) => {
                 if failure.code == FailureCode::ApprovalRequired {
@@ -637,6 +680,8 @@ impl AuthorizedServer {
                 }
                 let (effective, waited) = self.await_approval(name, &digest, wait.unwrap()).await?;
                 effective.authorize(name, &args)?;
+                // The market may have moved while the operator decided.
+                self.check_collar(&args).await?;
                 Some(waited)
             }
         };
@@ -739,11 +784,18 @@ impl AuthorizedServer {
         ctx: &RequestContext,
         (id, consumed_approval): (String, bool),
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
-        let result = self
-            .inner
-            .call_tool(name, args, ctx)
-            .await
-            .map(crate::contract::normalize);
+        // Judged with the audit record open: this principal has no other
+        // submission in flight, so none can take the same budget.
+        let budget =
+            crate::guardrails::check_budget(&self.principal, &self.audit, name, &args, &id).await;
+        let result = match budget.map_err(ToolFailure::from) {
+            Ok(()) => self
+                .inner
+                .call_tool(name, args, ctx)
+                .await
+                .map(crate::contract::normalize),
+            Err(failure) => Ok(failure.into_result()),
+        };
         // The SDK journal owns broker reconciliation. Keep dispatch outcome
         // attribution separately without claiming a tool success is a fill.
         let dispatch = crate::journal::Dispatch::of(&result);
@@ -770,6 +822,14 @@ impl AuthorizedServer {
             tracing::warn!(attempt = %id, error = %e, "approval refund failed; it stays spent");
         }
         Ok(result)
+    }
+
+    /// The principal's price collar on the order in `args`; see
+    /// [`crate::guardrails`].
+    async fn check_collar(&self, args: &Value) -> Result<(), ToolFailure> {
+        crate::guardrails::check_collar(&self.principal, self.inner.backend().trading(), args)
+            .await
+            .map_err(ToolFailure::from)
     }
 
     /// Record an intent that needs the operator's approval, as it would be
@@ -838,7 +898,7 @@ impl AuthorizedServer {
             let effective = self.effective_policy(name, &digest).await?;
             let verdict = crate::preflight::evaluate(
                 self.inner.backend(),
-                Some(&effective),
+                Some((&effective, &self.audit)),
                 self.inner.switches(),
                 name,
                 &args,
@@ -1758,5 +1818,22 @@ mod tests {
         assert!(reader.server_capabilities().prompts.is_none());
         assert!(reader.read_resource(uri, &ctx).await.is_err());
         assert!(reader.get_prompt(prompt, args("A"), &ctx).await.is_err());
+    }
+
+    #[test]
+    fn guardrail_settings_are_validated() {
+        let with = |field: &str, value: Value| {
+            let mut policy = serde_json::to_value(policy()).unwrap();
+            policy[field] = value;
+            serde_json::from_value::<PrincipalPolicy>(policy)
+                .unwrap()
+                .validate()
+        };
+        assert!(with("allowed_symbols", serde_json::json!(["AAPL"])).is_ok());
+        assert!(with("denied_symbols", serde_json::json!(["aapl"])).is_err());
+        assert!(with("price_collar_bps", serde_json::json!(500)).is_ok());
+        assert!(with("price_collar_bps", serde_json::json!(10_000)).is_err());
+        assert!(with("max_daily_notional", serde_json::json!("0")).is_err());
+        assert!(with("max_daily_notional", serde_json::json!("5000")).is_ok());
     }
 }

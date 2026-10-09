@@ -25,6 +25,18 @@ pub fn trading_date(now: DateTime<Utc>) -> chrono::NaiveDate {
         .date_naive()
 }
 
+/// When the trading day `now` falls in began: midnight in New York.
+pub fn trading_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
+    trading_date(now)
+        .and_hms_opt(0, 0, 0)
+        .and_then(|midnight| {
+            midnight
+                .and_local_timezone(chrono_tz::America::New_York)
+                .earliest()
+        })
+        .map_or(now, |midnight| midnight.with_timezone(&Utc))
+}
+
 fn deadline_exceeded() -> Error {
     Error::Timeout {
         duration: FEED_DEADLINE.as_secs(),

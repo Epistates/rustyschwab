@@ -7,7 +7,32 @@ use crate::{
     readiness::Readiness,
     types::trading::{OrderRequest, OrderSubmitResponse},
 };
+use rust_decimal::Decimal;
 use std::{path::PathBuf, sync::Arc};
+
+/// The market an order's price is judged against: the venue's latest bid,
+/// ask, mark and last trade for one symbol, each absent when the venue
+/// has none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Touch {
+    pub bid: Option<Decimal>,
+    pub ask: Option<Decimal>,
+    pub mark: Option<Decimal>,
+    pub last: Option<Decimal>,
+}
+impl Touch {
+    /// What a price is judged against: the ask for a buy and the bid for a
+    /// sell, or with no such side the mark, then the last trade. Only
+    /// positive prices count.
+    pub fn reference(&self, buys: bool) -> Option<Decimal> {
+        let touch = if buys { self.ask } else { self.bid };
+        [touch, self.mark, self.last]
+            .into_iter()
+            .flatten()
+            .find(|price| *price > Decimal::ZERO)
+    }
+}
 
 /// Trading commands share gateway policy/approval enforcement. Each implementation
 /// owns execution and accounting; paper never constructs a live client.
@@ -36,6 +61,12 @@ pub trait TradingBackend: Send + Sync {
         lease: &Lease,
     ) -> Result<OrderSubmitResponse>;
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()>;
+    /// The venue's market for `symbol`, for price checks; `None` when it has
+    /// none. The default knows no market, so a check that needs one fails
+    /// closed.
+    async fn touch(&self, _symbol: &str) -> Result<Option<Touch>> {
+        Ok(None)
+    }
     /// IDs of the orders on `account` that are still working (not filled,
     /// cancelled, rejected, expired or replaced), parents and children.
     async fn working_orders(&self, account: &str) -> Result<Vec<String>>;
@@ -130,6 +161,23 @@ impl TradingBackend for SchwabClient {
     }
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()> {
         self.cancel_order(account, id).await
+    }
+    async fn touch(&self, symbol: &str) -> Result<Option<Touch>> {
+        use crate::types::market_data::QuoteField;
+        let item = self
+            .get_quote_with_options(symbol, &[QuoteField::Quote])
+            .await?;
+        let price = |value: Option<f64>| {
+            value
+                .filter(|v| v.is_finite())
+                .and_then(|v| Decimal::try_from(v).ok())
+        };
+        Ok(item.quote.map(|quote| Touch {
+            bid: price(quote.bid_price),
+            ask: price(quote.ask_price),
+            mark: price(quote.mark),
+            last: price(quote.last_price),
+        }))
     }
     async fn working_orders(&self, account: &str) -> Result<Vec<String>> {
         let now = chrono::Utc::now();
@@ -233,6 +281,13 @@ impl TradingBackend for PaperBroker {
     async fn cancel_order(&self, account: &str, id: &str) -> Result<()> {
         self.cancel_order(account, id).await
     }
+    async fn touch(&self, symbol: &str) -> Result<Option<Touch>> {
+        Ok(self.quote(symbol).await?.map(|quote| Touch {
+            bid: Some(quote.bid),
+            ask: Some(quote.ask),
+            ..Touch::default()
+        }))
+    }
     async fn working_orders(&self, account: &str) -> Result<Vec<String>> {
         let mut ids = Vec::new();
         let mut after = 0;
@@ -251,5 +306,34 @@ impl TradingBackend for PaperBroker {
                     .map(|order| order.order_id.clone()),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_reference_is_the_far_touch_then_the_mark_then_the_last() {
+        let price = |v: i64| Some(Decimal::new(v, 1));
+        let full = Touch {
+            bid: price(995),
+            ask: price(1005),
+            mark: price(1000),
+            last: price(1001),
+        };
+        assert_eq!(full.reference(true), price(1005));
+        assert_eq!(full.reference(false), price(995));
+        let one_sided = Touch {
+            bid: Some(Decimal::ZERO),
+            ..full
+        };
+        assert_eq!(one_sided.reference(false), price(1000));
+        let last = Touch {
+            last: price(420),
+            ..Touch::default()
+        };
+        assert_eq!(last.reference(true), price(420));
+        assert_eq!(Touch::default().reference(true), None);
     }
 }

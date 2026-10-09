@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — principal guardrails
+
+- **Symbol lists.** `allowed_symbols` (empty: any) and `denied_symbols` on
+  a principal's policy. Every leg of every order in a strategy is judged,
+  an option by its underlying or its own symbol, and a denial wins.
+- **Price collar.** `price_collar_bps` refuses a limit order priced more
+  than that far through the far side of the market (a buy above the ask,
+  a sell below the bid); a passive price is never refused. The quote comes
+  from the venue (`TradingBackend::touch`, new, with `Touch`): Schwab's
+  live, the paper venue's own in paper mode. With no market to judge
+  against, the order is refused. Judged before an operator is asked to
+  approve, and again after an approval hold.
+- **Daily budget.** `max_daily_orders` and `max_daily_notional` bound what a
+  principal submits in a New York trading day. Judged with the
+  submission's audit record open, so concurrent calls cannot both take the
+  last of it; a submission that produced no order does not count, and a
+  refusal gives its approval back (`OrderJournal::records_since`, new).
+- `check_order` reports the collar and the budget with what it has used
+  (`dailyBudget`); `get_server_status` lists the new limits. The authority
+  gateway enforces all three for trader policies.
+- `OrderInstruction::buys` and `paper::feed::trading_day_start` (new).
+
 ### Changed — engineering infrastructure
 
 - **Fewer dependencies.** Unused dependencies are gone (`hyper`,

@@ -62,6 +62,11 @@ const SELECT_SUBMISSION_BY_TAG: &str = "SELECT id,account,operation,created_at,r
      ORDER BY created_at DESC,id LIMIT 1";
 const SELECT_SUBMISSION: &str = "SELECT id,account,operation,created_at,request,outcome,\
      dedup_key,armed FROM submissions WHERE id=?1";
+/// Submissions on `?1` created at or after `?2`, through the
+/// `submissions_account` index.
+const SELECT_SUBMISSIONS_SINCE: &str = "SELECT id,account,operation,created_at,request,outcome,\
+     dedup_key,armed FROM submissions WHERE account=?1 AND created_at>=?2 \
+     ORDER BY created_at,id";
 /// The order this store recorded only as a reference, never as the broker
 /// answered it (see [`ExecutionStore::forget_placeholder`]).
 const DELETE_ORDER_PLACEHOLDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2 \
@@ -421,6 +426,20 @@ impl OrderJournal {
     pub async fn records(&self) -> Result<Vec<SubmissionRecord>> {
         self.database
             .run(|conn| query_submissions(conn, SELECT_SUBMISSIONS, []))
+            .await
+    }
+    /// Submissions on `account` created at or after `since` (Unix
+    /// milliseconds), oldest first.
+    pub async fn records_since(&self, account: &str, since: i64) -> Result<Vec<SubmissionRecord>> {
+        let account = account.to_owned();
+        self.database
+            .run(move |conn| {
+                query_submissions(
+                    conn,
+                    SELECT_SUBMISSIONS_SINCE,
+                    rusqlite::params![account, since],
+                )
+            })
             .await
     }
     /// Append an operator-visible event to the audit trail (for actions the

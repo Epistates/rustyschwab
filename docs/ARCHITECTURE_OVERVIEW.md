@@ -345,7 +345,19 @@ future and stack frame stay small however many tools there are.
   `MAX_APPROVAL_WAIT_MS` and judges again; it holds for no other denial,
   grants nothing itself, and runs before `begin_once`, so a hold that ends
   unapproved or is cancelled leaves no audit record and no order.
-- `preflight.rs` — `check_order`: the same `review`, plus the trading switch
+- `guardrails.rs` — the principal's limits beyond the per-order caps.
+  `allowed_symbols`/`denied_symbols` are part of `review` (an option
+  matches by its underlying). `price_collar_bps` reads the venue's market
+  (`TradingBackend::touch`) once the policy passes, an approval aside, and
+  again after an approval hold, refusing a limit priced that far through
+  the far touch. `max_daily_orders`/`max_daily_notional` are judged once
+  `begin_once` opens the audit record, when the principal has no other
+  submission in flight, from the day's audit records
+  (`OrderJournal::records_since`); a refusal there is a journaled
+  `risk_denied` that gives its approval back. The authority gateway
+  applies the same three.
+- `preflight.rs` — `check_order`: the same `review`, the collar and the
+  daily budget (with what it has used), plus the trading switch
   and `Backend::submission_admission` (operator halt, recovery suspension
   or the paper venue draining), reported together as a `Verdict` without
   dispatching or auditing. `AuthorizedServer` evaluates it under the principal with durable

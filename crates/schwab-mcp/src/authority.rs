@@ -720,6 +720,11 @@ async fn order(
                 }
                 return Err(StatusCode::FORBIDDEN.into());
             }
+            if !cancel {
+                // As on the MCP path: the price collar, before the audit
+                // consumes an approval.
+                crate::guardrails::check_collar(&principal, state.client.as_ref(), &args).await?;
+            }
             // As on the MCP path: an untagged order is tagged with its intent
             // digest, so resubmitting the identical order under a fresh
             // request_id is a duplicate at the SDK's tag check, not a second
@@ -769,7 +774,18 @@ async fn order(
             let client = state.client.clone();
             let account = request.account_hash.clone();
             let lease = request.lease.clone();
+            let budget = {
+                let audit = audit.clone();
+                let attempt = attempt.clone();
+                let tool = tool.to_owned();
+                async move {
+                    // Judged with the audit record open, as on the MCP path.
+                    crate::guardrails::check_budget(&principal, &audit, &tool, &args, &attempt)
+                        .await
+                }
+            };
             let execute = async move {
+                budget.await?;
                 match request.action {
                     GatewayAction::Place { order } => client
                         .place_order_fenced(&account, &order, lease.as_ref().unwrap())

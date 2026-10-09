@@ -417,6 +417,73 @@ async fn the_operator_halt_and_the_write_switches_gate_paper_orders() {
     assert!(placed["data"]["orderId"].is_string());
 }
 
+/// A principal's guardrails over the paper venue: its symbol lists, a
+/// price collar judged against the venue's quote, and a daily order
+/// budget, each reported by `check_order` and `get_server_status`.
+#[tokio::test]
+async fn guardrails_bound_symbols_prices_and_the_days_orders() {
+    use std::num::NonZeroU32;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut desk = policy();
+    desk.denied_symbols = ["XYZ".to_owned()].into();
+    desk.price_collar_bps = NonZeroU32::new(100);
+    desk.max_daily_orders = NonZeroU32::new(2);
+    let server = AuthorizedServer::new(backend(broker, None), TRADING, desk);
+    let place = |side: &str, price: &str| json!({"account_hash": ACCOUNT, "order": order(side, "1", price)});
+
+    let status = call(&server, "get_server_status", json!({})).await;
+    assert_eq!(status["principal"]["deniedSymbols"], json!(["XYZ"]));
+    assert_eq!(status["principal"]["priceCollarBps"], 100);
+    assert_eq!(status["principal"]["maxDailyOrders"], 2);
+
+    let mut xyz = place("BUY", "10");
+    xyz["order"]["orderLegCollection"][0]["instrument"]["symbol"] = json!("XYZ");
+    let denied = call(&server, "place_order", xyz).await;
+    assert_eq!(denied["error"]["code"], "not_permitted", "{denied}");
+
+    // The ask is 10.01, so a one percent collar allows a buy up to 10.1101,
+    // and the bid is 10, so a sell down to 9.90.
+    for (side, price) in [("BUY", "10.12"), ("SELL", "9.89")] {
+        let verdict = call(&server, "check_order", place(side, price)).await;
+        assert_eq!(verdict["allowed"], false, "{verdict}");
+        assert_eq!(verdict["reasons"][0]["code"], "risk_denied", "{verdict}");
+        assert_eq!(verdict["limits"]["priceCollarBps"], 100);
+        let refused = call(&server, "place_order", place(side, price)).await;
+        assert_eq!(refused["error"]["code"], "risk_denied", "{refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("bps through"),
+            "{refused}"
+        );
+    }
+
+    // A passive price and one inside the collar both go, and use the budget;
+    // the refusals above did not.
+    for price in ["9", "10.11"] {
+        let placed = call(&server, "place_order", place("BUY", price)).await;
+        assert_eq!(placed["source"], "paper", "{placed}");
+    }
+    let verdict = call(&server, "check_order", place("BUY", "9.5")).await;
+    assert_eq!(verdict["dailyBudget"]["maxOrders"], 2, "{verdict}");
+    assert_eq!(verdict["dailyBudget"]["used"]["orders"], 2, "{verdict}");
+    assert_eq!(verdict["allowed"], false);
+    let over = call(&server, "place_order", place("BUY", "9.5")).await;
+    assert_eq!(over["error"]["code"], "risk_denied", "{over}");
+    assert!(
+        over["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("orders for the trading day"),
+        "{over}"
+    );
+    // The refused submission is journaled and does not count either.
+    let verdict = call(&server, "check_order", place("BUY", "9.4")).await;
+    assert_eq!(verdict["dailyBudget"]["used"]["orders"], 2, "{verdict}");
+}
+
 /// The venue's daily-loss control halts the desk the moment its marked
 /// equity has fallen past the cap. The desk is told it is halted; the
 /// figures behind it are for a principal that holds every account.
