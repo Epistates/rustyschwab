@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — defined-risk option strategies
+
+- **`schwab_types::trading::defined_risk`** finds the most a strategy of
+  option legs on one underlying and one expiration, priced `NET_DEBIT`,
+  `NET_CREDIT` or `NET_ZERO`, can lose held to expiration: verticals, iron
+  condors, butterflies, put ratios. It refuses a strategy that sells
+  more calls than it buys (no bound), legs at different expirations
+  (which need a pricing model) and mixed multipliers.
+- **Principals can trade them.** The MCP policy counts a strategy's
+  contracts and its max loss against `max_quantity` and `max_notional`
+  (and the daily notional budget), where it refused every multi-leg order.
+- **`PortfolioRisk` reserves them.** A strategy counts as a buy of its
+  contracts at its max loss against funds and the open-buy caps, outside
+  the per-symbol share position. A working strategy at the broker counts
+  the unfilled share of its risk, where it used to make every check fail
+  closed. `PortfolioLimits::option_multipliers` (new; a breaking change to
+  struct literals) lists each leg's verified multiplier.
+- The paper venue still trades single-leg equity orders only.
+
 ### Added — approvals reach the people who give them
 
 - **Approval by the client's user.** A principal with `client_approval`

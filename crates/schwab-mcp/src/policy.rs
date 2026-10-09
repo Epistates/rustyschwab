@@ -284,6 +284,9 @@ pub fn validate_policies(
 // Conservative gross exposure sums all legs and child strategies, including
 // mutually exclusive children. Network writes require bounded-price orders;
 // market, trailing-market, and naked stop orders have no finite execution cap.
+// A multi-leg option strategy on one underlying and expiration counts its
+// contracts and the most it can lose at expiration (`defined_risk`); one
+// whose loss has no bound is refused.
 // The one exception is a bracket exit: a child that only closes the long
 // position its bounded parent opens (same instrument, no more than the
 // parent's quantity) cannot fill for more than the parent paid, so an
@@ -309,10 +312,21 @@ fn exposure_under(
     let mut quantity = rust_decimal::Decimal::ZERO;
     let mut notional = rust_decimal::Decimal::ZERO;
     let mut child_entry = entry;
-    if order.order_strategy_type != OrderStrategyType::Oco {
+    if order.order_strategy_type != OrderStrategyType::Oco && order.order_leg_collection.len() > 1 {
+        // An option strategy is bounded by what it can lose at expiration.
+        let risk =
+            schwab_types::trading::defined_risk(order, |symbol| multipliers.get(symbol).copied())?;
+        quantity = quantity
+            .checked_add(risk.contracts)
+            .ok_or("Quantity overflow")?;
+        notional = notional
+            .checked_add(risk.max_loss)
+            .ok_or("Notional overflow")?;
+        child_entry = None;
+    } else if order.order_strategy_type != OrderStrategyType::Oco {
         use schwab_types::{common::AssetType, trading::OrderInstruction};
         let [leg] = order.order_leg_collection.as_slice() else {
-            return Err("Multi-leg exposure requires an external portfolio risk engine".into());
+            return Err("An order needs a leg".into());
         };
         if matches!(
             leg.instruction,
@@ -1939,6 +1953,38 @@ mod tests {
         assert!(reader.server_capabilities().prompts.is_none());
         assert!(reader.read_resource(uri, &ctx).await.is_err());
         assert!(reader.get_prompt(prompt, args("A"), &ctx).await.is_err());
+    }
+
+    /// A defined-risk option strategy counts its contracts and the most it
+    /// can lose; one with no bound is refused.
+    #[test]
+    fn option_strategies_are_bounded_by_their_defined_risk() {
+        const C100: &str = "XYZ   260116C00100000";
+        const C105: &str = "XYZ   260116C00105000";
+        let multipliers = std::collections::HashMap::from([
+            (C100.to_owned(), rust_decimal::Decimal::from(100)),
+            (C105.to_owned(), rust_decimal::Decimal::from(100)),
+        ]);
+        let strategy = |kind: &str, short: u32| -> schwab_types::trading::OrderRequest {
+            serde_json::from_value(serde_json::json!({"orderStrategyType": "SINGLE",
+                "orderType": kind, "session": "NORMAL", "duration": "DAY", "price": "1.5",
+                "orderLegCollection": [
+                    {"quantity": 2, "instruction": "SELL_TO_OPEN",
+                     "instrument": {"symbol": C100, "assetType": "OPTION"}},
+                    {"quantity": short, "instruction": "BUY_TO_OPEN",
+                     "instrument": {"symbol": C105, "assetType": "OPTION"}}]}))
+            .unwrap()
+        };
+        assert_eq!(
+            exposure(&strategy("NET_CREDIT", 2), &multipliers).unwrap(),
+            (
+                rust_decimal::Decimal::from(4),
+                rust_decimal::Decimal::from(700)
+            )
+        );
+        let naked = exposure(&strategy("NET_CREDIT", 1), &multipliers).unwrap_err();
+        assert!(naked.contains("no bound"), "{naked}");
+        assert!(exposure(&strategy("NET_CREDIT", 2), &Default::default()).is_err());
     }
 
     #[test]

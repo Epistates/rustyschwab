@@ -922,6 +922,7 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
         max_position_quantity: 10.into(),
         max_snapshot_age_ms: 60_000,
         max_daily_loss: None,
+        option_multipliers: Default::default(),
     };
     let client = base
         .with_risk_provider(Arc::new(PortfolioRisk {

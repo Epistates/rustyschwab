@@ -89,8 +89,14 @@ A principal's risk limits are judged on the order's bounded exposure, so
 under a principal policy an order must have a finite worst case:
 
 - One leg that is not an opening short: buys, and sells that close, are
-  accepted; `SELL_SHORT`, `SELL_TO_OPEN` and multi-leg orders are refused
-  for want of a portfolio risk engine.
+  accepted; a lone `SELL_SHORT` or `SELL_TO_OPEN` is refused for want of a
+  portfolio risk engine.
+- Or a defined-risk option strategy: option legs on one underlying and one
+  expiration, priced `net_debit`, `net_credit` or `net_zero` (verticals,
+  iron condors, butterflies, put ratios). Its exposure is its contracts
+  and the most it can lose at expiration, premium included; a strategy that
+  sells more calls than it buys has no bound and is refused, as are legs at
+  different expirations. Every leg needs a multiplier the operator verified.
 - A bounded price: `limit`, `stop_limit`, or a limit-on-close order. A
   `market`, `stop` or `trailing_stop` on its own has no finite cost and is
   refused; a `bracket` with a `limit` entry is accepted, its exits being

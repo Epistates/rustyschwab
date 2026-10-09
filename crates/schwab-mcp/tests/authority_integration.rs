@@ -113,6 +113,7 @@ async fn setup() -> Setup {
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
                 max_daily_loss: None,
+                option_multipliers: Default::default(),
             },
         )]),
     });

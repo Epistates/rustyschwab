@@ -226,6 +226,7 @@ async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidenc
         max_position_quantity: "2".parse().unwrap(),
         max_snapshot_age_ms: 5000,
         max_daily_loss: None,
+        option_multipliers: Default::default(),
     };
     let risk = PortfolioRisk {
         database: db,
@@ -264,6 +265,7 @@ async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
                 max_position_quantity: 2.into(),
                 max_snapshot_age_ms: 5000,
                 max_daily_loss: Some(50.into()),
+                option_multipliers: Default::default(),
             },
         )]),
     };
@@ -621,6 +623,7 @@ async fn external_partial_orders_count_toward_risk_and_dispatch_rechecks_freshne
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
                 max_daily_loss: None,
+                option_multipliers: Default::default(),
             },
         )]),
     };
@@ -671,6 +674,7 @@ async fn fenced_risk_revalidation_rejects_released_ownership_and_operator_halt()
                 max_position_quantity: 10.into(),
                 max_snapshot_age_ms: 5000,
                 max_daily_loss: None,
+                option_multipliers: Default::default(),
             },
         )]),
     };
@@ -973,6 +977,7 @@ async fn partial_fills_shrink_held_reservations() {
                 max_position_quantity: 100.into(),
                 max_snapshot_age_ms: 5000,
                 max_daily_loss: None,
+                option_multipliers: Default::default(),
             },
         )]),
     };

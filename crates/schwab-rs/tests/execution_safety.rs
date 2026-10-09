@@ -28,6 +28,7 @@ fn limits() -> PortfolioLimits {
         max_position_quantity: 200.into(),
         max_snapshot_age_ms: 5000,
         max_daily_loss: None,
+        option_multipliers: Default::default(),
     }
 }
 
@@ -514,6 +515,7 @@ async fn a_deposit_does_not_hide_a_daily_loss() {
         &journal,
         PortfolioLimits {
             max_daily_loss: Some(500.into()),
+            option_multipliers: Default::default(),
             ..limits()
         },
     );
@@ -637,4 +639,97 @@ async fn intents_awaiting_approval_are_recorded_with_their_state() {
         .await
         .unwrap();
     assert_eq!(state(&journal).await.state, IntentState::Spent);
+}
+
+/// An option strategy counts the most it can lose at expiration against the
+/// account's funds and buy caps, a working one at the broker its unfilled
+/// share; one with no bound, or with a leg whose multiplier the operator
+/// has not verified, is refused.
+#[tokio::test]
+async fn option_strategies_reserve_their_defined_risk() {
+    const C100: &str = "XYZ   260116C00100000";
+    const C105: &str = "XYZ   260116C00105000";
+    fn strategy(kind: &str, price: &str, legs: &[(&str, &str, u32)]) -> OrderRequest {
+        let legs: Vec<Value> = legs
+            .iter()
+            .map(|(instruction, symbol, quantity)| {
+                json!({"instruction": instruction, "quantity": quantity,
+                    "instrument": {"symbol": symbol, "assetType": "OPTION"}})
+            })
+            .collect();
+        serde_json::from_value(json!({"orderStrategyType": "SINGLE", "orderType": kind,
+            "session": "NORMAL", "duration": "DAY", "price": price,
+            "orderLegCollection": legs}))
+        .unwrap()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    // Two units of a 2.00 debit vertical, one filled: 200 still at risk.
+    let working = json!({"orderId": 8, "status": "WORKING", "orderStrategyType": "SINGLE",
+        "orderType": "NET_DEBIT", "session": "NORMAL", "duration": "DAY", "price": 2,
+        "quantity": 2, "filledQuantity": 1, "remainingQuantity": 1,
+        "orderLegCollection": [
+            {"orderLegType": "OPTION", "instruction": "BUY_TO_OPEN", "quantity": 2,
+             "instrument": {"assetType": "OPTION", "symbol": C100}},
+            {"orderLegType": "OPTION", "instruction": "SELL_TO_OPEN", "quantity": 2,
+             "instrument": {"assetType": "OPTION", "symbol": C105}}]});
+    baseline(
+        &journal,
+        funded()["securitiesAccount"].clone(),
+        vec![working],
+    )
+    .await;
+    let verified = PortfolioLimits {
+        option_multipliers: HashMap::from([
+            (C100.to_owned(), 100.into()),
+            (C105.to_owned(), 100.into()),
+        ]),
+        ..limits()
+    };
+    let debit = |units| {
+        strategy(
+            "NET_DEBIT",
+            "2",
+            &[("BUY_TO_OPEN", C100, units), ("SELL_TO_OPEN", C105, units)],
+        )
+    };
+
+    // Unverified multipliers: the working spread cannot be bounded, so
+    // nothing is admitted, not even an equity buy.
+    let blind = risk(&journal, limits());
+    assert!(matches!(
+        blind
+            .reserve("A", "blind", &order("BUY", "AAPL", 1, "10"))
+            .await,
+        Err(schwab_rs::Error::RiskDenied(_))
+    ));
+
+    let risk = risk(&journal, verified);
+    // 200 working + 600 + 200 = the 1000 of funds; one more unit is 1200.
+    risk.reserve("A", "three", &debit(3)).await.unwrap();
+    risk.reserve("A", "one", &debit(1)).await.unwrap();
+    assert!(matches!(
+        risk.check("A", &debit(1), None).await,
+        Err(schwab_rs::Error::RiskDenied(_))
+    ));
+    // A credit vertical risks its width less the credit: (5 - 4.9) × 100.
+    let credit = strategy(
+        "NET_CREDIT",
+        "4.9",
+        &[("SELL_TO_OPEN", C100, 1), ("BUY_TO_OPEN", C105, 1)],
+    );
+    assert!(
+        risk.check("A", &credit, None).await.is_err(),
+        "10 more is past the funds"
+    );
+    risk.release("one").await.unwrap();
+    risk.check("A", &credit, None).await.unwrap();
+
+    let naked = strategy(
+        "NET_CREDIT",
+        "1",
+        &[("SELL_TO_OPEN", C100, 2), ("BUY_TO_OPEN", C105, 1)],
+    );
+    let refused = risk.check("A", &naked, None).await.unwrap_err();
+    assert!(refused.to_string().contains("no bound"), "{refused}");
 }

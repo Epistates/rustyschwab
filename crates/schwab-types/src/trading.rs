@@ -52,8 +52,10 @@ use serde_with::skip_serializing_none;
 use std::collections::HashMap;
 
 mod builder;
+mod payoff;
 mod spec;
 pub use builder::OptionSymbol;
+pub use payoff::{DefinedRisk, defined_risk};
 pub use spec::{InstrumentSpec, LegSpec, OrderSettings, OrderSpec};
 
 /// An order as Schwab reports it. Tolerant: every enum decodes a value this

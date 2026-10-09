@@ -332,7 +332,8 @@ future and stack frame stay small however many tools there are.
   notional caps, option multipliers and approval requirement for one
   principal. `authorize(name, args)` runs before dispatch: it parses
   `args.order` as `OrderRequest`, computes exposure (rejecting anything it
-  cannot bound, such as market or stop children and multi-leg orders) and,
+  cannot bound, such as market or stop children; a multi-leg option
+  strategy counts its `defined_risk`, the most it can lose at expiration) and,
   when `require_approval` is set, demands a consumed single-use approval of
   `intent_digest(name, args)` (SHA-256 over canonically sorted JSON, with a
   valid `order` first normalized to its `OrderRequest` wire form so the

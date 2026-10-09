@@ -122,6 +122,13 @@ pub trait RiskProvider: Send + Sync {
 /// the symbol's long position less the symbol's other working sells. Selling
 /// what the account holds only reduces exposure, so sells do not draw on the
 /// open-order caps or funds.
+///
+/// An option strategy (several option legs on one underlying and one
+/// expiration, priced net) counts as a buy of its contracts whose notional
+/// is the most it can lose at expiration
+/// ([`defined_risk`](crate::types::trading::defined_risk)); it needs each
+/// leg's contract multiplier in `option_multipliers`, and one whose loss has
+/// no bound is refused.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortfolioLimits {
@@ -140,6 +147,10 @@ pub struct PortfolioLimits {
     /// control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_daily_loss: Option<Decimal>,
+    /// Operator-verified deliverable per contract by OSI option symbol (100
+    /// for a standard contract); an option strategy needs every leg's.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub option_multipliers: HashMap<String, Decimal>,
 }
 fn max_age() -> i64 {
     5000
@@ -286,42 +297,14 @@ impl PortfolioRisk {
         {
             return Err(Error::Config("Invalid portfolio risk limits".into()));
         }
-        if order.order_strategy_type != OrderStrategyType::Single
-            || order.order_leg_collection.len() != 1
-            || !matches!(
-                order.order_type,
-                Some(OrderType::Limit | OrderType::StopLimit)
-            )
-        {
-            return Err(Error::RiskDenied(
-                "Built-in portfolio risk requires a single-leg limit order; \
-                 use an external risk provider for strategies"
-                    .into(),
-            ));
-        }
-        let leg = &order.order_leg_collection[0];
-        if leg.instrument.asset_type != AssetType::Equity
-            || !matches!(
-                leg.instruction,
-                OrderInstruction::Buy | OrderInstruction::Sell
-            )
-        {
-            return Err(Error::RiskDenied(
-                "Built-in portfolio risk supports long equity exposure; \
-                 other assets require an external risk provider"
-                    .into(),
-            ));
-        }
-        let quantity = leg.quantity;
-        let price = order
-            .price
-            .ok_or_else(|| Error::InvalidParameter("Limit price is required".into()))?;
-        let notional = quantity
-            .checked_mul(price)
-            .ok_or_else(|| Error::InvalidParameter("Risk arithmetic overflow".into()))?;
-        let sell = leg.instruction == OrderInstruction::Sell;
+        let Proposed {
+            symbol,
+            sell,
+            quantity,
+            notional,
+            strategy,
+        } = Proposed::of(order, &limits)?;
         let side = if sell { "SELL" } else { "BUY" };
-        let symbol = leg.instrument.symbol.clone();
         let account = account.to_owned();
         let id = attempt_id.to_owned();
         self.database
@@ -455,7 +438,10 @@ impl PortfolioRisk {
                     .map_err(sql)?
                 {
                     let order: serde_json::Value = serde_json::from_str(&row.map_err(sql)?)?;
-                    outstanding.add(&external_exposure(&order)?, &symbol)?;
+                    outstanding.add(
+                        &external_exposure(&order, &limits.option_multipliers)?,
+                        &symbol,
+                    )?;
                 }
                 drop(orders);
                 let denied = |what: &str| {
@@ -500,7 +486,8 @@ impl PortfolioRisk {
                     if buy_notional > funds {
                         return denied("Available funds");
                     }
-                    if holding > limits.max_position_quantity {
+                    // A strategy holds contracts, not the symbol's shares.
+                    if !strategy && holding > limits.max_position_quantity {
                         return denied("Position quantity");
                     }
                 }
@@ -538,6 +525,80 @@ impl PortfolioRisk {
                 Ok(())
             })
             .await
+    }
+}
+/// What an order would add to the account, as the built-in provider judges
+/// it.
+struct Proposed {
+    /// The equity symbol, or a strategy's first leg's OSI symbol (which no
+    /// equity position or order shares).
+    symbol: String,
+    sell: bool,
+    quantity: Decimal,
+    notional: Decimal,
+    /// An option strategy, bounded by its defined risk.
+    strategy: bool,
+}
+impl Proposed {
+    fn of(order: &OrderRequest, limits: &PortfolioLimits) -> Result<Self> {
+        if order.order_strategy_type != OrderStrategyType::Single {
+            return Err(Error::RiskDenied(
+                "Built-in portfolio risk judges one order at a time; \
+                 use an external risk provider for conditional strategies"
+                    .into(),
+            ));
+        }
+        if order.order_leg_collection.len() > 1 {
+            let risk = crate::types::trading::defined_risk(order, |symbol| {
+                limits.option_multipliers.get(symbol).copied()
+            })
+            .map_err(Error::RiskDenied)?;
+            return Ok(Self {
+                symbol: order.order_leg_collection[0].instrument.symbol.clone(),
+                sell: false,
+                quantity: risk.contracts,
+                notional: risk.max_loss,
+                strategy: true,
+            });
+        }
+        if order.order_leg_collection.len() != 1
+            || !matches!(
+                order.order_type,
+                Some(OrderType::Limit | OrderType::StopLimit)
+            )
+        {
+            return Err(Error::RiskDenied(
+                "Built-in portfolio risk requires a limit order or a defined-risk \
+                 option strategy"
+                    .into(),
+            ));
+        }
+        let leg = &order.order_leg_collection[0];
+        if leg.instrument.asset_type != AssetType::Equity
+            || !matches!(
+                leg.instruction,
+                OrderInstruction::Buy | OrderInstruction::Sell
+            )
+        {
+            return Err(Error::RiskDenied(
+                "Built-in portfolio risk supports long equity exposure; \
+                 other assets require an external risk provider"
+                    .into(),
+            ));
+        }
+        let price = order
+            .price
+            .ok_or_else(|| Error::InvalidParameter("Limit price is required".into()))?;
+        Ok(Self {
+            symbol: leg.instrument.symbol.clone(),
+            sell: leg.instruction == OrderInstruction::Sell,
+            quantity: leg.quantity,
+            notional: leg
+                .quantity
+                .checked_mul(price)
+                .ok_or_else(|| Error::InvalidParameter("Risk arithmetic overflow".into()))?,
+            strategy: false,
+        })
     }
 }
 /// What [`PortfolioRisk::validate_and_reserve`] is asked to do.
@@ -674,8 +735,12 @@ impl RiskProvider for PortfolioRisk {
 }
 
 /// Conservative exposure for broker orders not covered by local holds:
-/// what their unfilled remainder could still buy or sell.
-fn external_exposure(order: &serde_json::Value) -> Result<Exposure> {
+/// what their unfilled remainder could still buy or sell. A working option
+/// strategy counts the unfilled share of its defined risk.
+fn external_exposure(
+    order: &serde_json::Value,
+    multipliers: &HashMap<String, Decimal>,
+) -> Result<Exposure> {
     let deny =
         || Error::RiskDenied("External open order needs a supported, bounded risk model".into());
     if matches!(
@@ -688,6 +753,13 @@ fn external_exposure(order: &serde_json::Value) -> Result<Exposure> {
             quantity: Decimal::ZERO,
             notional: Decimal::ZERO,
         });
+    }
+    if order
+        .get("orderLegCollection")
+        .and_then(|v| v.as_array())
+        .is_some_and(|legs| legs.len() > 1)
+    {
+        return external_strategy_exposure(order, multipliers).ok_or_else(deny);
     }
     if order.get("status").and_then(|v| v.as_str()).is_none()
         || order.get("orderStrategyType").and_then(|v| v.as_str()) != Some("SINGLE")
@@ -743,5 +815,39 @@ fn external_exposure(order: &serde_json::Value) -> Result<Exposure> {
         sell: Some(legs[0].get("instruction").and_then(|v| v.as_str()) == Some("SELL")),
         quantity: remaining,
         notional: remaining.checked_mul(price).ok_or_else(deny)?,
+    })
+}
+
+/// [`external_exposure`] of a working option strategy: its defined risk
+/// scaled by the share of its units still unfilled; `None` if it cannot be
+/// bounded.
+fn external_strategy_exposure(
+    order: &serde_json::Value,
+    multipliers: &HashMap<String, Decimal>,
+) -> Option<Exposure> {
+    use crate::types::trading::Order;
+    if order.get("status").and_then(|v| v.as_str()).is_none()
+        || order.get("orderStrategyType").and_then(|v| v.as_str()) != Some("SINGLE")
+    {
+        return None;
+    }
+    let parsed: Order = serde_json::from_value(order.clone()).ok()?;
+    let request = OrderRequest::try_from(&parsed).ok()?;
+    let risk =
+        crate::types::trading::defined_risk(&request, |symbol| multipliers.get(symbol).copied())
+            .ok()?;
+    let total = decimal(order.get("quantity"))?;
+    let remaining = decimal(order.get("remainingQuantity")).or_else(|| {
+        decimal(order.get("filledQuantity")).and_then(|filled| total.checked_sub(filled))
+    })?;
+    if total <= Decimal::ZERO || remaining < Decimal::ZERO || remaining > total {
+        return None;
+    }
+    let share = remaining.checked_div(total)?;
+    Some(Exposure {
+        symbol: Some(request.order_leg_collection[0].instrument.symbol.clone()),
+        sell: Some(false),
+        quantity: risk.contracts.checked_mul(share)?,
+        notional: risk.max_loss.checked_mul(share)?,
     })
 }
