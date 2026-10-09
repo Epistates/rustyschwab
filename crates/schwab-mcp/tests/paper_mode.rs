@@ -484,6 +484,129 @@ async fn guardrails_bound_symbols_prices_and_the_days_orders() {
     assert_eq!(verdict["dailyBudget"]["used"]["orders"], 2, "{verdict}");
 }
 
+/// A client session that answers every elicitation with `answer`, and
+/// counts them.
+#[derive(Debug)]
+struct Answering {
+    answer: Value,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl turbomcp_core::McpSession for Answering {
+    fn call<'a>(
+        &'a self,
+        method: &'a str,
+        params: Value,
+    ) -> turbomcp_core::SessionFuture<'a, Value> {
+        assert_eq!(method, "elicitation/create");
+        assert!(
+            params["message"]
+                .as_str()
+                .unwrap()
+                .contains("BUY 1 ABC LIMIT @ 9"),
+            "{params}"
+        );
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = self.answer.clone();
+        Box::pin(async move { Ok(answer) })
+    }
+    fn notify<'a>(&'a self, _: &'a str, _: Value) -> turbomcp_core::SessionFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+async fn call_in(server: &AuthorizedServer, ctx: &turbomcp::RequestContext, args: Value) -> Value {
+    let result = server.call_tool("place_order", args, ctx).await.unwrap();
+    let result = serde_json::to_value(result).unwrap();
+    if result["isError"] == true {
+        return result["structuredContent"].clone();
+    }
+    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+/// With `client_approval`, the client's user approves or declines the order
+/// itself, recorded as the client's approval; a client that cannot be asked
+/// leaves it to the operator, whom the webhook tells once per intent.
+#[tokio::test]
+async fn the_clients_user_can_approve_and_operators_are_notified() {
+    use schwab_mcp::approvals::Notifier;
+    use wiremock::matchers::method;
+    let hook = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&hook)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut desk = policy();
+    desk.require_approval = true;
+    desk.client_approval = true;
+    let server = AuthorizedServer::new(backend(broker, None), TRADING, desk)
+        .with_approval_notifier(Some(
+            Notifier::new(&format!("{}/hook", hook.uri())).unwrap(),
+        ));
+    let intent = |price: &str| json!({"account_hash": ACCOUNT, "order": order("BUY", "1", price)});
+    let with = |answer: Value| {
+        let session = Arc::new(Answering {
+            answer,
+            asked: Default::default(),
+        });
+        (
+            turbomcp::RequestContext::stdio().with_session(session.clone()),
+            session,
+        )
+    };
+
+    // Declined: refused, nothing placed.
+    let (ctx, session) = with(json!({"action": "decline"}));
+    let declined = call_in(&server, &ctx, intent("9")).await;
+    assert_eq!(declined["error"]["code"], "not_permitted", "{declined}");
+    assert_eq!(session.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Accepted: placed, and the store says who approved it.
+    let (ctx, _) = with(json!({"action": "accept", "content": {"approve": true}}));
+    let placed = call_in(&server, &ctx, intent("9")).await;
+    assert_eq!(placed["source"], "paper", "{placed}");
+    let digest = schwab_mcp::policy::intent_digest("place_order", &intent("9"));
+    assert_eq!(
+        server
+            .audit
+            .approval_operator(&digest)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("client:paper-desk")
+    );
+
+    // No session to ask: the operator's approval is required, as before.
+    let waiting = call(&server, "place_order", intent("9.1")).await;
+    assert_eq!(waiting["error"]["code"], "approval_required", "{waiting}");
+    let again = call(&server, "place_order", intent("9.1")).await;
+    assert_eq!(again["error"]["code"], "approval_required");
+
+    // One notice per new intent (9 and 9.1), not per call.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while hook.received_requests().await.unwrap_or_default().len() < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let notices = hook.received_requests().await.unwrap();
+    let text: Value = serde_json::from_slice(&notices[0].body).unwrap();
+    assert!(
+        text["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Approval needed: paper-desk asks to PLACE"),
+        "{text}"
+    );
+    hook.verify().await;
+}
+
 /// The venue's daily-loss control halts the desk the moment its marked
 /// equity has fallen past the cap. The desk is told it is halted; the
 /// figures behind it are for a principal that holds every account.

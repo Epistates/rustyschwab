@@ -24,6 +24,10 @@ struct Args {
     paper: Option<PathBuf>,
     #[arg(long, requires = "paper")]
     paper_state: Option<PathBuf>,
+    /// Webhook told when a trader's intent first needs an operator's
+    /// approval (https, or http to loopback).
+    #[arg(long, env = schwab_mcp::approvals::WEBHOOK_ENV)]
+    approval_webhook: Option<String>,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
         &schwab_mcp::read_config(&args.identity)?,
     )?)
     .await?;
+    let notifier = args
+        .approval_webhook
+        .as_deref()
+        .map(schwab_mcp::approvals::Notifier::new)
+        .transpose()?;
     let client: Arc<dyn TradingBackend>;
     let authority;
     let _recovery;
@@ -49,11 +58,10 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?,
         );
-        authority = Arc::new(schwab_mcp::authority::Authority::new_paper(
-            paper.clone(),
-            identity,
-            args.policy,
-        ));
+        authority = Arc::new(
+            schwab_mcp::authority::Authority::new_paper(paper.clone(), identity, args.policy)
+                .with_approval_notifier(notifier),
+        );
         client = paper;
         _recovery = None;
     } else {
@@ -78,13 +86,16 @@ async fn main() -> anyhow::Result<()> {
             accounts: limits,
         });
         let live = Arc::new(live.with_risk_provider(risk.clone())?);
-        authority = Arc::new(schwab_mcp::authority::Authority::new(
-            live.clone(),
-            risk,
-            identity,
-            args.policy,
-            accounts.clone(),
-        ));
+        authority = Arc::new(
+            schwab_mcp::authority::Authority::new(
+                live.clone(),
+                risk,
+                identity,
+                args.policy,
+                accounts.clone(),
+            )
+            .with_approval_notifier(notifier),
+        );
         authority.validate()?;
         live.init().await?;
         _recovery = Some(RecoveryWorker::start(live.clone(), accounts, 0, interval));

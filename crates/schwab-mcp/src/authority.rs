@@ -74,6 +74,7 @@ pub struct Authority {
     /// traffic (or unauthenticated noise) holds every general slot.
     operator_capacity: Arc<tokio::sync::Semaphore>,
     pub required_accounts: Vec<String>,
+    notifier: Option<crate::approvals::Notifier>,
 }
 impl std::fmt::Debug for Authority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -100,6 +101,7 @@ impl Authority {
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
             operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
+            notifier: None,
         }
     }
     /// Paper execution uses the same verified identity, policy, approval and lease routes.
@@ -117,7 +119,15 @@ impl Authority {
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
             operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
+            notifier: None,
         }
+    }
+    /// Tell operators through `notifier` when a trader's intent first
+    /// needs their approval, as the MCP server does.
+    #[must_use]
+    pub fn with_approval_notifier(mut self, notifier: Option<crate::approvals::Notifier>) -> Self {
+        self.notifier = notifier;
+        self
     }
     pub fn validate(&self) -> anyhow::Result<()> {
         self.grants().map(|_| ())
@@ -711,11 +721,20 @@ async fn order(
                 // approves an order, not a digest.
                 if failure.code == crate::contract::FailureCode::ApprovalRequired {
                     let dispatched = crate::policy::tag_intent(args.clone(), &digest);
-                    if let Err(e) = audit
+                    match audit
                         .record_intent(&principal.name, &digest, tool, &dispatched)
                         .await
                     {
-                        tracing::warn!(error = %e, "could not record an intent awaiting approval");
+                        Ok(1) => {
+                            if let Some(notifier) = &state.notifier {
+                                notifier.notify(&principal.name, &digest, tool, &dispatched);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "could not record an intent awaiting approval"
+                        ),
                     }
                 }
                 return Err(StatusCode::FORBIDDEN.into());

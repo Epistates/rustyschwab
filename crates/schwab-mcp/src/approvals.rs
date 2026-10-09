@@ -133,6 +133,112 @@ pub fn render(intent: &IntentRecord) -> String {
     out
 }
 
+/// The environment variable naming the approval webhook.
+pub const WEBHOOK_ENV: &str = "SCHWAB_MCP_APPROVAL_WEBHOOK";
+
+/// The longest rationale a notification quotes, in characters.
+const NOTICE_RATIONALE_CHARS: usize = 500;
+
+/// Tells operators an intent is waiting for their approval: one JSON POST
+/// per intent, the first time it is asked for, to a webhook. The body's
+/// `text` reads as a chat message (Slack and Mattermost incoming webhooks
+/// take it as is); `intent` carries the same facts for a program. Account
+/// numbers are masked, as in [`describe`], and nothing the operator could
+/// approve with is sent: approving still takes `schwab-admin` or the
+/// authority's operator API.
+///
+/// Delivery is best effort, off the request path, bounded at five seconds
+/// and never redirected; a failure is logged and the intent still waits.
+#[derive(Clone)]
+pub struct Notifier {
+    url: reqwest::Url,
+    client: reqwest::Client,
+}
+
+impl std::fmt::Debug for Notifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL of an incoming webhook is its credential.
+        f.debug_struct("Notifier")
+            .field("host", &self.url.host_str())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Notifier {
+    /// A notifier posting to `url`: HTTPS, or HTTP to a loopback address.
+    pub fn new(url: &str) -> anyhow::Result<Self> {
+        let url = reqwest::Url::parse(url)?;
+        let loopback = url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        });
+        anyhow::ensure!(
+            url.scheme() == "https" || (url.scheme() == "http" && loopback),
+            "The approval webhook must be https (or http to a loopback address)"
+        );
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        Ok(Self { url, client })
+    }
+
+    /// The notifier [`WEBHOOK_ENV`] configures, if it is set.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        match std::env::var(WEBHOOK_ENV) {
+            Ok(url) if !url.trim().is_empty() => Self::new(url.trim()).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// Post the notice for `principal`'s intent `digest` (`tool` with
+    /// `arguments`, as it would be dispatched) on its own task.
+    pub fn notify(&self, principal: &str, digest: &str, tool: &str, arguments: &Value) {
+        let body = notice(principal, digest, tool, arguments);
+        let request = self.client.post(self.url.clone()).json(&body);
+        let digest = digest.to_owned();
+        tokio::spawn(async move {
+            match request.send().await.and_then(|r| r.error_for_status()) {
+                Ok(_) => tracing::debug!(%digest, "approval notice delivered"),
+                Err(e) => {
+                    tracing::warn!(%digest, error = %e.without_url(), "approval notice failed")
+                }
+            }
+        });
+    }
+}
+
+/// The webhook body for an intent awaiting approval.
+fn notice(principal: &str, digest: &str, tool: &str, arguments: &Value) -> Value {
+    let order = describe(tool, arguments);
+    let rationale = arguments
+        .get("rationale")
+        .and_then(Value::as_str)
+        .map(|text| {
+            text.chars()
+                .take(NOTICE_RATIONALE_CHARS)
+                .collect::<String>()
+        });
+    let mut text =
+        format!("Approval needed: {principal} asks to {order}\nReview: schwab-admin show {digest}");
+    if let Some(rationale) = &rationale {
+        let _ = write!(text, "\nThe model says: {rationale:?}");
+    }
+    serde_json::json!({
+        "text": text,
+        "intent": {
+            "principal": principal,
+            "digest": digest,
+            "tool": tool,
+            "order": order,
+            "rationale": rationale,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +261,40 @@ mod tests {
         );
         let replace = json!({"account_hash": "A", "order_id": "77", "order": args["order"]});
         assert!(describe("replace_order", &replace).starts_with("REPLACE order 77"));
+    }
+
+    #[test]
+    fn a_notice_describes_the_order_and_quotes_the_model_apart() {
+        let args = json!({
+            "account_hash": "HASHVALUE1234",
+            "order": {"orderStrategyType": "SINGLE", "orderType": "LIMIT",
+                "session": "NORMAL", "duration": "DAY", "price": "150.25",
+                "orderLegCollection": [{"quantity": "10", "instruction": "BUY",
+                    "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]},
+            "rationale": "x".repeat(600),
+        });
+        let body = notice("desk", "ab12", "place_order", &args);
+        let text = body["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("Approval needed: desk asks to PLACE on account …1234: BUY 10 AAPL"),
+            "{text}"
+        );
+        assert!(text.contains("schwab-admin show ab12"));
+        assert!(!text.contains("HASHVALUE"), "the account is masked");
+        assert_eq!(body["intent"]["rationale"].as_str().unwrap().len(), 500);
+    }
+
+    #[test]
+    fn the_webhook_is_https_or_loopback() {
+        assert!(Notifier::new("https://hooks.example.com/T/B/x").is_ok());
+        assert!(Notifier::new("http://127.0.0.1:9000/hook").is_ok());
+        assert!(Notifier::new("http://[::1]:9000/hook").is_ok());
+        assert!(Notifier::new("http://localhost/hook").is_ok());
+        assert!(Notifier::new("http://hooks.example.com/x").is_err());
+        assert!(Notifier::new("ftp://127.0.0.1/x").is_err());
+        assert!(
+            format!("{:?}", Notifier::new("https://h.example/secret").unwrap())
+                .contains("h.example")
+        );
     }
 }

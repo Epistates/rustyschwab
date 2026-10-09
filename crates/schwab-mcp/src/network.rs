@@ -67,14 +67,15 @@ pub fn router_reloadable(
     identity: Option<Arc<crate::identity::JwtVerifier>>,
     policy_path: Option<std::path::PathBuf>,
 ) -> Router {
-    // Reloaded principals share the first server's backend, switches and
-    // stream: rebuilding a principal's server must not orphan the live
+    // Reloaded principals share the first server's backend, switches,
+    // approval notifier and stream: rebuilding a principal's server must not orphan the live
     // stream or its lease on the login's streamer slot.
     let shared = servers.first().map(|s| {
         (
             s.inner.backend().clone(),
             s.inner.switches(),
             s.inner.stream_hub(),
+            s.approval_notifier().cloned(),
         )
     });
     let (revoked, _) = tokio::sync::watch::channel(0);
@@ -83,7 +84,7 @@ pub fn router_reloadable(
         identity,
         revoked,
     });
-    if let (Some(path), Some((backend, switches, hub))) = (policy_path, shared) {
+    if let (Some(path), Some((backend, switches, hub, notifier))) = (policy_path, shared) {
         let weak = Arc::downgrade(&state);
         let initial = crate::read_config(&path).ok();
         tokio::spawn(async move {
@@ -128,6 +129,7 @@ pub fn router_reloadable(
                                 policy,
                                 hub.clone(),
                             )
+                            .with_approval_notifier(notifier.clone())
                         })
                         .collect(),
                     websocket,

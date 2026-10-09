@@ -625,7 +625,7 @@ pub enum IntentState {
 
 const UPSERT_INTENT: &str = "INSERT INTO intents(digest,principal,tool,arguments,first_seen,last_seen) \
      VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(digest) DO UPDATE SET \
-     arguments=excluded.arguments,last_seen=excluded.last_seen,seen=intents.seen+1";
+     arguments=excluded.arguments,last_seen=excluded.last_seen,seen=intents.seen+1 RETURNING seen";
 const SELECT_INTENTS: &str = "SELECT i.digest,i.principal,i.tool,i.arguments,i.first_seen,\
      i.last_seen,i.seen,a.operator,a.expires_at,a.consumed,\
      EXISTS(SELECT 1 FROM audit WHERE kind='approval_revoked' AND subject=i.digest) \
@@ -704,14 +704,15 @@ impl OrderJournal {
     }
     /// Note that `principal` asked for intent `digest` (`tool` with
     /// `arguments`) and it needs an operator's approval, so the operator
-    /// can review what it is: see [`intents`](Self::intents).
+    /// can review what it is: see [`intents`](Self::intents). Returns how
+    /// many times it has now been asked for, so a caller can tell the first.
     pub async fn record_intent(
         &self,
         principal: &str,
         digest: &str,
         tool: &str,
         arguments: &serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let values = (
             digest.to_owned(),
             principal.to_owned(),
@@ -720,7 +721,7 @@ impl OrderJournal {
         );
         self.database
             .run(move |c| {
-                c.execute(
+                c.query_row(
                     UPSERT_INTENT,
                     rusqlite::params![
                         values.0,
@@ -729,9 +730,9 @@ impl OrderJournal {
                         values.3,
                         chrono::Utc::now().timestamp_millis()
                     ],
+                    |r| r.get(0),
                 )
-                .map_err(sql)?;
-                Ok(())
+                .map_err(sql)
             })
             .await
     }

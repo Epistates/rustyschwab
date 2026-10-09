@@ -46,6 +46,12 @@ pub struct PrincipalPolicy {
     pub require_approval: bool,
     #[serde(default)]
     pub approved_intents: HashSet<String>,
+    /// With `require_approval`, ask the MCP client's user to approve each
+    /// order (an MCP elicitation) before falling back to an operator. The
+    /// operator delegates approval to whoever answers the client's prompts:
+    /// right for a person at a desktop client, wrong for an unattended agent.
+    #[serde(default)]
+    pub client_approval: bool,
     /// Tool calls this principal may make per minute (bursting to a tenth
     /// of it); absent, unlimited. Every principal shares one Schwab request
     /// budget, so this keeps one from crowding out the others.
@@ -92,6 +98,10 @@ impl PrincipalPolicy {
                 "Trading principals require positive finite quantity/notional limits"
             );
         }
+        anyhow::ensure!(
+            !self.client_approval || self.require_approval,
+            "client_approval needs require_approval"
+        );
         crate::guardrails::validate_symbols("allowed_symbols", &self.allowed_symbols)?;
         crate::guardrails::validate_symbols("denied_symbols", &self.denied_symbols)?;
         anyhow::ensure!(
@@ -418,6 +428,16 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
 /// answer: once audited, a dispatch runs to its outcome.
 pub const MAX_APPROVAL_WAIT_MS: u64 = 45_000;
 
+/// Who the approval store records as granting an approval the client's
+/// user gave (see [`PrincipalPolicy::client_approval`]), before the
+/// principal's name. The authority gateway honors approvals by configured
+/// operators only, so it never honors one of these.
+pub const CLIENT_APPROVER_PREFIX: &str = "client:";
+
+/// How long an approval the client's user gave lasts: long enough for the
+/// submission it was asked for, which follows at once.
+pub const CLIENT_APPROVAL_SECS: i64 = 60;
+
 /// How often a holding submission re-reads the approval store.
 const APPROVAL_POLL: Duration = Duration::from_secs(1);
 
@@ -466,6 +486,7 @@ pub struct AuthorizedServer {
     pub principal: Arc<PrincipalPolicy>,
     pub audit: OrderJournal,
     calls: Option<Arc<CallLimiter>>,
+    notifier: Option<crate::approvals::Notifier>,
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
@@ -498,7 +519,19 @@ impl AuthorizedServer {
             principal: Arc::new(policy),
             audit,
             calls,
+            notifier: None,
         }
+    }
+    /// Tell operators through `notifier` when an intent of this principal
+    /// first needs their approval.
+    #[must_use]
+    pub fn with_approval_notifier(mut self, notifier: Option<crate::approvals::Notifier>) -> Self {
+        self.notifier = notifier;
+        self
+    }
+    /// The notifier [`with_approval_notifier`](Self::with_approval_notifier) set.
+    pub fn approval_notifier(&self) -> Option<&crate::approvals::Notifier> {
+        self.notifier.as_ref()
     }
 }
 impl std::fmt::Debug for AuthorizedServer {
@@ -670,19 +703,28 @@ impl AuthorizedServer {
         let waited = match authorized {
             Ok(()) => None,
             Err(failure) => {
-                if failure.code == FailureCode::ApprovalRequired {
+                let approvable = failure.code == FailureCode::ApprovalRequired;
+                if approvable {
                     self.note_intent(name, &digest, &args).await;
                 }
-                let waitable =
-                    submission && wait.is_some() && failure.code == FailureCode::ApprovalRequired;
-                if !waitable {
+                if !(submission && approvable) {
                     return Err(failure);
                 }
-                let (effective, waited) = self.await_approval(name, &digest, wait.unwrap()).await?;
+                let started = Instant::now();
+                let effective = if self.principal.client_approval
+                    && self.ask_client(name, &digest, &args, ctx).await?
+                {
+                    self.effective_policy(name, &digest).await?
+                } else {
+                    let Some(wait) = wait else {
+                        return Err(failure);
+                    };
+                    self.await_approval(name, &digest, wait).await?.0
+                };
                 effective.authorize(name, &args)?;
-                // The market may have moved while the operator decided.
+                // The market may have moved while the approver decided.
                 self.check_collar(&args).await?;
-                Some(waited)
+                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
             }
         };
         let args = if submission {
@@ -837,12 +879,18 @@ impl AuthorizedServer {
     /// order rather than a bare digest (see [`crate::approvals`]).
     async fn note_intent(&self, name: &str, digest: &str, args: &Value) {
         let dispatched = tag_intent(args.clone(), digest);
-        if let Err(e) = self
+        match self
             .audit
             .record_intent(&self.principal.name, digest, name, &dispatched)
             .await
         {
-            tracing::warn!(error = %e, "could not record an intent awaiting approval");
+            Ok(1) => {
+                if let Some(notifier) = &self.notifier {
+                    notifier.notify(&self.principal.name, digest, name, &dispatched);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not record an intent awaiting approval"),
         }
     }
 
@@ -914,6 +962,79 @@ impl AuthorizedServer {
             Ok(crate::contract::local(verdict.into_payload()?))
         })
         .await)
+    }
+
+    /// Ask the client's user to approve intent `digest` (an MCP form
+    /// elicitation describing the order, as an operator would read it),
+    /// for a principal whose operator delegated approval to the client.
+    ///
+    /// `Ok(true)`: approved, and recorded in the approval store as granted
+    /// by [`CLIENT_APPROVER_PREFIX`] and the principal's name, for
+    /// [`CLIENT_APPROVAL_SECS`]. `Ok(false)`: the client cannot be asked
+    /// (no session, no elicitation capability), so the operator path
+    /// applies. A decline, a dismissal, or no answer within
+    /// [`MAX_APPROVAL_WAIT_MS`] refuses the order.
+    async fn ask_client(
+        &self,
+        name: &str,
+        digest: &str,
+        args: &Value,
+        ctx: &RequestContext,
+    ) -> Result<bool, ToolFailure> {
+        use std::fmt::Write;
+        if !ctx.has_session() {
+            return Ok(false);
+        }
+        let dispatched = tag_intent(args.clone(), digest);
+        let mut message = format!(
+            "Approve this order?\n{}",
+            crate::approvals::describe(name, &dispatched)
+        );
+        if let Some(rationale) = args.get("rationale").and_then(Value::as_str) {
+            let _ = write!(message, "\nThe model's reason, in its words: {rationale:?}");
+        }
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"approve": {
+                "type": "boolean",
+                "title": "Approve this order",
+                "default": false,
+            }},
+            "required": ["approve"],
+        });
+        let asked = tokio::time::timeout(
+            Duration::from_millis(MAX_APPROVAL_WAIT_MS),
+            ctx.elicit_form(message, schema),
+        )
+        .await;
+        let answer = match asked {
+            Err(_) => {
+                return Err(ToolFailure::new(
+                    FailureCode::ApprovalRequired,
+                    "The client's user did not answer the approval prompt; \
+                     an operator may still approve the intent",
+                )
+                .with_intent(digest));
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "the client cannot be asked to approve");
+                return Ok(false);
+            }
+            Ok(Ok(answer)) => serde_json::to_value(answer).unwrap_or_default(),
+        };
+        if answer["action"] != "accept" || answer["content"]["approve"] != true {
+            return Err(
+                ToolFailure::not_permitted("The client's user declined the order")
+                    .with_intent(digest),
+            );
+        }
+        let approver = format!("{CLIENT_APPROVER_PREFIX}{}", self.principal.name);
+        let expires_at = chrono::Utc::now().timestamp() + CLIENT_APPROVAL_SECS;
+        self.audit
+            .approve(&self.principal.name, digest, &approver, expires_at)
+            .await
+            .map_err(|e| ToolFailure::from(e).with_intent(digest))?;
+        Ok(true)
     }
 
     /// Hold, bounded, for the operator's approval of `digest`, then answer
@@ -1835,5 +1956,14 @@ mod tests {
         assert!(with("price_collar_bps", serde_json::json!(10_000)).is_err());
         assert!(with("max_daily_notional", serde_json::json!("0")).is_err());
         assert!(with("max_daily_notional", serde_json::json!("5000")).is_ok());
+        assert!(with("client_approval", serde_json::json!(true)).is_ok());
+        let mut unapproved = serde_json::to_value(policy()).unwrap();
+        unapproved["require_approval"] = false.into();
+        unapproved["client_approval"] = true.into();
+        let unapproved: PrincipalPolicy = serde_json::from_value(unapproved).unwrap();
+        assert!(
+            unapproved.validate().is_err(),
+            "client approval needs approvals"
+        );
     }
 }

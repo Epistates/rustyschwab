@@ -204,6 +204,8 @@ pub struct Principal {
     pub max_quantity: Option<Decimal>,
     pub max_notional: Option<Decimal>,
     pub require_approval: bool,
+    /// The client's user is asked to approve orders before an operator.
+    pub client_approval: bool,
     /// Empty: any symbol the other limits allow.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub allowed_symbols: Vec<String>,
@@ -232,6 +234,7 @@ impl From<&PrincipalPolicy> for Principal {
             max_quantity: policy.max_quantity,
             max_notional: policy.max_notional,
             require_approval: policy.require_approval,
+            client_approval: policy.client_approval,
             allowed_symbols: sorted(&policy.allowed_symbols),
             denied_symbols: sorted(&policy.denied_symbols),
             price_collar_bps: policy.price_collar_bps.map(|v| v.get()),

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — approvals reach the people who give them
+
+- **Approval by the client's user.** A principal with `client_approval`
+  (which needs `require_approval`) asks the MCP client's user to approve
+  each order through a form elicitation that describes it in words. An
+  accept records a one-minute approval granted by `client:<principal>`
+  (`CLIENT_APPROVER_PREFIX`, `CLIENT_APPROVAL_SECS`); a decline or
+  dismissal is `not_permitted`; a client without elicitation falls back to
+  the operator. The authority gateway honors configured operators only, so
+  never one of these.
+- **Approval notices.** `SCHWAB_MCP_APPROVAL_WEBHOOK` (or
+  `schwab-authority --approval-webhook`) receives a POST the first time an
+  intent needs approval, with a chat-ready `text` and the intent's facts
+  (`approvals::Notifier`). HTTPS only, or HTTP to loopback; no redirects;
+  best effort. `OrderJournal::record_intent` now returns how many times the
+  intent has been asked for.
+- The README's `wait_ms` cap is 45 s, as the code has it.
+
 ### Added — principal guardrails
 
 - **Symbol lists.** `allowed_symbols` (empty: any) and `denied_symbols` on

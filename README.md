@@ -499,9 +499,13 @@ until an operator clears it, and trips it again while the loss persists. See
   halts) with the intent digest to approve, also without contacting Schwab;
   `preview_order`, `place_order`, `cancel_order`, `replace_order` *(last
   three gated)*. `place_order` and `replace_order` take `wait_ms` (at most
-  60 s) to hold the submission while an operator grants the approval it is
+  45 s) to hold the submission while an operator grants the approval it is
   waiting on, instead of failing and being retried; they hold for nothing
-  else, and a hold that ends unapproved dispatches nothing. The write tools
+  else, and a hold that ends unapproved dispatches nothing. A principal
+  with `client_approval` asks the client's user to approve the order (an
+  MCP elicitation) first, and `SCHWAB_MCP_APPROVAL_WEBHOOK` tells operators
+  when an intent starts waiting. Principals can also be held to symbol
+  lists, a price collar and a daily budget. The write tools
   and `check_order` accept an optional
   `rationale` (at most 2000 characters): the model's reason, kept in the
   audit journal, never sent to Schwab, and excluded from the intent digest

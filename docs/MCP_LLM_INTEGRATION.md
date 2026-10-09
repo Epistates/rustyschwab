@@ -260,8 +260,36 @@ unapproved, or a client that gives up, leaves no record and no order. The
 approval is still the operator's, granted through `schwab-admin` or the
 authority against a verified operator subject; no tool the model holds
 approves anything, and waiting is not approving. A submission that waited
-records `approvalWaitedMs` in the audit journal. Nothing is
-audited or approved by checking. Grant `check_order` to any principal that
+records `approvalWaitedMs` in the audit journal.
+
+A principal whose operator set `client_approval` is asked differently: the
+server sends the client an MCP form elicitation describing the order in
+words (as `schwab-admin show` prints it, with the model's rationale apart)
+and a single "Approve this order" box. Accepting records a one-minute
+approval granted by `client:<principal>` and the order goes; declining or
+dismissing it is `not_permitted`, and no answer within 45 s is
+`approval_required`, which an operator may still grant. A client that does
+not support elicitation falls back to the operator path above. This
+delegates approval to whoever answers the client's prompts: an operator
+turns it on for a person at a desktop client, never for an unattended
+agent, and the authority gateway never honors such an approval.
+
+When `SCHWAB_MCP_APPROVAL_WEBHOOK` (or `schwab-authority
+--approval-webhook`) is set, the first time an intent needs approval the
+server POSTs `{"text", "intent"}` to it: `text` reads as a chat message
+(Slack and Mattermost incoming webhooks take it as is), with the order
+described, accounts masked and the `schwab-admin show` command to review
+it. The URL must be https, or http to a loopback address. Delivery is best
+effort and never approves anything.
+
+A principal's policy may also hold it to `allowed_symbols` and
+`denied_symbols` (`not_permitted`), a `price_collar_bps` judged against the
+venue's current quote, and a daily budget (`max_daily_orders`,
+`max_daily_notional`, per New York trading day); the last two are
+`risk_denied`. `check_order` reports all of them, with the budget's use so
+far in `dailyBudget`, and `get_server_status` lists the limits.
+
+Nothing is audited or approved by checking. Grant `check_order` to any principal that
 holds `place_order` or `replace_order`; without a principal (the local stdio
 transport with trading off) `limits` is null and approval does not apply.
 `preview_order` remains the way to obtain Schwab's own validation, fees and
