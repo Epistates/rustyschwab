@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — a NautilusTrader adapter
+
+- **`rustyschwab.nautilus`** for NautilusTrader 1.231 (`pip install
+  "rustyschwab[nautilus]"`, CPython 3.12 to 3.14, `nautilus_trader>=1.231,<2`;
+  an extra because Nautilus is LGPL-3.0), following its live-adapter
+  conventions: `SchwabDataClientConfig`, `SchwabExecClientConfig`,
+  `SchwabLiveDataClientFactory`, `SchwabLiveExecClientFactory`, venue
+  `SCHWAB`, account `SCHWAB-<account hash>`.
+- **Instruments and data**: `Equity` and `OptionContract` from quotes and
+  option chains; quote and trade ticks from the Level One stream, with a
+  gap re-read from REST and a dropped stream reopened and resubscribed;
+  bars from price history.
+- **Execution**: market, limit, stop and stop-limit equity and single-leg
+  option orders, DAY and GTC, modify as a Schwab replace. The Nautilus
+  client order ID is the Schwab tag; fills and cancels are read from the
+  account's orders by polling; an order of unknown outcome is never resent.
+  Order, fill and position reports and account state serve reconciliation.
+- **Paper mode**: `SchwabPaperConfig` runs the execution client on the
+  offline paper venue, filled from the node's own SCHWAB quotes, with no
+  Schwab account.
+- The adapter's tests skip without NautilusTrader; CI runs them on one
+  Python 3.12 row. Not yet exercised against a live Schwab account.
+
 ### Added — Python bindings
 
 - **`rustyschwab` for Python**: asyncio-native bindings for the SDK, built
