@@ -57,9 +57,10 @@ await broker.place_order("paper", order)
 - `Stream`: the streamer as an async iterator, with subscribe, unsubscribe and view, automatic reconnection and explicit gap notifications.
 - `PaperBroker`: the SDK's deterministic paper venue, driven by sequenced events, for backtests and tests.
 - A `SchwabError` hierarchy that mirrors the SDK's error kinds, such as `RiskDenied`, `Halted`, `RateLimited`, `AuthError`, `BrokerError` and `SubmissionUnknown`.
+- `rustyschwab.nautilus`, an optional [NautilusTrader](https://nautilustrader.io/) adapter: instruments, quote and trade ticks, bars, order execution, reports and reconciliation for Schwab equities and options, and the same execution client on the offline paper venue. Install it with `pip install "rustyschwab[nautilus]"` (CPython 3.12 to 3.14, as NautilusTrader requires).
 - Type stubs (`py.typed`).
 
-The [Python guide](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md) covers installation, authorization, configuration, orders, streaming, paper trading, error handling and how asyncio and the Rust runtime fit together. The [SDK documentation](https://github.com/epistates/rustyschwab/blob/main/docs/INDEX.md) explains the model behind it.
+The [Python guide](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md) covers installation, authorization, configuration, orders, streaming, paper trading, the NautilusTrader adapter, error handling and how asyncio and the Rust runtime fit together. The [SDK documentation](https://github.com/epistates/rustyschwab/blob/main/docs/INDEX.md) explains the model behind it.
 
 ## Development
 
@@ -67,6 +68,7 @@ The crate is outside the Cargo workspace and builds with [maturin](https://www.m
 
 ```sh
 maturin develop && pytest      # offline; a local mock server stands in for Schwab
+pip install -e ".[nautilus]"   # then pytest also runs the NautilusTrader adapter tests
 cargo test                     # Rust unit tests
 ```
 

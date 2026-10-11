@@ -42,6 +42,11 @@ Changelog = "https://github.com/epistates/rustyschwab/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=1.0", "websockets>=14"]
+# The NautilusTrader adapter, rustyschwab.nautilus. Developed against the 1.231
+# stable line; the range stops before 2.0, a rewrite whose release candidates
+# change the adapter interfaces. NautilusTrader supports CPython 3.12 to 3.14
+# only, and is LGPL-3.0, which is why it is an extra and not a dependency.
+nautilus = ["nautilus_trader>=1.231,<2"]
 
 [tool.maturin]
 module-name = "rustyschwab._native"
@@ -55,3 +60,17 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = ["error"]
+
+# NautilusTrader is compiled Cython with no stubs, so mypy cannot see most of
+# it. Its names are Any for mypy, installed or not, so the check gives the same
+# answer with and without the extra. Subclassing them is allowed in the adapter
+# package alone; `mypy --strict python/rustyschwab` stays strict for everything
+# else.
+[[tool.mypy.overrides]]
+module = ["nautilus_trader", "nautilus_trader.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[[tool.mypy.overrides]]
+module = ["rustyschwab.nautilus", "rustyschwab.nautilus.*"]
+disallow_subclassing_any = false
