@@ -70,7 +70,10 @@ A failure is a tool result with `isError: true` whose text and
 An unauthenticated Schwab session is `unavailable` with `ask_operator`, since
 only the operator can re-run OAuth. Policy denials from the principal wrapper
 use the same shape, so the model reads them instead of receiving a JSON-RPC
-error; JSON-RPC errors are reserved for protocol faults. Schwab's own 4xx
+error. A call refused before any tool runs (an unknown tool, or arguments
+failing the tool's input schema) is TurboMCP's own `isError` result with
+its reason as text and no structured error; JSON-RPC errors are reserved
+for protocol faults. Schwab's own 4xx
 rejection text (title and detail, describing the submitted request) is relayed
 in `message`; every other upstream detail is logged under a reference id.
 Client middleware that retries must key on `retryable`, never on `isError`.

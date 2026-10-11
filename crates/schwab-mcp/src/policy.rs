@@ -689,14 +689,15 @@ impl McpServerCore for AuthorizedServer {
     }
 }
 impl WithTools for AuthorizedServer {
+    /// Every tool the server has, granted or not: the dispatcher answers a
+    /// tool it cannot look up as unknown, and one that exists but is not
+    /// granted must reach [`call_tool`](Self::call_tool) to be refused as
+    /// `not_permitted`, a result the model can read. The list is filtered.
     async fn lookup_tool(
         &self,
         ctx: &ListToolsContext,
         name: String,
     ) -> McpResult<Option<neutral::Tool>> {
-        if !self.principal.tools.contains(&name) {
-            return Ok(None);
-        }
         self.inner.lookup_tool(ctx, name).await
     }
     async fn list_tools(
@@ -719,9 +720,9 @@ impl WithTools for AuthorizedServer {
         // Any call, even a denied or unknown one, shows the principal is
         // alive; the guard also keeps it so for as long as the call runs.
         let _alive = self.dead_man.as_ref().map(Beacon::call);
-        // A tool that does not exist is a protocol error, as on the
-        // unauthorized transport and per the MCP spec; one that exists but
-        // is not granted is a `not_permitted` result the model can read.
+        // The dispatcher answers a tool that does not exist before this runs;
+        // a direct caller gets a protocol error. One that exists but is not
+        // granted is a `not_permitted` result the model can read.
         let listing = ListToolsContext::new(ctx.base.clone());
         let Some(tool) = self.inner.lookup_tool(&listing, name.to_owned()).await? else {
             return Err(McpError::tool_not_found(name));
@@ -2178,6 +2179,57 @@ mod tests {
         assert!(
             refused.contains("needs place_order or replace_order"),
             "{refused}"
+        );
+    }
+
+    /// Through the dispatcher a client talks to, a tool that exists but is
+    /// not granted is refused as `not_permitted` in the contract's shape,
+    /// and only the granted tools are listed.
+    #[tokio::test]
+    async fn ungranted_tools_are_refused_on_the_wire() {
+        use tower::{Service, ServiceExt};
+        let mut dispatcher = authorized().dispatcher();
+        let meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mut send = async |method: &str, params: Value| {
+            let request = turbomcp::JsonRpcRequest::new(1, method, Some(params));
+            let reply = dispatcher
+                .ready()
+                .await
+                .unwrap()
+                .call(request.into())
+                .await
+                .unwrap()
+                .unwrap();
+            let turbomcp::JsonRpcMessage::Response(reply) = reply else {
+                panic!("expected a response");
+            };
+            reply.result.unwrap()
+        };
+        let refused = send(
+            "tools/call",
+            serde_json::json!({"name": "get_quotes", "arguments": {"symbols": ["AAPL"]},
+                "_meta": meta}),
+        )
+        .await;
+        assert_eq!(refused["isError"], true, "{refused}");
+        assert_eq!(
+            refused["structuredContent"]["error"]["code"], "not_permitted",
+            "{refused}"
+        );
+        let listed = send("tools/list", serde_json::json!({"_meta": meta})).await;
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"get_account") && !names.contains(&"get_quotes"),
+            "{names:?}"
         );
     }
 

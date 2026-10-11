@@ -11,9 +11,11 @@
 //! message, attemptId?, intentDigest?}}`. `code` is a closed vocabulary,
 //! `retryable` says whether the same call may be repeated after a delay
 //! (only when nothing reached the broker), and `disposition` names the
-//! model's next move. Protocol-level JSON-RPC errors are reserved for
-//! protocol faults (unknown tool, malformed arguments); every business
-//! outcome is a tool result so the model can read it and self-correct.
+//! model's next move. A call the transport refuses before any tool runs (an
+//! unknown tool, arguments failing the tool's input schema) is TurboMCP's
+//! own `isError` result, its text saying why, without the structured error.
+//! Every business outcome is a tool result so the model can read it and
+//! self-correct.
 //!
 //! Upstream detail crosses this boundary only when it is addressed to the
 //! caller: SDK guardrail messages and Schwab's own 4xx rejection text
