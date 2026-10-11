@@ -1,0 +1,7 @@
+target/
+dist/
+python/rustyschwab/*.so
+python/rustyschwab/*.pyd
+__pycache__/
+.pytest_cache/
+*.egg-info/

@@ -6,6 +6,7 @@
 - [App callback URLs](APP_CALLBACK.md) — redirect URI requirements and local HTTPS.
 - [Placing orders](ORDERS.md) — constructors for single-leg, option, multi-leg and composite orders; the JSON `OrderSpec`.
 - [Real-time streaming](STREAMING.md) — services, field selection, backpressure and reconnect semantics.
+- [Python bindings](PYTHON.md) — `pip install rustyschwab`: authorization, quotes, orders, streaming, paper backtests and error handling from asyncio.
 - [Troubleshooting](TROUBLESHOOTING.md) — 401s, symbol formatting, TLS, async pitfalls.
 
 ## Running it in production

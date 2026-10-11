@@ -1,0 +1,57 @@
+[build-system]
+# 1.9.4 is the first maturin that sets PYO3_BUILD_EXTENSION_MODULE, which
+# replaces PyO3's deprecated `extension-module` cargo feature.
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rustyschwab"
+description = "Asyncio-native Python bindings for the rustyschwab Schwab SDK: Trader and Market Data APIs, streaming, journaled orders and an offline paper venue"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Nick Paterno" }]
+keywords = ["schwab", "trading", "asyncio", "market-data", "streaming", "backtesting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
+# The version comes from Cargo.toml.
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/epistates/rustyschwab"
+Documentation = "https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md"
+Repository = "https://github.com/epistates/rustyschwab"
+Changelog = "https://github.com/epistates/rustyschwab/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=1.0", "websockets>=14"]
+
+[tool.maturin]
+module-name = "rustyschwab._native"
+python-source = "python"
+# One abi3 wheel per platform covers every CPython from 3.10.
+# (abi3-py310 is enabled on the pyo3 dependency in Cargo.toml.)
+include = [{ path = "LICENSE-*", format = "sdist" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]

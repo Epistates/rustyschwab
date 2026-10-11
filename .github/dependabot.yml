@@ -8,6 +8,19 @@ updates:
     groups:
       compatible-rust-updates:
         update-types: [minor, patch]
+  # The Python bindings are outside the workspace, with their own lockfile.
+  - package-ecosystem: cargo
+    directory: /crates/schwab-py
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      compatible-rust-updates:
+        update-types: [minor, patch]
+  - package-ecosystem: pip
+    directory: /crates/schwab-py
+    schedule:
+      interval: weekly
   - package-ecosystem: github-actions
     directory: /
     schedule:

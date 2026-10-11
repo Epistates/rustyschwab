@@ -5,8 +5,10 @@ members = [
     "crates/schwab-mcp",
     "examples/*",
 ]
-# cargo-fuzz targets build on their own (nightly, sanitizers).
-exclude = ["fuzz"]
+# cargo-fuzz targets build on their own (nightly, sanitizers); the Python
+# bindings are built by maturin with a Python toolchain and keep their own
+# lockfile (see crates/schwab-py/Cargo.toml).
+exclude = ["fuzz", "crates/schwab-py"]
 resolver = "2"
 
 [workspace.package]

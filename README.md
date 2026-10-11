@@ -14,6 +14,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 - **[Placing Orders](https://github.com/epistates/rustyschwab/blob/main/docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
 - **[Real-time Streaming](https://github.com/epistates/rustyschwab/blob/main/docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
 - **[Troubleshooting](https://github.com/epistates/rustyschwab/blob/main/docs/TROUBLESHOOTING.md)**: Common issues and solutions.
+- **[Python bindings](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md)**: `pip install rustyschwab`, an asyncio-native client with streaming and the paper venue.
 - **[Architecture Overview](https://github.com/epistates/rustyschwab/blob/main/docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md)**: For contributors.
 
 ## Features
@@ -288,6 +289,11 @@ tokio = { version = "1", features = ["full"] }
 
 `schwab-rs` re-exports the wire types as `schwab_rs::types`, so a separate
 `schwab-types` dependency is only needed by crates that use the types alone.
+
+From Python, `pip install rustyschwab` installs the same SDK as an asyncio
+client (CPython 3.10+, abi3 wheels). See the [Python guide](docs/PYTHON.md);
+the bindings live in [`crates/schwab-py`](crates/schwab-py), outside the Cargo
+workspace.
 
 ## Quick Start
 

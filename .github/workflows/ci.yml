@@ -195,6 +195,60 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans licenses sources
+      # The Python bindings are outside the workspace with a lockfile of their own.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: crates/schwab-py/Cargo.toml
+          command: check advisories bans licenses sources
+
+  # The Python bindings are not a workspace member (see crates/schwab-py/Cargo.toml),
+  # so nothing above builds them. This builds the wheel the way a user installs
+  # it and runs the pytest suite against that wheel, on the oldest and newest
+  # supported Python (the wheel is abi3, one build for all of them).
+  python:
+    name: python (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.14"
+          - os: macos-latest
+            python: "3.13"
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/schwab-py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: crates/schwab-py
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Bindings and SDK ship the same version
+        run: |
+          bindings=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
+          sdk=$(cargo metadata --format-version 1 --no-deps --manifest-path ../../Cargo.toml | jq -r '.packages[] | select(.name == "schwab-rs") | .version')
+          [ "$bindings" = "$sdk" ] || { echo "::error::schwab-py is $bindings but schwab-rs is $sdk"; exit 1; }
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      # Links the interpreter and runs the conversion and error-mapping unit tests.
+      - run: cargo test --locked
+      - run: python -m pip install "maturin>=1.9.4,<2"
+      - run: maturin build --locked --out dist
+      - name: Install the wheel with the test extras
+        run: python -m pip install "$(echo dist/*.whl)[test]" mypy
+      - run: python -m pytest
+      - run: python -m mypy --strict python/rustyschwab
 
   compatibility:
     if: github.event_name == 'pull_request'
