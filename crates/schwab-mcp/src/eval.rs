@@ -13,7 +13,7 @@
 //! reached the venue except through an authorized, accepted dispatch; a
 //! violation is a server defect, not a model score.
 use crate::backend::{Backend, Paper};
-use crate::contract::{FailureCode, Reported};
+use crate::contract::{FailureCode, Reported, ToolResult};
 use crate::policy::{AuthorizedServer, PrincipalPolicy, intent_digest, intent_tag};
 use crate::server::Switches;
 use anyhow::Context;
@@ -454,6 +454,18 @@ impl Recording {
     }
 }
 
+impl Recording {
+    /// Serve the recorded principal over stdio until the client disconnects.
+    pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
+        let dispatcher = ServerBuilder::new(self)
+            .with_tools()
+            .with_resources()
+            .with_prompts()
+            .build();
+        turbomcp::serve_stdio(turbomcp::LegacySessionAdapter::new(dispatcher)).await
+    }
+}
+
 fn write_record(sink: &mut dyn Write, record: &Record) -> anyhow::Result<()> {
     serde_json::to_writer(&mut *sink, record)?;
     sink.write_all(b"\n")?;
@@ -461,50 +473,79 @@ fn write_record(sink: &mut dyn Write, record: &Record) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl McpHandler for Recording {
-    fn server_info(&self) -> ServerInfo {
+impl McpServerCore for Recording {
+    fn server_info(&self) -> Implementation {
         self.inner.server_info()
     }
-    fn list_tools(&self) -> Vec<Tool> {
-        self.inner.list_tools()
+    fn supported_versions(&self) -> &'static [turbomcp::ProtocolVersion] {
+        self.inner.supported_versions()
     }
-    fn list_resources(&self) -> Vec<Resource> {
-        self.inner.list_resources()
+    fn instructions(&self) -> Option<String> {
+        self.inner.instructions()
     }
-    fn list_prompts(&self) -> Vec<Prompt> {
-        self.inner.list_prompts()
+}
+impl WithTools for Recording {
+    async fn lookup_tool(
+        &self,
+        ctx: &ListToolsContext,
+        name: String,
+    ) -> McpResult<Option<neutral::Tool>> {
+        self.inner.lookup_tool(ctx, name).await
     }
-    async fn call_tool<'a>(
-        &'a self,
-        name: &'a str,
-        args: Value,
-        ctx: &'a RequestContext,
+    async fn list_tools(
+        &self,
+        ctx: &ListToolsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListToolsResult> {
+        self.inner.list_tools(ctx, params).await
+    }
+    async fn call_tool(
+        &self,
+        ctx: &CallToolContext,
+        params: neutral::CallToolParams,
     ) -> McpResult<ToolResult> {
         let record = Record::Call {
-            tool: name.to_owned(),
-            arguments: args.clone(),
+            tool: params.name.clone(),
+            arguments: Value::Object(params.arguments.clone()),
         };
         {
             let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
             write_record(&mut **sink, &record)
                 .map_err(|e| McpError::internal(format!("transcript write failed: {e}")))?;
         }
-        self.inner.call_tool(name, args, ctx).await
+        self.inner.call_tool(ctx, params).await
     }
-    async fn read_resource<'a>(
-        &'a self,
-        uri: &'a str,
-        ctx: &'a RequestContext,
-    ) -> McpResult<ResourceResult> {
-        self.inner.read_resource(uri, ctx).await
+}
+impl WithResources for Recording {
+    async fn list_resources(
+        &self,
+        ctx: &ListResourcesContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListResourcesResult> {
+        self.inner.list_resources(ctx, params).await
     }
-    async fn get_prompt<'a>(
-        &'a self,
-        name: &'a str,
-        args: Option<Value>,
-        ctx: &'a RequestContext,
-    ) -> McpResult<PromptResult> {
-        self.inner.get_prompt(name, args, ctx).await
+    async fn read_resource(
+        &self,
+        ctx: &ReadResourceContext,
+        params: neutral::ReadResourceParams,
+    ) -> McpResult<neutral::ReadResourceResult> {
+        self.inner.read_resource(ctx, params).await
+    }
+}
+impl WithPrompts for Recording {
+    async fn list_prompts(
+        &self,
+        ctx: &ListPromptsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListPromptsResult> {
+        self.inner.list_prompts(ctx, params).await
+    }
+    async fn get_prompt(
+        &self,
+        ctx: &GetPromptContext,
+        params: neutral::GetPromptParams,
+    ) -> McpResult<neutral::GetPromptResult> {
+        self.inner.get_prompt(ctx, params).await
     }
 }
 
@@ -640,7 +681,7 @@ pub async fn score(
     for (index, (tool, arguments)) in transcript.calls.iter().enumerate() {
         let result = fixture
             .server
-            .call_tool(tool, arguments.clone(), &RequestContext::stdio())
+            .call(tool, arguments.clone())
             .await
             .map_err(|e| {
                 anyhow::anyhow!("call {index} ({tool}) failed at the protocol level: {e}")
@@ -670,7 +711,7 @@ pub async fn score(
 
 fn step(index: usize, tool: &str, arguments: &Value, result: ToolResult) -> anyhow::Result<Step> {
     let reported = Reported::of(&result);
-    let (outcome, message, order_id) = if result.is_error() {
+    let (outcome, message, order_id) = if result.is_error {
         let (code, message) = reported
             .failure
             .with_context(|| format!("call {index} ({tool}) failed without a contract code"))?;

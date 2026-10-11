@@ -95,12 +95,11 @@ impl<'a> Audience<'a> {
 }
 
 /// The grammar as `resources/read` returns it.
-pub fn order_spec() -> ResourceResult {
-    let mut result = ResourceResult::text(ORDER_SPEC_URI, ORDER_SPEC_MARKDOWN);
-    if let Some(ResourceContents::Text(text)) = result.contents.first_mut() {
-        text.mime_type = Some(ORDER_SPEC_MIME.into());
-    }
-    result
+pub fn order_spec() -> neutral::ReadResourceResult {
+    neutral::ReadResourceResult::new(vec![
+        neutral::ResourceContents::text(ORDER_SPEC_URI, ORDER_SPEC_MARKDOWN)
+            .with_mime_type(ORDER_SPEC_MIME),
+    ])
 }
 
 /// The `propose_trade` arguments, normalized: trimmed, with blank
@@ -150,7 +149,7 @@ impl Proposal {
 
 /// The workflow rendered for `audience` as one user message: only the
 /// steps its tools allow, with what the session cannot do said outright.
-pub fn propose_trade(audience: &Audience<'_>, proposal: &Proposal) -> PromptResult {
+pub fn propose_trade(audience: &Audience<'_>, proposal: &Proposal) -> neutral::GetPromptResult {
     let account = &proposal.account_hash;
     let instrument = proposal
         .symbol
@@ -373,10 +372,12 @@ pub fn propose_trade(audience: &Audience<'_>, proposal: &Proposal) -> PromptResu
     for (index, step) in steps.iter().enumerate() {
         let _ = write!(text, "\n{}. {step}", index + 1);
     }
-    PromptResult::user(text).with_description(format!(
-        "Propose a trade for account {account}: read the session, market and account, compose \
+    neutral::GetPromptResult::new(vec![neutral::PromptMessage::user_text(text)]).with_description(
+        format!(
+            "Propose a trade for account {account}: read the session, market and account, compose \
          and check the order, and present it for confirmation."
-    ))
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -386,8 +387,11 @@ mod tests {
     fn allow(tools: &[&str]) -> HashSet<String> {
         tools.iter().map(|t| (*t).to_owned()).collect()
     }
-    fn text(result: &PromptResult) -> &str {
-        result.messages[0].content.as_text().unwrap()
+    fn text(result: &neutral::GetPromptResult) -> &str {
+        let neutral::Content::Text { text, .. } = &result.messages[0].content else {
+            panic!("{result:?}");
+        };
+        text
     }
     fn proposal() -> Proposal {
         Proposal::new("A".into(), Some(" AAPL ".into()), Some("".into())).unwrap()
@@ -577,11 +581,17 @@ mod tests {
     #[test]
     fn grammar_is_markdown_and_complete() {
         let result = order_spec();
-        let ResourceContents::Text(content) = &result.contents[0] else {
+        let neutral::ResourceContents::Text {
+            uri,
+            mime_type,
+            text,
+            ..
+        } = &result.contents[0]
+        else {
             panic!("{result:?}");
         };
-        assert_eq!(content.uri, ORDER_SPEC_URI);
-        assert_eq!(content.mime_type.as_deref(), Some(ORDER_SPEC_MIME));
+        assert_eq!(uri, ORDER_SPEC_URI);
+        assert_eq!(mime_type.as_deref(), Some(ORDER_SPEC_MIME));
         for kind in [
             "market",
             "limit",
@@ -595,10 +605,10 @@ mod tests {
             "trigger",
             "bracket",
         ] {
-            assert!(content.text.contains(&format!("| `{kind}` |")), "{kind}");
+            assert!(text.contains(&format!("| `{kind}` |")), "{kind}");
         }
         // Every example in the grammar expands.
-        for example in content.text.split("```json").skip(1) {
+        for example in text.split("```json").skip(1) {
             let json = example.split("```").next().unwrap();
             let value: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {json}"));
             if value.get("kind").is_some() {

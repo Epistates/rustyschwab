@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 use turbomcp::prelude::*;
 
 use crate::backend::Backend;
-use crate::contract::{FailureCode, Reported, ToolFailure};
+use crate::contract::{FailureCode, Reported, ToolFailure, ToolResult};
 use crate::order_status::OrderStatusReport;
 use crate::portfolio::ORDER_LOOKBACK_DAYS;
 use crate::projection::{self, Page, Row};
@@ -81,7 +81,7 @@ pub enum Dispatch {
 impl Dispatch {
     pub fn of(result: &McpResult<ToolResult>) -> Self {
         match result {
-            Ok(result) if !result.is_error() => Self::Completed {
+            Ok(result) if !result.is_error => Self::Completed {
                 order_id: Reported::of(result).order_id().map(str::to_owned),
             },
             Ok(result) => Self::Failed {

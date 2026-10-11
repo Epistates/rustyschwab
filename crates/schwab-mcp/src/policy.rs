@@ -7,7 +7,7 @@
 //! knows whether to change the order, wait for the operator, or stop.
 use crate::SchwabMcp;
 use crate::backend::Backend;
-use crate::contract::{FailureCode, ToolFailure};
+use crate::contract::{FailureCode, ToolFailure, ToolResult};
 use crate::dead_man::{self, Beacon, Liveness, Reaper};
 use crate::guidance;
 use crate::server::Switches;
@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use turbomcp::prelude::*;
+use turbomcp::{ProtocolVersion, VersionDispatcher};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -233,9 +234,8 @@ impl PrincipalPolicy {
 }
 
 /// The first top-level argument `tool`'s input schema does not declare.
-fn undeclared_argument(tool: &turbomcp::Tool, args: &Value) -> Option<String> {
-    let schema = serde_json::to_value(&tool.input_schema).ok()?;
-    let declared = schema.get("properties")?.as_object()?;
+fn undeclared_argument(tool: &neutral::Tool, args: &Value) -> Option<String> {
+    let declared = tool.input_schema.get("properties")?.as_object()?;
     args.as_object()?
         .keys()
         .find(|key| !declared.contains_key(*key))
@@ -610,6 +610,40 @@ impl AuthorizedServer {
         self.notifier = notifier;
         self
     }
+    /// The MCP dispatcher for this principal alone. Resources and prompts
+    /// are registered only when the principal is offered them, so the
+    /// capabilities it is told agree with what it can use.
+    pub fn dispatcher(self) -> VersionDispatcher<Self> {
+        let guidance = self.offers_guidance();
+        let builder = ServerBuilder::new(self).with_tools();
+        if guidance {
+            builder.with_resources().with_prompts().build()
+        } else {
+            builder.build()
+        }
+    }
+    /// Whether this principal is offered the order-spec resource and the
+    /// `propose_trade` prompt: it holds a tool they are about.
+    pub fn offers_guidance(&self) -> bool {
+        let audience = self.audience();
+        audience.offers_resource(guidance::ORDER_SPEC_URI)
+            || audience.offers_prompt(guidance::PROPOSE_TRADE)
+    }
+    /// Serve this principal over stdio until the client disconnects.
+    pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
+        turbomcp::serve_stdio(turbomcp::LegacySessionAdapter::new(self.dispatcher())).await
+    }
+    /// Call tool `name` with `arguments` in process, as a client with no
+    /// elicitation channel would on the current protocol revision: for the
+    /// evaluation harness and for tests.
+    pub async fn call(&self, name: &str, arguments: Value) -> McpResult<ToolResult> {
+        let arguments = match arguments {
+            Value::Object(arguments) => arguments,
+            _ => serde_json::Map::new(),
+        };
+        let ctx = CallToolContext::new(RequestContext::default());
+        WithTools::call_tool(self, &ctx, neutral::CallToolParams::new(name, arguments)).await
+    }
     /// The notifier [`with_approval_notifier`](Self::with_approval_notifier) set.
     pub fn approval_notifier(&self) -> Option<&crate::approvals::Notifier> {
         self.notifier.as_ref()
@@ -623,60 +657,73 @@ impl std::fmt::Debug for AuthorizedServer {
             .finish_non_exhaustive()
     }
 }
-impl McpHandler for AuthorizedServer {
+/// Why a dispatch did not reach its tool: a refusal the model reads as a
+/// tool result, or a protocol outcome the transport must carry as is (an
+/// elicitation suspending the call until the client answers).
+enum Refusal {
+    Failure(ToolFailure),
+    Protocol(McpError),
+}
+impl From<ToolFailure> for Refusal {
+    fn from(failure: ToolFailure) -> Self {
+        Self::Failure(failure)
+    }
+}
+
+impl McpServerCore for AuthorizedServer {
     /// The inner server's identity with the execution mode in its title, so
-    /// a client sees `paper` at initialize time, before any tool call.
-    fn server_info(&self) -> turbomcp::ServerInfo {
+    /// a client sees `paper` during discovery, before any tool call.
+    fn server_info(&self) -> Implementation {
         let mode = self.inner.backend().mode();
-        let info = self.inner.server_info();
-        let description = info.description.clone().unwrap_or_default();
-        info.with_title(format!("Schwab MCP ({mode})"))
-            .with_description(format!("Execution mode: {mode}. {description}"))
+        let mut info = self.inner.server_info();
+        info.title = Some(format!("Schwab MCP ({mode})"));
+        info
     }
-    fn list_tools(&self) -> Vec<turbomcp::Tool> {
-        self.inner
-            .list_tools()
-            .into_iter()
-            .filter(|t| self.principal.tools.contains(t.name.as_str()))
-            .collect()
+    fn supported_versions(&self) -> &'static [ProtocolVersion] {
+        self.inner.supported_versions()
     }
-    /// Resources and prompts follow the tools they are about: a principal
-    /// without an order tool is shown neither, and `server_capabilities`
-    /// then omits them.
-    fn list_resources(&self) -> Vec<turbomcp::Resource> {
-        let audience = self.audience();
-        self.inner
-            .list_resources()
-            .into_iter()
-            .filter(|r| audience.offers_resource(&r.uri))
-            .collect()
+    fn instructions(&self) -> Option<String> {
+        let mode = self.inner.backend().mode();
+        let guidance = self.inner.instructions().unwrap_or_default();
+        Some(format!("Execution mode: {mode}. {guidance}"))
     }
-    fn list_prompts(&self) -> Vec<turbomcp::Prompt> {
-        let audience = self.audience();
-        self.inner
-            .list_prompts()
-            .into_iter()
-            .filter(|p| audience.offers_prompt(&p.name))
-            .collect()
+}
+impl WithTools for AuthorizedServer {
+    async fn lookup_tool(
+        &self,
+        ctx: &ListToolsContext,
+        name: String,
+    ) -> McpResult<Option<neutral::Tool>> {
+        if !self.principal.tools.contains(&name) {
+            return Ok(None);
+        }
+        self.inner.lookup_tool(ctx, name).await
     }
-    async fn call_tool<'a>(
-        &'a self,
-        name: &'a str,
-        args: Value,
-        ctx: &'a RequestContext,
+    async fn list_tools(
+        &self,
+        ctx: &ListToolsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListToolsResult> {
+        let mut page = self.inner.list_tools(ctx, params).await?;
+        page.tools
+            .retain(|tool| self.principal.tools.contains(&tool.name));
+        Ok(page)
+    }
+    async fn call_tool(
+        &self,
+        ctx: &CallToolContext,
+        params: neutral::CallToolParams,
     ) -> McpResult<ToolResult> {
+        let name = params.name.as_str();
+        let args = Value::Object(params.arguments.clone());
         // Any call, even a denied or unknown one, shows the principal is
         // alive; the guard also keeps it so for as long as the call runs.
         let _alive = self.dead_man.as_ref().map(Beacon::call);
         // A tool that does not exist is a protocol error, as on the
         // unauthorized transport and per the MCP spec; one that exists but
         // is not granted is a `not_permitted` result the model can read.
-        let Some(tool) = self
-            .inner
-            .list_tools()
-            .into_iter()
-            .find(|tool| tool.name == name)
-        else {
+        let listing = ListToolsContext::new(ctx.base.clone());
+        let Some(tool) = self.inner.lookup_tool(&listing, name.to_owned()).await? else {
             return Err(McpError::tool_not_found(name));
         };
         if let Some(calls) = &self.calls
@@ -701,32 +748,65 @@ impl McpHandler for AuthorizedServer {
         }
         match self.dispatch(name, args, ctx).await {
             Ok(result) => result,
-            Err(failure) => Ok(failure.into_result()),
+            Err(Refusal::Failure(failure)) => Ok(failure.into_result()),
+            Err(Refusal::Protocol(error)) => Err(error),
         }
     }
-    async fn read_resource<'a>(
-        &'a self,
-        uri: &'a str,
-        ctx: &'a RequestContext,
-    ) -> McpResult<ResourceResult> {
-        if !self.audience().offers_resource(uri) {
-            return Err(McpError::resource_not_found(uri));
+}
+impl WithResources for AuthorizedServer {
+    /// Resources and prompts follow the tools they are about: a principal
+    /// without an order tool is shown neither.
+    async fn list_resources(
+        &self,
+        ctx: &ListResourcesContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListResourcesResult> {
+        let audience = self.audience();
+        let mut page = self.inner.list_resources(ctx, params).await?;
+        page.resources
+            .retain(|resource| audience.offers_resource(&resource.uri));
+        Ok(page)
+    }
+    async fn read_resource(
+        &self,
+        ctx: &ReadResourceContext,
+        params: neutral::ReadResourceParams,
+    ) -> McpResult<neutral::ReadResourceResult> {
+        if !self.audience().offers_resource(&params.uri) {
+            return Err(McpError::resource_not_found(params.uri));
         }
-        self.inner.read_resource(uri, ctx).await
+        self.inner.read_resource(ctx, params).await
+    }
+}
+impl WithPrompts for AuthorizedServer {
+    async fn list_prompts(
+        &self,
+        ctx: &ListPromptsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListPromptsResult> {
+        let audience = self.audience();
+        let mut page = self.inner.list_prompts(ctx, params).await?;
+        page.prompts
+            .retain(|prompt| audience.offers_prompt(&prompt.name));
+        Ok(page)
     }
     /// The workflow is rendered for this principal's tools and switches,
     /// and only for an account it holds: a prompt that named another
     /// account would send the model to tools that refuse it.
-    async fn get_prompt<'a>(
-        &'a self,
-        name: &'a str,
-        args: Option<Value>,
-        _ctx: &'a RequestContext,
-    ) -> McpResult<PromptResult> {
-        if !self.audience().offers_prompt(name) {
-            return Err(McpError::prompt_not_found(name));
+    async fn get_prompt(
+        &self,
+        _ctx: &GetPromptContext,
+        params: neutral::GetPromptParams,
+    ) -> McpResult<neutral::GetPromptResult> {
+        if !self.audience().offers_prompt(&params.name) {
+            return Err(McpError::invalid_params(format!(
+                "Unknown prompt: {}",
+                params.name
+            )));
         }
-        let proposal = guidance::Proposal::parse(args)?;
+        let arguments = serde_json::to_value(&params.arguments)
+            .map_err(|e| McpError::internal(e.to_string()))?;
+        let proposal = guidance::Proposal::parse(Some(arguments))?;
         if !self.principal.grants_account(&proposal.account_hash) {
             return Err(McpError::permission_denied(
                 "Account not authorized for this principal",
@@ -754,12 +834,12 @@ impl AuthorizedServer {
         &self,
         name: &str,
         args: Value,
-        ctx: &RequestContext,
-    ) -> Result<McpResult<ToolResult>, ToolFailure> {
+        ctx: &CallToolContext,
+    ) -> Result<McpResult<ToolResult>, Refusal> {
         match name {
-            "check_order" => return self.check_order(args).await,
-            "get_server_status" => return self.get_server_status(args).await,
-            "get_trade_journal" => return self.get_trade_journal(args).await,
+            "check_order" => return Ok(self.check_order(args).await?),
+            "get_server_status" => return Ok(self.get_server_status(args).await?),
+            "get_trade_journal" => return Ok(self.get_trade_journal(args).await?),
             _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
@@ -792,7 +872,7 @@ impl AuthorizedServer {
                     self.note_intent(name, &digest, &args).await;
                 }
                 if !(submission && approvable) {
-                    return Err(failure);
+                    return Err(failure.into());
                 }
                 let started = Instant::now();
                 let effective = if self.principal.client_approval
@@ -801,7 +881,7 @@ impl AuthorizedServer {
                     self.effective_policy(name, &digest).await?
                 } else {
                     let Some(wait) = wait else {
-                        return Err(failure);
+                        return Err(failure.into());
                     };
                     self.await_approval(name, &digest, wait).await?.0
                 };
@@ -837,7 +917,9 @@ impl AuthorizedServer {
             let mut request = serde_json::json!({
                 "principal": self.principal.name,
                 "intentDigest": digest,
-                "requestId": ctx.request_id(),
+                // Not the transport's JSON-RPC id, which the dispatcher
+                // keeps: a fresh id for correlating this record in logs.
+                "requestId": uuid::Uuid::new_v4().to_string(),
                 "arguments": args,
             });
             if let Some(ms) = waited {
@@ -866,11 +948,7 @@ impl AuthorizedServer {
                     | "stream_set_service_fields"
             );
             let audited = stream_control.then(|| args.clone());
-            let result = self
-                .inner
-                .call_tool(name, args, ctx)
-                .await
-                .map(crate::contract::normalize);
+            let result = self.call_inner(name, args, ctx).await;
             // The stream is shared by the whole server: who changed it, and
             // how, belongs in the audit trail.
             if let Some(arguments) = audited {
@@ -896,9 +974,28 @@ impl AuthorizedServer {
         let this = self.clone();
         let name = name.to_owned();
         let ctx = ctx.clone();
-        tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await })
+        let audited = tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await })
             .await
-            .map_err(|e| ToolFailure::internal("Dispatch task failed", e))?
+            .map_err(|e| ToolFailure::internal("Dispatch task failed", e))??;
+        Ok(audited)
+    }
+
+    /// Run tool `name` on the inner server, its argument-extraction failures
+    /// brought into the contract.
+    async fn call_inner(
+        &self,
+        name: &str,
+        args: Value,
+        ctx: &CallToolContext,
+    ) -> McpResult<ToolResult> {
+        let arguments = match args {
+            Value::Object(arguments) => arguments,
+            _ => serde_json::Map::new(),
+        };
+        self.inner
+            .call_tool(ctx, neutral::CallToolParams::new(name, arguments))
+            .await
+            .map(crate::contract::normalize)
     }
 
     /// The audited half of [`dispatch`](Self::dispatch): run the tool and
@@ -907,7 +1004,7 @@ impl AuthorizedServer {
         &self,
         name: &str,
         args: Value,
-        ctx: &RequestContext,
+        ctx: &CallToolContext,
         (id, consumed_approval): (String, bool),
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
         // Judged with the audit record open: this principal has no other
@@ -915,11 +1012,7 @@ impl AuthorizedServer {
         let budget =
             crate::guardrails::check_budget(&self.principal, &self.audit, name, &args, &id).await;
         let result = match budget.map_err(ToolFailure::from) {
-            Ok(()) => self
-                .inner
-                .call_tool(name, args, ctx)
-                .await
-                .map(crate::contract::normalize),
+            Ok(()) => self.call_inner(name, args, ctx).await,
             Err(failure) => Ok(failure.into_result()),
         };
         // The SDK journal owns broker reconciliation. Keep dispatch outcome
@@ -1055,20 +1148,22 @@ impl AuthorizedServer {
     /// `Ok(true)`: approved, and recorded in the approval store as granted
     /// by [`CLIENT_APPROVER_PREFIX`] and the principal's name, for
     /// [`CLIENT_APPROVAL_SECS`]. `Ok(false)`: the client cannot be asked
-    /// (no session, no elicitation capability), so the operator path
+    /// (no client channel, no elicitation capability), so the operator path
     /// applies. A decline, a dismissal, or no answer within
     /// [`MAX_APPROVAL_WAIT_MS`] refuses the order.
+    ///
+    /// On the stateless revision the question suspends the call
+    /// ([`Refusal::Protocol`]) and the client calls again with the answer,
+    /// running the dispatch from the top: everything before this is safe to
+    /// repeat, and an approval this answer already recorded is honored.
     async fn ask_client(
         &self,
         name: &str,
         digest: &str,
         args: &Value,
-        ctx: &RequestContext,
-    ) -> Result<bool, ToolFailure> {
+        ctx: &CallToolContext,
+    ) -> Result<bool, Refusal> {
         use std::fmt::Write;
-        if !ctx.has_session() {
-            return Ok(false);
-        }
         let dispatched = tag_intent(args.clone(), digest);
         let mut message = format!(
             "Approve this order?\n{}",
@@ -1088,36 +1183,56 @@ impl AuthorizedServer {
         });
         let asked = tokio::time::timeout(
             Duration::from_millis(MAX_APPROVAL_WAIT_MS),
-            ctx.elicit_form(message, schema),
+            ctx.client.elicit(
+                &format!("client-approval:{digest}"),
+                neutral::ElicitParams::new(message, schema),
+            ),
         )
         .await;
+        let unanswered = || {
+            ToolFailure::new(
+                FailureCode::ApprovalRequired,
+                "The client's user did not answer the approval prompt; \
+                 an operator may still approve the intent",
+            )
+            .with_intent(digest)
+        };
         let answer = match asked {
-            Err(_) => {
-                return Err(ToolFailure::new(
-                    FailureCode::ApprovalRequired,
-                    "The client's user did not answer the approval prompt; \
-                     an operator may still approve the intent",
-                )
-                .with_intent(digest));
+            Err(_) | Ok(Err(McpError::Timeout(_))) => return Err(unanswered().into()),
+            Ok(Err(McpError::InputRequired)) => {
+                return Err(Refusal::Protocol(McpError::InputRequired));
             }
             Ok(Err(e)) => {
                 tracing::debug!(error = %e, "the client cannot be asked to approve");
                 return Ok(false);
             }
-            Ok(Ok(answer)) => serde_json::to_value(answer).unwrap_or_default(),
+            Ok(Ok(answer)) => answer,
         };
-        if answer["action"] != "accept" || answer["content"]["approve"] != true {
+        if !answer.accepted() || answer.content.get("approve") != Some(&Value::Bool(true)) {
             return Err(
                 ToolFailure::not_permitted("The client's user declined the order")
-                    .with_intent(digest),
+                    .with_intent(digest)
+                    .into(),
             );
         }
         let approver = format!("{CLIENT_APPROVER_PREFIX}{}", self.principal.name);
         let expires_at = chrono::Utc::now().timestamp() + CLIENT_APPROVAL_SECS;
-        self.audit
+        if let Err(e) = self
+            .audit
             .approve(&self.principal.name, digest, &approver, expires_at)
             .await
-            .map_err(|e| ToolFailure::from(e).with_intent(digest))?;
+        {
+            // A call run again with the same answer finds its approval
+            // already recorded.
+            let approved = self
+                .audit
+                .is_approved(&self.principal.name, digest)
+                .await
+                .unwrap_or(false);
+            if !approved {
+                return Err(ToolFailure::from(e).with_intent(digest).into());
+            }
+        }
         Ok(true)
     }
 
@@ -1265,7 +1380,7 @@ mod tests {
             },
             policy(),
         );
-        let ctx = RequestContext::stdio();
+        let ctx = crate::testing::call_context();
         let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
         let digest = intent_digest("place_order", &args);
 
@@ -1283,10 +1398,10 @@ mod tests {
         oversized["order"]["orderLegCollection"][0]["quantity"] = "3".into();
         oversized["wait_ms"] = MAX_APPROVAL_WAIT_MS.into();
         let started = Instant::now();
-        let denied = server
-            .dispatch("place_order", oversized, &ctx)
-            .await
-            .unwrap_err();
+        let Err(Refusal::Failure(denied)) = server.dispatch("place_order", oversized, &ctx).await
+        else {
+            panic!("a risk denial is a failure the model reads");
+        };
         assert_eq!(denied.code, FailureCode::RiskDenied);
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -1375,15 +1490,15 @@ mod tests {
     #[tokio::test]
     async fn check_order_reports_the_principal_verdict_without_dispatching() {
         let server = authorized();
-        let ctx = RequestContext::stdio();
         let verdict = |result: McpResult<ToolResult>| {
             let result = result.unwrap();
-            assert!(!result.is_error(), "{result:?}");
-            serde_json::from_str::<Value>(result.first_text().unwrap()).unwrap()
+            assert!(!result.is_error, "{result:?}");
+            serde_json::from_str::<Value>(crate::contract::first_text(&result).unwrap()).unwrap()
         };
         let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
         let placement = intent_digest("place_order", &args);
-        let pending = verdict(server.call_tool("check_order", args.clone(), &ctx).await);
+        let pending =
+            verdict(crate::testing::call_tool(&server, "check_order", args.clone()).await);
         assert_eq!(pending["allowed"], false);
         let codes = |v: &Value| {
             v["reasons"]
@@ -1420,15 +1535,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let approved = verdict(server.call_tool("check_order", args.clone(), &ctx).await);
+        let approved =
+            verdict(crate::testing::call_tool(&server, "check_order", args.clone()).await);
         assert_eq!(approved["approved"], true);
         assert_eq!(codes(&approved), ["not_permitted"]);
         assert!(server.audit.records().await.unwrap().is_empty());
 
         // A submission refused before sending leaves the one-use approval
         // unspent, so it goes through once trading is switched on.
-        let refused = server
-            .call_tool("place_order", args.clone(), &ctx)
+        let refused = crate::testing::call_tool(&server, "place_order", args.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -1441,7 +1556,8 @@ mod tests {
         // An `order_id` makes it a replacement, which this principal lacks.
         let mut replacing = args.clone();
         replacing["order_id"] = "1".into();
-        let replacement = verdict(server.call_tool("check_order", replacing, &ctx).await);
+        let replacement =
+            verdict(crate::testing::call_tool(&server, "check_order", replacing).await);
         assert_eq!(
             replacement["intentDigest"],
             intent_digest(
@@ -1455,28 +1571,26 @@ mod tests {
         );
 
         // The tool's own arguments are the caller's problem, not a verdict.
-        let denied = server
-            .call_tool(
-                "check_order",
-                serde_json::json!({"account_hash":"B","order":order("2".into())}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(denied.is_error());
+        let denied = crate::testing::call_tool(
+            &server,
+            "check_order",
+            serde_json::json!({"account_hash":"B","order":order("2".into())}),
+        )
+        .await
+        .unwrap();
+        assert!(denied.is_error);
         assert_eq!(
             denied.structured_content.unwrap()["error"]["code"],
             "not_permitted"
         );
-        let malformed = server
-            .call_tool(
-                "check_order",
-                serde_json::json!({"account_hash":"A","order":{"orderType":"LIMIT"}}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(malformed.is_error());
+        let malformed = crate::testing::call_tool(
+            &server,
+            "check_order",
+            serde_json::json!({"account_hash":"A","order":{"orderType":"LIMIT"}}),
+        )
+        .await
+        .unwrap();
+        assert!(malformed.is_error);
         assert_eq!(
             malformed.structured_content.unwrap()["error"]["code"],
             "invalid_arguments"
@@ -1488,12 +1602,10 @@ mod tests {
     #[tokio::test]
     async fn server_status_carries_the_principal_and_the_halt() {
         let server = authorized();
-        let ctx = RequestContext::stdio();
-        let denied = server
-            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+        let denied = crate::testing::call_tool(&server, "get_server_status", serde_json::json!({}))
             .await
             .unwrap();
-        assert!(denied.is_error(), "not in the tool allowlist");
+        assert!(denied.is_error, "not in the tool allowlist");
         assert_eq!(
             denied.structured_content.unwrap()["error"]["code"],
             "not_permitted"
@@ -1513,12 +1625,12 @@ mod tests {
             .halt_submissions("desk review", "operator")
             .await
             .unwrap();
-        let result = server
-            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+        let result = crate::testing::call_tool(&server, "get_server_status", serde_json::json!({}))
             .await
             .unwrap();
-        assert!(!result.is_error(), "{result:?}");
-        let status: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let status: Value =
+            serde_json::from_str(crate::contract::first_text(&result).unwrap()).unwrap();
         assert_eq!(status["principal"]["name"], "desk");
         assert_eq!(status["principal"]["accounts"], serde_json::json!(["A"]));
         assert_eq!(status["principal"]["maxQuantity"], "2");
@@ -1542,11 +1654,11 @@ mod tests {
         all.all_accounts = true;
         let server =
             AuthorizedServer::new(server.inner.backend().clone(), Switches::default(), all);
-        let result = server
-            .call_tool("get_server_status", serde_json::json!({}), &ctx)
+        let result = crate::testing::call_tool(&server, "get_server_status", serde_json::json!({}))
             .await
             .unwrap();
-        let status: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        let status: Value =
+            serde_json::from_str(crate::contract::first_text(&result).unwrap()).unwrap();
         assert_eq!(status["trading"]["operatorHalt"], "desk review");
     }
     #[test]
@@ -1596,35 +1708,33 @@ mod tests {
     #[tokio::test]
     async fn denials_are_structured_tool_results() {
         let server = authorized();
-        let ctx = RequestContext::stdio();
         let error = |result: McpResult<ToolResult>| {
             let result = result.expect("denial is a tool result");
-            assert!(result.is_error());
-            let text: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+            assert!(result.is_error);
+            let text: Value =
+                serde_json::from_str(crate::contract::first_text(&result).unwrap()).unwrap();
             let body = result.structured_content.unwrap();
             assert_eq!(text, body);
             body["error"].clone()
         };
         let unlisted = error(
-            server
-                .call_tool("get_quote", serde_json::json!({"symbol":"AAPL"}), &ctx)
+            crate::testing::call_tool(&server, "get_quote", serde_json::json!({"symbol":"AAPL"}))
                 .await,
         );
         assert_eq!(unlisted["code"], "not_permitted");
         assert_eq!(unlisted["retryable"], false);
         assert_eq!(unlisted["disposition"], "not_permitted");
         let foreign = error(
-            server
-                .call_tool(
-                    "get_account",
-                    serde_json::json!({"account_hash":"B","include_positions":false}),
-                    &ctx,
-                )
-                .await,
+            crate::testing::call_tool(
+                &server,
+                "get_account",
+                serde_json::json!({"account_hash":"B","include_positions":false}),
+            )
+            .await,
         );
         assert_eq!(foreign["code"], "not_permitted");
         let args = serde_json::json!({"account_hash":"A","order":{"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}});
-        let pending = error(server.call_tool("place_order", args.clone(), &ctx).await);
+        let pending = error(crate::testing::call_tool(&server, "place_order", args.clone()).await);
         assert_eq!(pending["code"], "approval_required");
         assert_eq!(pending["disposition"], "ask_operator");
         assert_eq!(pending["intentDigest"], intent_digest("place_order", &args));
@@ -1638,24 +1748,22 @@ mod tests {
         );
         // Arguments the macro cannot extract are normalized into the contract.
         let malformed = error(
-            server
-                .call_tool(
-                    "stream_snapshot",
-                    serde_json::json!({"service": "NOT_A_SERVICE"}),
-                    &ctx,
-                )
-                .await,
+            crate::testing::call_tool(
+                &server,
+                "stream_snapshot",
+                serde_json::json!({"service": "NOT_A_SERVICE"}),
+            )
+            .await,
         );
         assert_eq!(malformed["code"], "invalid_arguments");
         // A write's undeclared argument would change its digest unseen.
         let mut padded = args.clone();
         padded["nonce"] = "x".into();
-        let padded = error(server.call_tool("place_order", padded, &ctx).await);
+        let padded = error(crate::testing::call_tool(&server, "place_order", padded).await);
         assert_eq!(padded["code"], "invalid_arguments");
         // A tool that does not exist at all is a protocol error.
         assert!(
-            server
-                .call_tool("no_such_tool", serde_json::json!({}), &ctx)
+            crate::testing::call_tool(&server, "no_such_tool", serde_json::json!({}))
                 .await
                 .is_err()
         );
@@ -1666,10 +1774,11 @@ mod tests {
         let mut limited = policy();
         limited.max_calls_per_minute = std::num::NonZeroU32::new(1);
         let server = authorized_as(Switches::default(), limited);
-        let ctx = RequestContext::stdio();
         let args = serde_json::json!({"symbol": "AAPL"});
-        let _ = server.call_tool("get_quote", args.clone(), &ctx).await;
-        let second = server.call_tool("get_quote", args, &ctx).await.unwrap();
+        let _ = crate::testing::call_tool(&server, "get_quote", args.clone()).await;
+        let second = crate::testing::call_tool(&server, "get_quote", args)
+            .await
+            .unwrap();
         assert_eq!(
             second.structured_content.unwrap()["error"]["code"],
             "rate_limited"
@@ -1687,7 +1796,6 @@ mod tests {
             },
             policy(),
         );
-        let ctx = RequestContext::stdio();
         let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
         let digest = intent_digest("place_order", &args);
         server
@@ -1701,8 +1809,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..2 {
-            let failed = server
-                .call_tool("place_order", args.clone(), &ctx)
+            let failed = crate::testing::call_tool(&server, "place_order", args.clone())
                 .await
                 .unwrap();
             assert_eq!(
@@ -1727,7 +1834,6 @@ mod tests {
             },
             policy(),
         );
-        let ctx = RequestContext::stdio();
         let args = serde_json::json!({"account_hash":"A","order":order("2".into())});
         let digest = intent_digest("place_order", &args);
         server
@@ -1757,8 +1863,7 @@ mod tests {
             .unwrap();
         // Too recent to judge: its dispatcher may still be running, and it
         // holds the one-use approval.
-        let blocked = server
-            .call_tool("place_order", args.clone(), &ctx)
+        let blocked = crate::testing::call_tool(&server, "place_order", args.clone())
             .await
             .unwrap();
         assert_eq!(
@@ -1778,8 +1883,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let retried = server
-            .call_tool("place_order", args.clone(), &ctx)
+        let retried = crate::testing::call_tool(&server, "place_order", args.clone())
             .await
             .unwrap();
         // The retry itself reached the tool (and failed there, for want of
@@ -1805,24 +1909,21 @@ mod tests {
         let mut policy = policy();
         policy.require_approval = false;
         server.principal = Arc::new(policy);
-        let ctx = RequestContext::stdio();
         let args = serde_json::json!({"account_hash":"A","order":{"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}});
         let digest = intent_digest("place_order", &args);
         assert!(
-            server
-                .call_tool("place_order", args.clone(), &ctx)
+            crate::testing::call_tool(&server, "place_order", args.clone())
                 .await
                 .unwrap()
-                .is_error()
+                .is_error
         );
         let mut explicit = args.clone();
         explicit["order"]["tag"] = "desk-7".into();
         assert!(
-            server
-                .call_tool("place_order", explicit.clone(), &ctx)
+            crate::testing::call_tool(&server, "place_order", explicit.clone())
                 .await
                 .unwrap()
-                .is_error()
+                .is_error
         );
         let records = server.audit.records().await.unwrap();
         assert_eq!(records.len(), 2);
@@ -1949,38 +2050,27 @@ mod tests {
     /// Prompts and resources follow the principal's tools and accounts: a
     /// principal with `check_order` is offered both, rendered for the tools
     /// and switches it has; one without sees neither, and the capabilities
-    /// it is told at initialize agree.
+    /// its stdio dispatcher advertises agree.
     #[tokio::test]
     async fn guidance_is_gated_by_the_principal() {
-        let ctx = RequestContext::stdio();
+        use crate::testing::{prompt_text, prompts, read_text, resources};
         let uri = guidance::ORDER_SPEC_URI;
         let prompt = guidance::PROPOSE_TRADE;
         let args = |account: &str| Some(serde_json::json!({"account_hash": account}));
 
         let desk = authorized();
-        assert_eq!(desk.list_resources().len(), 1);
-        assert_eq!(desk.list_prompts().len(), 1);
-        assert!(desk.server_capabilities().resources.is_some());
-        assert!(desk.server_capabilities().prompts.is_some());
+        assert_eq!(resources(&desk).await.len(), 1);
+        assert_eq!(prompts(&desk).await.len(), 1);
+        assert!(desk.offers_guidance());
         assert!(
-            desk.read_resource(uri, &ctx)
+            read_text(&desk, uri)
                 .await
-                .unwrap()
-                .first_text()
                 .unwrap()
                 .starts_with("# OrderSpec")
         );
-        assert!(desk.read_resource("schwab://other", &ctx).await.is_err());
+        assert!(read_text(&desk, "schwab://other").await.is_err());
         // Held `place_order`, but the trading switch is off.
-        let text = desk
-            .get_prompt(prompt, args("A"), &ctx)
-            .await
-            .unwrap()
-            .messages[0]
-            .content
-            .as_text()
-            .unwrap()
-            .to_owned();
+        let text = prompt_text(&desk, prompt, args("A")).await.unwrap();
         assert!(text.contains("Call `get_account`"), "{text}");
         assert!(!text.contains("`get_quotes`"), "{text}");
         assert!(
@@ -1988,13 +2078,13 @@ mod tests {
             "{text}"
         );
         // Another account, or a missing one, is refused before rendering.
-        let denied = desk.get_prompt(prompt, args("B"), &ctx).await.unwrap_err();
+        let denied = prompt_text(&desk, prompt, args("B")).await.unwrap_err();
         assert!(
             denied.to_string().contains("Account not authorized"),
             "{denied}"
         );
-        assert!(desk.get_prompt(prompt, None, &ctx).await.is_err());
-        assert!(desk.get_prompt("other", args("A"), &ctx).await.is_err());
+        assert!(prompt_text(&desk, prompt, None).await.is_err());
+        assert!(prompt_text(&desk, "other", args("A")).await.is_err());
 
         // With the switch on, the same principal is walked through placing it.
         let trading = authorized_as(
@@ -2004,15 +2094,7 @@ mod tests {
             },
             policy(),
         );
-        let text = trading
-            .get_prompt(prompt, args("A"), &ctx)
-            .await
-            .unwrap()
-            .messages[0]
-            .content
-            .as_text()
-            .unwrap()
-            .to_owned();
+        let text = prompt_text(&trading, prompt, args("A")).await.unwrap();
         assert!(text.contains("call `place_order`"), "{text}");
         assert!(!text.contains("does not submit"), "{text}");
 
@@ -2020,12 +2102,11 @@ mod tests {
         let mut reader = policy();
         reader.tools = ["get_account", "get_quotes"].map(String::from).into();
         let reader = authorized_as(Switches::default(), reader);
-        assert!(reader.list_resources().is_empty());
-        assert!(reader.list_prompts().is_empty());
-        assert!(reader.server_capabilities().resources.is_none());
-        assert!(reader.server_capabilities().prompts.is_none());
-        assert!(reader.read_resource(uri, &ctx).await.is_err());
-        assert!(reader.get_prompt(prompt, args("A"), &ctx).await.is_err());
+        assert!(resources(&reader).await.is_empty());
+        assert!(prompts(&reader).await.is_empty());
+        assert!(!reader.offers_guidance());
+        assert!(read_text(&reader, uri).await.is_err());
+        assert!(prompt_text(&reader, prompt, args("A")).await.is_err());
     }
 
     /// A defined-risk option strategy counts its contracts and the most it

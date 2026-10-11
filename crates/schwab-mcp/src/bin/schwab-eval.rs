@@ -4,7 +4,6 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use schwab_mcp::eval::{Fixture, Recording, Scenario, Transcript, score};
 use std::{fs::File, io::BufReader, path::PathBuf};
-use turbomcp::prelude::*;
 
 #[derive(Parser)]
 #[command(about = "Score a model's tool-call transcript against a paper trading scenario")]

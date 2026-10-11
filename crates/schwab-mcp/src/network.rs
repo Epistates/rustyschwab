@@ -1,72 +1,368 @@
-//! Authenticate before selecting a principal-isolated MCP router/session store.
+//! The network transports: authenticate every request, then serve it as the
+//! principal its credential names.
+//!
+//! One MCP dispatcher serves every principal. [`Credentials`] (turbomcp's
+//! `HttpAuthenticator` seam, used by the Streamable HTTP and WebSocket
+//! transports alike) checks the bearer token against the current policy:
+//! a principal's short-lived static token by its SHA-256 digest, or an
+//! issuer's JWT by its subject. It stamps the principal's name, the
+//! credential's expiry and the policy generation into the request's
+//! identity, and [`PrincipalRouter`] serves the request with that
+//! principal's [`AuthorizedServer`], so a session or connection can never
+//! act as anyone but the credential's principal.
+//!
+//! A policy reload ([`router_reloadable`]) swaps the principals and bumps
+//! the generation: a credential authenticated under an earlier policy (an
+//! open WebSocket, whose identity is fixed at the upgrade) is refused from
+//! its next request, as is one past its expiry.
 use crate::policy::{AuthorizedServer, PrincipalPolicy, digest, validate_policies};
-use axum::{
-    Router,
-    body::Body,
-    extract::{
-        Request, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
-    http::StatusCode,
-    response::{IntoResponse, Response},
-    routing::{any, get},
-};
+use axum::Router;
+use parking_lot::RwLock;
+use serde_json::{Value, json};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use tower::ServiceExt;
+use turbomcp::http::HttpConfig;
 use turbomcp::prelude::*;
+use turbomcp::{AuthDecision, HttpAuthenticator, ProtocolVersion, VersionDispatcher};
 
-#[derive(Clone)]
-struct Entry {
-    digest: String,
-    subject: Option<String>,
-    expires_at: Option<i64>,
-    router: Router,
+/// The principals a network transport serves, replaced as a whole when the
+/// policy reloads.
+struct Registry {
+    generation: u64,
+    servers: Vec<AuthorizedServer>,
 }
-struct NetworkState {
-    entries: parking_lot::RwLock<Vec<Entry>>,
+
+/// Replace the principals in `registry`, retiring every credential
+/// authenticated under the previous policy.
+fn replace(registry: &RwLock<Registry>, servers: Vec<AuthorizedServer>) {
+    let mut registry = registry.write();
+    registry.generation += 1;
+    registry.servers = servers;
+}
+
+/// The current principals, shared by the authenticator and the router.
+#[derive(Clone)]
+pub struct Principals {
+    registry: Arc<RwLock<Registry>>,
     identity: Option<Arc<crate::identity::JwtVerifier>>,
-    revoked: tokio::sync::watch::Sender<u64>,
 }
-#[derive(Clone)]
-struct CredentialValidity {
-    expires_at: i64,
-    revoked: tokio::sync::watch::Receiver<u64>,
+
+impl std::fmt::Debug for Principals {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let registry = self.registry.read();
+        f.debug_struct("Principals")
+            .field("generation", &registry.generation)
+            .field("principals", &registry.servers.len())
+            .field("issuer_tokens", &self.identity.is_some())
+            .finish()
+    }
 }
-fn entries(servers: Vec<AuthorizedServer>, websocket: bool) -> Vec<Entry> {
-    servers
-        .into_iter()
-        .map(|server| {
-            let digest = server.principal.token_sha256.to_ascii_lowercase();
-            let subject = server.principal.identity_subject.clone();
-            let expires_at = server.principal.token_expires_at;
-            let router = if websocket {
-                Router::new()
-                    .route("/", get(upgrade))
-                    .route("/ws", get(upgrade))
-                    .route("/mcp/ws", get(upgrade))
-                    .with_state(server)
-            } else {
-                server.builder().into_axum_router()
+
+impl Principals {
+    fn new(
+        servers: Vec<AuthorizedServer>,
+        identity: Option<Arc<crate::identity::JwtVerifier>>,
+    ) -> Self {
+        Self {
+            registry: Arc::new(RwLock::new(Registry {
+                generation: 0,
+                servers,
+            })),
+            identity,
+        }
+    }
+
+    /// The server of the principal named `name`, if the policy of
+    /// `generation` is still the current one.
+    fn server(&self, name: &str, generation: u64) -> Option<AuthorizedServer> {
+        let registry = self.registry.read();
+        (registry.generation == generation)
+            .then(|| {
+                registry
+                    .servers
+                    .iter()
+                    .find(|s| s.principal.name == name)
+                    .cloned()
+            })
+            .flatten()
+    }
+
+    /// The principal `token` authenticates, with the credential's expiry
+    /// (Unix seconds) and the policy generation it was checked against.
+    async fn authenticate(&self, token: &str) -> Option<(String, i64, u64)> {
+        let now = chrono::Utc::now().timestamp();
+        if let Some(identity) = &self.identity {
+            let claims = identity.verify(token).await.ok()?;
+            let registry = self.registry.read();
+            let server = registry
+                .servers
+                .iter()
+                .find(|s| s.principal.identity_subject.as_deref() == Some(&claims.sub))?;
+            return Some((
+                server.principal.name.clone(),
+                claims.exp as i64,
+                registry.generation,
+            ));
+        }
+        let hash = digest(token.as_bytes());
+        let registry = self.registry.read();
+        registry.servers.iter().find_map(|s| {
+            let expires_at = s.principal.token_expires_at.filter(|at| *at > now)?;
+            bool::from(
+                s.principal
+                    .token_sha256
+                    .to_ascii_lowercase()
+                    .as_bytes()
+                    .ct_eq(hash.as_bytes()),
+            )
+            .then(|| (s.principal.name.clone(), expires_at, registry.generation))
+        })
+    }
+}
+
+/// The bearer-token check for both network transports.
+#[derive(Debug, Clone)]
+pub struct Credentials {
+    principals: Principals,
+}
+
+impl Credentials {
+    fn challenge(&self) -> AuthDecision {
+        AuthDecision::Challenge {
+            status: 401,
+            www_authenticate: self
+                .principals
+                .identity
+                .as_ref()
+                .map_or_else(|| "Bearer".into(), |id| id.challenge()),
+        }
+    }
+}
+
+impl HttpAuthenticator for Credentials {
+    fn authenticate<'a>(
+        &'a self,
+        authorization: Option<&'a str>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AuthDecision> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(token) = authorization
+                .and_then(|header| header.strip_prefix("Bearer "))
+                .filter(|token| (32..=16384).contains(&token.len()))
+            else {
+                return self.challenge();
             };
-            Entry {
-                digest,
-                subject,
-                expires_at,
-                router,
+            match self.principals.authenticate(token).await {
+                Some((name, expires_at, generation)) => AuthDecision::Allow(json!({
+                    "sub": name,
+                    "claims": {"exp": expires_at, GENERATION_CLAIM: generation},
+                })),
+                None => self.challenge(),
             }
         })
-        .collect()
+    }
+
+    /// The issuer's RFC 9728 metadata with JWT credentials; static tokens
+    /// have no authorization server to point at.
+    fn resource_metadata(&self) -> Value {
+        self.principals
+            .identity
+            .as_ref()
+            .map_or_else(|| json!({}), |id| id.metadata())
+    }
 }
-pub fn router(servers: Vec<AuthorizedServer>, websocket: bool) -> Router {
-    router_reloadable(servers, websocket, None, None)
+
+/// Where the authenticator records the policy generation it checked a
+/// credential against, beside its expiry.
+const GENERATION_CLAIM: &str = "io.rustyschwab/policyGeneration";
+
+/// Serves each request as the principal its credential names.
+#[derive(Clone)]
+pub struct PrincipalRouter {
+    principals: Principals,
+    info: Implementation,
+    instructions: Option<String>,
+    versions: &'static [ProtocolVersion],
 }
+
+impl std::fmt::Debug for PrincipalRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrincipalRouter")
+            .field("principals", &self.principals)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PrincipalRouter {
+    /// The authenticated principal's server, or why the request may not be
+    /// served: no identity (the transport always sets one), a credential
+    /// past its expiry, or one authenticated under a replaced policy.
+    fn select(&self, base: &RequestContext) -> McpResult<AuthorizedServer> {
+        let identity = &base.identity;
+        let refused = || McpError::authentication("Credential expired or revoked");
+        let name = identity.subject().ok_or_else(refused)?;
+        let expires_at = identity
+            .claim("exp")
+            .and_then(Value::as_i64)
+            .ok_or_else(refused)?;
+        let generation = identity
+            .claim(GENERATION_CLAIM)
+            .and_then(Value::as_u64)
+            .ok_or_else(refused)?;
+        if expires_at <= chrono::Utc::now().timestamp() {
+            return Err(refused());
+        }
+        self.principals.server(name, generation).ok_or_else(refused)
+    }
+}
+
+impl McpServerCore for PrincipalRouter {
+    fn server_info(&self) -> Implementation {
+        self.info.clone()
+    }
+    fn supported_versions(&self) -> &'static [ProtocolVersion] {
+        self.versions
+    }
+    fn instructions(&self) -> Option<String> {
+        self.instructions.clone()
+    }
+}
+
+impl WithTools for PrincipalRouter {
+    async fn lookup_tool(
+        &self,
+        ctx: &ListToolsContext,
+        name: String,
+    ) -> McpResult<Option<neutral::Tool>> {
+        self.select(&ctx.base)?.lookup_tool(ctx, name).await
+    }
+    async fn list_tools(
+        &self,
+        ctx: &ListToolsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListToolsResult> {
+        self.select(&ctx.base)?.list_tools(ctx, params).await
+    }
+    async fn call_tool(
+        &self,
+        ctx: &CallToolContext,
+        params: neutral::CallToolParams,
+    ) -> McpResult<neutral::CallToolResult> {
+        self.select(&ctx.base)?.call_tool(ctx, params).await
+    }
+}
+
+impl WithResources for PrincipalRouter {
+    async fn list_resources(
+        &self,
+        ctx: &ListResourcesContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListResourcesResult> {
+        self.select(&ctx.base)?.list_resources(ctx, params).await
+    }
+    async fn read_resource(
+        &self,
+        ctx: &ReadResourceContext,
+        params: neutral::ReadResourceParams,
+    ) -> McpResult<neutral::ReadResourceResult> {
+        self.select(&ctx.base)?.read_resource(ctx, params).await
+    }
+}
+
+impl WithPrompts for PrincipalRouter {
+    async fn list_prompts(
+        &self,
+        ctx: &ListPromptsContext,
+        params: neutral::ListParams,
+    ) -> McpResult<neutral::ListPromptsResult> {
+        self.select(&ctx.base)?.list_prompts(ctx, params).await
+    }
+    async fn get_prompt(
+        &self,
+        ctx: &GetPromptContext,
+        params: neutral::GetPromptParams,
+    ) -> McpResult<neutral::GetPromptResult> {
+        self.select(&ctx.base)?.get_prompt(ctx, params).await
+    }
+}
+
+/// What a network transport needs: the dispatcher over every principal and
+/// the authenticator that names them.
+#[derive(Debug, Clone)]
+pub struct Network {
+    pub dispatcher: VersionDispatcher<PrincipalRouter>,
+    pub credentials: Arc<Credentials>,
+}
+
+impl Network {
+    /// The Streamable HTTP endpoint at `/mcp`, with RFC 9728 metadata at
+    /// `/.well-known/oauth-protected-resource`. Requests are bounded at two
+    /// minutes; a write already handed to its own task still finishes.
+    pub fn http_router(&self) -> Router {
+        turbomcp::http::router(
+            self.dispatcher.clone(),
+            HttpConfig::new()
+                .with_authenticator(self.credentials.clone())
+                .request_timeout(std::time::Duration::from_secs(120)),
+        )
+    }
+
+    /// Serve MCP over WebSocket on `listener` until `shutdown` fires. The
+    /// credential is checked at the upgrade and its principal re-checked on
+    /// every request; browser origins are refused. Each connection is its
+    /// own session for clients on the session-based revisions.
+    pub async fn serve_websocket(
+        &self,
+        listener: tokio::net::TcpListener,
+        shutdown: turbomcp::CancellationToken,
+    ) -> anyhow::Result<()> {
+        let serve = turbomcp::ServeConfig {
+            shutdown,
+            // As many calls in flight per connection as a model needs, not
+            // as many as a client could pile up.
+            max_in_flight: 32,
+            ..Default::default()
+        };
+        let dispatcher = self.dispatcher.clone();
+        turbomcp::ws::serve_websocket_with(
+            listener,
+            move || turbomcp::LegacySessionAdapter::new(dispatcher.clone()),
+            turbomcp::ws::WsConfig::new()
+                .with_authenticator(self.credentials.clone())
+                .max_message_bytes(1024 * 1024)
+                .with_serve_config(serve),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("WebSocket transport failed: {e}"))
+    }
+}
+
+/// The network transports over `servers`, with no policy reload.
+pub fn network(servers: Vec<AuthorizedServer>) -> Network {
+    network_reloadable(servers, None, None)
+}
+
+/// The Streamable HTTP router over `servers`, with no policy reload.
+pub fn router(servers: Vec<AuthorizedServer>) -> Router {
+    network(servers).http_router()
+}
+
+/// The HTTP router of [`network_reloadable`].
 pub fn router_reloadable(
     servers: Vec<AuthorizedServer>,
-    websocket: bool,
     identity: Option<Arc<crate::identity::JwtVerifier>>,
     policy_path: Option<std::path::PathBuf>,
 ) -> Router {
+    network_reloadable(servers, identity, policy_path).http_router()
+}
+
+/// The network transports over `servers`, authenticating with `identity`'s
+/// JWTs if given (else each principal's static token), and reloading the
+/// principals when the policy file at `policy_path` changes.
+pub fn network_reloadable(
+    servers: Vec<AuthorizedServer>,
+    identity: Option<Arc<crate::identity::JwtVerifier>>,
+    policy_path: Option<std::path::PathBuf>,
+) -> Network {
     // Reloaded principals share the first server's backend, switches,
     // approval notifier, stream and dead-man registry: rebuilding a
     // principal's server must not orphan the live stream or its lease on the
@@ -81,21 +377,27 @@ pub fn router_reloadable(
             s.liveness().clone(),
         )
     });
-    let (revoked, _) = tokio::sync::watch::channel(0);
-    let state = Arc::new(NetworkState {
-        entries: parking_lot::RwLock::new(entries(servers, websocket)),
-        identity,
-        revoked,
-    });
+    let (info, instructions, versions) = servers.first().map_or_else(
+        || {
+            (
+                Implementation::new("schwab-mcp", env!("CARGO_PKG_VERSION")),
+                None,
+                ProtocolVersion::SUPPORTED,
+            )
+        },
+        |s| (s.server_info(), s.instructions(), s.supported_versions()),
+    );
+    let principals = Principals::new(servers, identity);
     if let (Some(path), Some((backend, switches, hub, notifier, liveness))) = (policy_path, shared)
     {
-        let weak = Arc::downgrade(&state);
+        let weak = Arc::downgrade(&principals.registry);
+        let static_credentials = principals.identity.is_none();
         let initial = crate::read_config(&path).ok();
         tokio::spawn(async move {
             let mut previous = initial;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let Some(state) = weak.upgrade() else {
+                let Some(registry) = weak.upgrade() else {
                     break;
                 };
                 // Off the async workers: a slow or odd file must not stall
@@ -113,9 +415,7 @@ pub fn router_reloadable(
                 let policies = current
                     .as_deref()
                     .and_then(|bytes| serde_json::from_slice::<Vec<PrincipalPolicy>>(bytes).ok())
-                    .filter(|policies| {
-                        validate_policies(policies, state.identity.is_none()).is_ok()
-                    });
+                    .filter(|policies| validate_policies(policies, static_credentials).is_ok());
                 let valid = policies.is_some();
                 let policies = policies.unwrap_or_default();
                 // With no principal left to control it, nobody can see or
@@ -123,304 +423,47 @@ pub fn router_reloadable(
                 if !policies.iter().any(PrincipalPolicy::owns_streaming) {
                     hub.shutdown().await;
                 }
-                *state.entries.write() = entries(
-                    policies
-                        .into_iter()
-                        .map(|policy| {
-                            AuthorizedServer::with_stream_hub(
-                                backend.clone(),
-                                switches,
-                                policy,
-                                hub.clone(),
-                            )
-                            .with_approval_notifier(notifier.clone())
-                            .with_liveness(liveness.clone())
-                        })
-                        .collect(),
-                    websocket,
-                );
-                state.revoked.send_modify(|version| *version += 1);
-                tracing::info!(valid, "MCP policy reloaded; existing sessions revoked");
+                let servers = policies
+                    .into_iter()
+                    .map(|policy| {
+                        AuthorizedServer::with_stream_hub(
+                            backend.clone(),
+                            switches,
+                            policy,
+                            hub.clone(),
+                        )
+                        .with_approval_notifier(notifier.clone())
+                        .with_liveness(liveness.clone())
+                    })
+                    .collect();
+                replace(&registry, servers);
+                tracing::info!(valid, "MCP policy reloaded; earlier credentials revoked");
                 previous = current;
             }
         });
     }
-    Router::new().fallback(any(authenticate)).with_state(state)
-}
-async fn authenticate(
-    State(state): State<Arc<NetworkState>>,
-    mut request: Request<Body>,
-) -> Response {
-    if request.method() == axum::http::Method::GET
-        && request.uri().path() == "/.well-known/oauth-protected-resource"
-    {
-        return state
-            .identity
-            .as_ref()
-            .map(|id| axum::Json(id.metadata()).into_response())
-            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
-    }
-    let revoked = state.revoked.subscribe();
-    let supplied = request
-        .headers()
-        .get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "));
-    let Some(token) = supplied.filter(|s| s.len() >= 32 && s.len() <= 16384) else {
-        return unauthorized(&state);
+    let router = PrincipalRouter {
+        principals: principals.clone(),
+        info,
+        instructions,
+        versions,
     };
-    let now = chrono::Utc::now().timestamp();
-    let selected = if let Some(identity) = &state.identity {
-        match identity.verify(token).await {
-            Ok(claims) => state
-                .entries
-                .read()
-                .iter()
-                .find(|e| e.subject.as_deref() == Some(&claims.sub))
-                .map(|e| (e.router.clone(), claims.exp as i64)),
-            Err(_) => None,
-        }
-    } else {
-        let hash = digest(token.as_bytes());
-        state
-            .entries
-            .read()
-            .iter()
-            .find(|e| {
-                e.expires_at.is_some_and(|at| at > now)
-                    && bool::from(e.digest.as_bytes().ct_eq(hash.as_bytes()))
-            })
-            .map(|e| (e.router.clone(), e.expires_at.unwrap()))
-    };
-    let Some((router, expires_at)) = selected else {
-        return unauthorized(&state);
-    };
-    let mut validity = CredentialValidity {
-        expires_at,
-        revoked,
-    };
-    if validity.revoked.has_changed().unwrap_or(true) {
-        return unauthorized(&state);
-    }
-    request.extensions_mut().insert(validity.clone());
-    let deadline = std::time::Duration::from_secs((expires_at - now).clamp(1, 120) as u64);
-    tokio::select! {
-        response = router.oneshot(request) => response.unwrap_or_else(|never| match never {}),
-        _ = validity.revoked.changed() => unauthorized(&state),
-        _ = tokio::time::sleep(deadline) => StatusCode::GATEWAY_TIMEOUT.into_response(),
-    }
-}
-fn unauthorized(state: &NetworkState) -> Response {
-    let challenge = state
-        .identity
-        .as_ref()
-        .map_or_else(|| "Bearer".into(), |id| id.challenge());
-    (StatusCode::UNAUTHORIZED, [("www-authenticate", challenge)]).into_response()
-}
-async fn upgrade(
-    State(server): State<AuthorizedServer>,
-    headers: axum::http::HeaderMap,
-    axum::Extension(validity): axum::Extension<CredentialValidity>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    // This endpoint serves native MCP clients. Browser origins are not authorized.
-    if headers.contains_key("origin") {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    static CONNECTIONS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-        std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(128)));
-    let Ok(permit) = CONNECTIONS.clone().try_acquire_owned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    ws.max_message_size(1024 * 1024)
-        .max_frame_size(1024 * 1024)
-        .on_upgrade(move |socket| async move {
-            let _permit = permit;
-            session(socket, server, validity).await
-        })
-}
-async fn session(
-    mut socket: WebSocket,
-    server: AuthorizedServer,
-    mut validity: CredentialValidity,
-) {
-    let expiry = tokio::time::sleep(std::time::Duration::from_secs(
-        (validity.expires_at - chrono::Utc::now().timestamp()).max(0) as u64,
-    ));
-    tokio::pin!(expiry);
-    use std::collections::HashMap;
-    let mut version: Option<String> = None;
-    let mut initialized = false;
-    let mut jobs = tokio::task::JoinSet::new();
-    let mut pending = HashMap::<String, tokio::task::AbortHandle>::new();
-    loop {
-        tokio::select! {
-            _ = validity.revoked.changed() => break,
-            _ = &mut expiry => break,
-            completed = jobs.join_next(), if !jobs.is_empty() => {
-                if let Some(Ok((id, response))) = completed {
-                    pending.remove(&id);
-                    if !send(&mut socket, response).await {
-                        break;
-                    }
-                }
-            }
-            next = socket.recv() => {
-                let text = match next {
-                    Some(Ok(Message::Text(text))) => text,
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-                    Some(Ok(Message::Pong(_))) => continue,
-                    _ => break,
-                };
-                let request = match rpc::parse_request(&text) {
-                    Ok(request) => request,
-                    Err(_) => {
-                        let response = rpc::JsonRpcOutgoing::error(
-                            Some(serde_json::Value::Null),
-                            McpError::parse_error("Invalid JSON-RPC request"),
-                        );
-                        if !send(&mut socket, response).await {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                if request.method == "notifications/cancelled" {
-                    if let Some(id) = request.params.as_ref().and_then(|p| p.get("requestId"))
-                        && let Some(handle) = pending.remove(&id.to_string())
-                    {
-                        handle.abort();
-                    }
-                    continue;
-                }
-                if request.method == "notifications/initialized" {
-                    initialized = version.is_some();
-                    continue;
-                }
-                if request.is_notification() {
-                    continue;
-                }
-                if request.method == "initialize" {
-                    let response = if version.is_some() {
-                        rpc::JsonRpcOutgoing::error(
-                            request.id,
-                            McpError::invalid_request("Already initialized"),
-                        )
-                    } else {
-                        rpc::route_request(&server, request, &RequestContext::websocket()).await
-                    };
-                    let negotiated = response
-                        .result
-                        .as_ref()
-                        .and_then(|r| r.get("protocolVersion"))
-                        .and_then(|v| v.as_str());
-                    if let Some(v) = negotiated {
-                        version = Some(v.into());
-                    }
-                    if !send(&mut socket, response).await {
-                        break;
-                    }
-                    continue;
-                }
-                if !initialized || pending.len() >= 32 {
-                    let response = rpc::JsonRpcOutgoing::error(
-                        request.id,
-                        McpError::invalid_request("Session not ready or concurrency limit reached"),
-                    );
-                    if !send(&mut socket, response).await {
-                        break;
-                    }
-                    continue;
-                }
-                let id = request.id.as_ref().unwrap().to_string();
-                if pending.contains_key(&id) {
-                    let response = rpc::JsonRpcOutgoing::error(
-                        request.id,
-                        McpError::invalid_request("Request ID is already active"),
-                    );
-                    if !send(&mut socket, response).await {
-                        break;
-                    }
-                    continue;
-                }
-                let handler = server.clone();
-                let version = version.clone().unwrap();
-                let key = id.clone();
-                let handle = jobs.spawn(async move {
-                    let ctx = RequestContext::websocket().with_request_id(key.clone());
-                    let request_id = request.id.clone();
-                    let routed = rpc::route_request_versioned(&handler, request, &ctx, &version);
-                    let response = tokio::time::timeout(std::time::Duration::from_secs(120), routed)
-                        .await
-                        .unwrap_or_else(|_| {
-                            rpc::JsonRpcOutgoing::error(
-                                request_id,
-                                McpError::internal(
-                                    "Operation deadline exceeded; reconcile any pending execution",
-                                ),
-                            )
-                        });
-                    (key, response)
-                });
-                pending.insert(id, handle);
-            }
-        }
-    }
-    jobs.abort_all();
-}
-async fn send(socket: &mut WebSocket, response: rpc::JsonRpcOutgoing) -> bool {
-    if !response.should_send() {
-        return true;
-    }
-    let Ok(text) = rpc::serialize_response(&response) else {
-        return false;
-    };
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            socket.send(Message::Text(text.into()))
-        )
-        .await,
-        Ok(Ok(()))
-    )
-}
-
-mod rpc {
-    pub use turbomcp_core::jsonrpc::JsonRpcOutgoing;
-    pub use turbomcp_core::router::{parse_request, serialize_response};
-    pub async fn route_request<H: turbomcp::McpHandler>(
-        handler: &H,
-        request: turbomcp_core::jsonrpc::JsonRpcIncoming,
-        ctx: &turbomcp::RequestContext,
-    ) -> JsonRpcOutgoing {
-        turbomcp_core::router::route_request(handler, request, ctx, &Default::default()).await
-    }
-    pub async fn route_request_versioned<H: turbomcp::McpHandler>(
-        handler: &H,
-        request: turbomcp_core::jsonrpc::JsonRpcIncoming,
-        ctx: &turbomcp::RequestContext,
-        version: &str,
-    ) -> JsonRpcOutgoing {
-        turbomcp_core::router::route_request(
-            handler,
-            request,
-            ctx,
-            &turbomcp_core::router::RouteConfig {
-                protocol_version: Some(version),
-            },
-        )
-        .await
+    Network {
+        dispatcher: ServerBuilder::new(router)
+            .with_tools()
+            .with_resources()
+            .with_prompts()
+            .build(),
+        credentials: Arc::new(Credentials { principals }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, extract::Request, http::StatusCode};
+    use tower::ServiceExt;
+
     fn server(name: &str, token: &str, tools: &[&str]) -> AuthorizedServer {
         let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
             oauth: schwab_rs::OAuthConfig {
@@ -444,93 +487,120 @@ mod tests {
             policy,
         )
     }
+
+    fn post(token: Option<&str>, body: Value) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .extension(axum::extract::ConnectInfo(
+                "127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap(),
+            ))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", body["method"].as_str().unwrap_or_default());
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    fn list_tools() -> Value {
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientInfo":{"name":"audit","version":"1"},
+                "io.modelcontextprotocol/clientCapabilities":{}}}})
+    }
+
+    async fn tool_names(app: &Router, token: &str) -> Vec<String> {
+        let response = app
+            .clone()
+            .oneshot(post(Some(token), list_tools()))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert!(
+            status.is_success(),
+            "{status}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        body["result"]["tools"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{body}"))
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
     #[tokio::test]
     async fn every_network_request_requires_a_valid_bearer_token() {
         let token = "a".repeat(32);
-        let app = router(vec![server("A", &token, &["get_quote"])], false);
+        let app = router(vec![server("A", &token, &["get_quote"])]);
         for bearer in [
             None,
-            Some("Bearer wrong"),
-            Some("Bearer bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some("wrong"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
         ] {
-            let mut request = Request::builder().uri("/mcp").method("POST");
-            if let Some(bearer) = bearer {
-                request = request.header("authorization", bearer);
-            }
-            assert_eq!(
-                app.clone()
-                    .oneshot(request.body(Body::empty()).unwrap())
-                    .await
-                    .unwrap()
-                    .status(),
-                StatusCode::UNAUTHORIZED
-            );
+            let response = app
+                .clone()
+                .oneshot(post(bearer, list_tools()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
-        let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"audit","version":"1"},"capabilities":{}}});
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/mcp")
-                    .header("authorization", format!("Bearer {token}"))
-                    .extension(axum::extract::ConnectInfo(
-                        "127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap(),
-                    ))
-                    .header("content-type", "application/json")
-                    .header("accept", "application/json, text/event-stream")
-                    .body(Body::from(init.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
-        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(tool_names(&app, &token).await, ["get_quote"]);
     }
+
+    /// Each request is served as its own credential's principal, whatever
+    /// session or connection it arrives on.
     #[tokio::test]
-    async fn sessions_cannot_be_reused_by_another_principal() {
+    async fn principals_have_distinct_tool_inventories() {
         let a = "a".repeat(32);
         let b = "b".repeat(32);
-        let app = router(
-            vec![
-                server("A", &a, &["get_quote"]),
-                server("B", &b, &["get_account"]),
-            ],
-            false,
-        );
-        let request = |token: &str, body: serde_json::Value, session: Option<&str>| {
-            let mut builder = Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .extension(axum::extract::ConnectInfo(
-                    "127.0.0.1:32123".parse::<std::net::SocketAddr>().unwrap(),
-                ))
-                .header("authorization", format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream");
-            if let Some(session) = session {
-                builder = builder.header("mcp-session-id", session);
-            }
-            builder.body(Body::from(body.to_string())).unwrap()
-        };
-        let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"audit","version":"1"},"capabilities":{}}});
-        let response = app.clone().oneshot(request(&a, init, None)).await.unwrap();
-        assert!(response.status().is_success());
-        let session = response
-            .headers()
-            .get("mcp-session-id")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        let response = app
-            .oneshot(request(
-                &b,
-                serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
-                Some(session),
-            ))
-            .await
-            .unwrap();
-        assert!(response.status().is_client_error());
+        let app = router(vec![
+            server("A", &a, &["get_quote"]),
+            server("B", &b, &["get_account"]),
+        ]);
+        assert_eq!(tool_names(&app, &a).await, ["get_quote"]);
+        assert_eq!(tool_names(&app, &b).await, ["get_account"]);
     }
+
+    /// A credential checked under a replaced policy is refused, even for a
+    /// principal the new policy keeps; one presented afresh is served.
+    #[tokio::test]
+    async fn a_reload_revokes_earlier_credentials() {
+        let token = "a".repeat(32);
+        let network = network(vec![server("A", &token, &["get_quote"])]);
+        let principals = network.credentials.principals.clone();
+        let router = PrincipalRouter {
+            principals: principals.clone(),
+            info: Implementation::new("schwab-mcp", "test"),
+            instructions: None,
+            versions: ProtocolVersion::SUPPORTED,
+        };
+        let (name, expires_at, generation) = principals.authenticate(&token).await.unwrap();
+        let Value::Object(claims) = json!({"exp": expires_at, GENERATION_CLAIM: generation}) else {
+            unreachable!()
+        };
+        let base = RequestContext::default()
+            .with_identity(turbomcp::Identity::Bearer { sub: name, claims });
+        assert!(router.select(&base).is_ok());
+        replace(
+            &principals.registry,
+            vec![server("A", &token, &["get_quote"])],
+        );
+        assert!(
+            router.select(&base).is_err(),
+            "the old generation is revoked"
+        );
+        let app = network.http_router();
+        assert_eq!(tool_names(&app, &token).await, ["get_quote"]);
+    }
+
     #[tokio::test]
     async fn policy_reload_revokes_credentials_without_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -541,26 +611,13 @@ mod tests {
             serde_json::to_vec(&vec![&*server.principal]).unwrap(),
         )
         .unwrap();
-        let app = router_reloadable(vec![server], false, None, Some(path.clone()));
+        let app = router_reloadable(vec![server], None, Some(path.clone()));
         std::fs::write(&path, "malformed policy").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/mcp")
-                    .header("authorization", format!("Bearer {}", "a".repeat(32)))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(post(Some(&"a".repeat(32)), list_tools()))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-    #[test]
-    fn principals_have_distinct_tool_inventories() {
-        let a = server("A", &"a".repeat(32), &["get_quote"]);
-        let b = server("B", &"b".repeat(32), &["get_account"]);
-        assert_eq!(a.list_tools()[0].name, "get_quote");
-        assert_eq!(b.list_tools()[0].name, "get_account");
     }
 }

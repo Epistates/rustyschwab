@@ -22,7 +22,6 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
-use turbomcp::prelude::*;
 
 /// Env var that opts a network transport into binding beyond loopback.
 const ALLOW_REMOTE_ENV: &str = "SCHWAB_MCP_ALLOW_REMOTE";
@@ -41,7 +40,7 @@ fn remote_bind_allowed() -> bool {
 }
 
 /// Remote binds require an explicit deployment opt-in and TLS termination.
-/// Every network request is authenticated by `network::router`.
+/// Every network request is authenticated by `network::Credentials`.
 fn guard_network_bind(transport: &str, addr: SocketAddr, allow_remote: bool) -> anyhow::Result<()> {
     if !addr.ip().is_loopback() && !allow_remote {
         anyhow::bail!(
@@ -207,28 +206,36 @@ async fn main() -> anyhow::Result<()> {
             ),
             None => None,
         };
-        let app = schwab_mcp::network::router_reloadable(
+        let network = schwab_mcp::network::network_reloadable(
             servers,
-            transport != "http",
             identity,
             std::env::var_os("SCHWAB_MCP_POLICY_FILE").map(std::path::PathBuf::from),
         );
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let serve = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(async {
-            let _ = stopped.await;
-        });
-        let serving = std::future::IntoFuture::into_future(serve);
+        let stop = turbomcp::CancellationToken::new();
+        let serving: std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>> =
+            if transport == "http" {
+                let app = network.http_router();
+                let stopped = stop.clone();
+                Box::pin(async move {
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async move { stopped.cancelled().await })
+                    .await
+                    .map_err(anyhow::Error::from)
+                })
+            } else {
+                let stopped = stop.clone();
+                Box::pin(async move { network.serve_websocket(listener, stopped).await })
+            };
         tokio::pin!(serving);
         tokio::select! {
             result = &mut serving => result?,
             _ = shutdown_signal() => {
                 backend.trading().begin_drain();
-                let _ = stop.send(());
+                stop.cancel();
                 // Long-lived transports must not prevent bounded process exit.
                 let grace = std::time::Duration::from_secs(30);
                 if let Ok(result) = tokio::time::timeout(grace, &mut serving).await {

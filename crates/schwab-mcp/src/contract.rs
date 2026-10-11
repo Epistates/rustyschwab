@@ -28,6 +28,23 @@ use turbomcp::prelude::*;
 
 use crate::redact;
 
+/// A tool's answer: v4's neutral `CallToolResult`.
+pub type ToolResult = neutral::CallToolResult;
+
+/// The largest response a tool returns, in bytes: a larger one is refused
+/// as `response_too_large` rather than clipped, under every transport's
+/// message limit (the HTTP transport's default request bound is the same
+/// mebibyte).
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// The first text block of `result`, if any.
+pub fn first_text(result: &ToolResult) -> Option<&str> {
+    result.content.iter().find_map(|block| match block {
+        neutral::Content::Text { text, .. } => Some(text.as_str()),
+        _ => None,
+    })
+}
+
 /// Where a successful response's `data` came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -302,16 +319,14 @@ impl From<schwab_types::ValidationError> for ToolFailure {
 
 impl From<McpError> for ToolFailure {
     fn from(e: McpError) -> Self {
-        use turbomcp_core::ErrorKind;
-        match e.kind {
-            ErrorKind::InvalidParams | ErrorKind::ParseError => Self::invalid_arguments(e.message),
-            ErrorKind::PermissionDenied | ErrorKind::Authentication => {
-                Self::not_permitted(e.message)
+        match e {
+            McpError::InvalidParams(message) => Self::invalid_arguments(message),
+            McpError::PermissionDenied(message) | McpError::Authentication(message) => {
+                Self::not_permitted(message)
             }
-            ErrorKind::RateLimited => Self::new(FailureCode::RateLimited, e.message),
-            ErrorKind::Timeout => Self::new(FailureCode::Timeout, e.message),
-            ErrorKind::Unavailable => Self::new(FailureCode::Unavailable, e.message),
-            _ => Self::internal("MCP operation failed", e),
+            McpError::Timeout(message) => Self::new(FailureCode::Timeout, message),
+            McpError::Transport(message) => Self::new(FailureCode::Unavailable, message),
+            e => Self::internal("MCP operation failed", e),
         }
     }
 }
@@ -390,10 +405,9 @@ pub(crate) fn run(
 /// to a failure, so an error result without it can only be that case and
 /// is re-issued as `invalid_arguments`.
 pub fn normalize(result: ToolResult) -> ToolResult {
-    if result.is_error() && result.structured_content.is_none() {
-        let message = result
-            .first_text()
-            .unwrap_or("Arguments did not match the tool's input schema");
+    if result.is_error && result.structured_content.is_none() {
+        let message =
+            first_text(&result).unwrap_or("Arguments did not match the tool's input schema");
         return ToolFailure::invalid_arguments(message).into_result();
     }
     result
@@ -414,7 +428,7 @@ pub struct Reported {
 
 impl Reported {
     pub fn of(result: &ToolResult) -> Self {
-        if result.is_error() {
+        if result.is_error {
             let failure = result.structured_content.as_ref().and_then(|content| {
                 let error = &content["error"];
                 let code = serde_json::from_value(error["code"].clone()).ok()?;
@@ -428,9 +442,7 @@ impl Reported {
         }
         Self {
             failure: None,
-            body: result
-                .first_text()
-                .and_then(|text| serde_json::from_str(text).ok()),
+            body: first_text(result).and_then(|text| serde_json::from_str(text).ok()),
         }
     }
 
@@ -448,7 +460,7 @@ impl Reported {
 /// transport's message limit.
 fn encode(value: &Value) -> Result<String, ToolFailure> {
     let text = value.to_string();
-    let limit = turbomcp_core::MAX_MESSAGE_SIZE;
+    let limit = MAX_RESPONSE_BYTES;
     if text.len() > limit {
         return Err(ToolFailure::new(
             FailureCode::ResponseTooLarge,
@@ -489,14 +501,14 @@ mod tests {
         let result = ToolFailure::not_permitted("Account not authorized")
             .with_intent("abc")
             .into_result();
-        assert!(result.is_error());
+        assert!(result.is_error);
         let structured = result.structured_content.clone().unwrap();
         assert_eq!(structured["error"]["code"], "not_permitted");
         assert_eq!(structured["error"]["disposition"], "not_permitted");
         assert_eq!(structured["error"]["retryable"], false);
         assert_eq!(structured["error"]["intentDigest"], "abc");
         assert!(structured["error"].get("attemptId").is_none());
-        let text: Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        let text: Value = serde_json::from_str(first_text(&result).unwrap()).unwrap();
         assert_eq!(text, structured);
     }
 
@@ -564,9 +576,9 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_successes_are_refused_not_clipped() {
-        let huge = json!({"blob": "x".repeat(turbomcp_core::MAX_MESSAGE_SIZE)});
+        let huge = json!({"blob": "x".repeat(MAX_RESPONSE_BYTES)});
         let result = run("test", async { Ok(huge) }).await.unwrap();
-        assert!(result.is_error());
+        assert!(result.is_error);
         assert_eq!(
             result.structured_content.unwrap()["error"]["code"],
             "response_too_large"
@@ -574,7 +586,7 @@ mod tests {
         let result = run("test", async { Ok(json!({"ok": true})) })
             .await
             .unwrap();
-        assert!(!result.is_error());
-        assert_eq!(result.first_text(), Some(r#"{"ok":true}"#));
+        assert!(!result.is_error);
+        assert_eq!(first_text(&result), Some(r#"{"ok":true}"#));
     }
 }

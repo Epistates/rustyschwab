@@ -882,4 +882,4 @@ configuration and external release gates. This candidate has not been published.
 
 For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](https://github.com/epistates/rustyschwab/blob/main/docs/SHARED_AUTHORITY.md).
 
-See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper mode, and the TurboMCP v4 migration criteria.
+See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper mode, and the TurboMCP v4 transport notes.

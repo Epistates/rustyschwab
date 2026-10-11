@@ -14,7 +14,7 @@ Three published crates plus example packages, all on the workspace version
 |---|---|---|
 | `schwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
 | `schwab-rs` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
-| `schwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 3.3, `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `schwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
 
 `examples/` holds workspace packages (`oauth-flow`, `auth_test`,
 `comprehensive`, `streaming-examples`, `enterprise-bench`); run them with
@@ -234,7 +234,9 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 ### Server and tools
 
-`server::SchwabMcp` is one `#[turbomcp::server]` impl with 39 `#[tool]`
+`server::SchwabMcp` is one `#[turbomcp::server]` impl (turbomcp 4, serving
+the `2025-06-18` and `2025-11-25` session revisions and the stateless
+`2026-07-28` one through the same handlers) with 39 `#[tool]`
 methods in category order: market data (12, including the `get_candles`
 and `get_option_contracts` projections), accounts (6, including the
 `get_positions` projection and `get_portfolio_summary`), orders read (5,
@@ -372,12 +374,17 @@ future and stack frame stay small however many tools there are.
   tools the switches keep off, and the mode. `AuthorizedServer` lists and
   serves them only to principals holding the tools they are about, and the
   prompt only for the principal's accounts.
-- `network.rs` — the axum router authenticates every request first
-  (constant-time comparison of a bearer token's SHA-256 against the policy,
-  or `identity::JwtVerifier` for short-lived RS256 tokens from
-  `SCHWAB_MCP_IDENTITY_FILE`), then routes into that principal's isolated
-  MCP router and session store. The policy file is re-read every 2 s; any
-  change, or an invalid file, revokes existing sessions.
+- `network.rs` — one turbomcp dispatcher serves every principal over
+  Streamable HTTP (`/mcp`) and WebSocket. `Credentials`, turbomcp's
+  `HttpAuthenticator` seam, checks the bearer token on every HTTP request
+  and at the WebSocket upgrade (constant-time comparison of its SHA-256
+  against the policy, or `identity::JwtVerifier` for short-lived RS256
+  tokens from `SCHWAB_MCP_IDENTITY_FILE`) and names the principal, its
+  credential's expiry and the policy generation in the request identity.
+  `PrincipalRouter` serves each request with that principal's
+  `AuthorizedServer`, refusing an expired credential or one checked under
+  a replaced policy. The policy file is re-read every 2 s; any change, or
+  an invalid file, retires every earlier credential.
 - `authority.rs` and `bin/schwab-authority.rs` — the shared transactional
   authority: `/v1/backend` for privileged SDK workers (`RemoteBackend`),
   `/v1/orders` + `/v1/lease` for trading identities that must not hold

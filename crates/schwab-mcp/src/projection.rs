@@ -41,7 +41,7 @@ pub fn budget() -> usize {
 fn parse_budget(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_BUDGET_BYTES)
-        .clamp(MIN_BUDGET_BYTES, turbomcp_core::MAX_MESSAGE_SIZE)
+        .clamp(MIN_BUDGET_BYTES, crate::contract::MAX_RESPONSE_BYTES)
 }
 
 /// One projected row with the key that orders it and resumes after it.
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(parse_budget(Some("1")), MIN_BUDGET_BYTES);
         assert_eq!(
             parse_budget(Some("99999999999")),
-            turbomcp_core::MAX_MESSAGE_SIZE
+            crate::contract::MAX_RESPONSE_BYTES
         );
     }
 }

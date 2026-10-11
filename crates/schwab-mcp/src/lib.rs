@@ -26,6 +26,8 @@ pub mod redact;
 pub mod server;
 pub mod status;
 pub mod stream_cache;
+#[doc(hidden)]
+pub mod testing;
 
 pub use server::SchwabMcp;
 

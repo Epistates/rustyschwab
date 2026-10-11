@@ -1,6 +1,7 @@
 # MCP and LLM integration review
 
-Reviewed 2026-09-10. The MCP server now uses stable TurboMCP 3.3.0, with
+Reviewed 2026-09-10; transport updated 2026-10-11. The MCP server runs on
+TurboMCP 4 (see [TurboMCP v4](#turbomcp-v4)), with
 explicit behavior annotations for all 39 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
 `get_server_status`, the three projection tools, `get_portfolio_summary`,
@@ -454,19 +455,17 @@ a session that does not submit.
 On the authorized transports both follow the principal: a principal without
 an order tool (`build_order`, `check_order`, `preview_order`, `place_order`,
 `replace_order`) is not shown the resource; one without `check_order` is not
-shown the prompt; `initialize` then omits the capability, and a direct read
-answers `resource not found` or `prompt not found`. The prompt is rendered
+shown the prompt. On stdio `initialize` then omits the capability; the
+network transports serve every principal from one dispatcher, so they
+advertise it and list each principal only its own. A direct read answers
+`resource not found` or an invalid-params error naming the prompt. The prompt is rendered
 only for an account the principal holds; another account is refused before
 rendering. No account data is exposed as a resource: the tools already serve
 it, under the same authorization and the response budgets a resource read
 would lack.
 
-TurboMCP renders an `Err` from a `#[prompt]` handler as a user message
-reading `Error: …` rather than a JSON-RPC error. On the stdio transport a
-blank `account_hash` therefore comes back as that message, and only a
-missing one as the macro's own JSON-RPC error; the authorized wrapper
-validates the arguments before rendering and answers a JSON-RPC error for
-either.
+A prompt whose arguments are missing or blank answers a JSON-RPC error on
+every transport.
 
 ## Paper mode
 
@@ -585,19 +584,35 @@ release.
 | Medium | Model evaluation | Done: `schwab-eval` scores stale data, prompt injection, account confusion, denied approvals, unknown submissions, repeated submissions and a tripped daily-loss halt, requires zero unauthorized executions and records model, prompt and config per report. Remaining: partial and uncertain fills, and a batch runner that drives a model across every scenario. |
 | Medium | Optional resources/prompts | Done: the `OrderSpec` grammar resource and the `propose_trade` prompt, listed, read and rendered only for principals holding the tools they are about, and only for their accounts. No approval-granting tool is exposed. Account data stays behind the budgeted tools rather than resources. |
 
-## TurboMCP v4 decision
+## TurboMCP v4
 
-The registry reports `4.0.0-alpha.4`, published alongside stable `3.3.0`.
-V4 is a prerelease with new provider/lookup, dispatcher and session ownership
-contracts. Its [migration guide](https://github.com/Epistates/turbomcp/blob/main/docs/DEPLOYMENT.md)
-requires authoritative tool lookup, identity-bound sessions, and coordinated
-HTTP session termination. It also validates input and structured output schemas.
-The current `McpHandler` policy wrapper, direct core imports, HTTP router and
-custom WebSocket dispatch must be ported together. A version-number-only upgrade
-would not establish compatibility or preserve our authorization boundary.
+The server runs on TurboMCP `4.0.0-alpha.5`, a prerelease. One set of
+handlers answers the `2025-06-18` and `2025-11-25` session revisions and
+the stateless `2026-07-28` revision; a client picks by the version it
+sends. On the stateless revision there is no `initialize` or session: each
+request carries its protocol version and client capabilities in `_meta`,
+and HTTP clients send the `Mcp-Method` header.
 
-Adopt v4 in a dedicated migration with the existing authorization regression
-suite plus independent transport conformance, schema, overload, cancellation
-and session-revocation tests. Assess whether its OAuth/session facilities can
-replace custom plumbing while preserving account risk and approval rules.
-No v4 runtime or model-provider integration was added in this pass.
+- **Authorization is unchanged in substance.** `AuthorizedServer` wraps the
+  macro-built `SchwabMcp` through v4's capability traits and filters what a
+  principal may list, read and call, as before. On the network transports
+  the bearer check is turbomcp's `HttpAuthenticator` seam and every request
+  is routed by its own credential (see the network notes in the
+  architecture overview), so no session or connection outlives its
+  principal's policy.
+- **Client approval works on both revisions.** On `2025-11-25` the approval
+  question is an inline `elicitation/create`; on `2026-07-28` the call
+  answers `input_required` with the question, and the client calls again
+  with the answer. The dispatch runs again from the top then, so everything
+  before the question is safe to repeat, and an approval the answer already
+  recorded is honored.
+- **Tool schemas keep `$defs` and `$ref`** rather than inlining them.
+- **Byte-pipe transports** (stdio, WebSocket) wrap the dispatcher in
+  turbomcp's `LegacySessionAdapter`, which gives `2025-11-25` clients their
+  session per connection.
+- **Not carried over:** the WebSocket server has no per-process connection
+  cap (limit connections at the TLS proxy) and no per-call deadline (writes
+  run to their outcome on their own task regardless; Schwab reads have the
+  SDK's request timeouts).
+
+Moving to a stable 4.x when it ships is a version bump plus this suite.

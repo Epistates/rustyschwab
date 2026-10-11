@@ -14,7 +14,6 @@ use schwab_rs::{
     auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
 };
 use serde_json::Value;
-use turbomcp::McpHandler;
 use turbomcp::prelude::*;
 use wiremock::MockServer;
 
@@ -58,14 +57,9 @@ pub async fn mocked_server(rest: &MockServer) -> (SchwabMcp, tempfile::TempDir) 
 
 /// Call a tool on either transport's server and return what the model
 /// reads: the parsed success text, or the structured failure.
-pub async fn call<S: McpHandler>(server: &S, tool: &str, args: Value) -> Value {
-    let result = server
-        .call_tool(tool, args, &RequestContext::stdio())
+pub async fn call<S: WithTools>(server: &S, tool: &str, args: Value) -> Value {
+    let result = schwab_mcp::testing::call_tool(server, tool, args)
         .await
         .unwrap();
-    let result = serde_json::to_value(result).unwrap();
-    if result["isError"] == true {
-        return result["structuredContent"].clone();
-    }
-    serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+    schwab_mcp::testing::reading(&result)
 }

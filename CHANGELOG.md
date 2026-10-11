@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — TurboMCP 4 and the stateless MCP revision
+
+- **schwab-mcp runs on TurboMCP `4.0.0-alpha.5`.** The same handlers answer
+  the `2025-06-18` and `2025-11-25` session revisions and the stateless
+  `2026-07-28` revision (no `initialize` or session; HTTP clients send
+  `Mcp-Method`). `AuthorizedServer` and the evaluation recorder implement
+  v4's capability traits over the macro-built `SchwabMcp`; tool results are
+  v4's neutral `CallToolResult` (`contract::ToolResult`), and the server's
+  model guidance moved from its description to `instructions`.
+- **One authenticated dispatcher for the network transports.**
+  `network::Credentials` (turbomcp's `HttpAuthenticator`) checks every HTTP
+  request and each WebSocket upgrade against the current policy and names
+  the principal, its expiry and the policy generation;
+  `network::PrincipalRouter` serves the request as that principal and
+  refuses an expired credential, or one checked under a replaced policy,
+  from its next request. This replaces the per-principal routers and the
+  hand-written WebSocket loop. Every request is routed by its own
+  credential, so no session or connection can cross principals.
+  `network_reloadable` returns both transports; `router` and
+  `router_reloadable` lost their `websocket` flag.
+- **Client approval on both revisions.** An inline `elicitation/create` on
+  `2025-11-25`, an `input_required` result answered by a second call on
+  `2026-07-28`; a re-run dispatch honors the approval its answer recorded.
+- Tool input schemas keep `$defs`/`$ref`. Stdio and WebSocket connections
+  get their session through `LegacySessionAdapter`. The WebSocket server
+  bounds 32 calls in flight per connection; it no longer caps connections
+  per process or times out calls (limit connections at the proxy).
+- `schwab_mcp::testing` (hidden) calls a server in process for tests and
+  the evaluation harness; `AuthorizedServer::call`, `dispatcher`,
+  `run_stdio` and `offers_guidance` are new.
+
 ### Added — a dead-man switch
 
 - **Silence cancels a principal's orders.** A principal holding

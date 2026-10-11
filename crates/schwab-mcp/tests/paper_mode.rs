@@ -23,7 +23,7 @@ use schwab_rs::paper::{
     MODEL_VERSION, PaperBroker, PaperConfig, PaperEvent, PaperEventKind, PaperFault,
 };
 use serde_json::{Value, json};
-use turbomcp::McpHandler;
+use turbomcp::McpServerCore;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
 const ACCOUNT: &str = "paper-test";
@@ -258,11 +258,12 @@ async fn orders_fill_and_cancel_inside_the_venue_and_never_reach_schwab() {
     );
     let account = json!({"account_hash": ACCOUNT});
 
-    // A client learns the mode at initialize time, before any tool call.
+    // A client learns the mode during discovery, before any tool call.
     let info = server.server_info();
     assert_eq!(info.title.as_deref(), Some("Schwab MCP (paper)"));
     assert!(
-        info.description
+        server
+            .instructions()
             .unwrap()
             .starts_with("Execution mode: paper.")
     );
@@ -484,40 +485,58 @@ async fn guardrails_bound_symbols_prices_and_the_days_orders() {
     assert_eq!(verdict["dailyBudget"]["used"]["orders"], 2, "{verdict}");
 }
 
-/// A client session that answers every elicitation with `answer`, and
-/// counts them.
-#[derive(Debug)]
-struct Answering {
-    answer: Value,
-    asked: std::sync::atomic::AtomicUsize,
+/// One `tools/call` of `place_order` with `args`, as a client on the
+/// stateless revision sends it: `elicitation` says whether the client
+/// declares the capability, and `answer` is its reply to the approval
+/// question a previous call asked (with that call's `requestState`).
+async fn place_on_the_wire(
+    dispatcher: &mut turbomcp::VersionDispatcher<AuthorizedServer>,
+    args: &Value,
+    elicitation: bool,
+    answer: Option<(&Value, Value)>,
+) -> Value {
+    use tower::{Service, ServiceExt};
+    let capabilities = if elicitation {
+        json!({"elicitation": {}})
+    } else {
+        json!({})
+    };
+    let mut params = json!({"name": "place_order", "arguments": args, "_meta": {
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "desk-client", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": capabilities,
+    }});
+    if let Some((asked, reply)) = answer {
+        let key = asked["inputRequests"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap();
+        params["inputResponses"] = json!({ key: reply });
+        if let Some(state) = asked.get("requestState") {
+            params["requestState"] = state.clone();
+        }
+    }
+    let request = turbomcp::JsonRpcRequest::new(1, "tools/call", Some(params));
+    let reply = dispatcher
+        .ready()
+        .await
+        .unwrap()
+        .call(request.into())
+        .await
+        .unwrap()
+        .expect("a response");
+    let turbomcp::JsonRpcMessage::Response(reply) = reply else {
+        panic!("expected a response");
+    };
+    reply
+        .result
+        .unwrap_or_else(|| panic!("protocol error: {:?}", reply.error))
 }
 
-impl turbomcp_core::McpSession for Answering {
-    fn call<'a>(
-        &'a self,
-        method: &'a str,
-        params: Value,
-    ) -> turbomcp_core::SessionFuture<'a, Value> {
-        assert_eq!(method, "elicitation/create");
-        assert!(
-            params["message"]
-                .as_str()
-                .unwrap()
-                .contains("BUY 1 ABC LIMIT @ 9"),
-            "{params}"
-        );
-        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let answer = self.answer.clone();
-        Box::pin(async move { Ok(answer) })
-    }
-    fn notify<'a>(&'a self, _: &'a str, _: Value) -> turbomcp_core::SessionFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
-async fn call_in(server: &AuthorizedServer, ctx: &turbomcp::RequestContext, args: Value) -> Value {
-    let result = server.call_tool("place_order", args, ctx).await.unwrap();
-    let result = serde_json::to_value(result).unwrap();
+/// What the model reads from a completed wire result.
+fn read(result: &Value) -> Value {
     if result["isError"] == true {
         return result["structuredContent"].clone();
     }
@@ -525,8 +544,10 @@ async fn call_in(server: &AuthorizedServer, ctx: &turbomcp::RequestContext, args
 }
 
 /// With `client_approval`, the client's user approves or declines the order
-/// itself, recorded as the client's approval; a client that cannot be asked
-/// leaves it to the operator, whom the webhook tells once per intent.
+/// itself (an elicitation on the stateless revision: the call returns the
+/// question, and the client calls again with the answer), recorded as the
+/// client's approval; a client that cannot be asked leaves it to the
+/// operator, whom the webhook tells once per intent.
 #[tokio::test]
 async fn the_clients_user_can_approve_and_operators_are_notified() {
     use schwab_mcp::approvals::Notifier;
@@ -547,28 +568,54 @@ async fn the_clients_user_can_approve_and_operators_are_notified() {
         .with_approval_notifier(Some(
             Notifier::new(&format!("{}/hook", hook.uri())).unwrap(),
         ));
+    let mut dispatcher = server.clone().dispatcher();
     let intent = |price: &str| json!({"account_hash": ACCOUNT, "order": order("BUY", "1", price)});
-    let with = |answer: Value| {
-        let session = Arc::new(Answering {
-            answer,
-            asked: Default::default(),
-        });
-        (
-            turbomcp::RequestContext::stdio().with_session(session.clone()),
-            session,
-        )
-    };
+
+    // The question describes the order in words.
+    let asked = place_on_the_wire(&mut dispatcher, &intent("9"), true, None).await;
+    assert_eq!(asked["resultType"], "input_required", "{asked}");
+    let question = asked["inputRequests"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(question["method"], "elicitation/create");
+    assert!(
+        question["params"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("BUY 1 ABC LIMIT @ 9"),
+        "{question}"
+    );
 
     // Declined: refused, nothing placed.
-    let (ctx, session) = with(json!({"action": "decline"}));
-    let declined = call_in(&server, &ctx, intent("9")).await;
-    assert_eq!(declined["error"]["code"], "not_permitted", "{declined}");
-    assert_eq!(session.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let declined = place_on_the_wire(
+        &mut dispatcher,
+        &intent("9"),
+        true,
+        Some((&asked, json!({"action": "decline"}))),
+    )
+    .await;
+    assert_eq!(
+        read(&declined)["error"]["code"],
+        "not_permitted",
+        "{declined}"
+    );
 
     // Accepted: placed, and the store says who approved it.
-    let (ctx, _) = with(json!({"action": "accept", "content": {"approve": true}}));
-    let placed = call_in(&server, &ctx, intent("9")).await;
-    assert_eq!(placed["source"], "paper", "{placed}");
+    let asked = place_on_the_wire(&mut dispatcher, &intent("9"), true, None).await;
+    let placed = place_on_the_wire(
+        &mut dispatcher,
+        &intent("9"),
+        true,
+        Some((
+            &asked,
+            json!({"action": "accept", "content": {"approve": true}}),
+        )),
+    )
+    .await;
+    assert_eq!(read(&placed)["source"], "paper", "{placed}");
     let digest = schwab_mcp::policy::intent_digest("place_order", &intent("9"));
     assert_eq!(
         server
@@ -580,9 +627,14 @@ async fn the_clients_user_can_approve_and_operators_are_notified() {
         Some("client:paper-desk")
     );
 
-    // No session to ask: the operator's approval is required, as before.
-    let waiting = call(&server, "place_order", intent("9.1")).await;
-    assert_eq!(waiting["error"]["code"], "approval_required", "{waiting}");
+    // A client that cannot be asked: the operator's approval is required,
+    // as before.
+    let waiting = place_on_the_wire(&mut dispatcher, &intent("9.1"), false, None).await;
+    assert_eq!(
+        read(&waiting)["error"]["code"],
+        "approval_required",
+        "{waiting}"
+    );
     let again = call(&server, "place_order", intent("9.1")).await;
     assert_eq!(again["error"]["code"], "approval_required");
 

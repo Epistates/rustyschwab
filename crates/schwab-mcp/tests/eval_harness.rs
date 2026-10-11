@@ -11,7 +11,7 @@ use schwab_rs::paper::PaperOrderStatus;
 use serde_json::{Value, json};
 use std::io::{BufReader, Write};
 use std::sync::{Arc, Mutex};
-use turbomcp::{McpHandler, RequestContext};
+use turbomcp::McpServerCore;
 
 fn order(order_type: &str, quantity: &str, price: Option<&str>, tag: Option<&str>) -> Value {
     let mut order = json!({
@@ -399,12 +399,16 @@ async fn the_recording_server_writes_meta_then_each_call_before_dispatching_it()
         server.server_info().title.as_deref(),
         Some("Schwab MCP (paper)")
     );
-    assert!(server.list_tools().iter().any(|t| t.name == "place_order"));
-    let result = server
-        .call_tool("place_order", limit(EVAL_ACCOUNT), &RequestContext::stdio())
+    assert!(
+        schwab_mcp::testing::tools(&server)
+            .await
+            .iter()
+            .any(|t| t.name == "place_order")
+    );
+    let result = schwab_mcp::testing::call_tool(&server, "place_order", limit(EVAL_ACCOUNT))
         .await
         .unwrap();
-    assert!(!result.is_error());
+    assert!(!result.is_error);
 
     let text = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
     let records: Vec<Record> = text

@@ -3,9 +3,11 @@
 //! This catches accidental `#[tool]` removal or macro mis-registration.
 
 use schwab_mcp::backend::Backend;
+use schwab_mcp::contract::first_text;
 use schwab_mcp::server::{SchwabMcp, Switches};
+use schwab_mcp::testing::{call_tool, prompt_text, prompts, read_text, resources, tools};
 use std::sync::Arc;
-use turbomcp::McpHandler;
+use turbomcp::McpServerCore;
 
 /// List of every tool the MCP server should expose. Update this list when
 /// adding or removing `#[tool]` methods in `src/server.rs`.
@@ -83,9 +85,9 @@ fn server_info_matches_crate_metadata() {
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
 }
 
-#[test]
-fn every_expected_tool_is_registered() {
-    let tools = server().list_tools();
+#[tokio::test]
+async fn every_expected_tool_is_registered() {
+    let tools = tools(&server()).await;
     for tool in &tools {
         let annotations = tool
             .annotations
@@ -112,8 +114,7 @@ fn every_expected_tool_is_registered() {
                 "build_order" | "check_order" | "stream_status" | "stream_snapshot"
             ))
         );
-        let schema = serde_json::to_value(tool).unwrap();
-        assert!(schema["inputSchema"].is_object(), "{}", tool.name);
+        assert!(tool.input_schema.is_object(), "{}", tool.name);
     }
     let names: Vec<String> = tools.iter().map(|t| t.name.to_string()).collect();
 
@@ -137,40 +138,30 @@ fn every_expected_tool_is_registered() {
 #[tokio::test]
 async fn build_order_expands_specs_into_order_requests() {
     let server = server();
-    let schema = serde_json::to_value(
-        server
-            .list_tools()
-            .into_iter()
-            .find(|t| t.name == "build_order")
-            .unwrap(),
-    )
-    .unwrap();
-    assert!(
-        schema["inputSchema"].to_string().contains("\"kind\""),
-        "{}",
-        schema["inputSchema"]
-    );
-    let result = server
-        .call_tool(
-            "build_order",
-            serde_json::json!({"spec": {
-                "kind": "bracket",
-                "entry": {"kind": "limit", "price": "150.25",
-                    "leg": {"instruction": "BUY", "quantity": "10",
-                        "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
-                "take_profit": "160",
-                "stop_loss": "145"
-            }}),
-            &turbomcp::RequestContext::stdio(),
-        )
+    let schema = tools(&server)
         .await
-        .unwrap();
-    let result = serde_json::to_value(result).unwrap();
-    let order = match &result["structuredContent"] {
-        serde_json::Value::Null => {
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
-        }
-        structured => structured.clone(),
+        .into_iter()
+        .find(|t| t.name == "build_order")
+        .unwrap()
+        .input_schema;
+    assert!(schema.to_string().contains("\"kind\""), "{schema}");
+    let result = call_tool(
+        &server,
+        "build_order",
+        serde_json::json!({"spec": {
+            "kind": "bracket",
+            "entry": {"kind": "limit", "price": "150.25",
+                "leg": {"instruction": "BUY", "quantity": "10",
+                    "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
+            "take_profit": "160",
+            "stop_loss": "145"
+        }}),
+    )
+    .await
+    .unwrap();
+    let order: serde_json::Value = match &result.structured_content {
+        None => serde_json::from_str(first_text(&result).unwrap()).unwrap(),
+        Some(structured) => structured.clone(),
     };
     let request: schwab_rs::types::trading::OrderRequest =
         serde_json::from_value(order.clone()).unwrap();
@@ -178,54 +169,50 @@ async fn build_order_expands_specs_into_order_requests() {
     assert_eq!(order["orderStrategyType"], "TRIGGER");
     assert_eq!(order["childOrderStrategies"][0]["orderStrategyType"], "OCO");
 
-    let rejected = server
-        .call_tool(
-            "build_order",
-            serde_json::json!({"spec": {"kind": "iceberg"}}),
-            &turbomcp::RequestContext::stdio(),
-        )
-        .await;
-    let rejected = serde_json::to_value(rejected.unwrap()).unwrap();
-    assert_eq!(rejected["isError"], true, "unknown kinds must be rejected");
+    let rejected = call_tool(
+        &server,
+        "build_order",
+        serde_json::json!({"spec": {"kind": "iceberg"}}),
+    )
+    .await
+    .unwrap();
+    assert!(rejected.is_error, "unknown kinds must be rejected");
 
     // A spec that parses but cannot expand fails inside the body, so it
     // carries the failure contract.
-    let empty_trigger = server
-        .call_tool(
-            "build_order",
-            serde_json::json!({"spec": {
-                "kind": "trigger",
-                "entry": {"kind": "limit", "price": "150.25",
-                    "leg": {"instruction": "BUY", "quantity": "10",
-                        "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
-                "children": []
-            }}),
-            &turbomcp::RequestContext::stdio(),
-        )
-        .await
-        .unwrap();
-    let error = serde_json::to_value(empty_trigger).unwrap();
-    assert_eq!(error["isError"], true);
-    assert_eq!(
-        error["structuredContent"]["error"]["code"],
-        "invalid_arguments"
-    );
-    assert_eq!(
-        error["structuredContent"]["error"]["disposition"],
-        "fix_arguments"
-    );
-    assert_eq!(error["structuredContent"]["error"]["retryable"], false);
+    let empty_trigger = call_tool(
+        &server,
+        "build_order",
+        serde_json::json!({"spec": {
+            "kind": "trigger",
+            "entry": {"kind": "limit", "price": "150.25",
+                "leg": {"instruction": "BUY", "quantity": "10",
+                    "instrument": {"asset_type": "EQUITY", "symbol": "AAPL"}}},
+            "children": []
+        }}),
+    )
+    .await
+    .unwrap();
+    assert!(empty_trigger.is_error);
+    let error = empty_trigger.structured_content.unwrap();
+    assert_eq!(error["error"]["code"], "invalid_arguments");
+    assert_eq!(error["error"]["disposition"], "fix_arguments");
+    assert_eq!(error["error"]["retryable"], false);
 }
 
 /// The time-windowed reads advertise the model-facing query shape: the
 /// window is optional (as is `params` itself where a default window
 /// exists), each bound accepts a date, RFC 3339 or epoch milliseconds,
 /// and the schema says so.
-#[test]
-fn windowed_reads_advertise_flexible_optional_bounds() {
-    let tools = server().list_tools();
+#[tokio::test]
+async fn windowed_reads_advertise_flexible_optional_bounds() {
+    let tools = tools(&server()).await;
     let schema = |name: &str| {
-        serde_json::to_value(tools.iter().find(|t| t.name == name).unwrap()).unwrap()["inputSchema"]
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .input_schema
             .clone()
     };
     let required =
@@ -243,8 +230,9 @@ fn windowed_reads_advertise_flexible_optional_bounds() {
         let params = &schema["properties"]["params"];
         let params = params["anyOf"]
             .as_array()
-            .and_then(|options| options.iter().find(|o| o["type"] == "object"))
+            .and_then(|options| options.iter().find(|o| o["type"] != "null"))
             .unwrap_or(params);
+        let params = resolve(&schema, params);
         assert!(
             !required(params).iter().any(|r| r == field),
             "{tool}: {field} must be optional: {text}"
@@ -255,10 +243,22 @@ fn windowed_reads_advertise_flexible_optional_bounds() {
             "{tool}: only a symbol makes params required: {text}"
         );
     }
+    let history = schema("get_price_history");
     assert_eq!(
-        schema("get_price_history")["properties"]["params"]["required"],
+        resolve(&history, &history["properties"]["params"])["required"],
         serde_json::json!(["symbol"])
     );
+}
+
+/// `value`, or the definition in `schema`'s `$defs` it refers to.
+fn resolve<'a>(
+    schema: &'a serde_json::Value,
+    value: &'a serde_json::Value,
+) -> &'a serde_json::Value {
+    value["$ref"]
+        .as_str()
+        .and_then(|reference| reference.strip_prefix("#/$defs/"))
+        .map_or(value, |name| &schema["$defs"][name])
 }
 
 /// Without a principal, `check_order` still reports what the server itself
@@ -267,23 +267,21 @@ fn windowed_reads_advertise_flexible_optional_bounds() {
 #[tokio::test]
 async fn check_order_reports_a_local_verdict_without_a_principal() {
     let server = server();
-    let ctx = turbomcp::RequestContext::stdio();
     let order = serde_json::json!({
         "orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
         "duration": "DAY", "price": "50",
         "orderLegCollection": [{"quantity": "2", "instruction": "BUY",
             "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
     });
-    let result = server
-        .call_tool(
-            "check_order",
-            serde_json::json!({"account_hash": "A", "order": order}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert!(!result.is_error(), "{result:?}");
-    let verdict: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+    let result = call_tool(
+        &server,
+        "check_order",
+        serde_json::json!({"account_hash": "A", "order": order}),
+    )
+    .await
+    .unwrap();
+    assert!(!result.is_error, "{result:?}");
+    let verdict: serde_json::Value = serde_json::from_str(first_text(&result).unwrap()).unwrap();
     assert_eq!(verdict["allowed"], false);
     assert_eq!(verdict["reasons"].as_array().unwrap().len(), 1);
     assert_eq!(verdict["reasons"][0]["code"], "not_permitted");
@@ -305,15 +303,14 @@ async fn check_order_reports_a_local_verdict_without_a_principal() {
 
     // A rationale is judged but never digested; a blank one is a reason.
     for (rationale, reasons) in [("Momentum entry.", 1), ("   ", 2)] {
-        let result = server
-            .call_tool(
-                "check_order",
-                serde_json::json!({"account_hash": "A", "order": order, "rationale": rationale}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let with: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+        let result = call_tool(
+            &server,
+            "check_order",
+            serde_json::json!({"account_hash": "A", "order": order, "rationale": rationale}),
+        )
+        .await
+        .unwrap();
+        let with: serde_json::Value = serde_json::from_str(first_text(&result).unwrap()).unwrap();
         assert_eq!(with["intentDigest"], verdict["intentDigest"], "{with}");
         assert_eq!(with["reasons"].as_array().unwrap().len(), reasons, "{with}");
         assert_eq!(
@@ -328,15 +325,14 @@ async fn check_order_reports_a_local_verdict_without_a_principal() {
     }
 
     // The journal is a principal's; this transport has none.
-    let result = server
-        .call_tool(
-            "get_trade_journal",
-            serde_json::json!({"account_hash": "A"}),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    assert!(result.is_error());
+    let result = call_tool(
+        &server,
+        "get_trade_journal",
+        serde_json::json!({"account_hash": "A"}),
+    )
+    .await
+    .unwrap();
+    assert!(result.is_error);
     assert_eq!(
         result.structured_content.unwrap()["error"]["code"],
         "not_permitted"
@@ -348,27 +344,24 @@ async fn check_order_reports_a_local_verdict_without_a_principal() {
 #[tokio::test]
 async fn responses_carry_provenance_envelopes() {
     let server = server();
-    let ctx = turbomcp::RequestContext::stdio();
-    let text = |result: turbomcp::ToolResult| -> serde_json::Value {
-        assert!(!result.is_error());
-        serde_json::from_str(result.first_text().unwrap()).unwrap()
+    let text = |result: schwab_mcp::contract::ToolResult| -> serde_json::Value {
+        assert!(!result.is_error);
+        serde_json::from_str(first_text(&result).unwrap()).unwrap()
     };
     let snapshot = text(
-        server
-            .call_tool(
-                "stream_snapshot",
-                serde_json::json!({"service": "LEVELONE_EQUITIES", "keys": ["AAPL"]}),
-                &ctx,
-            )
-            .await
-            .unwrap(),
+        call_tool(
+            &server,
+            "stream_snapshot",
+            serde_json::json!({"service": "LEVELONE_EQUITIES", "keys": ["AAPL"]}),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(snapshot["source"], "stream_cache");
     assert!(snapshot["asOf"].as_str().unwrap().ends_with('Z'));
     assert_eq!(snapshot["data"]["count"], 0);
     let status = text(
-        server
-            .call_tool("stream_status", serde_json::json!({}), &ctx)
+        call_tool(&server, "stream_status", serde_json::json!({}))
             .await
             .unwrap(),
     );
@@ -382,16 +375,11 @@ async fn responses_carry_provenance_envelopes() {
 #[tokio::test]
 async fn server_status_is_complete_without_a_session() {
     let server = server();
-    let result = server
-        .call_tool(
-            "get_server_status",
-            serde_json::json!({}),
-            &turbomcp::RequestContext::stdio(),
-        )
+    let result = call_tool(&server, "get_server_status", serde_json::json!({}))
         .await
         .unwrap();
-    assert!(!result.is_error(), "{result:?}");
-    let status: serde_json::Value = serde_json::from_str(result.first_text().unwrap()).unwrap();
+    assert!(!result.is_error, "{result:?}");
+    let status: serde_json::Value = serde_json::from_str(first_text(&result).unwrap()).unwrap();
     assert_eq!(status["mode"], "live");
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
     assert!(
@@ -421,14 +409,12 @@ async fn server_status_is_complete_without_a_session() {
 }
 
 /// The stdio server offers the `OrderSpec` grammar as one markdown
-/// resource and the propose-a-trade workflow as one prompt, and its
-/// capabilities say so.
+/// resource and the propose-a-trade workflow as one prompt.
 #[tokio::test]
 async fn guidance_is_one_resource_and_one_prompt() {
     let server = server();
-    let ctx = turbomcp::RequestContext::stdio();
 
-    let resources = server.list_resources();
+    let resources = resources(&server).await;
     assert_eq!(resources.len(), 1, "{resources:?}");
     assert_eq!(resources[0].uri, schwab_mcp::guidance::ORDER_SPEC_URI);
     assert_eq!(resources[0].name, "order_spec");
@@ -440,27 +426,20 @@ async fn guidance_is_one_resource_and_one_prompt() {
             .unwrap()
             .contains("build_order")
     );
-    let read = server
-        .read_resource(schwab_mcp::guidance::ORDER_SPEC_URI, &ctx)
+    let grammar = read_text(&server, schwab_mcp::guidance::ORDER_SPEC_URI)
         .await
         .unwrap();
-    let grammar = read.first_text().unwrap();
     assert!(grammar.starts_with("# OrderSpec"), "{grammar}");
     assert!(grammar.contains("`bracket`"));
-    assert!(
-        server
-            .read_resource("schwab://elsewhere", &ctx)
-            .await
-            .is_err()
-    );
+    assert!(read_text(&server, "schwab://elsewhere").await.is_err());
 
-    let prompts = server.list_prompts();
+    let prompts = prompts(&server).await;
     assert_eq!(prompts.len(), 1, "{prompts:?}");
     assert_eq!(prompts[0].name, schwab_mcp::guidance::PROPOSE_TRADE);
-    let arguments = prompts[0].arguments.as_deref().unwrap();
+    let arguments = &prompts[0].arguments;
     let required: Vec<(&str, bool)> = arguments
         .iter()
-        .map(|a| (a.name.as_str(), a.required == Some(true)))
+        .map(|a| (a.name.as_str(), a.required))
         .collect();
     assert_eq!(
         required,
@@ -470,15 +449,13 @@ async fn guidance_is_one_resource_and_one_prompt() {
 
     // The stdio server has every tool but, with the trading switch off,
     // cannot submit: the workflow says so and ends at the operator.
-    let rendered = server
-        .get_prompt(
-            schwab_mcp::guidance::PROPOSE_TRADE,
-            Some(serde_json::json!({"account_hash": "ABC123", "symbol": "AAPL"})),
-            &ctx,
-        )
-        .await
-        .unwrap();
-    let text = rendered.messages[0].content.as_text().unwrap();
+    let text = prompt_text(
+        &server,
+        schwab_mcp::guidance::PROPOSE_TRADE,
+        Some(serde_json::json!({"account_hash": "ABC123", "symbol": "AAPL"})),
+    )
+    .await
+    .unwrap();
     assert!(
         text.starts_with("Propose a trade for account `ABC123` in `AAPL`."),
         "{text}"
@@ -492,13 +469,8 @@ async fn guidance_is_one_resource_and_one_prompt() {
     );
     assert!(!text.contains("`place_order`"), "{text}");
     assert!(
-        server
-            .get_prompt(schwab_mcp::guidance::PROPOSE_TRADE, None, &ctx)
+        prompt_text(&server, schwab_mcp::guidance::PROPOSE_TRADE, None)
             .await
             .is_err()
     );
-
-    let capabilities = server.server_capabilities();
-    assert!(capabilities.resources.is_some());
-    assert!(capabilities.prompts.is_some());
 }
