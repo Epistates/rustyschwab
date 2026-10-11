@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — a dead-man switch
+
+- **Silence cancels a principal's orders.** A principal holding
+  `place_order` or `replace_order` can set `dead_man_secs` (30 to 86400).
+  After that long with no tool call from it, the server cancels the
+  working orders that principal placed. Any call resets the timer, a call
+  in flight is not silence, and one watcher serves the principal across
+  sessions, transports and policy reloads (a reload retires the old
+  watcher and the new one inherits the timer).
+- **Its own orders only.** Orders are attributed from the principal's
+  audit journal over 59 days, by the venue order id a dispatch recorded or
+  else by its order tag, and matched to the venue's working orders.
+  Another principal's order on the same account is never touched.
+- **The operator's control.** The cancels need neither `cancel_order` nor
+  `SCHWAB_MCP_ALLOW_CANCEL`. Each firing is a `dead_man_cancel` audit event
+  listing every order and outcome, a warning, and a count in
+  `schwab_mcp_dead_man_firings_total{outcome}`. It fires once per silence
+  and re-arms on the next call; a failed pass is retried up to three more
+  times.
+- `get_server_status` reports `principal.deadMan` (`windowSecs`,
+  `secondsLeft`). The authority gateway refuses a trader policy that sets
+  `dead_man_secs`, since it cannot observe silence.
+
+### Added — a tamper-evident audit trail
+
+- **Hash-chained audit table.** State schema 5 adds `prev_hash` and `hash`
+  to every `audit` row: SHA-256 over a domain tag, the previous hash,
+  sequence, time, kind, subject and payload, each length-prefixed, the
+  first row linking to 64 zeros. Existing rows are chained by the
+  migration. Appends read the previous hash and insert under the write
+  lock, so several processes on one database file keep one chain, and a
+  row removed from the end leaves a sequence gap the next event exposes.
+- **`OrderJournal::verify_audit`**, also on `ExecutionStore` (with
+  `RemoteBackend` passing it through), returns an `AuditChainReport` (rows
+  checked, first and last sequence, head hash) or names the first
+  sequence whose link or content does not match. Verification starts from
+  a recorded `audit_anchor` when old rows were removed on purpose.
+- **`schwab-admin verify-audit`** prints the rows checked and the head
+  hash, to record elsewhere as a checkpoint, and exits non-zero on a
+  break.
+- **Events carry the chain.** `AuditEvent` has `prev_hash` and `hash`
+  (serde-defaulted, so older peers still decode), so exports and delivered
+  batches let a sink check continuity. Delivery batch digests change
+  accordingly.
+
 ### Added — defined-risk option strategies
 
 - **`schwab_types::trading::defined_risk`** finds the most a strategy of
