@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — Python bindings
+
+- **`rustyschwab` for Python**: asyncio-native bindings for the SDK, built
+  with PyO3 and maturin as abi3 wheels for CPython 3.10+ (Linux
+  x86_64/aarch64, macOS arm64/x86_64, Windows x86_64) and an sdist. The
+  crate is `crates/schwab-py`, outside the Cargo workspace with its own
+  lockfile, so workspace builds need no Python.
+- **`Client`**: market data, accounts and positions, orders,
+  transactions, user preferences, order preview, and journaled
+  place/replace/cancel returning `{order_id, location, attempt_id, tag}`.
+  Requests and responses are dicts in Schwab's JSON shape, validated by the
+  SDK; configuration comes from the environment or a dict over the
+  defaults, and unknown keys are refused.
+- **`Stream`**: the streamer as an async iterator of `data`, `response`,
+  `notify` and `state` messages, with subscribe, unsubscribe, view and
+  close, and field numbers named.
+- **`PaperBroker`**: the offline paper venue, with event builders in
+  `rustyschwab.paper`, for backtests and tests.
+- **Exceptions** mirror `ErrorKind` (`SchwabError`, `RiskDenied`, `Halted`,
+  `RateLimited`, `AuthError.reauthorization_required`,
+  `BrokerError.status`, `SubmissionUnknown.attempt_id`, …); messages and
+  reprs never carry tokens, secrets or broker bodies.
+- **CI and release**: a `python` job (clippy, the Rust and pytest suites,
+  mypy) on Linux and macOS, cargo-deny over the bindings' lockfile, and
+  `publish-python.yml` for wheels, the sdist and PyPI trusted publishing.
+  `docs/PYTHON.md` documents it.
+
 ### Added — OpenTelemetry (OTLP) export
 
 - **Opt-in `otel` feature.** `schwab_rs::telemetry::init_otel` builds an
