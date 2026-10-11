@@ -196,6 +196,12 @@ fn load_grants(path: &std::path::Path) -> anyhow::Result<Vec<Grant>> {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("Trader policy required"))?;
             policy.validate()?;
+            // The gateway sees a trader's requests, not a session, so it
+            // cannot tell silence; accepting the field would only pretend.
+            anyhow::ensure!(
+                policy.dead_man_secs.is_none(),
+                "dead_man_secs is enforced by schwab-mcp principals, not by the authority gateway"
+            );
             anyhow::ensure!(
                 policy.identity_subject.as_deref() == Some(&grant.subject)
                     && names.insert(&policy.name),

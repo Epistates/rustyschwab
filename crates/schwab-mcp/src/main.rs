@@ -168,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     let hub = schwab_mcp::server::StreamHub::new();
     let notifier = schwab_mcp::approvals::Notifier::from_env()
         .with_context(|| format!("Invalid {}", schwab_mcp::approvals::WEBHOOK_ENV))?;
+    let liveness = schwab_mcp::dead_man::Liveness::default();
     let servers: Vec<_> = policies
         .into_iter()
         .map(|policy| {
@@ -178,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
                 hub.clone(),
             )
             .with_approval_notifier(notifier.clone())
+            .with_liveness(liveness.clone())
         })
         .collect();
     if transport == "stdio" {

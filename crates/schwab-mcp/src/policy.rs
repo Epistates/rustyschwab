@@ -8,6 +8,7 @@
 use crate::SchwabMcp;
 use crate::backend::Backend;
 use crate::contract::{FailureCode, ToolFailure};
+use crate::dead_man::{self, Beacon, Liveness, Reaper};
 use crate::guidance;
 use crate::server::Switches;
 use schwab_rs::execution::OrderJournal;
@@ -74,6 +75,12 @@ pub struct PrincipalPolicy {
     /// Bounded notional this principal may submit in a trading day.
     #[serde(default)]
     pub max_daily_notional: Option<rust_decimal::Decimal>,
+    /// Dead-man switch: after this many seconds with no tool call by the
+    /// principal, the server cancels the working orders it placed (see
+    /// [`crate::dead_man`]). Only for a principal that can place or replace
+    /// orders.
+    #[serde(default)]
+    pub dead_man_secs: Option<std::num::NonZeroU32>,
 }
 impl PrincipalPolicy {
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -113,6 +120,18 @@ impl PrincipalPolicy {
                 .is_none_or(|v| v > rust_decimal::Decimal::ZERO),
             "max_daily_notional must be positive"
         );
+        if let Some(secs) = self.dead_man_secs {
+            anyhow::ensure!(
+                self.tools.contains("place_order") || self.tools.contains("replace_order"),
+                "dead_man_secs needs place_order or replace_order"
+            );
+            anyhow::ensure!(
+                (dead_man::MIN_WINDOW_SECS..=dead_man::MAX_WINDOW_SECS).contains(&secs.get()),
+                "dead_man_secs must be {}-{} seconds, got {secs}",
+                dead_man::MIN_WINDOW_SECS,
+                dead_man::MAX_WINDOW_SECS
+            );
+        }
         Ok(())
     }
     /// Whether this principal may control the stream (any `stream_*` tool).
@@ -501,6 +520,10 @@ pub struct AuthorizedServer {
     pub audit: OrderJournal,
     calls: Option<Arc<CallLimiter>>,
     notifier: Option<crate::approvals::Notifier>,
+    /// Shared by every clone: the principal's dead-man switch, when its
+    /// policy sets one (see [`crate::dead_man`]).
+    dead_man: Option<Arc<Beacon>>,
+    liveness: Liveness,
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
@@ -528,13 +551,57 @@ impl AuthorizedServer {
                 governor::Quota::per_minute(per_minute).allow_burst(burst),
             ))
         });
-        Self {
+        let server = Self {
             inner: SchwabMcp::with_stream_hub(backend, switches, hub),
             principal: Arc::new(policy),
             audit,
             calls,
             notifier: None,
+            dead_man: None,
+            liveness: Liveness::default(),
+        };
+        let liveness = server.liveness.clone();
+        server.armed(liveness, None)
+    }
+    /// Register the principal's dead-man switch with `liveness`, which the
+    /// servers of one process share so that a policy reload retires the
+    /// generation it replaces instead of running a second watcher. Without
+    /// this a server arms its own, which is right for one server.
+    #[must_use]
+    pub fn with_liveness(self, liveness: Liveness) -> Self {
+        self.armed(liveness, None)
+    }
+    /// The registry [`with_liveness`](Self::with_liveness) set.
+    pub fn liveness(&self) -> &Liveness {
+        &self.liveness
+    }
+    /// Arm the dead-man switch for `window` instead of the policy's
+    /// `dead_man_secs`, which is validated to be too long for a test to wait
+    /// out. Not for production use.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_dead_man_window(self, window: Duration) -> Self {
+        let liveness = self.liveness.clone();
+        self.armed(liveness, Some(window))
+    }
+    /// Arm the switch in `liveness`, replacing any this server had.
+    fn armed(mut self, liveness: Liveness, window: Option<Duration>) -> Self {
+        if let Some(previous) = self.dead_man.take() {
+            previous.retire();
         }
+        let window = window.or_else(|| {
+            self.principal
+                .dead_man_secs
+                .map(|secs| Duration::from_secs(secs.get().into()))
+        });
+        let reaper = Reaper {
+            principal: self.principal.clone(),
+            audit: self.audit.clone(),
+            backend: self.inner.backend().clone(),
+        };
+        self.dead_man = liveness.arm(reaper, window);
+        self.liveness = liveness;
+        self
     }
     /// Tell operators through `notifier` when an intent of this principal
     /// first needs their approval.
@@ -598,6 +665,9 @@ impl McpHandler for AuthorizedServer {
         args: Value,
         ctx: &'a RequestContext,
     ) -> McpResult<ToolResult> {
+        // Any call, even a denied or unknown one, shows the principal is
+        // alive; the guard also keeps it so for as long as the call runs.
+        let _alive = self.dead_man.as_ref().map(Beacon::call);
         // A tool that does not exist is a protocol error, as on the
         // unauthorized transport and per the MCP spec; one that exists but
         // is not granted is a `not_permitted` result the model can read.
@@ -1087,6 +1157,9 @@ impl AuthorizedServer {
         Ok(crate::contract::run("get_server_status", async {
             let mut status = self.inner.server_status().await;
             status.scope_to(&self.principal);
+            if let (Some(principal), Some(dead_man)) = (status.principal.as_mut(), &self.dead_man) {
+                principal.dead_man = Some(dead_man.status());
+            }
             Ok(crate::contract::local(status.into_payload()?))
         })
         .await)
@@ -1985,6 +2058,46 @@ mod tests {
         let naked = exposure(&strategy("NET_CREDIT", 1), &multipliers).unwrap_err();
         assert!(naked.contains("no bound"), "{naked}");
         assert!(exposure(&strategy("NET_CREDIT", 2), &Default::default()).is_err());
+    }
+
+    /// The dead-man window is bounded, and only a principal that can place
+    /// or replace orders has orders to cancel.
+    #[test]
+    fn the_dead_man_window_is_validated() {
+        let with = |tools: Value, secs: Value| {
+            let mut policy = serde_json::to_value(policy()).unwrap();
+            policy["tools"] = tools;
+            policy["dead_man_secs"] = secs;
+            serde_json::from_value::<PrincipalPolicy>(policy)
+                .map_err(anyhow::Error::from)
+                .and_then(|policy| policy.validate())
+        };
+        let trader = serde_json::json!(["place_order"]);
+        assert!(with(trader.clone(), serde_json::json!(null)).is_ok());
+        for secs in [dead_man::MIN_WINDOW_SECS, 600, dead_man::MAX_WINDOW_SECS] {
+            assert!(with(trader.clone(), secs.into()).is_ok(), "{secs}");
+        }
+        for secs in [
+            1,
+            dead_man::MIN_WINDOW_SECS - 1,
+            dead_man::MAX_WINDOW_SECS + 1,
+        ] {
+            let refused = with(trader.clone(), secs.into()).unwrap_err().to_string();
+            assert!(refused.contains("dead_man_secs must be"), "{refused}");
+        }
+        assert!(
+            with(trader.clone(), 0.into()).is_err(),
+            "zero is not a window"
+        );
+        assert!(with(trader, (-5).into()).is_err());
+        assert!(with(serde_json::json!(["replace_order"]), 60.into()).is_ok());
+        let refused = with(serde_json::json!(["get_account"]), 60.into())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("needs place_order or replace_order"),
+            "{refused}"
+        );
     }
 
     #[test]

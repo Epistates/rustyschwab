@@ -13,6 +13,7 @@
 //! | `schwab_mcp_tool_call_duration_seconds` | histogram | `tool` | End-to-end time including upstream HTTP, retries, and redaction. |
 //! | `schwab_stream_recovery_seconds` | histogram | — | Time spent re-subscribing and reconciling the stream cache after a reconnect, capped at the recovery deadline. |
 //! | `schwab_stream_recovery_ready` | gauge | — | `1` when the last stream recovery completed within its deadline, `0` otherwise. |
+//! | `schwab_mcp_dead_man_firings_total` | counter | `outcome` | Dead-man switch firings that found working orders (or could not look): `canceled` when every cancel succeeded, `failed` otherwise. |
 //!
 //! Recording is via an RAII guard — see [`ToolTimer`].
 
@@ -24,6 +25,7 @@ pub const MCP_TOOL_CALLS_TOTAL: &str = "schwab_mcp_tool_calls_total";
 pub const MCP_TOOL_CALL_DURATION: &str = "schwab_mcp_tool_call_duration_seconds";
 pub const STREAM_RECOVERY_SECONDS: &str = "schwab_stream_recovery_seconds";
 pub const STREAM_RECOVERY_READY: &str = "schwab_stream_recovery_ready";
+pub const DEAD_MAN_FIRINGS_TOTAL: &str = "schwab_mcp_dead_man_firings_total";
 
 /// Every metric the server emits on top of the SDK's. See the module
 /// docs for labels.
@@ -46,6 +48,10 @@ pub const CATALOG: &[Metric] = &[
         STREAM_RECOVERY_READY,
         None,
         "1 when the last stream recovery completed within its deadline",
+    ),
+    Metric::counter(
+        DEAD_MAN_FIRINGS_TOTAL,
+        "Dead-man switch firings that found working orders to cancel, by outcome",
     ),
 ];
 

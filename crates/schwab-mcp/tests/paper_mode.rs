@@ -920,3 +920,196 @@ async fn a_submission_can_hold_for_an_approval_that_lands_out_of_band() {
     );
     assert_eq!(records[0].request["intentDigest"], digest);
 }
+
+/// The dead-man window the tests arm in place of the policy's validated
+/// minimum, which is too long to wait out.
+const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A desk of this name with a dead-man switch (its 60 seconds are replaced
+/// by [`WINDOW`] on the server).
+fn dead_man_desk(name: &str, token: &str) -> PrincipalPolicy {
+    let mut desk = policy();
+    desk.name = name.into();
+    desk.token_sha256 = token.repeat(64);
+    desk.dead_man_secs = std::num::NonZeroU32::new(60);
+    desk
+}
+
+/// The dead-man firings in the principal's audit journal.
+async fn firings(server: &AuthorizedServer) -> Vec<schwab_rs::execution::AuditEvent> {
+    let events = server.audit.audit_page(0, 1000).await.unwrap();
+    events
+        .into_iter()
+        .filter(|event| event.kind == "dead_man_cancel")
+        .collect()
+}
+
+/// The payload of the principal's firing after `already` earlier ones,
+/// once it has been recorded.
+async fn next_firing(server: &AuthorizedServer, already: usize) -> Value {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            let found = firings(server).await;
+            if found.len() > already {
+                return found[already].payload.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the dead-man switch did not fire")
+}
+
+async fn place(server: &AuthorizedServer, side: &str, quantity: &str, price: &str) -> String {
+    let placed = call(
+        server,
+        "place_order",
+        json!({"account_hash": ACCOUNT, "order": order(side, quantity, price)}),
+    )
+    .await;
+    assert_eq!(placed["source"], "paper", "{placed}");
+    placed["data"]["orderId"].as_str().unwrap().to_owned()
+}
+
+async fn status_of(server: &AuthorizedServer, id: &str) -> String {
+    let order = call(
+        server,
+        "get_order_status",
+        json!({"account_hash": ACCOUNT, "order_id": id}),
+    )
+    .await;
+    order["data"]["status"].as_str().unwrap().to_owned()
+}
+
+/// A principal that goes silent has the orders it placed cancelled, and
+/// only those: calls in time prevent it, another principal's order on the
+/// same account is untouched, the cancel is recorded and happens once, and
+/// the switch re-arms on the next call. The cancel switch is off: the dead
+/// man is the operator's own control.
+#[tokio::test]
+async fn a_silent_principals_orders_are_cancelled_and_nobody_elses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, now) = venue(dir.path()).await;
+    let switches = Switches {
+        trading: true,
+        cancel: false,
+    };
+    let desk = AuthorizedServer::new(
+        backend(broker.clone(), None),
+        switches,
+        dead_man_desk("paper-desk", "a"),
+    )
+    .with_dead_man_window(WINDOW);
+    // The neighbor's switch keeps its validated minute, and it is not
+    // silent that long.
+    let neighbor = AuthorizedServer::new(
+        backend(broker.clone(), None),
+        switches,
+        dead_man_desk("neighbor", "b"),
+    );
+    let mine = place(&desk, "BUY", "1", "9").await;
+    let theirs = place(&neighbor, "BUY", "1", "8").await;
+
+    // The status says to keep calling.
+    let status = call(&desk, "get_server_status", json!({})).await;
+    assert_eq!(status["principal"]["deadMan"]["windowSecs"], 1, "{status}");
+    assert_eq!(status["principal"]["deadMan"]["secondsLeft"], 1, "{status}");
+    let status = call(&neighbor, "get_server_status", json!({})).await;
+    assert_eq!(status["principal"]["deadMan"]["windowSecs"], 60, "{status}");
+
+    // Calls, of any kind, inside the window keep the order working for
+    // longer than the window.
+    for _ in 0..7 {
+        tokio::time::sleep(WINDOW / 5).await;
+        assert_eq!(status_of(&desk, &mine).await, "WORKING");
+    }
+    assert!(firings(&desk).await.is_empty());
+
+    // Silence cancels the desk's order, once, and records it.
+    let fired = next_firing(&desk, 0).await;
+    assert_eq!(fired["windowSecs"], 1);
+    assert_eq!(fired["unread"], json!([]));
+    let orders = fired["orders"].as_array().unwrap();
+    assert_eq!(orders.len(), 1, "{fired}");
+    assert_eq!(orders[0]["orderId"], mine.as_str());
+    assert_eq!(orders[0]["accountHash"], ACCOUNT);
+    assert_eq!(orders[0]["outcome"], "canceled");
+    broker
+        .apply(PaperEvent {
+            sequence: 3,
+            at_ms: now + 300,
+            kind: PaperEventKind::Clock,
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_of(&neighbor, &mine).await, "CANCELED");
+    assert_eq!(status_of(&neighbor, &theirs).await, "WORKING");
+    tokio::time::sleep(WINDOW * 2).await;
+    assert_eq!(firings(&desk).await.len(), 1, "once per silence");
+    assert!(firings(&neighbor).await.is_empty());
+
+    // The next call re-arms it.
+    let again = place(&desk, "BUY", "1", "7").await;
+    let fired = next_firing(&desk, 1).await;
+    assert_eq!(fired["orders"].as_array().unwrap().len(), 1, "{fired}");
+    assert_eq!(fired["orders"][0]["orderId"], again.as_str());
+    broker
+        .apply(PaperEvent {
+            sequence: 4,
+            at_ms: now + 600,
+            kind: PaperEventKind::Clock,
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_of(&neighbor, &again).await, "CANCELED");
+    assert_eq!(status_of(&neighbor, &theirs).await, "WORKING");
+}
+
+/// There is one watcher per principal: a server rebuilt for a policy reload
+/// takes over from the one it replaces, which fires no second time even
+/// while it lives on, and a principal whose servers are all dropped is no
+/// longer watched. A principal with nothing working fires nothing.
+#[tokio::test]
+async fn one_watcher_serves_a_principal_across_reloads_and_ends_with_its_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let liveness = schwab_mcp::dead_man::Liveness::default();
+    let build = |name: &str, token: &str| {
+        AuthorizedServer::new(
+            backend(broker.clone(), None),
+            TRADING,
+            dead_man_desk(name, token),
+        )
+        .with_liveness(liveness.clone())
+        .with_dead_man_window(WINDOW)
+    };
+
+    // Nothing working: silence cancels nothing and records nothing.
+    let desk = build("paper-desk", "a");
+    tokio::time::sleep(WINDOW * 3 / 2).await;
+    assert!(firings(&desk).await.is_empty());
+
+    // A reload rebuilds the server while the old one (and a session's
+    // clone of it) is still around: one firing, not two.
+    let mine = place(&desk, "BUY", "1", "9").await;
+    let reloaded = build("paper-desk", "a");
+    let session = reloaded.clone();
+    let fired = next_firing(&reloaded, 0).await;
+    assert_eq!(fired["orders"][0]["orderId"], mine.as_str());
+    tokio::time::sleep(WINDOW * 2).await;
+    assert_eq!(firings(&desk).await.len(), 1);
+    assert_eq!(
+        status_of(&session, &mine).await,
+        "PENDING_CANCEL",
+        "cancelled once, and not asked again"
+    );
+
+    // Dropped with every clone, a principal is not watched: its order is left.
+    let leaving = build("leaving", "b");
+    let left = place(&leaving, "BUY", "1", "8").await;
+    drop(leaving);
+    tokio::time::sleep(WINDOW * 2).await;
+    assert_eq!(status_of(&session, &left).await, "WORKING");
+    let leaving = build("leaving", "b");
+    assert!(firings(&leaving).await.is_empty());
+}

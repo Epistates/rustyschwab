@@ -505,7 +505,9 @@ until an operator clears it, and trips it again while the loss persists. See
   with `client_approval` asks the client's user to approve the order (an
   MCP elicitation) first, and `SCHWAB_MCP_APPROVAL_WEBHOOK` tells operators
   when an intent starts waiting. Principals can also be held to symbol
-  lists, a price collar and a daily budget. The write tools
+  lists, a price collar and a daily budget, and given a dead-man switch
+  (`dead_man_secs`) that cancels the orders they placed after a silence.
+  The write tools
   and `check_order` accept an optional
   `rationale` (at most 2000 characters): the model's reason, kept in the
   audit journal, never sent to Schwab, and excluded from the intent digest
@@ -579,6 +581,7 @@ line with them, and the server registers their help text with Prometheus):
 | `schwab_mcp_tool_call_duration_seconds` | histogram | `tool` | End-to-end latency per tool. |
 | `schwab_stream_recovery_seconds` | histogram | — | Stream cache recovery time after a reconnect. |
 | `schwab_stream_recovery_ready` | gauge | — | `1` when the last stream recovery completed within its deadline. |
+| `schwab_mcp_dead_man_firings_total` | counter | `outcome` | Dead-man switch firings that found working orders: `canceled` if every cancel succeeded, `failed` otherwise. |
 
 **Starter PromQL:**
 

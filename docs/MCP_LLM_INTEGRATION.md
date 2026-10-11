@@ -289,6 +289,22 @@ venue's current quote, and a daily budget (`max_daily_orders`,
 `risk_denied`. `check_order` reports all of them, with the budget's use so
 far in `dailyBudget`, and `get_server_status` lists the limits.
 
+A principal that can place or replace orders may also carry a dead-man
+switch, `dead_man_secs` (30 to 86400): after that many seconds with no tool
+call, the server cancels the working orders that principal placed. Any tool
+call counts, `get_server_status` included, and a call in flight is not
+silence, so keep calling while you wait on anything. The orders cancelled
+are only the principal's own, found from its audit journal over the last 59
+days and matched to the venue's working orders; another principal's orders
+on the same account are left. It fires once per silence and re-arms on your
+next call, so after it fires, read `get_trade_journal` and the account's
+orders before assuming anything is still working. `get_server_status`
+reports `principal.deadMan` as `{"windowSecs": 300, "secondsLeft": 300}`;
+because the status call is itself a call, the seconds left read the whole
+window and fall only between your calls. Cancels made by the switch do not
+need `cancel_order` or `SCHWAB_MCP_ALLOW_CANCEL`: it is the operator's
+safety control, not one of your tools.
+
 Nothing is audited or approved by checking. Grant `check_order` to any principal that
 holds `place_order` or `replace_order`; without a principal (the local stdio
 transport with trading off) `limits` is null and approval does not apply.
@@ -356,7 +372,8 @@ instead of discovering the switches one denial at a time:
  "serverTime": {"rfc3339": "2026-09-10T14:30:00.000Z", "epochMs": 1789137000000},
  "principal": {"name": "desk", "tools": ["check_order", "get_quotes", "place_order"],
                "accounts": ["…"], "allAccounts": false, "maxQuantity": "2",
-               "maxNotional": null, "requireApproval": true},
+               "maxNotional": null, "requireApproval": true,
+               "deadMan": {"windowSecs": 300, "secondsLeft": 300}},
  "trading": {"enabled": true, "cancelEnabled": true, "operatorHalt": null,
              "submissionsSuspended": false, "circuit": "closed", "admissible": true},
  "readiness": {"readsReady": true, "tradingReady": true, "tokensValid": true,

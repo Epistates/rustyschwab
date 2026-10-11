@@ -7,6 +7,7 @@ pub mod approvals;
 pub mod authority;
 pub mod backend;
 pub mod contract;
+pub mod dead_man;
 pub mod eval;
 pub mod guardrails;
 pub mod guidance;

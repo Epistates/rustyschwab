@@ -4,6 +4,7 @@
 //! cached until it can no longer answer.
 use crate::backend::Backend;
 use crate::contract::{FailureCode, ToolFailure};
+use crate::dead_man::DeadManStatus;
 use crate::policy::PrincipalPolicy;
 use crate::server::Switches;
 use chrono::{DateTime, Days, FixedOffset, NaiveDate, TimeDelta, Utc};
@@ -217,6 +218,11 @@ pub struct Principal {
     pub max_daily_orders: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_daily_notional: Option<Decimal>,
+    /// The dead-man switch: the principal's working orders are cancelled
+    /// after this long with no tool call, so keep calling. The seconds left
+    /// are those after this call, which restarts the clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dead_man: Option<DeadManStatus>,
 }
 
 impl From<&PrincipalPolicy> for Principal {
@@ -240,6 +246,11 @@ impl From<&PrincipalPolicy> for Principal {
             price_collar_bps: policy.price_collar_bps.map(|v| v.get()),
             max_daily_orders: policy.max_daily_orders.map(|v| v.get()),
             max_daily_notional: policy.max_daily_notional,
+            // The server reports the live countdown where it keeps one.
+            dead_man: policy.dead_man_secs.map(|secs| DeadManStatus {
+                window_secs: secs.get().into(),
+                seconds_left: secs.get().into(),
+            }),
         }
     }
 }

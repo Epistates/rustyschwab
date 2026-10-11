@@ -186,8 +186,9 @@ pub(crate) fn has_budget(policy: &PrincipalPolicy) -> bool {
 /// Whether a submission record counts against the budget: anything that
 /// may have produced an order. A submission the MCP path answered with a
 /// definite failure (anything but `reconciliation_required` or an internal
-/// fault), or the gateway recorded as rejected, produced none.
-fn counts(record: &SubmissionRecord) -> bool {
+/// fault), or the gateway recorded as rejected, produced none. The
+/// dead-man switch reads the same records for the orders to cancel.
+pub(crate) fn counts(record: &SubmissionRecord) -> bool {
     if !matches!(record.operation.as_str(), "place_order" | "replace_order") {
         return false;
     }
