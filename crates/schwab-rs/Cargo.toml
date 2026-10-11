@@ -57,6 +57,13 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
 
+# OTLP export for the optional `otel` feature.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+metrics-opentelemetry = { workspace = true, optional = true }
+
 # Metrics facade — no-op when no recorder is installed, so this doesn't
 # force any runtime overhead on SDK-only consumers.
 metrics = { workspace = true }
@@ -87,6 +94,8 @@ governor = { workspace = true }
 # Paused-clock tests (`#[tokio::test(start_paused = true)]`).
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
+# In-memory span/metric exporters for the `otel` tests.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 # Live conformance harness loads `.env` like the binaries do.
 dotenvy = { workspace = true }
@@ -96,6 +105,17 @@ default = ["rustls", "telemetry"]
 # `schwab_rs::telemetry`: ready-made tracing-subscriber setups. Off, the SDK
 # only emits `tracing` events and the application installs its subscriber.
 telemetry = ["dep:tracing-subscriber"]
+# `schwab_rs::telemetry::init_otel`: exports spans (and, through the `metrics`
+# facade, metrics) over OTLP/HTTP when the standard OTEL_* environment names
+# an endpoint. Off by default; no OpenTelemetry code is compiled without it.
+otel = [
+    "telemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:metrics-opentelemetry",
+]
 # The streamer's WebSocket gets an explicit rustls configuration (ring
 # provider, platform verifier): both ring and aws-lc-rs are in the tree, so
 # rustls cannot pick a process-level provider on its own. The tungstenite

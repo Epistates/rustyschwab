@@ -380,21 +380,27 @@ pub(crate) fn run(
     body: impl Future<Output = Result<Value, ToolFailure>> + Send,
 ) -> impl Future<Output = McpResult<ToolResult>> + Send {
     let body = Box::pin(body);
-    async move {
-        let timer = crate::metrics::ToolTimer::start(tool);
-        let failure = match body.await {
-            Ok(value) => match encode(&value) {
-                Ok(text) => {
-                    timer.success();
-                    return Ok(ToolResult::text(text));
-                }
+    // Only the tool's name: arguments and results stay out of the span, so
+    // nothing in a call leaves the process with it when `otel` export is on.
+    let span = tracing::info_span!("mcp.tool", tool);
+    tracing::Instrument::instrument(
+        async move {
+            let timer = crate::metrics::ToolTimer::start(tool);
+            let failure = match body.await {
+                Ok(value) => match encode(&value) {
+                    Ok(text) => {
+                        timer.success();
+                        return Ok(ToolResult::text(text));
+                    }
+                    Err(failure) => failure,
+                },
                 Err(failure) => failure,
-            },
-            Err(failure) => failure,
-        };
-        tracing::debug!(tool, code = ?failure.code, "tool call failed");
-        Ok(failure.into_result())
-    }
+            };
+            tracing::debug!(tool, code = ?failure.code, "tool call failed");
+            Ok(failure.into_result())
+        },
+        span,
+    )
 }
 
 /// Bring an argument-extraction failure into the contract.

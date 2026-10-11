@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — OpenTelemetry (OTLP) export
+
+- **Opt-in `otel` feature.** `schwab_rs::telemetry::init_otel` builds an
+  OTLP/HTTP-protobuf tracer provider from the standard environment
+  (`OTEL_EXPORTER_OTLP_ENDPOINT` and the per-signal endpoints, `_HEADERS`,
+  `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SDK_DISABLED`),
+  layers `tracing-opentelemetry` beside the fmt layer and returns an
+  `OtelGuard` that flushes and shuts down on drop. With no endpoint it
+  installs the same subscriber as before and exports nothing.
+- **Binaries.** `schwab-mcp --features otel` forwards it; `schwab-mcp` and
+  `schwab-authority` hold the guard until exit (and `schwab-authority`
+  then logs to stderr). Without the feature they are unchanged.
+- **Metrics over OTLP.** The `metrics` facade is bridged to OpenTelemetry
+  (`metrics-opentelemetry`) and fanned out beside the Prometheus recorder,
+  so `SCHWAB_METRICS_BIND` keeps working.
+- **Spans, and only spans.** The SDK now emits `schwab.request` (operation
+  label, HTTP method) and the server `mcp.tool` (tool name). Log events,
+  with their error text, paths and symbols, never leave the process, and
+  span fields carry no arguments, orders, accounts or tokens.
+
 ### Changed — TurboMCP 4 and the stateless MCP revision
 
 - **schwab-mcp runs on TurboMCP `4.0.0-alpha.5`.** The same handlers answer

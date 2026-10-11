@@ -43,6 +43,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-util = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
@@ -56,6 +57,12 @@ axum = { workspace = true, features = ["ws"] }
 tower = { workspace = true, features = ["util"] }
 futures-util = { workspace = true }
 subtle = "2.6"
+
+[features]
+# OTLP export of spans and metrics for the binaries, configured by the
+# standard OTEL_* environment. Off by default; the Prometheus endpoint is
+# unaffected either way.
+otel = ["schwab-rs/otel", "dep:metrics-util"]
 
 [dev-dependencies]
 wiremock = { workspace = true }

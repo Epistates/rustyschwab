@@ -31,6 +31,12 @@ struct Args {
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The authority installs no subscriber of its own, so a build with the
+    // `otel` feature also starts logging to stderr (`RUST_LOG`, default
+    // `info`); spans go to OTLP when the OTEL_* environment names an
+    // endpoint. The guard flushes them when `main` returns.
+    #[cfg(feature = "otel")]
+    let _telemetry = schwab_rs::telemetry::init_otel("schwab-authority", "info", std::io::stderr)?;
     let args = Args::parse();
     anyhow::ensure!(
         args.bind.ip().is_loopback(),

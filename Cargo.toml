@@ -67,6 +67,26 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # spawns its own scrape listener when `SCHWAB_METRICS_BIND` is set.
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
+# Lets the Prometheus recorder and the OTLP bridge share the one global slot.
+metrics-util = { version = "0.20", default-features = false, features = ["layers"] }
+
+# OpenTelemetry (opt-in `otel` feature). These move in lockstep: the 0.33
+# API/SDK/OTLP trio, the tracing bridge that targets it (0.34), and the
+# `metrics`-facade bridge whose version encodes `0.<metrics><otel>`.
+# OTLP goes over HTTP/protobuf on the blocking reqwest client the export
+# thread uses, with the rustls stack the workspace already has; the gRPC
+# path would add tonic, hyper-util and a second TLS integration.
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "reqwest-rustls",
+    "trace",
+    "metrics",
+] }
+tracing-opentelemetry = { version = "0.34", default-features = false }
+metrics-opentelemetry = "0.24033"
 
 # Time and date
 chrono = { version = "0.4", features = ["serde"] }

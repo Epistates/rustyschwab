@@ -123,6 +123,54 @@ Import `ops/dashboard.json` into Grafana and select your Prometheus datasource. 
 
 HTTP/WebSocket process shutdown handles SIGINT and, on Unix, SIGTERM. It permanently closes submission admission and allows up to thirty seconds for HTTP draining. Transport cancellation abandons only a write's answer; the write itself runs to its outcome unless the process exits first, in which case reconcile on restart. A principal's audit record left unresolved by a process exit is settled from the venue journal on that principal's next submission once it is two minutes old: with the venue's outcome when it has one, and, when nothing reached the venue, as such with its approval given back. For application-owned shutdown, stop admission first, preserve unresolved intents and reservations, disconnect streams, and let the process close its database connections. Never clear pending records to make a health probe pass. If disk is full, storage is corrupt, identity keys are unavailable or broker order pages are truncated, fail closed and investigate using the corresponding runbook above.
 
+## Observability: OpenTelemetry
+
+Prometheus (`SCHWAB_METRICS_BIND`) and the health probes above need no extra build. Export to an OpenTelemetry collector is opt-in at compile time: build `schwab-mcp` with `--features otel` (it forwards to `schwab-rs/otel`), or call `schwab_rs::telemetry::init_otel` in your own application. Nothing from the OpenTelemetry crates is compiled without the feature, and a build that has it exports nothing until the environment names an endpoint, at which point `schwab-mcp` and `schwab-authority` behave exactly like a build without the feature.
+
+The exporter speaks OTLP over HTTP/protobuf only (port 4318 on a stock collector), on the blocking reqwest client and the rustls stack the rest of the workspace uses. A different `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc`, `http/json`) stops the process at startup instead of posting to a port that would not understand it. Configuration is the standard environment:
+
+| Variable | Effect |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector base URL; `/v1/traces` and `/v1/metrics` are appended. Setting it (or a per-signal endpoint) turns export on. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Per-signal URL, used as given. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` (and the `_TRACES_` / `_METRICS_` variants) | Request headers, such as a collector API key, and the per-request timeout. |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | The resource. Without either, the service is `schwab-mcp` or `schwab-authority` rather than `unknown_service:<executable>`. |
+| `OTEL_SDK_DISABLED=true`, `OTEL_TRACES_EXPORTER=none`, `OTEL_METRICS_EXPORTER=none` | Switch export off while leaving the endpoint configured. |
+| `OTEL_BSP_*`, `OTEL_METRIC_EXPORT_INTERVAL` | Span batching and the metrics push interval (60 s by default). |
+| `RUST_LOG` | Filters the log output and the exported spans alike; a span below the active level is not exported. |
+
+Treat `OTEL_EXPORTER_OTLP_HEADERS` as a secret like any other credential in the process environment.
+
+What leaves the process is spans, plus metrics when a metrics endpoint is set, and nothing else. The server opens one `mcp.tool` span per tool call (field `tool`) and the SDK one `schwab.request` span per logical Schwab request (fields `op` and `http.request.method`, both fixed labels). Log events (`warn!`, `debug!`, ...) are not exported, even inside a span, because their fields carry error text, file paths, symbols and attempt ids; span fields never carry tool arguments, orders, account numbers, paths, query strings or tokens, and a new span must keep it that way. The metrics are the catalog in the repository README with the same names and labels, as OTLP instruments (duration histograms use second-scale buckets). With `SCHWAB_METRICS_BIND` also set, one recorder feeds both Prometheus and OTLP, so the two always agree.
+
+Hold the returned guard until the program is done: dropping it exports whatever is still buffered and shuts the providers down, blocking for at most the exporter timeout. `schwab-mcp` and `schwab-authority` keep it for the life of `main`, so a clean exit (end of a stdio session, SIGINT or SIGTERM on the network transports) flushes. A process that is killed outright loses the last batch, up to five seconds of spans by default and up to a minute of metrics. `schwab-authority` installed no log subscriber before; built with `otel` it logs to stderr as `schwab-mcp` does (`RUST_LOG`, `info` by default).
+
+To bring Prometheus-scraped metrics into a collector instead of pushing them (for example to keep `schwab-mcp` built without `otel`, or to use a collector that you already point at your Prometheus targets), leave `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` unset and scrape the endpoint with the collector's `prometheus` receiver:
+
+```yaml
+receivers:
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: schwab-mcp
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["127.0.0.1:9090"]   # SCHWAB_METRICS_BIND
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318              # spans from OTEL_EXPORTER_OTLP_ENDPOINT
+exporters:
+  otlphttp:
+    endpoint: https://otlp.example.com
+service:
+  pipelines:
+    traces:  {receivers: [otlp],       exporters: [otlphttp]}
+    metrics: {receivers: [prometheus], exporters: [otlphttp]}
+```
+
+Choose one path for metrics, push or scrape; running both ships every series twice.
+
 ## Qualification and release evidence
 
 The suite includes migration/backup/restore, cross-process locking, process kill during an uncommitted transition, tag matching, activity deduplication, stale generations, quota/fencing, approvals, risk reservations, JWT negative cases, policy reload and malformed-input/decimal properties.

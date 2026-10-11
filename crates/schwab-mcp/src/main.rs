@@ -21,6 +21,7 @@ use schwab_rs::{SchwabClient, SchwabConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(not(feature = "otel"))]
 use tracing_subscriber::EnvFilter;
 
 /// Env var that opts a network transport into binding beyond loopback.
@@ -51,27 +52,24 @@ fn guard_network_bind(transport: &str, addr: SocketAddr, allow_remote: bool) -> 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Optional `.env` — ignored if not present
-    dotenvy::dotenv().ok();
+/// The Prometheus scrape address, when the user opts in via
+/// `SCHWAB_METRICS_BIND=host:port`. Kept opt-in so stdio-transport
+/// deployments (Claude Desktop etc.) don't accidentally expose a network
+/// port.
+fn metrics_bind() -> anyhow::Result<Option<SocketAddr>> {
+    std::env::var("SCHWAB_METRICS_BIND")
+        .ok()
+        .map(|bind| {
+            bind.parse()
+                .with_context(|| format!("SCHWAB_METRICS_BIND={bind:?} is not a valid host:port"))
+        })
+        .transpose()
+}
 
-    // MCP uses stdout for protocol traffic — tracing must go to stderr
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    // Install the Prometheus recorder + scrape listener when the user
-    // opts in via `SCHWAB_METRICS_BIND=host:port`. Kept opt-in so
-    // stdio-transport deployments (Claude Desktop etc.) don't
-    // accidentally expose a network port.
-    if let Ok(bind) = std::env::var("SCHWAB_METRICS_BIND") {
-        let addr: SocketAddr = bind
-            .parse()
-            .with_context(|| format!("SCHWAB_METRICS_BIND={bind:?} is not a valid host:port"))?;
+/// Install the Prometheus recorder + scrape listener when
+/// `SCHWAB_METRICS_BIND` is set.
+fn install_prometheus() -> anyhow::Result<()> {
+    if let Some(addr) = metrics_bind()? {
         PrometheusBuilder::new()
             .with_http_listener(addr)
             .install()
@@ -84,6 +82,84 @@ async fn main() -> anyhow::Result<()> {
              to expose Prometheus scrape endpoint)"
         );
     }
+    Ok(())
+}
+
+/// Bucket bounds for the duration histograms, in seconds. OpenTelemetry's
+/// defaults start at 0 and step by 5 to 10000, which flattens every
+/// latency this server records into the first bucket.
+#[cfg(feature = "otel")]
+const SECONDS_BUCKETS: [f64; 13] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Install one global `metrics` recorder that feeds the OTLP exporter and,
+/// when `SCHWAB_METRICS_BIND` is set, the Prometheus listener too: the
+/// facade takes a single recorder, so the two share it through a fan-out.
+#[cfg(feature = "otel")]
+fn install_metrics_with_otel(
+    mut otel: schwab_rs::telemetry::OpenTelemetryRecorder,
+) -> anyhow::Result<()> {
+    use metrics_util::layers::FanoutBuilder;
+
+    let histograms = schwab_rs::metrics::CATALOG
+        .iter()
+        .chain(schwab_mcp::metrics::CATALOG)
+        .filter(|metric| metric.kind == schwab_rs::metrics::MetricKind::Histogram)
+        .map(|metric| metric.name);
+    otel.set_histogram_bounds_mut(histograms, &SECONDS_BUCKETS);
+
+    let mut fanout = FanoutBuilder::default().add_recorder(otel);
+    if let Some(addr) = metrics_bind()? {
+        let (recorder, exporter) = PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .build()
+            .context("failed to build the Prometheus metrics recorder / listener")?;
+        tokio::spawn(async move {
+            if let Err(error) = exporter.await {
+                tracing::error!(?error, "metrics: the Prometheus listener stopped");
+            }
+        });
+        fanout = fanout.add_recorder(recorder);
+        tracing::info!(%addr, "metrics: Prometheus scrape endpoint live at http://<bind>/metrics");
+    }
+    metrics::set_global_recorder(fanout.build())
+        .map_err(|_| anyhow::anyhow!("a metrics recorder is already installed"))?;
+    schwab_mcp::metrics::describe();
+    tracing::info!("metrics: exporting over OTLP");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Optional `.env` — ignored if not present
+    dotenvy::dotenv().ok();
+
+    // MCP uses stdout for protocol traffic — tracing must go to stderr.
+    // With the `otel` feature the subscriber also exports spans over OTLP
+    // when the OTEL_* environment names an endpoint; the guard flushes them
+    // when `main` returns.
+    #[cfg(feature = "otel")]
+    let mut telemetry = schwab_rs::telemetry::init_otel("schwab-mcp", "info", std::io::stderr)
+        .context("failed to set up OpenTelemetry export")?;
+    #[cfg(not(feature = "otel"))]
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    #[cfg(feature = "otel")]
+    match telemetry
+        .metrics_recorder()
+        .context("failed to set up OpenTelemetry metrics export")?
+    {
+        Some(otel) => install_metrics_with_otel(otel)?,
+        None => install_prometheus()?,
+    }
+    #[cfg(not(feature = "otel"))]
+    install_prometheus()?;
 
     let switches = Switches::from_env();
     let (backend, _recovery) = match std::env::var_os(PAPER_CONFIG_ENV) {

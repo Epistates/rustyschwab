@@ -534,6 +534,14 @@ impl SchwabClient {
     /// future is boxed (`BoxFuture`) so its `Send` bound is explicit —
     /// opaque `AsyncFn` futures trip rustc's "implementation of `Send` is
     /// not general enough" limitation once embedded in spawned handlers.
+    // The span carries the two static labels and nothing else: a path,
+    // query, header or order would leave the process with the span when
+    // `otel` export is on.
+    #[tracing::instrument(
+        name = "schwab.request",
+        skip_all,
+        fields(op = op, http.request.method = method_label)
+    )]
     async fn execute_resilient<'a, T>(
         &'a self,
         op: &'static str,

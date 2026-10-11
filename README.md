@@ -546,6 +546,9 @@ MCP will spawn a dedicated Prometheus scrape listener on that address;
 unset, no listener and every `metrics::counter!`/`histogram!` call is
 a no-op (the SDK depends only on the `metrics` facade, so library-only
 consumers are free to install their own recorder — StatsD, OTLP, etc.).
+To send the same metrics and traces to an OpenTelemetry collector, build
+with `--features otel` and set `OTEL_EXPORTER_OTLP_ENDPOINT`; see
+[docs/OPERATIONS.md](docs/OPERATIONS.md#observability-opentelemetry).
 
 ```bash
 SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
@@ -639,6 +642,7 @@ See the `examples/` directory for working examples:
 
 ### Feature flags
 - `callback-server`: runs a local Axum server to capture OAuth callback
+- `otel`: OTLP export of spans and metrics through `schwab_rs::telemetry::init_otel`, off by default; `schwab-mcp --features otel` wires it into the binaries (see [docs/OPERATIONS.md](docs/OPERATIONS.md#observability-opentelemetry))
 
 ### Token Storage Backends
 

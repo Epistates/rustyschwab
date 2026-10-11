@@ -108,6 +108,9 @@ jobs:
       - run: cargo check -p schwab-rs --no-default-features --features native-tls --locked
       - run: cargo check -p schwab-rs --no-default-features --features callback-server --locked
       - run: cargo check -p schwab-types --no-default-features --locked
+      # The OpenTelemetry export is opt-in; the binaries forward the feature.
+      - run: cargo check -p schwab-rs --no-default-features --features rustls,otel --locked
+      - run: cargo check -p schwab-mcp --bins --features otel --locked
       - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-hack

@@ -6,8 +6,11 @@
 //! - Structured, contextual logging
 //! - Span-based performance tracking
 //!
-//! Applications that export traces (OpenTelemetry or otherwise) install
-//! their own subscriber instead; these helpers then leave it in place.
+//! Applications that export traces install their own subscriber instead;
+//! these helpers then leave it in place. With the `otel` feature,
+//! [`init_otel`] is that subscriber for OTLP: it exports spans to whatever
+//! the standard `OTEL_EXPORTER_OTLP_*` environment names, and behaves like
+//! the helpers below when it names nothing.
 //!
 //! # Basic Usage
 //!
@@ -31,6 +34,11 @@
 //! # Show debug logs for schwab-rs, info for everything else
 //! RUST_LOG=schwab_rs=debug,info cargo run
 //! ```
+
+#[cfg(feature = "otel")]
+mod otel;
+#[cfg(feature = "otel")]
+pub use otel::{OpenTelemetryRecorder, OtelError, OtelGuard, init_otel};
 
 /// `RUST_LOG` when set and valid, else `default`.
 fn filter(default: &str) -> tracing_subscriber::EnvFilter {

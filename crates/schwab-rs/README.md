@@ -150,7 +150,9 @@ while let Some(message) = receiver.recv().await {
 | `native-tls` | no | the platform TLS stack instead |
 | `callback-server` | no | local HTTPS OAuth callback capture |
 | `schemars` | no | JSON Schema derives on the request types |
-| `full` | no | `rustls`, `callback-server`, `schemars` |
+| `telemetry` | yes | `schwab_rs::telemetry`: ready-made `tracing-subscriber` setups |
+| `otel` | no | `telemetry::init_otel`: OTLP/HTTP export of spans and, through the `metrics` facade, metrics, configured by the standard `OTEL_*` environment |
+| `full` | no | `rustls`, `callback-server`, `schemars`, `telemetry` |
 
 ## License
 
