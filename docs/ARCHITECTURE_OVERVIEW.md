@@ -154,8 +154,10 @@ WAL mode (`<tokens_file>.orders.store/state.sqlite3`; a pre-0.2 JSON journal
 at `<tokens_file>.orders.json` is imported once). Tables: `submissions`,
 `audit`, `consumed_approvals`, `used_order_tags`, `accounts`, `orders`,
 `executions`, `leases`, `quota`, `quota_config`, `approvals`,
-`reservations`, `meta`, `schema_migrations`. Migrations, online backup and
-restore live in `storage.rs`.
+`reservations`, `intents`, `audit_anchor`, `meta`, `schema_migrations`.
+Migrations, online backup and restore live in `storage.rs`. `audit` rows
+form a SHA-256 hash chain (`audit_chain.rs`, checked by
+`OrderJournal::verify_audit` and `schwab-admin verify-audit`).
 
 Around the journal:
 

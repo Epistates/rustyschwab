@@ -73,6 +73,7 @@ pub enum BackendRequest {
         after: i64,
         limit: u32,
     },
+    VerifyAudit,
     Health,
     Pending,
     PendingFor {
@@ -209,6 +210,7 @@ impl BackendRequest {
             Self::Audit { after, limit } => {
                 serde_json::to_value(execution.audit_page(after, limit).await?)?
             }
+            Self::VerifyAudit => serde_json::to_value(execution.verify_audit().await?)?,
             Self::Health => serde_json::to_value(execution.healthcheck().await?)?,
             Self::Pending => serde_json::to_value(execution.pending_count().await?)?,
             Self::PendingFor { accounts } => {
@@ -510,6 +512,9 @@ impl ExecutionStore for RemoteBackend {
     }
     async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
         self.call(&BackendRequest::Audit { after, limit }).await
+    }
+    async fn verify_audit(&self) -> Result<crate::audit_chain::AuditChainReport> {
+        self.call(&BackendRequest::VerifyAudit).await
     }
     async fn healthcheck(&self) -> Result<()> {
         self.call(&BackendRequest::Health).await

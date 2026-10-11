@@ -40,6 +40,8 @@ struct Migration {
     version: u32,
     name: &'static str,
     sql: &'static str,
+    /// Data work SQL cannot do, run after `sql` in the same transaction.
+    backfill: Option<fn(&Connection) -> Result<()>>,
 }
 
 /// Applied in order inside one transaction each; `meta.schema` records the
@@ -63,6 +65,7 @@ const MIGRATIONS: &[Migration] = &[
             CREATE TABLE IF NOT EXISTS quota_config(key TEXT PRIMARY KEY, per_second INTEGER NOT NULL, burst INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS approvals(digest TEXT PRIMARY KEY, principal TEXT NOT NULL, expires_at INTEGER NOT NULL, operator TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS reservations(id TEXT PRIMARY KEY, account TEXT NOT NULL, quantity TEXT NOT NULL, notional TEXT NOT NULL, state TEXT NOT NULL);",
+        backfill: None,
     },
     // Version 1 files tracked this import with an ad hoc `tags_imported` flag.
     Migration {
@@ -70,6 +73,7 @@ const MIGRATIONS: &[Migration] = &[
         name: "import_order_tags",
         sql: "INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(request,'$.tag') FROM submissions WHERE json_type(request,'$.tag')='text';
             DELETE FROM meta WHERE key='tags_imported';",
+        backfill: None,
     },
     // `armed` marks an intent whose request may have left this host; rows
     // written before it existed are assumed armed. Reservations learn what
@@ -93,6 +97,7 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS orders_status ON orders(account,json_extract(payload,'$.status'));
             CREATE INDEX IF NOT EXISTS orders_tag ON orders(account,json_extract(payload,'$.tag'));
             INSERT OR IGNORE INTO used_order_tags SELECT account,json_extract(payload,'$.tag') FROM orders WHERE json_type(payload,'$.tag')='text';",
+        backfill: None,
     },
     // Intents a principal asked for that need an operator's approval, so
     // the operator approves an order they can read, not a bare digest.
@@ -101,6 +106,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "pending_intents",
         sql: "CREATE TABLE IF NOT EXISTS intents(digest TEXT PRIMARY KEY, principal TEXT NOT NULL, tool TEXT NOT NULL, arguments TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, seen INTEGER NOT NULL DEFAULT 1);
             CREATE INDEX IF NOT EXISTS intents_recent ON intents(principal,last_seen);",
+        backfill: None,
+    },
+    // Each audit row names the hash of the one before it and carries its
+    // own, so an edited, deleted or reordered row is detectable (see
+    // `audit_chain`). Existing rows are chained in sequence order here.
+    // `audit_anchor` is where a deliberate deletion of the oldest rows
+    // records the last deleted row, so verification can start after it.
+    Migration {
+        version: 5,
+        name: "audit_hash_chain",
+        sql: "ALTER TABLE audit ADD COLUMN prev_hash TEXT NOT NULL DEFAULT '';
+            ALTER TABLE audit ADD COLUMN hash TEXT NOT NULL DEFAULT '';
+            CREATE TABLE IF NOT EXISTS audit_anchor(id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL, hash TEXT NOT NULL);",
+        backfill: Some(crate::audit_chain::backfill),
     },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -423,6 +442,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )
         .map_err(sql)?;
         tx.execute_batch(migration.sql).map_err(sql)?;
+        if let Some(backfill) = migration.backfill {
+            backfill(&tx)?;
+        }
         tx.execute(
             "INSERT INTO schema_migrations VALUES(?1,?2,?3)",
             rusqlite::params![
@@ -541,23 +563,40 @@ pub(crate) mod meta {
     }
 }
 
+/// Append one event to the hash-chained audit table.
+///
+/// Reading the previous hash and inserting must not interleave with another
+/// writer, in this process or another, or two rows would claim the same
+/// predecessor. On a connection with no transaction open this takes the
+/// write lock itself. Inside a transaction it requires that the caller
+/// already holds it (`BEGIN IMMEDIATE`, or an earlier write): a deferred
+/// transaction that has only read would race for the lock after reading the
+/// head, so it is refused rather than trusted.
 pub(crate) fn audit(
     conn: &Connection,
     kind: &str,
     subject: &str,
     payload: &serde_json::Value,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO audit(at,kind,subject,payload) VALUES(?1,?2,?3,?4)",
-        rusqlite::params![
-            chrono::Utc::now().timestamp_millis(),
-            kind,
-            subject,
-            serde_json::to_string(payload)?
-        ],
-    )
-    .map_err(sql)?;
-    Ok(())
+    let at = chrono::Utc::now().timestamp_millis();
+    let payload = serde_json::to_string(payload)?;
+    if !conn.is_autocommit() {
+        if conn.transaction_state(None::<&str>).map_err(sql)? != rusqlite::TransactionState::Write {
+            return Err(Error::Storage(
+                "Audit events must be written inside a write transaction".into(),
+            ));
+        }
+        return crate::audit_chain::append(conn, at, kind, subject, &payload);
+    }
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
+    let appended = crate::audit_chain::append(conn, at, kind, subject, &payload)
+        .and_then(|()| conn.execute_batch("COMMIT").map_err(sql));
+    if appended.is_err() && !conn.is_autocommit() {
+        // Best effort: the error being returned is the one that matters, and
+        // a connection left open is dropped by the pool.
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    appended
 }
 
 // Atomically reserve a new backup path with private permissions at creation:

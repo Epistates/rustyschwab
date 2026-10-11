@@ -87,7 +87,7 @@ const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
 const PRUNE_RELEASED_RESERVATIONS: &str = "DELETE FROM reservations WHERE state='released' \
      AND NOT EXISTS(SELECT 1 FROM submissions s WHERE s.id=reservations.id \
        AND (s.outcome IS NULL OR s.created_at>=?1))";
-const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload FROM audit \
+const SELECT_AUDIT_PAGE: &str = "SELECT sequence,at,kind,subject,payload,prev_hash,hash FROM audit \
      WHERE sequence>?1 ORDER BY sequence LIMIT ?2";
 /// Resolved submissions older than `?1` whose audit trail is exported through
 /// `?2`, hold no reservation, and are rejected/reconciled or whose broker
@@ -541,22 +541,34 @@ impl OrderJournal {
                             r.get(2)?,
                             r.get(3)?,
                             r.get::<_, String>(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
                         ))
                     })
                     .map_err(sql)?;
                 rows.map(|row| {
-                    let (sequence, at, kind, subject, payload) = row.map_err(sql)?;
+                    let (sequence, at, kind, subject, payload, prev_hash, hash) =
+                        row.map_err(sql)?;
                     Ok(AuditEvent {
                         sequence,
                         at,
                         kind,
                         subject,
                         payload: serde_json::from_str(&payload)?,
+                        prev_hash,
+                        hash,
                     })
                 })
                 .collect()
             })
             .await
+    }
+    /// Check the audit table's hash chain end to end and report where it
+    /// stands. A row that was edited, removed or reordered is an
+    /// [`Error::Storage`] naming the first sequence that fails; record the
+    /// report's head hash to also notice rows dropped from the end.
+    pub async fn verify_audit(&self) -> Result<crate::audit_chain::AuditChainReport> {
+        self.database.run(crate::audit_chain::verify).await
     }
     /// Explicit retention after durable export acknowledgement. Pending records,
     /// consumed approval tombstones and all audit events remain intact.
@@ -639,6 +651,14 @@ pub struct AuditEvent {
     pub kind: String,
     pub subject: String,
     pub payload: serde_json::Value,
+    /// Hash of the previous event (see [`crate::audit_chain`]); a sink checks
+    /// continuity by comparing it with the last `hash` it stored. Empty when
+    /// an older peer sent the event.
+    #[serde(default)]
+    pub prev_hash: String,
+    /// This event's hash.
+    #[serde(default)]
+    pub hash: String,
 }
 
 impl OrderJournal {
@@ -1046,6 +1066,8 @@ pub trait ExecutionStore: Send + Sync {
         orders: Vec<serde_json::Value>,
     ) -> Result<crate::reconciliation::ReconciliationReport>;
     async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>>;
+    /// Verify the audit hash chain of the store behind this handle.
+    async fn verify_audit(&self) -> Result<crate::audit_chain::AuditChainReport>;
     async fn healthcheck(&self) -> Result<()>;
     async fn pending_count(&self) -> Result<usize>;
     /// Unresolved submissions on these accounts: what blocks their next
@@ -1241,6 +1263,9 @@ impl ExecutionStore for OrderJournal {
     }
     async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
         OrderJournal::audit_page(self, after, limit).await
+    }
+    async fn verify_audit(&self) -> Result<crate::audit_chain::AuditChainReport> {
+        OrderJournal::verify_audit(self).await
     }
     async fn pending_count(&self) -> Result<usize> {
         self.database

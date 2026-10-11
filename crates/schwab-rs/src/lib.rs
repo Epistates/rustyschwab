@@ -10,6 +10,7 @@
 /// ```
 pub const VERSION: &str = concat!("schwab-rs ", env!("CARGO_PKG_VERSION"));
 
+pub mod audit_chain;
 pub mod audit_delivery;
 pub mod auth;
 pub mod broker;

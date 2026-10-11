@@ -50,6 +50,11 @@ enum DurableCommand {
         #[arg(long, default_value_t = 1000)]
         limit: u32,
     },
+    /// Check the audit table's hash chain. Prints the rows checked, their
+    /// sequence range and the head hash (record it elsewhere as a
+    /// checkpoint); exits non-zero, naming the first sequence that fails,
+    /// when a row was edited, removed or reordered.
+    VerifyAudit,
     Backup {
         destination: PathBuf,
     },
@@ -174,6 +179,14 @@ async fn main() -> anyhow::Result<()> {
             for event in journal.audit_page(after, limit).await? {
                 println!("{}", serde_json::to_string(&event)?);
             }
+        }
+        DurableCommand::VerifyAudit => {
+            let report = journal.verify_audit().await?;
+            println!("rows {}", report.rows);
+            if let (Some(first), Some(last)) = (report.first_sequence, report.last_sequence) {
+                println!("sequences {first}..={last}");
+            }
+            println!("head {}", report.head_hash);
         }
         DurableCommand::Backup { destination } => journal.database().backup(destination).await?,
         DurableCommand::Restore { destination } => {

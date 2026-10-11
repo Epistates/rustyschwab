@@ -843,10 +843,11 @@ async fn fresh_state_records_every_migration_and_refuses_newer_files() {
             (1, "baseline".to_string()),
             (2, "import_order_tags".into()),
             (3, "armed_intents_reservation_scope".into()),
-            (4, "pending_intents".into())
+            (4, "pending_intents".into()),
+            (5, "audit_hash_chain".into())
         ]
     );
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("4"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("5"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     connection
         .execute("UPDATE meta SET value='99' WHERE key='schema'", [])
@@ -876,6 +877,9 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
                  DROP INDEX orders_status;
                  DROP INDEX orders_tag;
                  DROP TABLE intents;
+                 DROP TABLE audit_anchor;
+                 ALTER TABLE audit DROP COLUMN prev_hash;
+                 ALTER TABLE audit DROP COLUMN hash;
                  ALTER TABLE submissions DROP COLUMN armed;
                  ALTER TABLE reservations DROP COLUMN symbol;
                  ALTER TABLE reservations DROP COLUMN side;
@@ -898,7 +902,7 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
     // Rows written before the marker existed read as armed.
     assert!(upgraded.records().await.unwrap()[0].armed);
     let connection = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("4"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("5"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     let history: Vec<u32> = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -907,7 +911,7 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(history, vec![2, 3, 4]);
+    assert_eq!(history, vec![2, 3, 4, 5]);
 }
 
 #[tokio::test]
@@ -951,7 +955,7 @@ async fn concurrent_first_use_initializes_once() {
     let migrations: i64 = connection
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(migrations, 4);
+    assert_eq!(migrations, 5);
 }
 
 /// A partial fill shrinks the order's held reservation to what can still
