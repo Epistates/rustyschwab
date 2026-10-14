@@ -43,17 +43,25 @@ class Simulation:
     derives from candles (the ``candle-bbo-v1`` model): the full spread
     around each price, and the share of a bar's volume offered on each side.
     The rest configure the venue in every simulated mode: ``slippage_bps``
-    moves each fill against the order, ``fee_per_share`` is charged on every
-    fill, an order becomes eligible to fill ``execution_latency_ms`` after it
-    is accepted and a cancel takes effect ``cancel_latency_ms`` after it is
-    asked for. Market orders are protected by ``market_collar_bps``.
-    ``regular_hours_only`` drops pre- and post-market bars.
+    moves each fill against the order; ``fee_per_share`` and ``fee_bps`` (of
+    notional) are charged on every fill, and ``sell_fee_bps`` and
+    ``sell_fee_per_share`` (capped per fill at ``sell_fee_cap``) on sells
+    only, for regulatory fees such as the SEC's Section 31 fee and FINRA's
+    trading activity fee, whose current rates you supply. An order becomes
+    eligible to fill ``execution_latency_ms`` after it is accepted and a
+    cancel takes effect ``cancel_latency_ms`` after it is asked for. Market
+    orders are protected by ``market_collar_bps``. ``regular_hours_only``
+    drops pre- and post-market bars.
     """
 
     spread_bps: Decimal | str | int = "2"
     participation_bps: Decimal | str | int = "1000"
     slippage_bps: Decimal | str | int = "0"
     fee_per_share: Decimal | str | int = "0"
+    fee_bps: Decimal | str | int = "0"
+    sell_fee_bps: Decimal | str | int = "0"
+    sell_fee_per_share: Decimal | str | int = "0"
+    sell_fee_cap: Decimal | str | int | None = None
     execution_latency_ms: int = 250
     cancel_latency_ms: int = 250
     market_collar_bps: Decimal | str | int = "500"
@@ -87,6 +95,12 @@ class Simulation:
             "slippage_bps": _amount(self.slippage_bps),
             "market_collar_bps": _amount(self.market_collar_bps),
             "fee_per_share": _amount(self.fee_per_share),
+            "fee_bps": _amount(self.fee_bps),
+            "sell_fee_bps": _amount(self.sell_fee_bps),
+            "sell_fee_per_share": _amount(self.sell_fee_per_share),
+            "sell_fee_per_share_cap": (
+                None if self.sell_fee_cap is None else _amount(self.sell_fee_cap)
+            ),
             "max_working_orders": self.max_working_orders,
         }
 

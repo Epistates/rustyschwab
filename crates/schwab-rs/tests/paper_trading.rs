@@ -98,6 +98,70 @@ async fn install_fault(broker: &PaperBroker, name: &str, when: &str, message: &s
         .unwrap();
 }
 #[tokio::test]
+async fn notional_and_sell_only_fees_are_charged_and_reserved() {
+    let mut value = serde_json::to_value(config()).unwrap();
+    value["fee_per_share"] = json!("0");
+    value["fee_bps"] = json!("10");
+    value["sell_fee_bps"] = json!("0.5");
+    value["sell_fee_per_share"] = json!("0.001");
+    value["sell_fee_per_share_cap"] = json!("0.005");
+    let fees: PaperConfig = serde_json::from_value(value).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let b = PaperBroker::open(dir.path().join("state/paper.sqlite3"), fees.clone())
+        .await
+        .unwrap();
+    b.apply(PaperEvent {
+        sequence: 1,
+        at_ms: 0,
+        kind: PaperEventKind::Session {
+            session_id: "session-1".into(),
+            open: true,
+        },
+    })
+    .await
+    .unwrap();
+    b.apply(quote(2, 100, "10", "10", "100")).await.unwrap();
+    b.place_order("paper-test", &order("buy", "BUY", "10", "11"))
+        .await
+        .unwrap();
+    // Reserved: 10 shares at the 11 bound plus 10 bps of it.
+    assert_eq!(
+        b.snapshot("paper-test").await.unwrap().reserved_cash,
+        d("110.11")
+    );
+    let bought = b.apply(quote(3, 200, "10", "10", "100")).await.unwrap();
+    // 10 bps of the 100 notional; no sell-only fees on a buy.
+    assert_eq!(bought.fills[0].fee, d("0.1"));
+    b.place_order("paper-test", &order("sell", "SELL", "10", "10"))
+        .await
+        .unwrap();
+    let sold = b.apply(quote(4, 300, "10", "10", "100")).await.unwrap();
+    // 10 bps + 0.5 bps of 100, plus 10 x 0.001 capped at 0.005.
+    assert_eq!(sold.fills[0].fee, d("0.110"));
+    let snapshot = b.snapshot("paper-test").await.unwrap();
+    assert_eq!(snapshot.ledger.fees, d("0.210"));
+    assert_eq!(snapshot.ledger.realized_pnl, d("-0.210"));
+    // The fee fields round-trip, and a config without them is unchanged.
+    assert_eq!(
+        serde_json::to_value(&fees).unwrap()["sell_fee_per_share_cap"],
+        json!("0.005")
+    );
+    assert!(
+        serde_json::to_value(config())
+            .unwrap()
+            .get("fee_bps")
+            .is_none()
+    );
+    let mut bad = serde_json::to_value(config()).unwrap();
+    bad["sell_fee_bps"] = json!("101");
+    let bad: PaperConfig = serde_json::from_value(bad).unwrap();
+    assert!(
+        PaperBroker::open(dir.path().join("state/bad.sqlite3"), bad)
+            .await
+            .is_err()
+    );
+}
+#[tokio::test]
 async fn a_batch_applies_like_single_events_or_not_at_all() {
     let (_single_dir, single) = setup().await;
     let (_batch_dir, batch) = setup().await;
@@ -139,7 +203,10 @@ async fn a_batch_applies_like_single_events_or_not_at_all() {
         quote(9, 700, "10", "10.01", "1"),
     ];
     assert!(batch.apply_batch(broken).await.is_err());
-    let next = batch.apply(quote(6, 500, "10", "10.01", "1")).await.unwrap();
+    let next = batch
+        .apply(quote(6, 500, "10", "10.01", "1"))
+        .await
+        .unwrap();
     assert!(!next.duplicate, "the failed batch left no event behind");
     assert_eq!(batch.verify_integrity().await.unwrap().event_sequence, 6);
 }

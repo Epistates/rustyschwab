@@ -394,6 +394,12 @@ fn validate_config(config: &PaperConfig) -> Result<()> {
         || config.market_collar_bps > Decimal::from(1000)
         || config.fee_per_share < Decimal::ZERO
         || config.fee_per_share > Decimal::ONE
+        || !(Decimal::ZERO..=Decimal::from(1000)).contains(&config.fee_bps)
+        || !(Decimal::ZERO..=Decimal::from(100)).contains(&config.sell_fee_bps)
+        || !(Decimal::ZERO..=Decimal::ONE).contains(&config.sell_fee_per_share)
+        || config
+            .sell_fee_per_share_cap
+            .is_some_and(|cap| !(Decimal::ZERO..=Decimal::from(1_000_000)).contains(&cap))
         || config.settlement_calendar.len() > 10000
         || config
             .settlement_calendar
@@ -515,13 +521,42 @@ fn symbol(order: &PaperOrder) -> &str {
 }
 fn reserve_cash(order: &PaperOrder, config: &PaperConfig) -> Result<Decimal> {
     if buy(order) && order.status.is_open() {
-        mul(
-            order.remaining_quantity,
-            add(order.price_bound, config.fee_per_share)?,
-        )
+        // The most one share can cost: the price bound and every buy fee.
+        let per_share = add(
+            mul(order.price_bound, add(Decimal::ONE, bps(config.fee_bps)?)?)?,
+            config.fee_per_share,
+        )?;
+        mul(order.remaining_quantity, per_share)
     } else {
         Ok(Decimal::ZERO)
     }
+}
+fn bps(rate: Decimal) -> Result<Decimal> {
+    div(rate, Decimal::from(10_000))
+}
+/// The fee on one fill: the per-share and notional fees on every fill, and
+/// on a sell the sell-only fees, the per-share part capped per fill.
+fn fill_fee(
+    config: &PaperConfig,
+    is_buy: bool,
+    quantity: Decimal,
+    notional: Decimal,
+) -> Result<Decimal> {
+    let mut fee = add(
+        mul(quantity, config.fee_per_share)?,
+        mul(notional, bps(config.fee_bps)?)?,
+    )?;
+    if !is_buy {
+        let mut per_share = mul(quantity, config.sell_fee_per_share)?;
+        if let Some(cap) = config.sell_fee_per_share_cap {
+            per_share = per_share.min(cap);
+        }
+        fee = add(
+            add(fee, mul(notional, bps(config.sell_fee_bps)?)?)?,
+            per_share,
+        )?;
+    }
+    Ok(fee)
 }
 fn end_order(
     c: &Connection,
@@ -754,8 +789,19 @@ impl PaperBroker {
                         sub(Decimal::ONE, collar)?,
                     )?
                 };
-                if !is_buy && price_bound < this.config.fee_per_share {
-                    return Err(rejected("Paper sell price protection cannot cover fees"));
+                if !is_buy {
+                    // A share sold at the bound must at least pay its fees.
+                    let config = &this.config;
+                    let kept = mul(
+                        price_bound,
+                        sub(
+                            Decimal::ONE,
+                            bps(add(config.fee_bps, config.sell_fee_bps)?)?,
+                        )?,
+                    )?;
+                    if kept < add(config.fee_per_share, config.sell_fee_per_share)? {
+                        return Err(rejected("Paper sell price protection cannot cover fees"));
+                    }
                 }
                 let mut order = PaperOrder {
                     order_id: String::new(),
@@ -1479,8 +1525,8 @@ fn apply_in(
             if quantity.is_zero() {
                 continue;
             }
-            let fee = mul(quantity, config.fee_per_share)?;
             let notional = mul(quantity, price)?;
+            let fee = fill_fee(config, is_buy, quantity, notional)?;
             let mut account = ledger(tx, &order.account)?;
             let position = account.positions.entry(ticker.clone()).or_default();
             if is_buy {

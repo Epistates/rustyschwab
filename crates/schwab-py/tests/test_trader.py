@@ -123,6 +123,17 @@ async def test_costs_follow_the_simulation(store: HistoryStore) -> None:
     assert Decimal(run.stats["end_equity"]) < Decimal(cheap.stats["end_equity"])
 
 
+async def test_notional_and_sell_fees(store: HistoryStore) -> None:
+    simulation = Simulation(fee_bps="10", sell_fee_bps="0.5", sell_fee_per_share="0.001", sell_fee_cap="0.005")
+    run = await Trader(cache=store).backtest(
+        BuyThenSell(), "ABC", cash=1_000, simulation=simulation, **window()
+    )
+    buy, sell = run.fills
+    assert buy["fee"] == buy["price"] * 10 * Decimal("0.001")
+    assert sell["fee"] == sell["price"] * 10 * Decimal("0.00105") + Decimal("0.005")
+    assert Decimal(run.stats["fees"]) == buy["fee"] + sell["fee"]
+
+
 async def test_rejections_withdrawals_and_start_orders(store: HistoryStore) -> None:
     def strategy(tc: Context, events: list[Event]) -> None:
         if len(tc.candles["ABC"]) == 2:

@@ -37,7 +37,23 @@ pub struct PaperConfig {
     pub quote_max_age_ms: i64,
     pub slippage_bps: Decimal,
     pub market_collar_bps: Decimal,
+    /// Charged on every fill, per share; 0 to 1.
     pub fee_per_share: Decimal,
+    /// Charged on every fill as basis points of its notional; 0 to 1000.
+    #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+    pub fee_bps: Decimal,
+    /// Charged on sell fills only, as basis points of their notional; 0 to
+    /// 100. Models a transaction fee such as the SEC's Section 31 fee, whose
+    /// rate changes: set the current one.
+    #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+    pub sell_fee_bps: Decimal,
+    /// Charged on sell fills only, per share; 0 to 1. Models a per-share
+    /// fee such as FINRA's trading activity fee.
+    #[serde(default, skip_serializing_if = "Decimal::is_zero")]
+    pub sell_fee_per_share: Decimal,
+    /// The most `sell_fee_per_share` adds to one fill; absent, no cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sell_fee_per_share_cap: Option<Decimal>,
     pub max_working_orders: usize,
     /// If enabled, every trading session needs an explicit settlement timestamp.
     #[serde(default)]
