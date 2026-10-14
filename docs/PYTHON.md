@@ -625,6 +625,7 @@ The extra installs `nautilus_trader>=1.231,<2`. NautilusTrader supports CPython 
 | `SchwabExecClientConfig`, `SchwabLiveExecClientFactory` | Build a `SchwabExecutionClient`: orders, reports, account state |
 | `SchwabPaperConfig` | Passed as `paper=` to the execution config to use the paper venue |
 | `SchwabInstrumentProvider` | Loads `Equity` and `OptionContract` instruments from quotes and option chains |
+| `load_bars`, `write_catalog` | Cached Schwab price history as bars for a `BacktestEngine` or `BacktestNode` ([Backtesting on Schwab history](#backtesting-on-schwab-history)) |
 
 The venue and client ID are `SCHWAB`. The account ID is `SCHWAB-<account hash>`: Schwab's `hashValue` from `client.account_numbers()`, never the account number. The account may be left out when the login has exactly one. OMS is `NETTING`, the base currency is USD, and the account type is `MARGIN` unless you say `CASH` (the client checks it against Schwab on connect and refuses to start on a mismatch). Register the factories under the name `SCHWAB`; a different name becomes the client ID and must not contain a hyphen, because it is the issuer in the account ID.
 
@@ -768,6 +769,71 @@ The execution client does not use the streamer, which the data client holds. It 
 | Account state | `liquidationValue` as the total; `availableFunds` (margin) or `cashAvailableForTrading` (cash) as free; the difference as locked |
 
 Reports carry the Nautilus `ClientOrderId` when the cache knows the order, and none otherwise, so an order placed in Schwab's own apps arrives as an external order. Orders the adapter does not model (multi-leg, trailing stops, mutual funds, fractional quantities) are left out of reports. Balances refresh after any fill and every `account_poll_interval_secs` (30).
+
+### Backtesting on Schwab history
+
+`load_bars` turns Schwab price history into the `Bar`s a `BacktestEngine` or `BacktestNode` replays, for the same instruments and bar types the live data client serves. It reads through `rustyschwab.HistoryStore`, the durable SQLite price-history cache that [`Trader`](#paper-trading-and-backtests) also uses: a span Schwab has served once is read from disk on every later run, so rerunning a backtest makes no request, and only the part of a longer window the cache lacks is fetched.
+
+```python
+import asyncio
+from datetime import date
+
+import rustyschwab
+from nautilus_trader.backtest.engine import BacktestEngine
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.model.currencies import USD
+from nautilus_trader.model.data import BarType
+from nautilus_trader.model.enums import AccountType, OmsType
+from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.objects import Money
+
+from rustyschwab.nautilus import SCHWAB_VENUE, SchwabInstrumentProvider, load_bars
+
+
+async def main() -> None:
+    async with rustyschwab.Client.from_env() as client:
+        provider = SchwabInstrumentProvider(client)
+        instrument_id = InstrumentId.from_str("AAPL.SCHWAB")
+        await provider.load_ids_async([instrument_id])
+        aapl = provider.find(instrument_id)
+
+        bar_type = BarType.from_str("AAPL.SCHWAB-5-MINUTE-LAST-EXTERNAL")
+        # Fetched once into ~/.rustyschwab/history.sqlite3, then read from there.
+        bars = await load_bars(client, aapl, bar_type, date(2026, 9, 1), date(2026, 9, 30))
+
+    engine = BacktestEngine(config=BacktestEngineConfig())
+    engine.add_venue(
+        venue=SCHWAB_VENUE,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.MARGIN,
+        base_currency=USD,
+        starting_balances=[Money(100_000, USD)],
+    )
+    engine.add_instrument(aapl)
+    engine.add_data(bars)
+    engine.add_strategy(MyStrategy(aapl, bar_type))   # any Strategy that trades AAPL.SCHWAB
+    engine.run()
+    print(engine.trader.generate_order_fills_report())
+    engine.dispose()
+
+
+asyncio.run(main())
+```
+
+`source` is a `rustyschwab.Client`, or a `rustyschwab.HistoryStore` alone to read what the cache holds with no client and no network (a window the cache does not cover comes back short or empty). `store=` names the cache for a client: an open `HistoryStore` or a path, `rustyschwab.trader.DEFAULT_CACHE` by default, the file `Trader` uses, so a cache filled by either serves both. The bar type must be one the data client can request: `1`, `5`, `10`, `15` or `30` `MINUTE`, `1` `DAY`, `WEEK` or `MONTH`, `LAST`, `EXTERNAL`; anything else raises `UnsupportedBars`. Candles are regular-session unless `extended_hours=True`, which must match between runs because the cache keeps the two apart. `start` and `end` are datetimes (naive ones are UTC) or dates (midnight UTC); a candle is in the window when it opens in it, both ends included.
+
+Timestamps follow the live client: a bar's `ts_event` is its close, because that is when Nautilus treats a bar as known, or its open with `timestamp_on_close=False` (match the live config's `bars_timestamp_on_close`). `ts_init` equals `ts_event`, where a live bar's is the time it was received, because the engine replays data in `ts_init` order and a load time would put every bar after the run. The prices, volumes and `ts_event` are the ones `request_bars` gives, from the same code.
+
+The engine fills orders against these bars (Nautilus' bar execution), so it models neither Schwab's quotes nor the paper venue's latency and partial fills; for those, backtest through [`Trader`](#paper-trading-and-backtests). To use a `BacktestNode`, write the bars and the instrument to a Parquet catalog once:
+
+```python
+from nautilus_trader.persistence.catalog import ParquetDataCatalog
+from rustyschwab.nautilus import write_catalog
+
+write_catalog(ParquetDataCatalog("catalog"), bars, [aapl])
+```
+
+Then point a `BacktestDataConfig` at `bar_types=["AAPL.SCHWAB-5-MINUTE-LAST-EXTERNAL"]`. `tests/nautilus/test_history.py` runs the loader, the cache and a `BacktestEngine` over a mock Schwab.
 
 ### Known limits
 
