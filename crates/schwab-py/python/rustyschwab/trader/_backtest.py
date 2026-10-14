@@ -168,23 +168,27 @@ class RunResult:
         )
         return f"{head}\n{performance.format_report(self.stats)}"
 
-    def to_html(self, path: str | Path) -> Path:
+    def to_html(self, path: str | Path, *, refresh_seconds: int | None = None) -> Path:
         """Write the charts (prices, fills, overlays and equity) to one
-        self-contained HTML file and return its path."""
+        self-contained HTML file and return its path. With
+        ``refresh_seconds`` the page reloads itself, so a file rewritten from
+        ``Session.snapshot()`` follows a running session in a browser."""
         from ._chart import render
 
         target = Path(path)
-        target.write_text(
-            render(
-                title=f"{self.mode.capitalize()}: {', '.join(self.symbols)}",
-                candles=self.candles,
-                fills=self.fills,
-                plots=self.plots,
-                equity=self.equity,
-                summary=self.report(),
-            ),
-            encoding="utf-8",
+        page = render(
+            title=f"{self.mode.capitalize()}: {', '.join(self.symbols)}",
+            candles=self.candles,
+            fills=self.fills,
+            plots=self.plots,
+            equity=self.equity,
+            summary=self.report(),
+            refresh_seconds=refresh_seconds,
         )
+        # Written whole and renamed, so a reloading browser never reads half.
+        partial = target.with_name(f".{target.name}.partial")
+        partial.write_text(page, encoding="utf-8")
+        partial.replace(target)
         return target
 
     def __repr__(self) -> str:
@@ -194,7 +198,7 @@ class RunResult:
         )
 
 
-def _candle(symbol: str, raw: Mapping[str, Any]) -> Candle:
+def to_candle(symbol: str, raw: Mapping[str, Any]) -> Candle:
     return {
         "type": "candle",
         "symbol": symbol,
@@ -293,7 +297,7 @@ async def run_backtest(
         if kept:
             first_last[history["symbol"]] = (dec(kept[0]["open"]), dec(kept[-1]["close"]))
         for raw in kept:
-            candle = _candle(history["symbol"], raw)
+            candle = to_candle(history["symbol"], raw)
             bars.setdefault(candle["time"], []).append(candle)
     if not bars:
         where = "Schwab returned" if client is not None else "the cache holds"

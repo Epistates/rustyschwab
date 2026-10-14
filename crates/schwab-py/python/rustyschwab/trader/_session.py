@@ -11,13 +11,21 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 from .. import performance
 from .._native import HistoryStore, PaperBroker
 from ..errors import SchwabError
 from ..schedule import MarketCalendar, Subscriptions, run_during_market_hours
-from ._backtest import ACCOUNT, RunResult, Simulation, book_event, quote_event
+from ._backtest import (
+    ACCOUNT,
+    RunResult,
+    Simulation,
+    book_event,
+    quote_event,
+    regular_hours,
+    to_candle,
+)
 from ._context import Candle, Context, Event, Mode, Strategy, log
 from ._engine import LiveVenue, PaperVenue, Runner, Venue, dec
 
@@ -145,9 +153,13 @@ class Session:
         limits: Mapping[str, Any] | None = None,
         poll_seconds: float = 5.0,
         max_candles: int | None = None,
+        warmup_days: float = 0,
+        history: Callable[[], Awaitable[HistoryStore]] | None = None,
     ) -> None:
         if mode == "live" and not account_hash:
             raise ValueError("live trading needs the account_hash of the account to trade")
+        if warmup_days < 0 or (warmup_days > 0 and history is None):
+            raise ValueError("warmup_days must be non-negative and needs a history cache")
         self.mode: Mode = mode
         self.strategy = strategy
         self.symbols = symbols
@@ -161,13 +173,47 @@ class Session:
         self.limits = limits
         self.poll_seconds = poll_seconds
         self.max_candles = max_candles
+        self.warmup_days = warmup_days
+        self.history = history
         self._stop = asyncio.Event()
+        self._started = 0
         self.tc: Context | None = None
         self.runner: Runner | None = None
 
     def stop(self) -> None:
         """Ask the session to finish after the message in hand."""
         self._stop.set()
+
+    def snapshot(self) -> RunResult:
+        """The session so far, for a report or a chart while it runs."""
+        if self.tc is None or self.runner is None:
+            raise RuntimeError("the session has not started")
+        return _result(
+            self.mode,
+            self.symbols,
+            self.tc,
+            self.runner,
+            self._started,
+            self.simulation,
+            self.state,
+        )
+
+    async def _warm_up(self, tc: Context) -> None:
+        """Fill ``tc.candles`` with the last ``warmup_days`` of minute bars,
+        without waking the strategy."""
+        assert self.history is not None
+        store = await self.history()
+        end = now_ms()
+        start = end - int(self.warmup_days * 86_400_000)
+        for symbol in self.symbols:
+            loaded = await store.load(self.client, symbol, start, end)
+            tc._ingest(
+                [
+                    to_candle(symbol, raw)
+                    for raw in loaded["candles"]
+                    if not self.simulation.regular_hours_only or regular_hours(int(raw["datetime"]))
+                ]
+            )
 
     async def run(self, *, until: datetime | None = None) -> RunResult:
         """Run until :meth:`stop`, ``until`` or cancellation."""
@@ -192,14 +238,16 @@ class Session:
             cash = Decimal(0)
         tc = Context(self.mode, self.symbols, cash, max_candles=self.max_candles)
         runner = Runner(self.strategy, tc, venue)
-        self.tc, self.runner = tc, runner
         tc.now = now_ms()
+        if self.warmup_days > 0:
+            await self._warm_up(tc)
         if isinstance(venue, LiveVenue):
             await venue.sync(tc, runner)
             tc.starting_cash = tc.equity()
+        self.tc, self.runner = tc, runner
         feed = _QuoteFeed(self.size_multiplier)
         calendar = MarketCalendar(self.client)
-        started = now_ms()
+        started = self._started = now_ms()
         stream = await self.client.open_stream(named_fields=True)
         background: list[asyncio.Task[None]] = []
         try:
@@ -304,7 +352,9 @@ class Session:
             wanted = current is not None
             if wanted != is_open:
                 session_id = moment.astimezone(calendar_zone()).strftime("%Y-%m-%d")
-                await broker.append_live({"kind": "session", "session_id": session_id, "open": wanted})
+                await broker.append_live(
+                    {"kind": "session", "session_id": session_id, "open": wanted}
+                )
                 log.info("paper session %s %s", session_id, "open" if wanted else "closed")
                 is_open = wanted
             await asyncio.sleep(15)

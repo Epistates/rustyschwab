@@ -207,6 +207,7 @@ class Trader:
         state: str | Path | None = None,
         limits: Mapping[str, Any] | None = None,
         max_candles: int | None = None,
+        warmup_days: float = 0,
     ) -> Session:
         """A session that trades live data on the paper venue: nothing is
         sent to Schwab. Level-one quotes always feed the venue (it fills
@@ -216,6 +217,9 @@ class Trader:
         ``size_multiplier`` scales the streamed bid and ask sizes into shares
         (Schwab documents them as shares; set 100 if your feed reports lots).
         ``state`` keeps the venue's state in that directory across runs.
+        ``warmup_days`` loads that much minute history into ``tc.candles``
+        before the first live bar, through the cache, without waking the
+        strategy.
         """
         return Session(
             "paper",
@@ -231,6 +235,8 @@ class Trader:
             state=None if state is None else Path(state),
             limits=limits,
             max_candles=max_candles,
+            warmup_days=warmup_days,
+            history=self.store,
         )
 
     def live(
@@ -244,6 +250,7 @@ class Trader:
         level2: bool = False,
         poll_seconds: float = 5.0,
         max_candles: int | None = None,
+        warmup_days: float = 0,
     ) -> Session:
         """A session that sends real orders to ``account_hash``.
 
@@ -251,7 +258,8 @@ class Trader:
         limits, halts and request budget apply, and an order whose outcome
         is unknown is reconciled rather than resent. Fills are read from the
         account's orders on every account-activity message and every
-        ``poll_seconds`` while orders are open. Start with small sizes.
+        ``poll_seconds`` while orders are open. ``warmup_days`` is as for
+        :meth:`paper`. Start with small sizes.
         """
         return Session(
             "live",
@@ -265,6 +273,8 @@ class Trader:
             level2=level2,
             poll_seconds=poll_seconds,
             max_candles=max_candles,
+            warmup_days=warmup_days,
+            history=self.store,
         )
 
     async def record(

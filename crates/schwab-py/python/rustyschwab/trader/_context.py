@@ -15,6 +15,7 @@ from typing import (
     Literal,
     Mapping,
     Protocol,
+    Sequence,
     TypedDict,
     Union,
 )
@@ -110,9 +111,7 @@ Event: TypeAlias = Union[Candle, Quote, Book, Fill]
 
 
 class StrategyFunction(Protocol):
-    def __call__(
-        self, tc: Context, events: list[Event], /
-    ) -> Awaitable[None] | None: ...
+    def __call__(self, tc: Context, events: list[Event], /) -> Awaitable[None] | None: ...
 
 
 #: A callable ``strategy(tc, events)``, plain or ``async``. An object may also
@@ -231,7 +230,11 @@ class Context:
     def sellable(self, symbol: str) -> Decimal:
         """Shares held less those committed to open sell orders."""
         committed = sum(
-            (o.remaining for o in self.orders.values() if o.symbol == symbol and o.is_open and not o.buys),
+            (
+                o.remaining
+                for o in self.orders.values()
+                if o.symbol == symbol and o.is_open and not o.buys
+            ),
             Decimal(0),
         )
         return max(self.positions.get(symbol, Decimal(0)) - committed, Decimal(0))
@@ -299,12 +302,17 @@ class Context:
         actions, self._actions = self._actions, []
         return actions
 
-    def _ingest(self, events: list[Event]) -> None:
+    def _ingest(self, events: Sequence[Event]) -> None:
         for event in events:
             symbol = event["symbol"]
             if event["type"] == "candle":
                 candles = self.candles.setdefault(symbol, [])
-                candles.append(event)
+                if candles and candles[-1]["time"] == event["time"]:
+                    # A bar seen again (warm-up history, then the stream)
+                    # replaces the earlier copy.
+                    candles[-1] = event
+                else:
+                    candles.append(event)
                 if self._max_candles is not None and len(candles) > self._max_candles:
                     del candles[: len(candles) - self._max_candles]
                 self._marks[symbol] = Decimal(str(event["close"]))

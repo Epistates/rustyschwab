@@ -71,7 +71,9 @@ class BuyThenSell:
             tc.order(orders.equity_sell_market("ABC", tc.sellable("ABC"), tag="exit"))
 
 
-async def test_a_backtest_fills_on_the_next_bar_and_reports(store: HistoryStore, tmp_path: Path) -> None:
+async def test_a_backtest_fills_on_the_next_bar_and_reports(
+    store: HistoryStore, tmp_path: Path
+) -> None:
     strategy = BuyThenSell()
     run = await Trader(cache=store).backtest(strategy, ["ABC"], cash=1_000, **window())
 
@@ -124,7 +126,9 @@ async def test_costs_follow_the_simulation(store: HistoryStore) -> None:
 
 
 async def test_notional_and_sell_fees(store: HistoryStore) -> None:
-    simulation = Simulation(fee_bps="10", sell_fee_bps="0.5", sell_fee_per_share="0.001", sell_fee_cap="0.005")
+    simulation = Simulation(
+        fee_bps="10", sell_fee_bps="0.5", sell_fee_per_share="0.001", sell_fee_cap="0.005"
+    )
     run = await Trader(cache=store).backtest(
         BuyThenSell(), "ABC", cash=1_000, simulation=simulation, **window()
     )

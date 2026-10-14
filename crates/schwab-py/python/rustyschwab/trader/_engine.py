@@ -314,9 +314,13 @@ def apply_account(tc: Context, account: Mapping[str, Any]) -> None:
     securities = account.get("securitiesAccount") or account
     balances = securities.get("currentBalances") or {}
     margin = securities.get("type") == "MARGIN"
-    names = ("availableFunds", "cashAvailableForTrading") if margin else (
-        "cashAvailableForTrading",
-        "availableFunds",
+    names = (
+        ("availableFunds", "cashAvailableForTrading")
+        if margin
+        else (
+            "cashAvailableForTrading",
+            "availableFunds",
+        )
     )
     for name in names:
         if balances.get(name) is not None:

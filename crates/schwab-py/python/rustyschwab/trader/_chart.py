@@ -51,7 +51,9 @@ class _Panel:
     def y(self, value: float) -> float:
         return _HEIGHT - _PAD - (value - self.low) / (self.high - self.low) * (_HEIGHT - 2 * _PAD)
 
-    def line(self, points: Sequence[tuple[int, float]], color: str, *, dashed: bool = False) -> None:
+    def line(
+        self, points: Sequence[tuple[int, float]], color: str, *, dashed: bool = False
+    ) -> None:
         path = " ".join(f"{self.x(t):.1f},{self.y(v):.1f}" for t, v in _thin(points))
         dash = ' stroke-dasharray="5 4"' if dashed else ""
         self.parts.append(
@@ -97,6 +99,7 @@ def render(
     plots: Mapping[str, Sequence[tuple[int, float]]],
     equity: Sequence[tuple[int, Decimal]],
     summary: str,
+    refresh_seconds: int | None = None,
 ) -> str:
     """The page: one price chart per symbol, then the equity curve."""
     sections = []
@@ -130,14 +133,19 @@ def render(
                 buy,
                 f"{fill['side']} {fill['quantity']} @ {fill['price']} ({_label(fill['time'])})",
             )
-        sections.append(f"<section>{panel.svg(symbol)}<div class=l>{' '.join(legend)}</div></section>")
+        sections.append(
+            f"<section>{panel.svg(symbol)}<div class=l>{' '.join(legend)}</div></section>"
+        )
     if equity:
         curve = [(at, float(value)) for at, value in equity]
         panel = _Panel([at for at, _ in curve], [value for _, value in curve])
         panel.line(curve, "#1f6fd6")
         sections.append(f"<section>{panel.svg('Equity')}</section>")
+    refresh = (
+        f'<meta http-equiv="refresh" content="{int(refresh_seconds)}">' if refresh_seconds else ""
+    )
     return (
-        "<!doctype html><html><head><meta charset=utf-8>"
+        f"<!doctype html><html><head><meta charset=utf-8>{refresh}"
         f"<title>{html.escape(title)}</title><style>"
         "body{font:14px system-ui,sans-serif;margin:24px;color:#222;background:#fff}"
         "svg{width:100%;height:auto;max-width:1100px;display:block}"

@@ -15,7 +15,7 @@ from test_stream import Streamer, advertise, streamer  # noqa: F401  (fixture)
 
 import rustyschwab
 from rustyschwab import HistoryStore, orders
-from rustyschwab.trader import Context, Event, Trader
+from rustyschwab.trader import Context, Event, Simulation, Trader
 
 ACCOUNT_PATH = f"/trader/v1/accounts/{ACCOUNT_HASH}"
 
@@ -52,7 +52,8 @@ def quote(bid: float, ask: float, size: int = 500) -> dict[str, Any]:
     return {
         "data": [
             {
-                "service": "LEVELONE_EQUITIES", "command": "SUBS",
+                "service": "LEVELONE_EQUITIES",
+                "command": "SUBS",
                 "timestamp": now_ms(),
                 "content": [
                     {"key": "AAPL", "1": bid, "2": ask, "4": size, "5": size, "34": now_ms()}
@@ -67,7 +68,8 @@ def candle(close: float) -> dict[str, Any]:
     return {
         "data": [
             {
-                "service": "CHART_EQUITY", "command": "SUBS",
+                "service": "CHART_EQUITY",
+                "command": "SUBS",
                 "timestamp": now_ms(),
                 "content": [
                     {
@@ -111,13 +113,35 @@ async def test_a_paper_session_fills_against_streamed_quotes(
 ) -> None:
     advertise(server, streamer.url)
     server.on("GET", "/marketdata/v1/markets", hours_around_now())
+    hour = now_ms() // 60_000 * 60_000 - 3_600_000
+    warm = [
+        {
+            "datetime": hour - i * 60_000,
+            "open": 189.0,
+            "high": 189.2,
+            "low": 188.9,
+            "close": 189.1,
+            "volume": 100,
+        }
+        for i in (2, 1, 0)
+    ]
+    server.on(
+        "GET", "/marketdata/v1/pricehistory", {"symbol": "AAPL", "empty": False, "candles": warm}
+    )
     strategy = BuyOnFirstCandle()
     session = Trader(client, cache=tmp_path / "history.sqlite3").paper(
-        strategy, ["AAPL"], cash=10_000
+        strategy,
+        ["AAPL"],
+        cash=10_000,
+        warmup_days=1,
+        simulation=Simulation(regular_hours_only=False),
     )
     task = asyncio.create_task(session.run())
     await until(lambda: len(streamer.sent("ADD")) + len(streamer.sent("SUBS")) >= 2)
     await asyncio.sleep(0.3)  # the venue's session opens from the calendar
+    # The warm-up bars are history, not events: the strategy has not run.
+    assert session.tc is not None and len(session.tc.candles["AAPL"]) == 3
+    assert strategy.events == []
 
     await streamer.push(quote(189.50, 189.52))
     await streamer.push(candle(189.51))
@@ -125,9 +149,12 @@ async def test_a_paper_session_fills_against_streamed_quotes(
     await asyncio.sleep(0.35)  # past the venue's execution latency
     await streamer.push(quote(189.54, 189.56))
     await until(lambda: session.tc is not None and session.tc.orders["buy"].status == "FILLED")
+    page = session.snapshot().to_html(tmp_path / "live.html", refresh_seconds=5).read_text()
+    assert 'http-equiv="refresh" content="5"' in page
 
     session.stop()
     result = await asyncio.wait_for(task, 10)
+    assert len(result.candles["AAPL"]) == 4
     assert result.mode == "paper"
     (fill,) = result.fills
     assert fill["quantity"] == 5 and str(fill["price"]) == "189.56"
