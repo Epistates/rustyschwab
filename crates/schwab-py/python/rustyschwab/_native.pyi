@@ -2,8 +2,9 @@
 
 import os
 from datetime import date
+from decimal import Decimal
 from types import TracebackType
-from typing import Any, Mapping, Sequence, TypedDict
+from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 from typing_extensions import Self
 
@@ -20,6 +21,14 @@ class Submitted(TypedDict):
     location: str | None
     attempt_id: str | None
     tag: str
+
+class OptionParts(TypedDict):
+    """An OSI option symbol taken apart by ``parse_option_symbol``."""
+
+    underlying: str
+    expiration: str
+    put_call: Literal["CALL", "PUT"]
+    strike: str
 
 class RequestBudget(TypedDict):
     perMinute: int
@@ -186,3 +195,21 @@ class PaperBroker:
     def begin_drain(self) -> None: ...
 
 def stream_fields(service: str) -> list[JsonObject]: ...
+def build_order(spec: Mapping[str, Any]) -> JsonObject: ...
+def validate_order(order: Mapping[str, Any]) -> None: ...
+def oco_order(first: Mapping[str, Any], second: Mapping[str, Any]) -> JsonObject: ...
+def trigger_order(
+    entry: Mapping[str, Any], children: Sequence[Mapping[str, Any]]
+) -> JsonObject: ...
+def bracket_order(
+    entry: Mapping[str, Any],
+    take_profit: str | int | float | Decimal,
+    stop_loss: str | int | float | Decimal,
+) -> JsonObject: ...
+def option_symbol(
+    underlying: str,
+    expiration: date | str,
+    put_call: Literal["CALL", "PUT"],
+    strike: str | int | float | Decimal,
+) -> str: ...
+def parse_option_symbol(symbol: str) -> OptionParts: ...

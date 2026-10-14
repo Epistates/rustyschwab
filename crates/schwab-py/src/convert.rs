@@ -40,7 +40,7 @@ fn class<'py>(
         .map(|class| class.bind(py))
 }
 
-fn is_instance(
+pub(crate) fn is_instance(
     cell: &'static PyOnceLock<Py<PyAny>>,
     obj: &Bound<'_, PyAny>,
     module: &str,

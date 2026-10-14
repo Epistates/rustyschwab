@@ -1,8 +1,8 @@
 //! Python bindings for the Schwab SDK, published as `rustyschwab`.
 //!
 //! This is the native half. The package in `python/rustyschwab` re-exports it
-//! next to the exception classes (`errors.py`) and the paper event builders
-//! (`paper.py`), which are plain Python.
+//! next to the exception classes (`errors.py`), the paper event builders
+//! (`paper.py`) and the order templates (`orders.py`), which are plain Python.
 //!
 //! The design in three rules:
 //!
@@ -18,6 +18,7 @@ mod client;
 mod config;
 mod convert;
 mod errors;
+mod orders;
 mod paper;
 mod runtime;
 mod stream;
@@ -35,5 +36,12 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<stream::Stream>()?;
     module.add_class::<paper::PyPaperBroker>()?;
     module.add_function(wrap_pyfunction!(stream::stream_fields, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::build_order, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::validate_order, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::oco_order, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::trigger_order, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::bracket_order, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::option_symbol, module)?)?;
+    module.add_function(wrap_pyfunction!(orders::parse_option_symbol, module)?)?;
     Ok(())
 }

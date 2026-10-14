@@ -16,18 +16,23 @@ plain ``dict`` and ``list`` values.
 
     asyncio.run(main())
 
-See the package documentation for authorization, orders, streaming and
-backtesting with :class:`PaperBroker`.
+Orders are built with the templates in :mod:`rustyschwab.orders`, which run on
+the SDK's own order builder. See the package documentation for authorization,
+orders, streaming and backtesting with :class:`PaperBroker`.
 """
 
-from . import errors, paper
+from . import errors, orders, paper
 from ._native import (
     Client,
     PaperBroker,
     Stream,
     __sdk_version__,
     __version__,
+    build_order,
+    option_symbol,
+    parse_option_symbol,
     stream_fields,
+    validate_order,
 )
 from .errors import (
     ApiError,
@@ -104,7 +109,12 @@ __all__ = [
     "WebSocketError",
     "__sdk_version__",
     "__version__",
+    "build_order",
     "errors",
+    "option_symbol",
+    "orders",
     "paper",
+    "parse_option_symbol",
     "stream_fields",
+    "validate_order",
 ]
