@@ -8,6 +8,8 @@ from typing import Any, Literal, Mapping, Sequence, TypedDict
 
 from typing_extensions import Self
 
+from .performance import PerformanceReport
+
 __version__: str
 __sdk_version__: str
 
@@ -213,3 +215,16 @@ def option_symbol(
     strike: str | int | float | Decimal,
 ) -> str: ...
 def parse_option_symbol(symbol: str) -> OptionParts: ...
+
+# The report's TypedDicts are defined once, in rustyschwab.performance, which
+# also wraps this function for Decimal amounts.
+def analyze_performance(
+    fills: Sequence[Mapping[str, Any]],
+    equity: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    starting_equity: Any,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = 252,
+    benchmark: Mapping[str, tuple[Any, Any]] | None = None,
+    marks: Mapping[str, Any] | None = None,
+) -> PerformanceReport: ...

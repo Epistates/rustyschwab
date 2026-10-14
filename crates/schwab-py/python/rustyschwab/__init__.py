@@ -21,7 +21,7 @@ the SDK's own order builder. See the package documentation for authorization,
 orders, streaming and backtesting with :class:`PaperBroker`.
 """
 
-from . import errors, orders, paper
+from . import errors, orders, paper, performance
 from ._native import (
     Client,
     PaperBroker,
@@ -115,6 +115,7 @@ __all__ = [
     "orders",
     "paper",
     "parse_option_symbol",
+    "performance",
     "stream_fields",
     "validate_order",
 ]

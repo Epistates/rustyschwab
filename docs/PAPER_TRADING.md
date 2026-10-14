@@ -139,6 +139,19 @@ schwab-paper --config paper-replay.json --state ./backtest/state.sqlite3 \
 
 `--pace-ms` waits that long between commands, so virtual time advances one mark per second while the model trades through the server against the same venue. The event and command transcripts, the histories and the three model parameters together reproduce the run.
 
+## Performance reports
+
+`schwab_rs::performance::analyze(&fills, &equity, &options)` turns a run's fills, and optionally its mark-to-market equity curve, into a `PerformanceReport`. It is a pure function over decimals: no I/O, no clock, so the same inputs give the same report. A paper venue fill (`PaperFill`) lacks the symbol and side of its order; `performance::Fill` adds them, and accepts a paper fill's `order_id` and `event_sequence` as they are. The Python binding is `rustyschwab.performance` ([PYTHON.md](PYTHON.md#performance-reports)).
+
+Accounting rules, all fixed by the module:
+
+- Fills match first in first out at the share level, long and short; a fill that crosses through flat closes the old position and opens the new one. Each match of one entry lot against one closing fill is a round trip, so partial fills, scale-ins and scale-outs count separately.
+- A fill's fee is spread over the quantities it opens and closes in proportion to quantity, the last piece taking the exact remainder. A round trip carries its entry and exit portions; a round trip wins when its P&L after fees is positive. The `multiplier` (100 for options) scales P&L.
+- Open lots are valued at `options.marks` or, for a symbol without one, its last fill price. That is an assumption; pass marks for a real valuation.
+- Sharpe, Sortino, volatility and Calmar use the curve's last value per New York trading date, annualized by `periods_per_year` (default 252), and are `None` with fewer than two daily returns or no deviation. Drawdown uses the full-resolution curve, seeded at `starting_equity`. With no curve supplied, one is built from the fills and the report says so in `equity_source`.
+
+A paper run's own curve is `PaperSnapshot::equity` after each event, which is `None` while any position lacks a fresh quote; skip those points. For a run that ends flat, the report's `realized_pnl_net` equals the ledger's `realized_pnl`; `tests/test_performance.py` checks this.
+
 ## Authenticated gateway
 
 ```sh

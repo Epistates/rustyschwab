@@ -2,7 +2,8 @@
 //!
 //! This is the native half. The package in `python/rustyschwab` re-exports it
 //! next to the exception classes (`errors.py`), the paper event builders
-//! (`paper.py`) and the order templates (`orders.py`), which are plain Python.
+//! (`paper.py`), the order templates (`orders.py`) and the performance report
+//! helpers (`performance.py`), which are plain Python.
 //!
 //! The design in three rules:
 //!
@@ -21,6 +22,7 @@ mod errors;
 mod history;
 mod orders;
 mod paper;
+mod performance;
 mod runtime;
 mod stream;
 mod submission;
@@ -46,5 +48,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(orders::bracket_order, module)?)?;
     module.add_function(wrap_pyfunction!(orders::option_symbol, module)?)?;
     module.add_function(wrap_pyfunction!(orders::parse_option_symbol, module)?)?;
+    module.add_function(wrap_pyfunction!(performance::analyze_performance, module)?)?;
     Ok(())
 }

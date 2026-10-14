@@ -331,6 +331,44 @@ Things to know:
 
 A venue configured with `"clock": "wall"` runs on the system clock instead: `broker.append_live({"kind": "quote", ...})` takes live market input and assigns its own sequence and time. That is how to paper trade against live quotes from `client.open_stream()` or `client.quotes()`.
 
+### Performance reports
+
+`rustyschwab.performance` reports on a run: net return, maximum drawdown and its duration, Sharpe, Sortino and Calmar ratios, and trade statistics (win rate, profit factor, expectancy, holding time) for the whole run and for each symbol. The arithmetic runs in the SDK (`schwab_rs::performance`), in decimals, and takes no I/O.
+
+Closed trades are matched first in first out at the share level, long and short. A sell with nothing long to close opens a short, a fill that crosses through flat closes one position and opens the other, and each match of an entry lot against a closing fill is its own round trip, so partial fills, scale-ins and scale-outs are counted separately. A fill's fee is spread over the quantities it covers. Open lots are valued at `marks` (a symbol to price mapping) or, without one, at the symbol's last fill price.
+
+```python
+from rustyschwab import performance
+
+fills = [  # a paper fill plus its order's symbol and side; see performance.paper_fills
+    {"symbol": "ABC", "side": "BUY", "quantity": "5", "price": "10.61", "fee": "0.05", "at_ms": 180_000},
+    {"symbol": "ABC", "side": "SELL", "quantity": "5", "price": "10.29", "fee": "0.05", "at_ms": 240_000},
+]
+report = performance.analyze(fills, starting_equity="1000")
+print(performance.format_report(report))
+```
+
+`analyze(fills, equity=None, *, starting_equity, risk_free_rate=0.0, periods_per_year=252, benchmark=None, marks=None)` takes:
+
+- `fills`: dicts of `symbol`, `side`, `quantity`, `price`, `at_ms` and optionally `fee` (for the whole fill, default 0) and `multiplier` (100 for options, default 1), in time order. `side` is `BUY` or `SELL` or any Schwab instruction (`SELL_SHORT`, `BUY_TO_COVER`, `SELL_TO_CLOSE`, ...).
+- `equity`: your mark-to-market curve as `{"at_ms", "equity"}` points in time order, for example `snapshot["equity"]` after each bar. Without one, the curve is built from the fills (realized P&L less fees, one point per fill) and `report["equity_source"]` says `"fills"`.
+- `benchmark`: a symbol to `(first_price, last_price)` mapping, for an equal-weight buy-and-hold return and `excess_return`.
+
+Amounts may be `str`, `int`, `float` or `Decimal`. The report is a plain `dict` (a `PerformanceReport` `TypedDict`): money is a decimal string, as everywhere else in this package, and ratios and fractions are floats. Ratios are computed on the curve's last value for each New York trading date and annualized by `periods_per_year`; they are `None` with fewer than two trading days or no variation. Drawdown uses the full-resolution curve. Out-of-order fills or points, a non-positive quantity or price, or a negative fee raise `InvalidParameter`.
+
+A paper venue fill has no symbol or side. `performance.paper_fills(order, fills)` adds them from the order record, and a run's fills combine in time order:
+
+```python
+fills = []
+for order_id in order_ids:
+    order = await broker.order("paper", order_id)
+    fills += performance.paper_fills(order, await broker.fills("paper", order_id))
+fills.sort(key=lambda fill: fill["at_ms"])
+report = performance.analyze(fills, starting_equity="1000")
+```
+
+`tests/test_performance.py` runs this on the backtest above and checks the report against the venue's ledger.
+
 ## NautilusTrader
 
 `rustyschwab.nautilus` connects [NautilusTrader](https://nautilustrader.io/) to Schwab: instruments, quote and trade ticks, historical bars, order execution, reports, reconciliation and account state, for US equities and equity options. Orders go through the same execution journal as everything else in this package, so an order of unknown outcome is never sent twice. The execution client can also run against the offline [paper venue](#paper-trading-and-backtests), which needs no Schwab account.
