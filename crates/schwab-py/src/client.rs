@@ -25,7 +25,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 #[derive(Debug)]
-struct Shared {
+pub(crate) struct Shared {
     sdk: SchwabClient,
     streaming: Option<StreamConfig>,
     initialized: tokio::sync::OnceCell<()>,
@@ -34,7 +34,7 @@ struct Shared {
 impl Shared {
     /// The SDK client, once its token store is loaded. Every call starts
     /// here, so `Client` works without an explicit `init()`.
-    async fn ready(&self) -> Result<&SchwabClient, Failure> {
+    pub(crate) async fn ready(&self) -> Result<&SchwabClient, Failure> {
         self.initialized.get_or_try_init(|| self.sdk.init()).await?;
         Ok(&self.sdk)
     }
@@ -78,6 +78,12 @@ impl Client {
         T: for<'a> IntoPyObject<'a> + Send + 'static,
     {
         awaitable(py, work(self.shared.clone()))
+    }
+
+    /// The SDK client behind this one, for other native classes that read
+    /// through it.
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 }
 

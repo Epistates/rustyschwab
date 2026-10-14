@@ -18,6 +18,7 @@ mod client;
 mod config;
 mod convert;
 mod errors;
+mod history;
 mod orders;
 mod paper;
 mod runtime;
@@ -35,6 +36,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<client::Client>()?;
     module.add_class::<stream::Stream>()?;
     module.add_class::<paper::PyPaperBroker>()?;
+    module.add_class::<history::PyHistoryStore>()?;
+    module.add_function(wrap_pyfunction!(history::synthesize_quotes, module)?)?;
     module.add_function(wrap_pyfunction!(stream::stream_fields, module)?)?;
     module.add_function(wrap_pyfunction!(orders::build_order, module)?)?;
     module.add_function(wrap_pyfunction!(orders::validate_order, module)?)?;

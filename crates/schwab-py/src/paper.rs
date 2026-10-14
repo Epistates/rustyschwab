@@ -84,6 +84,22 @@ impl PyPaperBroker {
         awaitable(py, async move { Ok(Json(broker.apply(event?).await?)) })
     }
 
+    /// Apply a list of consecutive events in one transaction, all of them or
+    /// none, and return their results in order. A backtest applies a bar's
+    /// quotes this way. At most 10,000 events.
+    fn apply_batch<'py>(
+        &self,
+        py: Python<'py>,
+        events: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let events = from_py::<Vec<PaperEvent>>(events, "paper events");
+        let broker = self.broker.clone();
+        awaitable(
+            py,
+            async move { Ok(Json(broker.apply_batch(events?).await?)) },
+        )
+    }
+
     /// Apply a live market input (`{"kind": "quote", ...}`) on a venue with a
     /// wall clock, which assigns its sequence and time.
     fn append_live<'py>(
