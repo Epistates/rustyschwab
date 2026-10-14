@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — MCP `get_performance`
+
+- **`get_performance`**: an agent's track record from the account's own
+  fills in a window (default 30 days; live order history reaches 59 days
+  back): FIFO round trips long and short, realized and unrealized P&L
+  with open lots marked from quotes, win rate, profit factor, drawdown
+  and per-symbol tables, computed by the SDK rather than by the model.
+  Options use the principal's verified multipliers. Warnings name
+  positions the window's fills do not explain. Works in paper mode, where
+  execution legs carry the venue's fee. Read-only, account-scoped, granted
+  by name like every tool (40 tools).
+
 ### Added — strategies in backtest, paper and live
 
 - **`rustyschwab.trader`** runs one strategy, a callable
