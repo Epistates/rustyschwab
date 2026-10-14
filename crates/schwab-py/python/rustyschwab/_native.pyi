@@ -173,6 +173,9 @@ class PaperBroker:
     @property
     def config(self) -> JsonObject: ...
     async def apply(self, event: Mapping[str, Any]) -> JsonObject: ...
+    async def apply_batch(
+        self, events: Sequence[Mapping[str, Any]]
+    ) -> list[JsonObject]: ...
     async def append_live(self, kind: Mapping[str, Any]) -> JsonObject: ...
     async def place_order(
         self, account: str, order: Mapping[str, Any]
@@ -196,6 +199,63 @@ class PaperBroker:
     async def verify(self) -> JsonObject: ...
     def begin_drain(self) -> None: ...
 
+class HistoryStore:
+    @staticmethod
+    async def open(path: str | os.PathLike[str]) -> HistoryStore: ...
+    @property
+    def path(self) -> str: ...
+    async def load(
+        self,
+        client: Client,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        frequency_type: str = "minute",
+        frequency: int = 1,
+        extended_hours: bool = False,
+    ) -> JsonObject: ...
+    async def candles(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        frequency_type: str = "minute",
+        frequency: int = 1,
+        extended_hours: bool = False,
+    ) -> list[JsonObject]: ...
+    async def missing(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        frequency_type: str = "minute",
+        frequency: int = 1,
+        extended_hours: bool = False,
+    ) -> list[tuple[int, int]]: ...
+    async def put_candles(
+        self,
+        symbol: str,
+        candles: Sequence[Mapping[str, Any]],
+        *,
+        frequency_type: str = "minute",
+        frequency: int = 1,
+        extended_hours: bool = False,
+        complete: tuple[int, int] | None = None,
+    ) -> None: ...
+    async def record(self, entries: Sequence[Mapping[str, Any]]) -> None: ...
+    async def recorded(
+        self, kind: str, symbols: Sequence[str], start_ms: int, end_ms: int
+    ) -> list[JsonObject]: ...
+
+def synthesize_quotes(
+    histories: Sequence[Mapping[str, Any]],
+    model: Mapping[str, Any],
+    *,
+    first_sequence: int = 1,
+) -> list[JsonObject]: ...
 def stream_fields(service: str) -> list[JsonObject]: ...
 def build_order(spec: Mapping[str, Any]) -> JsonObject: ...
 def validate_order(order: Mapping[str, Any]) -> None: ...

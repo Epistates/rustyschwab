@@ -23,9 +23,10 @@ asyncio uses the blocking :mod:`rustyschwab.sync`; :mod:`rustyschwab.schedule`
 opens the stream for the market's real sessions.
 """
 
-from . import auth, errors, orders, paper, performance, schedule, streaming, sync
+from . import auth, errors, orders, paper, performance, schedule, streaming, sync, trader
 from ._native import (
     Client,
+    HistoryStore,
     PaperBroker,
     Stream,
     __sdk_version__,
@@ -34,6 +35,7 @@ from ._native import (
     option_symbol,
     parse_option_symbol,
     stream_fields,
+    synthesize_quotes,
     validate_order,
 )
 from .errors import (
@@ -84,6 +86,7 @@ __all__ = [
     "ConnectionClosed",
     "DuplicateRequest",
     "Halted",
+    "HistoryStore",
     "HttpError",
     "InvalidParameter",
     "InvalidUrl",
@@ -123,5 +126,7 @@ __all__ = [
     "stream_fields",
     "streaming",
     "sync",
+    "synthesize_quotes",
+    "trader",
     "validate_order",
 ]
