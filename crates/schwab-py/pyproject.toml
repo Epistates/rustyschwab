@@ -31,8 +31,14 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
     "Typing :: Typed",
 ]
+# The scheduler's time zones come from the standard library's zoneinfo, which
+# has no time zone database on Windows.
+dependencies = ["tzdata; sys_platform == 'win32'"]
 # The version comes from Cargo.toml.
 dynamic = ["version"]
+
+[project.scripts]
+rustyschwab = "rustyschwab.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/epistates/rustyschwab"
