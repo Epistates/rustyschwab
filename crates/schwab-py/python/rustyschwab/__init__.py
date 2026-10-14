@@ -18,11 +18,12 @@ plain ``dict`` and ``list`` values.
 
 Orders are built with the templates in :mod:`rustyschwab.orders`, which run on
 the SDK's own order builder. See the package documentation for authorization,
-orders, streaming and backtesting with :class:`PaperBroker`.
-:mod:`rustyschwab.schedule` opens the stream for the market's real sessions.
+orders, streaming and backtesting with :class:`PaperBroker`. Code without
+asyncio uses the blocking :mod:`rustyschwab.sync`; :mod:`rustyschwab.schedule`
+opens the stream for the market's real sessions.
 """
 
-from . import errors, orders, paper, performance, schedule, streaming
+from . import auth, errors, orders, paper, performance, schedule, streaming, sync
 from ._native import (
     Client,
     PaperBroker,
@@ -110,6 +111,7 @@ __all__ = [
     "WebSocketError",
     "__sdk_version__",
     "__version__",
+    "auth",
     "build_order",
     "errors",
     "option_symbol",
@@ -120,5 +122,6 @@ __all__ = [
     "schedule",
     "stream_fields",
     "streaming",
+    "sync",
     "validate_order",
 ]
