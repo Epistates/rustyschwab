@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — strategies in backtest, paper and live
+
+- **`rustyschwab.trader`** runs one strategy, a callable
+  `strategy(tc, events)`, in three modes. `Trader.backtest` replays cached
+  minute bars through the paper venue under the `candle-bbo-v1` quote
+  model, so fills have latency, finite liquidity, slippage, fees and
+  settlement, and an order fills no earlier than the next bar.
+  `Trader.paper` trades streamed quotes on a wall-clock venue whose session
+  follows Schwab's market calendar. `Trader.live` sends real orders through
+  the journaled path and reads fills from account activity and polling.
+  `Trader.record` writes candles, quotes and books to the cache for later
+  backtests. Sessions take `warmup_days` and `snapshot()`.
+- **`RunResult`**: the performance report, fills, orders with their
+  outcomes, the equity curve, plots, `report()`, and `to_html()`, a
+  self-contained chart page (no scripts) that can reload itself.
+- **`Simulation`** sets the market model and costs: spread, bar volume on
+  offer, slippage, per-share and notional fees, sell-only fees, latencies.
+- A 30-session, three-symbol, one-minute backtest (140,000 audited venue
+  events) runs in about 15 seconds.
+
+### Added — price history cache, performance analytics, fees
+
+- **`schwab_rs::history::HistoryStore`** (Python `HistoryStore`): a SQLite
+  cache of price history that records which spans it holds, fetches only
+  the gaps in bounded chunks and marks a span complete only before the
+  current New York date. It also stores recorded stream payloads, since
+  Schwab has no quote or book history.
+- **`schwab_rs::performance::analyze`** (Python `rustyschwab.performance`):
+  FIFO round trips at share level, long and short, with fees prorated;
+  return, drawdown and its duration, volatility, Sharpe, Sortino, Calmar,
+  win rate, profit factor, expectancy, holding time, per-symbol tables and
+  a buy-and-hold benchmark. `format_report` prints it.
+- **`PaperBroker::apply_batch`**: consecutive events in one transaction,
+  all or none, with the same per-event record, audit and capture.
+- **Paper fees**: `fee_bps` (notional, every fill), and `sell_fee_bps` and
+  `sell_fee_per_share` with `sell_fee_per_share_cap` (sells only), for
+  commissions and regulatory fees. They default to zero and are left out
+  of stored configs, so existing venues reopen unchanged.
+- **`synthesize_quotes`** exposes the candle-to-quote model to Python.
+- `Candle::new` and `PriceHistoryResponse::new`, as both types are
+  non-exhaustive.
+
+### Added — Python: order templates, blocking client, scheduling, CLI
+
+- **`rustyschwab.orders`**: templates for equities (market, limit, stop,
+  stop-limit, trailing stop; buy, sell, short, cover), single options,
+  verticals, straddles, strangles, iron condors, calendars, OCO, trigger
+  and bracket orders, all built and validated by the SDK's order builder.
+  `build_order` takes the SDK's JSON order spec; `validate_order` checks a
+  hand-written order offline; `option_symbol` and `parse_option_symbol`.
+- **`rustyschwab.sync`**: a blocking twin of every `Client` method (a test
+  fails if one is missing), and a blocking `Stream` with iteration,
+  `recv(timeout)` and `start(receiver)` on a thread. Optional
+  `call_on_auth` reauthorizes and retries reads.
+- **`rustyschwab.schedule`**: streams during the market's real sessions
+  from Schwab's calendar, so holidays and early closes are honored; a
+  fixed-time mode as well. `rustyschwab.streaming.dispatch` feeds sync or
+  async receivers.
+- **`rustyschwab` command line**: `login` (browser, pasted redirect, no
+  secrets printed) and `fields SERVICE`.
+- **`rustyschwab.auth`**: the terminal prompt and authorization helpers.
+- **NautilusTrader**: `load_bars` reads Schwab history through the cache as
+  Nautilus bars for `BacktestEngine`, stamped as the live client stamps
+  them; `write_catalog` writes them to a `ParquetDataCatalog`.
+- **[Coming from Schwabdev](docs/MIGRATING_FROM_SCHWABDEV.md)**: every
+  Schwabdev call and its equivalent.
+
 ### Added — a NautilusTrader adapter
 
 - **`rustyschwab.nautilus`** for NautilusTrader 1.231 (`pip install

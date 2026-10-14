@@ -491,6 +491,8 @@ session = trader.live(strategy, ["AMD"], account_hash=ACCOUNT_HASH)   # real ord
 
 `live` sends orders to the account through the journaled order path: the client's risk limits, halts and request budget apply, and an order whose outcome is unknown is reconciled by its tag, never resent. It subscribes to account activity and reads the open orders on each message and every `poll_seconds`. Start with small sizes.
 
+`warmup_days=` loads that much minute history into `tc.candles` before the first live bar, through the cache and without waking the strategy, so indicators start warm. `session.snapshot()` returns a `RunResult` for the session so far, and `snapshot().to_html(path, refresh_seconds=5)` writes a page that reloads itself, to follow a session in a browser.
+
 Both stop on `session.stop()`, `run(until=datetime)` or cancellation, then run `on_stop` and return a `RunResult`. Schwab allows one streaming session per login, so do not open another stream (or the NautilusTrader data client) on the same login at the same time.
 
 ### Recording quotes and books

@@ -14,12 +14,17 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
 - **[Placing Orders](https://github.com/epistates/rustyschwab/blob/main/docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
 - **[Real-time Streaming](https://github.com/epistates/rustyschwab/blob/main/docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
 - **[Troubleshooting](https://github.com/epistates/rustyschwab/blob/main/docs/TROUBLESHOOTING.md)**: Common issues and solutions.
-- **[Python bindings](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md)**: `pip install rustyschwab`, an asyncio-native client with streaming and the paper venue.
+- **[Python bindings](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md)**: `pip install rustyschwab`, asyncio and blocking clients, order templates, streaming, one strategy for backtest, paper and live, performance reports and a NautilusTrader adapter.
+- **[Coming from Schwabdev](https://github.com/epistates/rustyschwab/blob/main/docs/MIGRATING_FROM_SCHWABDEV.md)**: every Schwabdev call and its equivalent.
 - **[Architecture Overview](https://github.com/epistates/rustyschwab/blob/main/docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md)**: For contributors.
 
 ## Features
 
-- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency, authenticated gateway support and backtesting over price history under a declared synthetic-quote model. Start with `ops/paper/replay.jsonl`.
+- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency, per-share, notional and sell-only regulatory fees, authenticated gateway support and backtesting over price history under a declared synthetic-quote model. Start with `ops/paper/replay.jsonl`.
+
+- **Backtesting and analytics** — `history::HistoryStore` caches price history and recorded quotes and books in SQLite, fetching only the spans it lacks; `performance::analyze` reports return, drawdown, Sharpe, Sortino, Calmar and FIFO round-trip statistics, long and short. In Python, [`rustyschwab.trader`](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md#strategies-backtest-paper-and-live) runs one strategy as a backtest, on live data against the paper venue, or live.
+
+- **[MCP server for LLM agents](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md)** — `schwab-mcp` exposes market data, accounts and trading to MCP clients under per-principal policy: symbol lists, price collars, daily budgets, defined-risk option spreads, human or client approval, a dead-man switch, a tamper-evident audit log and a paper mode.
 
 - **OAuth2 Authentication**
   - Authorization code flow with built-in callback server
