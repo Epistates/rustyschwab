@@ -8,7 +8,7 @@
 //!
 //! Applications that export traces install their own subscriber instead;
 //! these helpers then leave it in place. With the `otel` feature,
-//! [`init_otel`] is that subscriber for OTLP: it exports spans to whatever
+//! `init_otel` is that subscriber for OTLP: it exports spans to whatever
 //! the standard `OTEL_EXPORTER_OTLP_*` environment names, and behaves like
 //! the helpers below when it names nothing.
 //!
