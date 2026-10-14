@@ -233,6 +233,35 @@ pub struct Candle {
     pub extra: HashMap<String, serde_json::Value>,
 }
 
+impl Candle {
+    /// A candle opening at `datetime` (epoch milliseconds).
+    pub fn new(datetime: i64, open: f64, high: f64, low: f64, close: f64, volume: i64) -> Self {
+        Self {
+            open,
+            high,
+            low,
+            close,
+            volume,
+            datetime,
+            extra: HashMap::new(),
+        }
+    }
+}
+
+impl PriceHistoryResponse {
+    /// A history of `candles` for `symbol`, without a previous close.
+    pub fn new(symbol: impl Into<String>, candles: Vec<Candle>) -> Self {
+        Self {
+            symbol: symbol.into(),
+            empty: candles.is_empty(),
+            previous_close: None,
+            previous_close_date: None,
+            candles,
+            extra: HashMap::new(),
+        }
+    }
+}
+
 /// Options chain response with calls and puts organized by expiration and strike.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]

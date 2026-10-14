@@ -98,6 +98,52 @@ async fn install_fault(broker: &PaperBroker, name: &str, when: &str, message: &s
         .unwrap();
 }
 #[tokio::test]
+async fn a_batch_applies_like_single_events_or_not_at_all() {
+    let (_single_dir, single) = setup().await;
+    let (_batch_dir, batch) = setup().await;
+    for b in [&single, &batch] {
+        b.place_order("paper-test", &order("buy", "BUY", "3", "11"))
+            .await
+            .unwrap();
+    }
+    let events = vec![
+        quote(3, 200, "10", "10.01", "1"),
+        quote(4, 300, "10", "10.02", "1"),
+        quote(5, 400, "10", "10.03", "5"),
+    ];
+    let mut one_by_one = Vec::new();
+    for event in events.clone() {
+        one_by_one.push(single.apply(event).await.unwrap());
+    }
+    let batched = batch.apply_batch(events.clone()).await.unwrap();
+    let fills = |results: &[PaperEventResult]| {
+        results
+            .iter()
+            .flat_map(|r| r.fills.iter().map(|f| (f.quantity, f.price)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fills(&batched), fills(&one_by_one));
+    assert_eq!(
+        batch.snapshot("paper-test").await.unwrap().ledger.cash,
+        single.snapshot("paper-test").await.unwrap().ledger.cash
+    );
+    assert!(
+        batch.apply_batch(events).await.unwrap()[0].duplicate,
+        "an exact retry is idempotent"
+    );
+
+    // The third event is out of order, so none of the three is applied.
+    let broken = vec![
+        quote(6, 500, "10", "10.01", "1"),
+        quote(7, 600, "10", "10.01", "1"),
+        quote(9, 700, "10", "10.01", "1"),
+    ];
+    assert!(batch.apply_batch(broken).await.is_err());
+    let next = batch.apply(quote(6, 500, "10", "10.01", "1")).await.unwrap();
+    assert!(!next.duplicate, "the failed batch left no event behind");
+    assert_eq!(batch.verify_integrity().await.unwrap().event_sequence, 6);
+}
+#[tokio::test]
 async fn partial_fills_reservations_cost_basis_and_realized_pnl_survive_restart() {
     let (dir, b) = setup().await;
     let id = b

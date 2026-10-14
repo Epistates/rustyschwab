@@ -20,6 +20,7 @@ pub mod config;
 pub mod coordination;
 pub mod error;
 pub mod execution;
+pub mod history;
 pub mod metrics;
 pub mod paper;
 pub mod readiness;

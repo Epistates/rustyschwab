@@ -1178,18 +1178,51 @@ impl PaperBroker {
         source: PaperEventSource,
     ) -> Result<PaperEventResult> {
         validate_source(&source)?;
-        if event.sequence == 0
-            || event.sequence > i64::MAX as u64
-            || !(0..=MAX_AT_MS).contains(&event.at_ms)
-        {
-            return Err(invalid("Invalid paper event sequence or time"));
-        }
+        check_sequenced(&event)?;
         let config = self.config.clone();
         self.journal
             .database()
             .run(move |c| apply_event(c, &config, event, source))
             .await
     }
+    /// Apply consecutive sequenced events in one transaction: all of them, or
+    /// none if any fails. Each event is recorded, audited and captured exactly
+    /// as [`PaperBroker::apply`] records it, so the transcript is the same; a
+    /// backtest uses this to apply a bar's quotes for one commit instead of
+    /// one per quote. At most 10,000 events per batch.
+    pub async fn apply_batch(&self, events: Vec<PaperEvent>) -> Result<Vec<PaperEventResult>> {
+        if events.len() > MAX_BATCH_EVENTS {
+            return Err(invalid("Too many paper events in one batch"));
+        }
+        events.iter().try_for_each(check_sequenced)?;
+        let config = self.config.clone();
+        self.journal
+            .database()
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                let results = events
+                    .into_iter()
+                    .map(|event| apply_in(&tx, &config, event, PaperEventSource::Local))
+                    .collect::<Result<Vec<_>>>()?;
+                tx.commit().map_err(sql)?;
+                Ok(results)
+            })
+            .await
+    }
+}
+
+const MAX_BATCH_EVENTS: usize = 10_000;
+
+fn check_sequenced(event: &PaperEvent) -> Result<()> {
+    if event.sequence == 0
+        || event.sequence > i64::MAX as u64
+        || !(0..=MAX_AT_MS).contains(&event.at_ms)
+    {
+        return Err(invalid("Invalid paper event sequence or time"));
+    }
+    Ok(())
 }
 
 fn capture(c: &Connection, command: PaperCommand, outcome: PaperCapturedOutcome) -> Result<()> {
@@ -1241,9 +1274,21 @@ fn apply_event(
     let tx = c
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(sql)?;
+    let result = apply_in(&tx, config, event, source)?;
+    tx.commit().map_err(sql)?;
+    Ok(result)
+}
+
+/// Apply one event inside the caller's write transaction.
+fn apply_in(
+    tx: &Connection,
+    config: &PaperConfig,
+    event: PaperEvent,
+    source: PaperEventSource,
+) -> Result<PaperEventResult> {
     let mut event = event;
     if event.sequence == 0 {
-        let clock: Clock = get(&tx, "paper_clock")?;
+        let clock: Clock = get(tx, "paper_clock")?;
         event.sequence = clock
             .sequence
             .checked_add(1)
@@ -1276,7 +1321,7 @@ fn apply_event(
             return Err(invalid("Live paper event is stale or future dated"));
         }
     }
-    let mut clock: Clock = get(&tx, "paper_clock")?;
+    let mut clock: Clock = get(tx, "paper_clock")?;
     if event.sequence != clock.sequence + 1 || event.at_ms < clock.at_ms {
         return Err(invalid("Paper events must be contiguous and time ordered"));
     }
@@ -1304,7 +1349,7 @@ fn apply_event(
         }
         PaperEventKind::Clock => {}
         PaperEventKind::Dividend { .. } | PaperEventKind::Split { .. } => {
-            corporate_action(&tx, config, &clock, &event.kind)?;
+            corporate_action(tx, config, &clock, &event.kind)?;
         }
         PaperEventKind::Quote {
             symbol,
@@ -1362,16 +1407,16 @@ fn apply_event(
             quotes = Some((symbol.clone(), quote, *bid_size, *ask_size));
         }
     }
-    settle_cash(&tx, config, clock.at_ms)?;
-    let mut orders = open_orders(&tx)?;
+    settle_cash(tx, config, clock.at_ms)?;
+    let mut orders = open_orders(tx)?;
     // A cancel effective exactly at this event wins over a fill at this event.
     for order in &mut orders {
         if order.request.duration == Some(OrderDuration::Day)
             && (!clock.open || order.session_id != clock.session_id)
         {
-            end_order(&tx, order, PaperOrderStatus::Expired, clock.at_ms)?;
+            end_order(tx, order, PaperOrderStatus::Expired, clock.at_ms)?;
         } else if order.cancel_at_ms.is_some_and(|at| at <= clock.at_ms) {
-            end_order(&tx, order, PaperOrderStatus::Canceled, clock.at_ms)?;
+            end_order(tx, order, PaperOrderStatus::Canceled, clock.at_ms)?;
         }
     }
     let mut fills = Vec::new();
@@ -1394,9 +1439,9 @@ fn apply_event(
                     continue;
                 }
                 order.triggered = true;
-                save_order(&tx, order)?;
+                save_order(tx, order)?;
                 audit(
-                    &tx,
+                    tx,
                     "paper_stop_triggered",
                     &order.order_id,
                     &json!({"at_ms":clock.at_ms,"sequence":clock.sequence}),
@@ -1406,7 +1451,7 @@ fn apply_event(
                     .at_ms
                     .checked_add(config.execution_latency_ms)
                     .ok_or_else(|| corrupt("Clock overflow"))?;
-                save_order(&tx, order)?;
+                save_order(tx, order)?;
                 continue;
             }
             let slip = div(config.slippage_bps, Decimal::from(10000))?;
@@ -1425,7 +1470,7 @@ fn apply_event(
                     order.request.order_type,
                     Some(OrderType::Market | OrderType::Stop)
                 ) {
-                    end_order(&tx, order, PaperOrderStatus::Rejected, clock.at_ms)?;
+                    end_order(tx, order, PaperOrderStatus::Rejected, clock.at_ms)?;
                 }
                 continue;
             }
@@ -1436,7 +1481,7 @@ fn apply_event(
             }
             let fee = mul(quantity, config.fee_per_share)?;
             let notional = mul(quantity, price)?;
-            let mut account = ledger(&tx, &order.account)?;
+            let mut account = ledger(tx, &order.account)?;
             let position = account.positions.entry(ticker.clone()).or_default();
             if is_buy {
                 let cost = add(notional, fee)?;
@@ -1468,7 +1513,7 @@ fn apply_event(
                 )?;
             }
             account.fees = add(account.fees, fee)?;
-            save_ledger(&tx, &order.account, &account)?;
+            save_ledger(tx, &order.account, &account)?;
             order.filled_quantity = add(order.filled_quantity, quantity)?;
             order.remaining_quantity = sub(order.remaining_quantity, quantity)?;
             if order.remaining_quantity.is_zero() {
@@ -1476,7 +1521,7 @@ fn apply_event(
                 order.cancel_at_ms = None;
             }
             order.reserved_cash = reserve_cash(order, config)?;
-            save_order(&tx, order)?;
+            save_order(tx, order)?;
             *liquidity = sub(*liquidity, quantity)?;
             let fill = PaperFill {
                 order_id: order.order_id.clone(),
@@ -1487,7 +1532,7 @@ fn apply_event(
                 fee,
             };
             audit(
-                &tx,
+                tx,
                 "paper_fill",
                 &order.order_id,
                 &serde_json::to_value(&fill)?,
@@ -1495,8 +1540,8 @@ fn apply_event(
             fills.push(fill);
         }
     }
-    enforce_daily_loss(&tx, config, &clock)?;
-    put(&tx, "paper_clock", &clock)?;
+    enforce_daily_loss(tx, config, &clock)?;
+    put(tx, "paper_clock", &clock)?;
     let result = PaperEventResult {
         mode: "paper".into(),
         duplicate: false,
@@ -1509,7 +1554,7 @@ fn apply_event(
     )
     .map_err(sql)?;
     audit(
-        &tx,
+        tx,
         "paper_event",
         &event.sequence.to_string(),
         &json!({
@@ -1517,13 +1562,12 @@ fn apply_event(
         ),
     )?;
     capture(
-        &tx,
+        tx,
         PaperCommand::Event { event },
         PaperCapturedOutcome::Success {
             result: serde_json::to_value(&result)?,
         },
     )?;
-    tx.commit().map_err(sql)?;
     Ok(result)
 }
 
