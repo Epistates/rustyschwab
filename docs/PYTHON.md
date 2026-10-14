@@ -14,6 +14,7 @@
 - [Synchronous use](#synchronous-use)
 - [Callbacks and market-hours scheduling](#callbacks-and-market-hours-scheduling)
 - [Command line](#command-line)
+- [Strategies: backtest, paper and live](#strategies-backtest-paper-and-live)
 - [Paper trading and backtests](#paper-trading-and-backtests)
 - [NautilusTrader](#nautilustrader)
 - [Error handling](#error-handling)
@@ -387,6 +388,120 @@ rustyschwab fields CHART_EQUITY --json
 `login` builds a client from the `SCHWAB_*` environment, as `Client.from_env()` does, with a JSON object from `--config` laid over it if given. It prints the consent URL, opens it in a browser, and reads the address Schwab redirects to (or just its `code`) from the terminal, or takes it from `--redirect-url`. It then completes the authorization and says so. It never prints tokens or the code it was given; errors print as `error: ...` and exit with status 1. Pasting the address ends the flow even though the browser shows an error page for it.
 
 `fields SERVICE` prints the field numbers and names of a streamer service from the SDK's own table, the same one `rustyschwab.stream_fields(service)` returns, with nested tables (the order books' levels) indented. `--json` prints that list as JSON.
+
+## Strategies: backtest, paper and live
+
+`rustyschwab.trader` runs one strategy in three modes: a backtest over cached price history, paper trading on live data, and live trading on an account. The strategy code is the same in all three.
+
+```python
+import asyncio
+from rustyschwab import Client, orders
+from rustyschwab.trader import Trader
+
+def crossover(tc, events):
+    for event in events:
+        if event["type"] != "candle":
+            continue
+        symbol = event["symbol"]
+        closes = [c["close"] for c in tc.candles[symbol][-30:]]
+        if len(closes) < 30 or tc.working(symbol):
+            continue
+        fast, slow = sum(closes[-10:]) / 10, sum(closes) / 30
+        tc.plot(f"fast {symbol}", fast)
+        held = tc.positions.get(symbol, 0)
+        if fast > slow and not held:
+            tc.order(orders.equity_buy_market(symbol, 10))
+        elif fast < slow and held:
+            tc.order(orders.equity_sell_market(symbol, held))
+
+async def main():
+    trader = Trader(Client.from_env())
+    run = await trader.backtest(crossover, ["AMD", "INTC"], days=20, cash=10_000)
+    print(run.report())
+    run.to_html("crossover.html")
+
+asyncio.run(main())
+```
+
+### The strategy
+
+A strategy is any callable `strategy(tc, events)`, plain or `async`. An object may also define `on_start(tc)`, `on_fill(tc, fill)` and `on_stop(tc)`.
+
+`events` is what is new since the last call, in time order. Each is a `dict` with a `type`:
+
+| `type` | When | Fields |
+| --- | --- | --- |
+| `candle` | a bar completed | `symbol`, `time` (bar open, epoch ms), `open`, `high`, `low`, `close`, `volume` |
+| `quote` | a level-one update, if `level1=True` | `symbol`, `time`, and the fields that changed: `bid`, `ask`, `last`, `bid_size`, `ask_size`, `last_size`, `volume` |
+| `book` | a book snapshot, if `level2=True` | `symbol`, `time`, `bids`, `asks` (Schwab's price levels) |
+| `fill` | one of the strategy's orders executed | `symbol`, `time`, `tag`, `order_id`, `side`, `quantity`, `price`, `fee` |
+
+`tc` is a `Context`:
+
+| Read | |
+| --- | --- |
+| `tc.candles[symbol]` | the bars so far, latest last (`max_candles=` bounds the history kept) |
+| `tc.quotes[symbol]` | the latest level-one quote, merged from the updates |
+| `tc.books[symbol]` | the latest book snapshot |
+| `tc.positions[symbol]` | shares held (`Decimal`; absent when flat) |
+| `tc.cash` | cash the account can spend now, less what open buys set aside |
+| `tc.sellable(symbol)` | shares held less those committed to open sells |
+| `tc.equity()` | all cash plus positions at their latest price |
+| `tc.orders[tag]` | every order placed, as a `TrackedOrder` (`status`, `filled_quantity`, `average_price`, `fees`, `fills`, `reason`) |
+| `tc.working(symbol=None)` | the open orders |
+| `tc.now`, `tc.mode`, `tc.state` | the time (epoch ms), the mode, and a dict for the strategy's own state |
+
+| Act | |
+| --- | --- |
+| `tc.order(order)` | place an order (Schwab's shape; the `rustyschwab.orders` templates build them) and get its tag back |
+| `tc.cancel(tag)` | cancel an open order; `False` if it is not open |
+| `tc.plot(name, value)` | add a point to an overlay; a name containing a symbol is drawn on that symbol's chart |
+
+Orders placed during a call are sent in order when the strategy returns. `tc.orders[tag]` follows each from `PENDING` to `WORKING`, `FILLED`, `CANCELED`, `EXPIRED` or `REJECTED` (with the venue's `reason`). A rejection does not stop the run. The runner tracks single-leg orders; multi-leg orders go through the `Client` directly.
+
+### Backtests
+
+```python
+run = await trader.backtest(strategy, ["AMD"], start=date(2026, 9, 1), end=date(2026, 9, 30),
+                            minutes=1, cash=10_000, simulation=Simulation(fee_per_share="0.005"))
+```
+
+- **History.** Candles come from a `HistoryStore` cache (default `~/.rustyschwab/history.sqlite3`). The first run fetches what the cache lacks, in ten-day chunks; later runs over the same window make no request. Bars before today in New York are kept for good. `Trader(None)` backtests from the cache alone.
+- **Fills.** Each bar becomes four quotes (open, low and high in the order the bar most likely traded, close) with a synthetic spread and a share of the bar's volume on offer, under the declared `candle-bbo-v1` model. These go through the same paper venue as everything else, so fills have latency, finite liquidity, slippage, fees and settlement, in decimals. The strategy sees a bar after its four quotes have printed, so an order fills no earlier than the next bar. Each New York date is a session; `DAY` orders expire at its end.
+- **Costs and the market model** are a `Simulation`: `spread_bps` (default 2), `participation_bps` (share of bar volume offered, default 1000 = 10%), `slippage_bps`, `fee_per_share`, `execution_latency_ms`, `cancel_latency_ms`, `market_collar_bps` and `regular_hours_only` (default on).
+- **Recorded data.** `level1=True` and `level2=True` replay quotes and books captured with `trader.record` as events. Fills still come from the bars.
+- **Determinism.** The same history, strategy and `Simulation` give the same fills. `keep_state="dir"` keeps the venue's state file, whose audited transcript `schwab-paper-verify` can check.
+- **Speed.** A 30-session, three-symbol, one-minute backtest (11,700 bars, 140,000 venue events, every one recorded and audited) takes about 15 seconds on a laptop.
+
+`backtest` returns a `RunResult`: `stats` (the [performance report](#performance-reports): return, drawdown, Sharpe, Sortino, Calmar, buy and hold, round trips, win rate, profit factor, per symbol), `fills`, `orders`, `equity` (one point per bar), `plots`, `candles`, `rejected`, `report()` for the text summary, and `to_html(path)`, which writes the price charts with fills and overlays and the equity curve to one HTML file with no scripts and no network.
+
+### Paper trading and live trading
+
+```python
+session = trader.paper(strategy, ["AMD"], cash=10_000)            # nothing reaches Schwab
+task = asyncio.create_task(session.run())
+...
+session.stop()
+result = await task                                               # a RunResult for the session
+
+session = trader.live(strategy, ["AMD"], account_hash=ACCOUNT_HASH)   # real orders
+```
+
+`paper` feeds streamed level-one quotes to a paper venue on the system clock, and opens and closes its session with the market's real hours, so holidays and early closes are honoured. `level1` only decides whether quotes also wake the strategy. `size_multiplier` converts streamed sizes to shares if needed, and `state=` keeps the venue between runs.
+
+`live` sends orders to the account through the journaled order path: the client's risk limits, halts and request budget apply, and an order whose outcome is unknown is reconciled by its tag, never resent. It subscribes to account activity and reads the open orders on each message and every `poll_seconds`. Start with small sizes.
+
+Both stop on `session.stop()`, `run(until=datetime)` or cancellation, then run `on_stop` and return a `RunResult`. Schwab allows one streaming session per login, so do not open another stream (or the NautilusTrader data client) on the same login at the same time.
+
+### Recording quotes and books
+
+Schwab has no history API for quotes or books. `trader.record` writes them to the cache as they stream, so backtests can replay them:
+
+```python
+await trader.record(["AMD", "INTC"], chart=True, level1=True, level2=True)
+```
+
+With `market_hours=True` (the default) the stream opens and closes with the market's real sessions, so a recorder can run for days. Recorded minute candles go into the same cache the backtester reads. When a span is later fetched from the price-history API, the fetched bars replace the recorded ones.
 
 ## Paper trading and backtests
 
