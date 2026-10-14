@@ -43,7 +43,6 @@ const SCHEMA: i64 = 1;
 
 /// The width of one candle in a series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BarSize {
     pub frequency_type: FrequencyType,
     pub frequency: i32,
@@ -120,7 +119,6 @@ impl BarSize {
 /// extended-hours bars. Times are epoch milliseconds, both ends inclusive,
 /// matching Schwab's `startDate` and `endDate`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct HistoryRequest {
     pub symbol: String,
     pub bars: BarSize,
@@ -195,7 +193,6 @@ impl HistorySource for SchwabClient {
 
 /// One recorded stream payload.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct Recorded {
     /// What was recorded, such as `LEVELONE_EQUITIES` or `NASDAQ_BOOK`.
     pub kind: String,
