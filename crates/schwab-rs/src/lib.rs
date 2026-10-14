@@ -23,6 +23,7 @@ pub mod execution;
 pub mod history;
 pub mod metrics;
 pub mod paper;
+pub mod performance;
 pub mod readiness;
 pub mod reconciliation;
 pub mod recovery;
