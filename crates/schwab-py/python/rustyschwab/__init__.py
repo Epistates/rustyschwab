@@ -19,9 +19,10 @@ plain ``dict`` and ``list`` values.
 Orders are built with the templates in :mod:`rustyschwab.orders`, which run on
 the SDK's own order builder. See the package documentation for authorization,
 orders, streaming and backtesting with :class:`PaperBroker`.
+:mod:`rustyschwab.schedule` opens the stream for the market's real sessions.
 """
 
-from . import errors, orders, paper, performance
+from . import errors, orders, paper, performance, schedule, streaming
 from ._native import (
     Client,
     PaperBroker,
@@ -116,6 +117,8 @@ __all__ = [
     "paper",
     "parse_option_symbol",
     "performance",
+    "schedule",
     "stream_fields",
+    "streaming",
     "validate_order",
 ]
