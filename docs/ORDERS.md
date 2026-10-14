@@ -259,6 +259,10 @@ take `legs`; all accept `settings` with `session`, `duration`, `tag`,
 `symbol` or all of `underlying`, `expiration`, `right`, `strike`. Unknown
 keys are errors.
 
+### From Python
+
+The Python package (`rustyschwab`, see [PYTHON.md](PYTHON.md#building-orders)) exposes this same builder. `rustyschwab.build_order(spec)` takes the `OrderSpec` as a `dict` and returns the order JSON that `place_order` accepts, `option_symbol` and `parse_option_symbol` wrap `OptionSymbol`, and `validate_order` runs `OrderRequest::validate` on a dict. The templates in `rustyschwab.orders` (`equity_buy_limit`, `bull_call_vertical_open`, `iron_condor_open`, `bracket`, ...) are Python that describe the order as a spec, or compose finished orders with `one_cancels_other`, `triggers` and `bracket`, so Python and Rust produce the same order from the same intent. Errors from the SDK's constructors and `validate()` arrive as `ValidationError`.
+
 ## Tips
 
 - Symbols: equities `AAPL`; indexes `$SPX`; options via `OptionSymbol`.

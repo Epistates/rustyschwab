@@ -154,6 +154,62 @@ await client.cancel_order(account_hash, replaced["order_id"])
 
 [ORDERS.md](ORDERS.md) covers options, multi-leg and composite orders; the JSON is the same.
 
+### Building orders
+
+You do not have to write that dict. `rustyschwab.orders` has a template for each common order, and every one is built by the SDK's own order builder: the template describes the order as an `OrderSpec` (the JSON behind the MCP `build_order` tool, see [ORDERS.md](ORDERS.md#json-specs-and-the-mcp-build_order-tool)), the Rust constructors expand it, and `validate()` runs on the result. A Python order has the same shape and the same checks as one made in Rust, and a bad one raises `ValidationError` before anything is sent.
+
+```python
+from rustyschwab import orders, option_symbol
+
+buy = orders.equity_buy_limit("AAPL", 10, "189.50", duration="GOOD_TILL_CANCEL", tag="swing-1")
+protected = orders.bracket(buy, take_profit="200", stop_loss="180")
+
+long_call = option_symbol("AAPL", "2026-12-18", "CALL", 190)    # "AAPL  261218C00190000"
+short_call = option_symbol("AAPL", "2026-12-18", "CALL", 195)
+spread = orders.bull_call_vertical_open(long_call, short_call, 2, "1.20")   # NET_DEBIT, VERTICAL
+
+await client.place_order(account_hash, protected)
+```
+
+Every template returns a plain `dict`, so the result goes to `place_order`, `preview_order` or `PaperBroker.place_order` unchanged, and `json.dumps` works on it.
+
+| Family | Templates |
+|---|---|
+| Equities | `equity_{buy,sell,sell_short,buy_to_cover}_` + `market`, `limit`, `stop`, `stop_limit`, `trailing_stop` |
+| Single options | `option_{buy_to_open,sell_to_open,buy_to_close,sell_to_close}_` + `market`, `limit` |
+| Vertical spreads | `{bull_call,bear_call,bull_put,bear_put}_vertical_` + `open`, `close` |
+| Other strategies | `long_straddle_*`, `short_straddle_*`, `long_strangle_*`, `short_strangle_*`, `iron_condor_*`, `long_call_calendar_*`, `long_put_calendar_*`, each with `open` and `close` |
+| Composites | `one_cancels_other(a, b)`, `first_triggers_second(a, b)`, `bracket(entry, take_profit, stop_loss)` |
+
+Names and argument order follow schwab-py where it has a template: `equity_buy_limit(symbol, quantity, price)`, `bull_call_vertical_open(long_call_symbol, short_call_symbol, quantity, net_debit)`. The spread templates take the price as `net_debit` or `net_credit`, whichever the strategy pays when it is opened or closed, so a bull call spread opens for a debit and closes for a credit and a bull put spread the reverse. They also check that the two symbols are the right kind of option on one underlying and expiration, with the strikes the right way round for the strategy, and refuse the order otherwise. Trailing stops take exactly one of `amount=` (a price difference) and `percent=`, and `basis=` (default `"LAST"`).
+
+Every template accepts the same keywords, typed as `orders.OrderOptions`: `session`, `duration`, `tag`, `special_instruction`, `destination`, `tax_lot_method` and `stop_type`. The defaults are the SDK's, the `NORMAL` session and `DAY` duration. Extended-hours sessions take limit orders only, and options trade only in `NORMAL`.
+
+**Amounts.** Quantities and prices may be `str`, `int`, `Decimal` or `float`, the same as a price in a hand-written order. A `str` or `Decimal` keeps every digit; a `float` is read as its shortest round-trip spelling, so `189.5` is `"189.5"` but `0.1 + 0.2` is `"0.30000000000000004"`. Build computed prices from `str` or `Decimal`. A `bool`, `NaN`, exponent form such as `"1e3"` and padded or underscored strings are refused.
+
+**Composites.** They take any finished order, from a template or written by hand, and call the SDK's `one_cancels_other`, `triggers` and `bracket`:
+
+```python
+exits = orders.one_cancels_other(
+    orders.equity_sell_limit("XYZ", 5, "15.27"),
+    orders.equity_sell_stop_limit("XYZ", 5, "11.30", "11.27"),
+)
+staged = orders.first_triggers_second(orders.equity_buy_limit("XYZ", 5, "14.97"), exits)
+```
+
+`bracket` needs a single-leg order that opens a position and exits that sit on the right sides of its price; it adds a good-till-cancel take-profit limit and stop-loss as an `OCO` pair that closes the entry's full quantity.
+
+**Option symbols.** `option_symbol(underlying, expiration, put_call, strike)` builds the 21-character OSI symbol Schwab uses, from a `datetime.date` or `"YYYY-MM-DD"`, `"CALL"` or `"PUT"`, and a `str`, `int` or `Decimal` strike. `parse_option_symbol(symbol)` is the inverse and returns `{"underlying", "expiration", "put_call", "strike"}`, with the strike as a decimal string. Both raise `ValidationError` for what the format cannot carry (a root over six characters, a strike finer than 0.001) and `parse_option_symbol` accepts only the canonical spelling.
+
+**Your own specs and dicts.** `rustyschwab.build_order(spec)` takes any `OrderSpec` dict, so a spec written for the MCP `build_order` tool builds the same order in Python. `rustyschwab.validate_order(order)` runs the SDK's order checks on a hand-written dict offline, naming the failing field in `ValidationError.field`, which is what `place_order` does before it sends. It does not know Schwab's own rules (buying power, eligibility, tick sizes); `preview_order` does.
+
+```python
+try:
+    rustyschwab.validate_order({**order, "stopPrice": "180"})
+except rustyschwab.ValidationError as error:
+    print(error.field, error)     # stopPrice  Invalid parameter: LIMIT does not take stopPrice
+```
+
 **The result.** `place_order` and `replace_order` return `order_id` (`None` if Schwab accepted the order without a `Location` header), `location`, `tag` and `attempt_id`. The tag is yours if the order carried one, and a generated `rs-<uuid>` otherwise. `attempt_id` is the execution-journal record of this submission, the same ID a `SubmissionUnknown` error carries, so store it with your own order record.
 
 **Uncertain outcomes.** If a request may have reached Schwab but no answer came back (a timeout, a 5xx, a dropped connection), the call raises `SubmissionUnknown` and never retries. The journal then holds the attempt, and the next submission on that account raises `ReconciliationRequired` until it is resolved. Resolve it by reading the account's orders, not by resending:
