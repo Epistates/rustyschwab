@@ -2,10 +2,10 @@
 
 Reviewed 2026-09-10; transport updated 2026-10-11. The MCP server runs on
 TurboMCP 4 (see [TurboMCP v4](#turbomcp-v4)), with
-explicit behavior annotations for all 39 tools (`build_order`, which expands
+explicit behavior annotations for all 40 tools (`build_order`, which expands
 an `OrderSpec` locally, `check_order`, the local pre-flight described below,
 `get_server_status`, the three projection tools, `get_portfolio_summary`,
-`get_order_status` and `get_trade_journal` were added after the review, as
+`get_order_status`, `get_trade_journal` and `get_performance` were added after the review, as
 were the one resource and one prompt described under
 [Prompts and resources](#prompts-and-resources)). Reads and previews are marked
 read-only; order and stream mutations are conservatively marked destructive
@@ -364,6 +364,71 @@ a permission, risk or approval denial) never reached the audit and are not
 rows; those the server dispatched and the venue or a switch refused are,
 with their `failure`. Only the principal wrapper keeps a journal; the
 local stdio transport answers `not_permitted`.
+
+## Performance
+
+`get_performance(account_hash, since?, until?, symbols?)` evaluates how an
+account has traded from its own fills, so a model reads verified numbers
+instead of doing the arithmetic (`crates/schwab-mcp/src/performance.rs`,
+over the SDK's `schwab_rs::performance::analyze`). It is a read tool like
+`get_portfolio_summary`: a principal needs the tool and the account, and
+`symbols` narrows the fills to those symbols and the options on them.
+
+The window defaults to the last 30 days ending now (`since` and `until` take
+the [query windows](#query-windows) spellings). Schwab lists only the last
+60 days of orders, so on the live backend a `since` older than 59 days is
+moved up to it and `window.clampedToOrderHorizon` says so; the paper venue
+keeps every order and has no horizon. The call reads the account's orders
+entered in the window and turns every `EXECUTION` activity whose
+`executionType` is `FILL` (or absent) into a fill: each `executionLegs`
+entry maps to its order leg by `legId` (a collection without ids is read in
+Schwab's order, a single-leg order has one leg to give), the leg's
+instruction decides the side, children of trigger, bracket and
+one-cancels-other orders are read where they nest, and an execution without
+a price, quantity, time or leg, with an `EXCHANGE` instruction, or on a
+future, forex or fixed-income instrument is counted in `skippedExecutions`
+instead. Options are valued at the multiplier the principal's
+`option_multipliers` verifies for the symbol, else the instrument's own
+`optionMultiplier`, else 100; the unauthorized stdio transport has no policy
+and so uses the last two. Fills in the paper venue are the same activities,
+carrying the venue's per-fill fee as a `fee` on the execution leg; Schwab's
+order data has none, so live fees are zero. The paper venue's own ledger
+(`get_portfolio_summary`'s `paper`) costs sales at the average price, so it
+agrees with these first in first out round trips only when entries share a
+price.
+
+Fills are matched first in first out, long and short, and every match of an
+entry against a closing fill is a round trip. The answer is the SDK's report
+camel-cased, money as decimal strings, without its daily series or
+benchmark: `realizedPnl`, `realizedPnlNet`, `unrealizedPnl`, `fees`,
+`netPnl`, `netReturn`, `maxDrawdown` and its amount and times, `sharpe`,
+`sortino`, `calmar`, `volatility`, `trades` (win rate, profit factor,
+expectancy, average win and loss, largest win and loss, average holding
+time) overall, the same per symbol under `symbols`, and the most recent 100
+round trips under `roundTrips` with `roundTripsTotal` and
+`roundTripsOmitted`; every statistic covers all of them. Also `window`,
+`ordersRead`, `ordersWithFills`, `fills`, `skippedExecutions`, `warnings`
+and `notes`, which says what the numbers cover.
+
+What the numbers are measured against:
+
+- Open lots are valued at the current quote (`marks`, source `quote`: the
+  mark, else the midpoint, else the last trade), or at the last fill price
+  when none is available (source `last_fill`, an assumption). At most 100
+  open symbols are quoted.
+- The equity curve is built from the fills, so the ratios use only the days
+  with fills. The starting equity is the account's liquidation value less
+  the window's net profit and loss, which assumes nothing else moved the
+  balance; when the account cannot be read, or its value is less than the
+  window's profit, `startEquity`, `endEquity`, `netReturn`, `maxDrawdown`,
+  `annualizedReturn`, `volatility`, `sharpe`, `sortino` and `calmar` are null
+  and `warnings` says so.
+- Only fills of orders entered in the window are seen. A position opened
+  before it has no entry to match, so its closing fills open a position
+  instead; each symbol whose account holding differs from what the fills
+  leave open (including an expiration or assignment, which are not orders)
+  gets a `warnings` entry. A list of 3000 orders, Schwab's page size, is
+  warned about as possibly cut off.
 
 ## Server status
 

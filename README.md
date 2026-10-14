@@ -501,7 +501,14 @@ until an operator clears it, and trips it again while the loss persists. See
   `rationale` it was given, how the dispatch ended (`completed`, `error`
   with the failure code, or `pending`) and the venue's current status of
   the order it produced, so a model resuming a session sees what it
-  decided, why, and what came of it
+  decided, why, and what came of it; `get_performance(account_hash, since?,
+  until?, symbols?)` works out how the account has traded from its own fills
+  in the window (default 30 days, inside Schwab's 60-day order list): round
+  trips matched first in first out, long and short, with realized and
+  unrealized P&L, win rate, profit factor, drawdown and the Sharpe and
+  Sortino ratios, overall and per symbol, so a model reads verified numbers
+  instead of doing the arithmetic; `warnings` names any position that
+  predates the window
 - **Orders (write)** — `build_order(spec)` expands a compact spec
   (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
   contract parts) into the exact `order` JSON the write tools accept, locally

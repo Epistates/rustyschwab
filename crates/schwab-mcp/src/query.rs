@@ -73,9 +73,19 @@ fn window(
     end: Option<&FlexibleTime>,
     now: DateTime<Utc>,
 ) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
+    window_of(start, end, now, DEFAULT_WINDOW_DAYS)
+}
+
+/// [`window`] with the omitted start `days` before the end.
+pub(crate) fn window_of(
+    start: Option<&FlexibleTime>,
+    end: Option<&FlexibleTime>,
+    now: DateTime<Utc>,
+    days: i64,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), String> {
     let end = end.map_or(Ok(now), |t| t.resolve(Bound::End))?;
     let start = start.map_or_else(
-        || shift(end, -Duration::days(DEFAULT_WINDOW_DAYS)),
+        || shift(end, -Duration::days(days)),
         |t| t.resolve(Bound::Start),
     )?;
     Ok((start, end))

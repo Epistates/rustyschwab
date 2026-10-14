@@ -38,6 +38,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "get_account_orders",
     "get_all_orders",
     "get_trade_journal",
+    "get_performance",
     // Orders (write)
     "build_order",
     "check_order",

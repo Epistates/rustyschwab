@@ -841,6 +841,7 @@ impl AuthorizedServer {
             "check_order" => return Ok(self.check_order(args).await?),
             "get_server_status" => return Ok(self.get_server_status(args).await?),
             "get_trade_journal" => return Ok(self.get_trade_journal(args).await?),
+            "get_performance" => return Ok(self.get_performance(args).await?),
             _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
@@ -1291,6 +1292,22 @@ impl AuthorizedServer {
             let page = crate::journal::collect(&self.audit, backend, &self.principal.name, request)
                 .await?;
             Ok(crate::contract::envelope(backend.source(), page))
+        })
+        .await)
+    }
+
+    /// `get_performance` under this principal: a permitted account's
+    /// fills, its options valued at the multipliers the operator verified.
+    async fn get_performance(&self, args: Value) -> Result<McpResult<ToolResult>, ToolFailure> {
+        self.principal.authorize("get_performance", &args)?;
+        Ok(crate::contract::run("get_performance", async {
+            let request = crate::performance::Request::parse(args)?;
+            crate::performance::collect(
+                self.inner.backend(),
+                request,
+                &self.principal.option_multipliers,
+            )
+            .await
         })
         .await)
     }

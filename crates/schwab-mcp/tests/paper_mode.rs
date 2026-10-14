@@ -65,8 +65,8 @@ fn policy() -> PrincipalPolicy {
         "token_sha256": "a".repeat(64),
         "tools": ["get_server_status", "get_account", "get_quotes", "get_price_history",
                   "get_order", "get_order_status", "get_account_orders", "get_all_orders",
-                  "get_portfolio_summary", "get_trade_journal", "check_order", "place_order",
-                  "cancel_order"],
+                  "get_portfolio_summary", "get_trade_journal", "get_performance",
+                  "check_order", "place_order", "cancel_order"],
         "accounts": [ACCOUNT],
         "max_quantity": "10",
         "max_notional": "1000",
@@ -375,6 +375,142 @@ async fn orders_fill_and_cancel_inside_the_venue_and_never_reach_schwab() {
         paths.iter().all(|p| p.starts_with("/marketdata/")),
         "{paths:?}"
     );
+}
+
+/// `get_performance` over the venue's fills: a round trip, then an open lot
+/// valued at the venue's quote, the symbol filter, and the principal's
+/// account scope. The buy and the sell fill in the same second, so the
+/// order of the round trip rests on the order ids.
+#[tokio::test]
+async fn get_performance_reports_the_round_trips_of_paper_fills() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, now) = venue(dir.path()).await;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy());
+    let performance = json!({"account_hash": ACCOUNT});
+
+    // Nothing traded yet: a flat report, not a failure.
+    let flat = call(&server, "get_performance", performance.clone()).await;
+    assert_eq!(flat["source"], "paper", "{flat}");
+    assert_eq!(flat["data"]["fills"], 0);
+    assert_eq!(flat["data"]["roundTripsTotal"], 0);
+    assert_eq!(flat["data"]["trades"]["winRate"], Value::Null);
+
+    // Buy two at the ask, then sell them at the bid.
+    place(&server, "BUY", "2", "11").await;
+    broker
+        .apply(quote(3, now + 100, "10", "10.01", "100"))
+        .await
+        .unwrap();
+    place(&server, "SELL", "2", "9").await;
+    broker
+        .apply(quote(4, now + 200, "12", "12.01", "100"))
+        .await
+        .unwrap();
+
+    let report = call(&server, "get_performance", performance.clone()).await;
+    assert_eq!(report["source"], "paper", "{report}");
+    let data = &report["data"];
+    assert_eq!(data["fills"], 2, "{data}");
+    assert_eq!(data["ordersRead"], 2);
+    assert_eq!(data["ordersWithFills"], 2);
+    assert_eq!(data["skippedExecutions"], 0);
+    assert_eq!(data["roundTripsTotal"], 1);
+    assert_eq!(data["roundTripsOmitted"], 0);
+    let trip = &data["roundTrips"][0];
+    assert_eq!(trip["symbol"], "ABC");
+    assert_eq!(trip["direction"], "long");
+    assert_eq!(trip["quantity"], "2");
+    assert_eq!(trip["entryPrice"], "10.01");
+    assert_eq!(trip["exitPrice"], "12");
+    assert_eq!(trip["grossPnl"], "3.98");
+    // (12 - 10.01) * 2 before the venue's fee of a cent a share, four shares.
+    assert_eq!(data["realizedPnl"], "3.98");
+    assert_eq!(data["realizedPnlNet"], "3.94");
+    assert_eq!(data["unrealizedPnl"], "0");
+    assert_eq!(data["fees"], "0.04");
+    assert_eq!(trip["fees"], "0.04");
+    assert_eq!(data["trades"]["wins"], 1);
+    assert_eq!(data["trades"]["winRate"], 1.0);
+    assert_eq!(data["symbols"]["ABC"]["openQuantity"], "0");
+    assert_eq!(data["symbols"]["ABC"]["netPnl"], "3.94");
+    assert_eq!(data["equitySource"], "fills");
+    assert_eq!(data["warnings"], json!([]), "{data}");
+    assert_eq!(data["window"]["clampedToOrderHorizon"], false);
+    assert!(
+        data["notes"]
+            .as_str()
+            .unwrap()
+            .contains("first in first out")
+    );
+    let ledger = call(&server, "get_portfolio_summary", performance.clone()).await;
+    // The venue's own ledger agrees with the fills it rendered.
+    assert_eq!(ledger["data"]["paper"]["realizedPnl"], 3.94);
+    assert_eq!(ledger["data"]["paper"]["fees"], 0.04);
+    // The starting equity is the account's value less the window's profit.
+    let liquidation = ledger["data"]["balances"]["liquidationValue"]
+        .as_f64()
+        .unwrap();
+    let start: f64 = data["startEquity"].as_str().unwrap().parse().unwrap();
+    assert!((start + 3.94 - liquidation).abs() < 0.015, "{data}");
+
+    // A third order is left open and valued at the venue's quote midpoint.
+    place(&server, "BUY", "1", "13").await;
+    broker
+        .apply(quote(5, now + 300, "12", "12.01", "100"))
+        .await
+        .unwrap();
+    let open = call(&server, "get_performance", performance.clone()).await;
+    let data = &open["data"];
+    assert_eq!(data["fills"], 3);
+    assert_eq!(data["roundTripsTotal"], 1);
+    assert_eq!(data["symbols"]["ABC"]["openQuantity"], "1");
+    assert_eq!(
+        data["marks"]["ABC"],
+        json!({"price": "12.005", "source": "quote"})
+    );
+    assert_eq!(data["unrealizedPnl"], "-0.005");
+    assert_eq!(data["warnings"], json!([]), "{data}");
+
+    // The filter narrows to the symbols named; none matches nothing.
+    let none = call(
+        &server,
+        "get_performance",
+        json!({"account_hash": ACCOUNT, "symbols": ["zzz"]}),
+    )
+    .await;
+    assert_eq!(none["data"]["fills"], 0);
+    assert_eq!(none["data"]["symbolsFilter"], json!(["ZZZ"]));
+    let named = call(
+        &server,
+        "get_performance",
+        json!({"account_hash": ACCOUNT, "symbols": ["abc"], "since": "2000-01-01"}),
+    )
+    .await;
+    assert_eq!(named["data"]["fills"], 3);
+    // The paper venue keeps every order, so no horizon moves the start.
+    assert_eq!(named["data"]["window"]["clampedToOrderHorizon"], false);
+
+    // Bad windows are invalid arguments; another account is refused.
+    let inverted = call(
+        &server,
+        "get_performance",
+        json!({"account_hash": ACCOUNT, "since": "2030-02-01", "until": "2030-01-01"}),
+    )
+    .await;
+    assert_eq!(inverted["error"]["code"], "invalid_arguments", "{inverted}");
+    let other = call(
+        &server,
+        "get_performance",
+        json!({"account_hash": "nobody"}),
+    )
+    .await;
+    assert_eq!(other["error"]["code"], "not_permitted", "{other}");
+
+    // The plain server answers the same read without a principal.
+    let plain = SchwabMcp::new(backend(broker, None), Switches::default());
+    let read = call(&plain, "get_performance", performance).await;
+    assert_eq!(read["data"]["roundTripsTotal"], 1, "{read}");
+    assert_eq!(read["data"]["realizedPnl"], "3.98");
 }
 
 #[tokio::test]

@@ -22,9 +22,10 @@ Three published crates plus example packages, all on the workspace version
 
 ```
                  ┌──────────────────────────── schwab-mcp ────────────────────────────┐
-                 │ server.rs (39 tools)  policy.rs  network.rs  identity.rs  redact.rs │
+                 │ server.rs (40 tools)  policy.rs  network.rs  identity.rs  redact.rs │
                  │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
                  │ projection.rs  portfolio.rs  order_status.rs  journal.rs             │
+                 │ performance.rs                                                       │
                  │ guidance.rs (1 resource, 1 prompt)  authority.rs (gateway)           │
                  │ bins: admin/authority/remote/paper/paper-verify/eval                 │
                  └───────────────┬─────────────────────────────────┬──────────────────┘
@@ -236,11 +237,11 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 
 `server::SchwabMcp` is one `#[turbomcp::server]` impl (turbomcp 4, serving
 the `2025-06-18` and `2025-11-25` session revisions and the stateless
-`2026-07-28` one through the same handlers) with 39 `#[tool]`
+`2026-07-28` one through the same handlers) with 40 `#[tool]`
 methods in category order: market data (12, including the `get_candles`
 and `get_option_contracts` projections), accounts (6, including the
-`get_positions` projection and `get_portfolio_summary`), orders read (5,
-including `get_order_status` and `get_trade_journal`), orders write (`build_order`,
+`get_positions` projection and `get_portfolio_summary`), orders read (6,
+including `get_order_status`, `get_trade_journal` and `get_performance`), orders write (`build_order`,
 `check_order`, `preview_order`, `place_order`, `cancel_order`,
 `replace_order`), transactions (2), streaming control and cached reads (7),
 server (`get_server_status`).

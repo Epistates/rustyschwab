@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod network;
 pub mod order_status;
 pub mod paper_replay;
+pub mod performance;
 pub mod policy;
 pub mod portfolio;
 pub mod preflight;

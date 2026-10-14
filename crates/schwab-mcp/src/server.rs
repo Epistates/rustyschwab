@@ -29,6 +29,7 @@ use crate::contract::{self, Source, ToolFailure, ToolResult};
 use crate::guidance;
 use crate::journal;
 use crate::order_status;
+use crate::performance;
 use crate::policy;
 use crate::portfolio;
 use crate::preflight;
@@ -850,6 +851,51 @@ impl SchwabMcp {
             Err(ToolFailure::not_permitted(
                 "The trade journal belongs to a principal; this transport has none",
             ))
+        })
+        .await
+    }
+
+    /// How an account has traded, worked out from its own fills so you
+    /// do not do the arithmetic: the orders entered in a window (by
+    /// default the last 30 days; `since` and `until` take a calendar date,
+    /// RFC 3339 or epoch milliseconds; Schwab lists only the last 60 days
+    /// of orders) have their executions matched first in first out, long
+    /// and short, into round trips. The answer has the realized and
+    /// unrealized profit and loss, fees, win rate, profit factor,
+    /// expectancy, average win and loss, holding time, maximum drawdown
+    /// and Sharpe, Sortino and Calmar ratios, each as `trades` overall and
+    /// per symbol under `symbols`, and the most recent 100 round trips
+    /// (`roundTripsTotal` counts them all). `symbols` narrows it to those
+    /// symbols and the options on them. Open lots are valued at current
+    /// quotes (`marks`); money is a decimal string. It reads only fills in
+    /// the window: a position opened earlier is not matched, `warnings`
+    /// names any symbol whose holding disagrees with the fills, and
+    /// `notes` says what else the numbers cover. In paper mode these are
+    /// the venue's fills.
+    #[tool(
+        read_only = true,
+        destructive = false,
+        idempotent = true,
+        open_world = true
+    )]
+    async fn get_performance(
+        &self,
+        account_hash: String,
+        since: Option<FlexibleTime>,
+        until: Option<FlexibleTime>,
+        symbols: Option<Vec<String>>,
+    ) -> McpResult<ToolResult> {
+        contract::run("get_performance", async {
+            let request = performance::Request {
+                account_hash,
+                since,
+                until,
+                symbols,
+            };
+            // Only reached on the unauthorized stdio transport, which has no
+            // policy of verified option multipliers; `AuthorizedServer` passes
+            // its principal's.
+            performance::collect(&self.backend, request, &Default::default()).await
         })
         .await
     }

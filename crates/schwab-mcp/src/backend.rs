@@ -555,6 +555,9 @@ fn order_json(order: &PaperOrder, fills: &[PaperFill]) -> Value {
                     "quantity": fill.quantity.to_f64(),
                     "price": fill.price.to_f64(),
                     "time": schwab_time(fill.at_ms),
+                    // Not in Schwab's shape, which carries no fees on orders:
+                    // the venue's, so `get_performance` can count them.
+                    "fee": fill.fee.to_f64(),
                 }],
             })
         })
