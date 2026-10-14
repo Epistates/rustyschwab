@@ -11,6 +11,9 @@
 - [Market data and accounts](#market-data-and-accounts)
 - [Orders](#orders)
 - [Streaming](#streaming)
+- [Synchronous use](#synchronous-use)
+- [Callbacks and market-hours scheduling](#callbacks-and-market-hours-scheduling)
+- [Command line](#command-line)
 - [Paper trading and backtests](#paper-trading-and-backtests)
 - [NautilusTrader](#nautilustrader)
 - [Error handling](#error-handling)
@@ -59,6 +62,8 @@ Schwab issues a 30-minute access token and a 7-day refresh token. The client ref
    ```
 
    `complete_authorization` checks the OAuth `state` against the one `authorization_url` issued, exchanges the code and stores the tokens. A bare `code` value works if the authorization was started from the same token file. The Rust `oauth-flow` example does the same with a built-in HTTPS callback server.
+
+`rustyschwab login` runs this flow from the [command line](#command-line). In code, `rustyschwab.auth` has the pieces: `terminal_prompt()` is a hook that prints the URL, opens the browser and reads the pasted address; `authorize_async(client, hook)` runs the flow on an async client, and `ensure_authorized(client, hook)` runs it only when the stored tokens need a person. A hook is any function from the consent URL to the redirect URL, so it can ask somewhere other than a terminal. The blocking client takes one as `call_on_auth`, see [Synchronous use](#synchronous-use).
 
 ## Configuration
 
@@ -266,6 +271,122 @@ Content fields arrive under their names (`bidPrice`) by default. Pass `named_fie
 Schwab allows one streaming session per user. Opening a second one ends the first with `ended: {"reason": "replaced"}`.
 
 `stream.subscriptions()`, `stream.status()` and `stream.is_authenticated` read the session; `asyncio.wait_for(anext(stream), timeout)` waits with a deadline and leaves the stream intact on timeout.
+
+## Synchronous use
+
+`rustyschwab.sync` is the same client with blocking methods, for scripts, notebooks and threaded programs that do not use asyncio. Every method of `rustyschwab.Client` has a twin with the same arguments and result, and a test fails if one is added without it.
+
+```python
+from rustyschwab import sync
+
+with sync.Client.from_env() as client:
+    print(client.quote("AAPL")["quote"]["lastPrice"])
+    placed = client.place_order(account_hash, order)
+
+    stream = client.open_stream()
+    stream.subscribe("LEVELONE_EQUITIES", ["AAPL", "MSFT"], fields=["bidPrice", "askPrice"])
+
+    def receiver(message, *, label):
+        if message["type"] == "data":
+            print(label, message["data"][0]["content"])
+
+    stream.start(receiver, label="quotes")          # a daemon thread calls receiver(message, label="quotes")
+    ...
+    stream.stop()                                    # stop the thread; the connection and subscriptions stay
+    stream.close()                                   # log out and disconnect
+```
+
+**Streams.** `sync.Stream` has `subscribe`, `unsubscribe`, `view`, `subscriptions`, `status` and `close`, and reads three ways. `for message in stream` blocks for each message and ends with the final `state` message. `stream.recv(timeout)` returns the next message, `None` once the stream has ended, or raises `TimeoutError` and leaves the stream usable. `stream.start(receiver, *, daemon=True, on_error="log", **kwargs)` calls `receiver(message, **kwargs)` on a background thread, in order, until `stop()`. Only one reader at a time: a started stream refuses `recv` and iteration. `stop()` is idempotent and joins the thread; `start()` may be called again afterwards, and messages that arrive in between queue up to the SDK's limit and are counted in `lost_messages` beyond it. A receiver must be a plain function. For a coroutine, use the async client with `rustyschwab.streaming.dispatch`.
+
+**Errors in the receiver.** With `on_error="log"` an exception is logged to `rustyschwab.sync` and the next message is delivered, so one bad tick does not end the stream. With `on_error="raise"` the thread stops, `stream.error` holds the exception, and the next `stop()` or `join()` raises it once.
+
+**One event loop thread.** Calls wait on one private asyncio event loop that runs on a daemon thread named `rustyschwab-sync`. It is created by the first blocking call and shared by every client, stream and schedule in the process, so any number of threads can call at once. It stops at interpreter exit, which first stops started streams and schedules, or earlier with `rustyschwab.sync.shutdown()`; the next call starts a new one. It is not inherited across `fork`. Do not call blocking methods from inside a running event loop of your own, which they would block, nor from a receiver on the loop thread, which raises `RuntimeError` instead of deadlocking.
+
+**Timeouts.** `sync.Client(config, timeout=...)` bounds how long each call waits and raises `TimeoutError` after cancelling it. The default is no limit beyond the SDK's own request timeouts. As with a cancelled coroutine, a timed-out `place_order` still leaves its journal record resolved.
+
+**Reauthorization.** `sync.Client(..., call_on_auth=hook)` calls `hook(consent_url)` when a call fails because the refresh token is missing or expired, completes the authorization with the redirect URL it returns, and retries the call once. `rustyschwab.auth.terminal_prompt()` is the terminal flow: print the URL, open the browser, read the pasted address. Several threads waiting on a refresh share one prompt. Order placement, replacement and cancellation never prompt or retry this way; call `client.authorize()` first (it runs the flow explicitly and returns whether it completed).
+
+```python
+client = sync.Client.from_env(call_on_auth=rustyschwab.auth.terminal_prompt())
+client.account_numbers()      # asks for a new login only if one is needed
+```
+
+`client.native` and `stream.native` give the async objects, for use on a loop of your own.
+
+## Callbacks and market-hours scheduling
+
+**Callbacks on the async stream.** `rustyschwab.streaming.dispatch(stream, receiver, *, on_error="log", **kwargs)` reads the stream and calls `receiver(message, **kwargs)` for each message until it ends. `receiver` may be a function or a coroutine function; a coroutine is awaited before the next read, which keeps the SDK's backpressure accounting honest. `streaming.start(...)` runs it as a task you can cancel. `on_error` is as for the blocking stream.
+
+```python
+from rustyschwab import streaming
+
+async with await client.open_stream() as stream:
+    await stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
+    await streaming.dispatch(stream, handle_message)
+```
+
+**Only during the market's sessions.** Schwabdev's `start_auto` runs the stream between fixed clock times on fixed weekdays. `rustyschwab.schedule` asks Schwab's market-hours calendar (`client.market_hours`, one request a day) for the real session windows instead, so a holiday has no session and an early close ends the stream at 13:00.
+
+```python
+from datetime import timedelta
+from rustyschwab import schedule
+
+plan = schedule.Subscriptions()
+plan.add("LEVELONE_EQUITIES", ["AAPL", "MSFT"], fields=["bidPrice", "askPrice"])
+plan.add("ACCT_ACTIVITY", ["Account Activity"])
+
+async def receiver(message):
+    ...
+
+await schedule.run_during_market_hours(client, plan, receiver=receiver)   # until cancelled
+```
+
+It sleeps until `lead` (default one minute) before the next window opens, opens a stream with `plan(client)`, hands every message to the receiver, closes the stream when the window ends, sleeps until the next session and repeats. Each session opens a new stream, so what to subscribe to is a `Subscriptions` (replayed every time) or any async function that takes the client and returns an open, subscribed stream. Cancelling the task closes the open stream.
+
+| Parameter | Meaning |
+| --- | --- |
+| `market` | `"equity"` (default), `"option"`, `"future"`, `"bond"` or `"forex"` |
+| `sessions` | Which calendar sessions count: `("regularMarket",)` by default, or `"preMarket"`, `"postMarket"`. Touching sessions form one window, so the stream stays open across them |
+| `product` | Keep one product code, such as `"EQ"`; by default every product of the market counts |
+| `lead` | How long before the window to open (default one minute) |
+| `tz` | Which day is "today" (default `America/New_York`) |
+| `on_error` | `"log"` or `"raise"`; `"raise"` closes the stream and ends the schedule |
+| `max_sessions` | Stop after this many sessions and return the count (default: run until cancelled) |
+| `clock`, `sleep` | Replace the wall clock and `asyncio.sleep`, for tests |
+
+It is built to run unattended. If the calendar cannot be read, it logs the failure to `rustyschwab.schedule` and retries after 5 seconds, doubling up to 5 minutes. A stream that cannot be opened, or that ends for good before the window does (for example `ended: {"reason": "idle"}`), is reopened the same way. After a long wait it re-reads its clock at least hourly, so a suspended laptop catches up. The SDK still reconnects inside a session on its own. Starting in the middle of a session opens at once.
+
+The fixed-window mode is there for parity: `schedule.run_during_hours(client, plan, receiver=receiver, start_time=time(9, 29), stop_time=time(16, 0), on_days=(0, 1, 2, 3, 4), tz="America/New_York")` takes Schwabdev's arguments and defaults. It opens on holidays and runs past an early close, which is why the calendar version is the one to use.
+
+**Blocking form.** `sync.Client.run_during_market_hours(plan, receiver, ...)` and `run_during_hours(...)` take the same parameters, return a `Schedule` at once and run in the background. The receiver is a plain function that a worker thread calls, in order. `plan` may also be a function that takes the `sync.Client` and returns an open, subscribed `sync.Stream`.
+
+```python
+from rustyschwab import schedule, sync
+
+client = sync.Client.from_env()
+plan = schedule.Subscriptions().add("LEVELONE_EQUITIES", ["AAPL"])
+running = client.run_during_market_hours(plan, print)
+...
+running.stop()          # closes the stream; idempotent
+# running.join() waits for it to end by itself (only with max_sessions) and raises what stopped it
+```
+
+## Command line
+
+Installing the package adds a `rustyschwab` command (also `python -m rustyschwab`). It uses the standard library only.
+
+```sh
+rustyschwab login                    # authorize once and store the tokens
+rustyschwab login --no-browser       # print the URL but do not open a browser
+rustyschwab login --redirect-url 'https://127.0.0.1:8080/?code=...&state=...'
+rustyschwab login --config overrides.json
+rustyschwab fields LEVELONE_EQUITIES
+rustyschwab fields CHART_EQUITY --json
+```
+
+`login` builds a client from the `SCHWAB_*` environment, as `Client.from_env()` does, with a JSON object from `--config` laid over it if given. It prints the consent URL, opens it in a browser, and reads the address Schwab redirects to (or just its `code`) from the terminal, or takes it from `--redirect-url`. It then completes the authorization and says so. It never prints tokens or the code it was given; errors print as `error: ...` and exit with status 1. Pasting the address ends the flow even though the browser shows an error page for it.
+
+`fields SERVICE` prints the field numbers and names of a streamer service from the SDK's own table, the same one `rustyschwab.stream_fields(service)` returns, with nested tables (the order books' levels) indented. `--json` prints that list as JSON.
 
 ## Paper trading and backtests
 
@@ -584,7 +705,7 @@ Messages are safe to log. They never contain tokens, the app secret or broker re
 - Calls return coroutines, so `await`, `asyncio.create_task`, `gather` and `wait_for` all work, and nothing is sent until the coroutine runs. Awaiting one twice raises `RuntimeError`.
 - One multi-threaded tokio runtime serves the whole process, whichever event loop awaits (asyncio, uvloop, or several loops in turn). Python's event loop only waits for results; the GIL is not held while a request is in flight, and slow requests overlap rather than queue. The SDK's request budget (Schwab's 120 requests a minute by default) still paces them, with a share kept for order submissions and cancels.
 - Cancelling a task awaiting a call cancels the Rust future. The exception is order submission: it runs to its outcome on its own task, so a cancelled or timed-out `place_order` still leaves its journal record resolved, and an attempt you stopped waiting for is reconciled like any other.
-- There is no synchronous API. From a script, use `asyncio.run`.
+- Code without asyncio uses the blocking [`rustyschwab.sync`](#synchronous-use), which runs these same coroutines on one private event loop thread.
 - Results are converted to Python objects under the GIL when a call completes. Very large responses (full option chains) cost milliseconds of GIL time.
 - The SDK's `tracing` events are not forwarded to Python `logging`.
 
