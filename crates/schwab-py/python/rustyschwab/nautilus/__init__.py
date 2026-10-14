@@ -10,6 +10,8 @@ NautilusTrader's adapter conventions:
   registered on a ``TradingNode`` under the venue name ``SCHWAB``.
 * :class:`SchwabInstrumentProvider`, :class:`SchwabDataClient` and
   :class:`SchwabExecutionClient`.
+* :func:`load_bars`, cached Schwab price history as bars for a ``BacktestEngine``
+  or ``BacktestNode``, and :func:`write_catalog` to put them in a Parquet catalog.
 
 See the NautilusTrader section of the Python guide for a complete node.
 """
@@ -28,6 +30,7 @@ from .constants import SCHWAB, SCHWAB_CLIENT_ID, SCHWAB_VENUE
 from .data import SchwabDataClient
 from .execution import SchwabExecutionClient
 from .factories import SchwabLiveDataClientFactory, SchwabLiveExecClientFactory
+from .history import load_bars, write_catalog
 from .providers import SchwabInstrumentProvider
 
 __all__ = [
@@ -42,4 +45,6 @@ __all__ = [
     "SchwabLiveDataClientFactory",
     "SchwabLiveExecClientFactory",
     "SchwabPaperConfig",
+    "load_bars",
+    "write_catalog",
 ]

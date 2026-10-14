@@ -408,7 +408,7 @@ def parse_candles(
     bar_type: BarType,
     candles: Iterable[Mapping[str, Any]],
     instrument: Instrument,
-    ts_init: int,
+    ts_init: int | None,
     *,
     on_close: bool = True,
 ) -> list[Bar]:
@@ -416,6 +416,8 @@ def parse_candles(
 
     Schwab stamps a candle with its open time. With ``on_close`` the bar's
     ``ts_event`` is its close, which is when Nautilus treats a bar as known.
+    ``ts_init`` is when the system received the bars; ``None`` gives each bar
+    its own ``ts_event``, which is what a backtest replays them by.
     """
     bars: list[Bar] = []
     for candle in candles:
@@ -426,6 +428,7 @@ def parse_candles(
         volume = _decimal(candle.get("volume")) or Decimal(0)
         precision = instrument.price_precision
         o, h, low, c = (Price(float(v), precision) for v in values if v is not None)
+        ts_event = _bar_close_ns(bar_type, open_ns) if on_close else open_ns
         bars.append(
             Bar(
                 bar_type=bar_type,
@@ -434,8 +437,8 @@ def parse_candles(
                 low=low,
                 close=c,
                 volume=Quantity(int(volume), instrument.size_precision),
-                ts_event=_bar_close_ns(bar_type, open_ns) if on_close else open_ns,
-                ts_init=ts_init,
+                ts_event=ts_event,
+                ts_init=ts_event if ts_init is None else ts_init,
             )
         )
     bars.sort(key=lambda bar: bar.ts_event)
