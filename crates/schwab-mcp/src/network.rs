@@ -464,13 +464,22 @@ mod tests {
     use axum::{body::Body, extract::Request, http::StatusCode};
     use tower::ServiceExt;
 
-    fn server(name: &str, token: &str, tools: &[&str]) -> AuthorizedServer {
+    /// A principal's server, with its token file and journal in `dir` so the
+    /// test's directory removes them.
+    fn server(
+        dir: &tempfile::TempDir,
+        name: &str,
+        token: &str,
+        tools: &[&str],
+    ) -> AuthorizedServer {
         let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
             oauth: schwab_rs::OAuthConfig {
                 app_key: "k".repeat(32),
                 app_secret: "s".repeat(16),
                 token_store_kind: schwab_rs::auth::TokenStoreKind::File,
-                tokens_file: std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4())),
+                tokens_file: dir
+                    .path()
+                    .join(format!("{name}-{}.json", uuid::Uuid::new_v4())),
                 ..Default::default()
             },
             streaming: None,
@@ -538,8 +547,9 @@ mod tests {
 
     #[tokio::test]
     async fn every_network_request_requires_a_valid_bearer_token() {
+        let dir = tempfile::tempdir().unwrap();
         let token = "a".repeat(32);
-        let app = router(vec![server("A", &token, &["get_quote"])]);
+        let app = router(vec![server(&dir, "A", &token, &["get_quote"])]);
         for bearer in [
             None,
             Some("wrong"),
@@ -559,11 +569,12 @@ mod tests {
     /// session or connection it arrives on.
     #[tokio::test]
     async fn principals_have_distinct_tool_inventories() {
+        let dir = tempfile::tempdir().unwrap();
         let a = "a".repeat(32);
         let b = "b".repeat(32);
         let app = router(vec![
-            server("A", &a, &["get_quote"]),
-            server("B", &b, &["get_account"]),
+            server(&dir, "A", &a, &["get_quote"]),
+            server(&dir, "B", &b, &["get_account"]),
         ]);
         assert_eq!(tool_names(&app, &a).await, ["get_quote"]);
         assert_eq!(tool_names(&app, &b).await, ["get_account"]);
@@ -573,8 +584,9 @@ mod tests {
     /// principal the new policy keeps; one presented afresh is served.
     #[tokio::test]
     async fn a_reload_revokes_earlier_credentials() {
+        let dir = tempfile::tempdir().unwrap();
         let token = "a".repeat(32);
-        let network = network(vec![server("A", &token, &["get_quote"])]);
+        let network = network(vec![server(&dir, "A", &token, &["get_quote"])]);
         let principals = network.credentials.principals.clone();
         let router = PrincipalRouter {
             principals: principals.clone(),
@@ -591,7 +603,7 @@ mod tests {
         assert!(router.select(&base).is_ok());
         replace(
             &principals.registry,
-            vec![server("A", &token, &["get_quote"])],
+            vec![server(&dir, "A", &token, &["get_quote"])],
         );
         assert!(
             router.select(&base).is_err(),
@@ -605,7 +617,7 @@ mod tests {
     async fn policy_reload_revokes_credentials_without_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.json");
-        let server = server("A", &"a".repeat(32), &["get_quote"]);
+        let server = server(&dir, "A", &"a".repeat(32), &["get_quote"]);
         std::fs::write(
             &path,
             serde_json::to_vec(&vec![&*server.principal]).unwrap(),

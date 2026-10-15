@@ -1391,7 +1391,7 @@ mod tests {
             );
         }
 
-        let server = authorized_as(
+        let (_dir, server) = authorized_as(
             Switches {
                 trading: true,
                 cancel: true,
@@ -1507,7 +1507,7 @@ mod tests {
     /// included, reports every reason at once, and audits nothing.
     #[tokio::test]
     async fn check_order_reports_the_principal_verdict_without_dispatching() {
-        let server = authorized();
+        let (_dir, server) = authorized();
         let verdict = |result: McpResult<ToolResult>| {
             let result = result.unwrap();
             assert!(!result.is_error, "{result:?}");
@@ -1619,7 +1619,7 @@ mod tests {
     /// principal is not told.
     #[tokio::test]
     async fn server_status_carries_the_principal_and_the_halt() {
-        let server = authorized();
+        let (_dir, server) = authorized();
         let denied = crate::testing::call_tool(&server, "get_server_status", serde_json::json!({}))
             .await
             .unwrap();
@@ -1703,29 +1703,36 @@ mod tests {
     fn code(result: Result<(), ToolFailure>) -> Option<FailureCode> {
         result.err().map(|f| f.code)
     }
-    fn authorized() -> AuthorizedServer {
+    /// A server whose token file and journal live in the returned
+    /// directory, which removes them when the test drops it.
+    fn authorized() -> (tempfile::TempDir, AuthorizedServer) {
         authorized_as(Switches::default(), policy())
     }
-    fn authorized_as(switches: Switches, policy: PrincipalPolicy) -> AuthorizedServer {
+    fn authorized_as(
+        switches: Switches,
+        policy: PrincipalPolicy,
+    ) -> (tempfile::TempDir, AuthorizedServer) {
+        let dir = tempfile::tempdir().unwrap();
         let client = schwab_rs::SchwabClient::new(schwab_rs::SchwabConfig {
             oauth: schwab_rs::OAuthConfig {
                 app_key: "k".repeat(32),
                 app_secret: "s".repeat(16),
                 token_store_kind: schwab_rs::auth::TokenStoreKind::File,
-                tokens_file: std::env::temp_dir().join(format!("{}.json", uuid::Uuid::new_v4())),
+                tokens_file: dir.path().join("tokens.json"),
                 ..Default::default()
             },
             streaming: None,
             ..Default::default()
         })
         .unwrap();
-        AuthorizedServer::new(Backend::Live(Arc::new(client)), switches, policy)
+        let server = AuthorizedServer::new(Backend::Live(Arc::new(client)), switches, policy);
+        (dir, server)
     }
     /// Denials reach the model as `isError` results it can read, never as
     /// JSON-RPC errors, and carry the code and intent digest it needs next.
     #[tokio::test]
     async fn denials_are_structured_tool_results() {
-        let server = authorized();
+        let (_dir, server) = authorized();
         let error = |result: McpResult<ToolResult>| {
             let result = result.expect("denial is a tool result");
             assert!(result.is_error);
@@ -1791,7 +1798,7 @@ mod tests {
     async fn a_principal_call_limit_answers_rate_limited() {
         let mut limited = policy();
         limited.max_calls_per_minute = std::num::NonZeroU32::new(1);
-        let server = authorized_as(Switches::default(), limited);
+        let (_dir, server) = authorized_as(Switches::default(), limited);
         let args = serde_json::json!({"symbol": "AAPL"});
         let _ = crate::testing::call_tool(&server, "get_quote", args.clone()).await;
         let second = crate::testing::call_tool(&server, "get_quote", args)
@@ -1807,7 +1814,7 @@ mod tests {
     /// for want of a Schwab session) keeps its approval for the retry.
     #[tokio::test]
     async fn an_unsent_submission_gives_its_approval_back() {
-        let server = authorized_as(
+        let (_dir, server) = authorized_as(
             Switches {
                 trading: true,
                 cancel: false,
@@ -1845,7 +1852,7 @@ mod tests {
     /// principal until an operator steps in.
     #[tokio::test]
     async fn a_stranded_dispatch_is_settled_from_the_venue_journal() {
-        let server = authorized_as(
+        let (_dir, server) = authorized_as(
             Switches {
                 trading: true,
                 cancel: false,
@@ -1923,7 +1930,7 @@ mod tests {
     /// dispatched copy carries the derived tag, and an explicit tag stays.
     #[tokio::test]
     async fn submissions_are_tagged_with_their_intent_digest() {
-        let mut server = authorized();
+        let (_dir, mut server) = authorized();
         let mut policy = policy();
         policy.require_approval = false;
         server.principal = Arc::new(policy);
@@ -2076,7 +2083,7 @@ mod tests {
         let prompt = guidance::PROPOSE_TRADE;
         let args = |account: &str| Some(serde_json::json!({"account_hash": account}));
 
-        let desk = authorized();
+        let (_dir, desk) = authorized();
         assert_eq!(resources(&desk).await.len(), 1);
         assert_eq!(prompts(&desk).await.len(), 1);
         assert!(desk.offers_guidance());
@@ -2105,7 +2112,7 @@ mod tests {
         assert!(prompt_text(&desk, "other", args("A")).await.is_err());
 
         // With the switch on, the same principal is walked through placing it.
-        let trading = authorized_as(
+        let (_dir, trading) = authorized_as(
             Switches {
                 trading: true,
                 cancel: true,
@@ -2119,7 +2126,7 @@ mod tests {
         // A reader holds no order tool: nothing is listed or served.
         let mut reader = policy();
         reader.tools = ["get_account", "get_quotes"].map(String::from).into();
-        let reader = authorized_as(Switches::default(), reader);
+        let (_dir, reader) = authorized_as(Switches::default(), reader);
         assert!(resources(&reader).await.is_empty());
         assert!(prompts(&reader).await.is_empty());
         assert!(!reader.offers_guidance());
@@ -2205,7 +2212,8 @@ mod tests {
     #[tokio::test]
     async fn ungranted_tools_are_refused_on_the_wire() {
         use tower::{Service, ServiceExt};
-        let mut dispatcher = authorized().dispatcher();
+        let (_dir, server) = authorized();
+        let mut dispatcher = server.dispatcher();
         let meta = serde_json::json!({
             "io.modelcontextprotocol/protocolVersion": "2026-07-28",
             "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},

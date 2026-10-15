@@ -25,7 +25,8 @@ fn create_test_config(mock_server_uri: &str) -> SchwabConfig {
             callback_url: "https://127.0.0.1:8080/callback".to_string(),
             auth_url: format!("{}/oauth/authorize", mock_server_uri),
             token_url: format!("{}/oauth/token", mock_server_uri),
-            tokens_file: std::env::temp_dir()
+            // Under target/, not the system temp directory, which no one cleans.
+            tokens_file: std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
                 .join(format!("oauth-test-{}.json", uuid::Uuid::new_v4())),
             capture_callback: false,
             auto_refresh: false,
