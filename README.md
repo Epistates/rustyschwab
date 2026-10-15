@@ -72,7 +72,7 @@ A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 a
   - Custom field selection per service
   - All 13 streaming services fully implemented
 
-## 🔒 Security
+## Security
 
 Token handling is layered: secrets are zeroized in memory, encrypted or
 keychain-held at rest, and never written to logs. The table compares the
