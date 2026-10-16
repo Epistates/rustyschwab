@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decoded. A test exchanges a real-shaped redirect, with `session`.
 - **The callback server listened on the wrong port** for a callback URL
   without one: 8080 instead of 443, where Schwab redirects.
+- **Reconciliation evidence covers foreign tags.** An order matching an
+  unknown submission but listed under a tag the SDK did not send (a broker
+  may stamp its own) is now counted in
+  `schwab_reconciliation_untagged_matches_total` and logged for an
+  operator, as an untagged one was. It still never resolves the
+  submission. The live smoke run checks whether Schwab keeps the SDK's tag.
 - The setup guide gains the steps Schwabdev documents and we lacked
   (requesting Trader API - Individual, the same email as the brokerage
   account, days for "Ready for Use", enabling thinkorswim, several callback
