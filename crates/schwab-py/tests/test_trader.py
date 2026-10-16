@@ -270,6 +270,24 @@ async def test_apply_batch_is_all_or_nothing(tmp_path: Path) -> None:
     assert (await broker.apply(paper.clock(3, 20)))["duplicate"] is False
 
 
+async def test_the_readme_strategy_runs(store: HistoryStore) -> None:
+    """The repository README's Python example, run against the cached bars."""
+    readme = Path(__file__).parents[3] / "README.md"
+    block = readme.read_text().split("```python\n", 1)[1].split("```", 1)[0]
+    body, last = block.rstrip().rsplit("\n", 1)
+    assert last == "asyncio.run(main())"
+    namespace: dict[str, Any] = {}
+    exec(body, namespace)
+
+    run = await Trader(cache=store).backtest(
+        namespace["strategy"], ["ABC"], cash=10_000, **window()
+    )
+    # One share, bought once: the example must not stack orders while one
+    # is still working.
+    assert [(f["side"], f["quantity"]) for f in run.fills] == [("BUY", Decimal(1))]
+    assert run.report()
+
+
 def test_context_bookkeeping() -> None:
     tc = Context("backtest", ("ABC",), Decimal(100))
     tc.positions["ABC"] = Decimal(5)

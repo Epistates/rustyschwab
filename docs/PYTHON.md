@@ -44,7 +44,7 @@ Schwab issues a 30-minute access token and a 7-day refresh token. The client ref
    export SCHWAB_TOKENS_FILE=~/.config/schwab/tokens.json
    ```
 
-   The default store is the Keychain on macOS and an encrypted file elsewhere. [README](../README.md#environment-variables) lists every variable.
+   The default store is the Keychain on macOS and an encrypted file elsewhere. The [setup guide](SETUP_GUIDE.md#5-token-persistence) compares the stores, and `.env.example` lists every variable.
 3. Authorize once:
 
    ```python

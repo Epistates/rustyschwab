@@ -121,6 +121,44 @@ The reason names the account and the equity either side of the fall, so it is wr
 
 Import `ops/dashboard.json` into Grafana and select your Prometheus datasource. Poll readiness to update aggregate readiness gauges. Use `ops/alerts.yml` with Prometheus and install the optional metrics recorder with `SCHWAB_METRICS_BIND`. Initial operating targets should be reviewed against measured broker behavior: no automatic ambiguous submission replay; no trading from an unreconciled required account; alarm on any unknown outcome; record p50/p95/p99 request latency, recovery duration, baseline age, stream loss and time spent unready. Define availability/error budgets for the broker dependency separately from the utility.
 
+### Metrics
+
+Metrics are opt-in. Set `SCHWAB_METRICS_BIND=127.0.0.1:9090` and the MCP server starts a Prometheus scrape listener on that address. Unset, there is no listener and every `metrics::counter!`/`histogram!` call is a no-op: the SDK depends only on the `metrics` facade, so a library consumer can install its own recorder.
+
+```bash
+SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
+# in another shell
+curl http://127.0.0.1:9090/metrics
+```
+
+Every metric, with its kind, labels and meaning, is listed in the module docs of [`schwab_rs::metrics`](https://docs.rs/schwab-rs/latest/schwab_rs/metrics/) and `schwab_mcp::metrics` (`cargo doc -p schwab-mcp --open`). Those tables and the `CATALOG` constants are the source of truth: a workspace test keeps them, every call site, `ops/alerts.yml` and `ops/dashboard.json` in line, and the server registers the help text with Prometheus.
+
+Starter PromQL:
+
+```promql
+# 5xx error rate per operation
+sum by (op) (rate(schwab_http_requests_total{status="5xx"}[5m]))
+
+# p99 latency by op
+histogram_quantile(0.99,
+  sum by (le, op) (rate(schwab_http_request_duration_seconds_bucket[5m])))
+
+# Tool call error ratio
+sum by (tool) (rate(schwab_mcp_tool_calls_total{outcome="error"}[5m]))
+ / sum by (tool) (rate(schwab_mcp_tool_calls_total[5m]))
+
+# Circuit breaker open (alert on > 0)
+max_over_time(schwab_circuit_state[1m]) == 2
+
+# Stream healthy (alert on 0 during market hours)
+schwab_stream_connected
+
+# Sustained token refresh failures
+increase(schwab_token_refresh_total{outcome="failure"}[15m])
+```
+
+### Shutdown
+
 HTTP/WebSocket process shutdown handles SIGINT and, on Unix, SIGTERM. It permanently closes submission admission and allows up to thirty seconds for HTTP draining. Transport cancellation abandons only a write's answer; the write itself runs to its outcome unless the process exits first, in which case reconcile on restart. A principal's audit record left unresolved by a process exit is settled from the venue journal on that principal's next submission once it is two minutes old: with the venue's outcome when it has one, and, when nothing reached the venue, as such with its approval given back. For application-owned shutdown, stop admission first, preserve unresolved intents and reservations, disconnect streams, and let the process close its database connections. Never clear pending records to make a health probe pass. If disk is full, storage is corrupt, identity keys are unavailable or broker order pages are truncated, fail closed and investigate using the corresponding runbook above.
 
 ## Observability: OpenTelemetry

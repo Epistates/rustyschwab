@@ -1,907 +1,122 @@
-# Schwab Rust SDK
+# rustyschwab
 
-A Rust SDK for Charles Schwab's Trading and Market Data APIs, providing OAuth2 authentication, REST API access, and WebSocket streaming capabilities.
+A Rust SDK, Python package and MCP server for the Charles Schwab Trader and Market Data APIs, built for automated strategies and LLM agents that place real orders.
 
 > [!WARNING]
-> **RISK WARNING**: This SDK is for advanced users and is provided "as is" without warranty of any kind. Automated trading involves significant risk of financial loss.
-> **Test your logic in isolated simulation before using real capital.** The [paper trading mode](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md) runs locally; it does not connect to thinkorswim paperMoney.
-> Use of this SDK is entirely at your own risk.
+> Automated trading can lose money. This software is provided as is, without warranty. Start with the [paper venue](docs/PAPER_TRADING.md), which runs locally and does not connect to thinkorswim paperMoney. Not affiliated with Charles Schwab & Co., Inc.
 
-## Documentation
+**Status:** 0.2.0 release candidate, not yet on crates.io or PyPI; install from this repository. One maintainer. Everything is tested against recorded Schwab responses and local fakes, but no live-account run has been recorded yet, so treat live trading as unproven. See [what is core, what is experimental, and what has run live](docs/SUPPORT.md).
 
-- **[Full Documentation Index](https://github.com/epistates/rustyschwab/blob/main/docs/INDEX.md)**: Main entry point for all guides.
-- **[Setup Guide](https://github.com/epistates/rustyschwab/blob/main/docs/SETUP_GUIDE.md)**: Detailed instructions for getting started.
-- **[Placing Orders](https://github.com/epistates/rustyschwab/blob/main/docs/ORDERS.md)**: Comprehensive guide for trading equities and options.
-- **[Real-time Streaming](https://github.com/epistates/rustyschwab/blob/main/docs/STREAMING.md)**: Deep dive into the WebSocket client and services.
-- **[Troubleshooting](https://github.com/epistates/rustyschwab/blob/main/docs/TROUBLESHOOTING.md)**: Common issues and solutions.
-- **[Python bindings](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md)**: `pip install rustyschwab`, asyncio and blocking clients, order templates, streaming, one strategy for backtest, paper and live, performance reports and a NautilusTrader adapter.
-- **[Coming from Schwabdev](https://github.com/epistates/rustyschwab/blob/main/docs/MIGRATING_FROM_SCHWABDEV.md)**: every Schwabdev call and its equivalent.
-- **[Architecture Overview](https://github.com/epistates/rustyschwab/blob/main/docs/ARCHITECTURE_OVERVIEW.md)** and **[Contributing](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md)**: For contributors.
+## What is in it
 
-## Features
+| Part | For | Docs |
+| --- | --- | --- |
+| [`schwab-rs`](crates/schwab-rs) | Rust applications: OAuth, REST, the streamer, the order journal, risk limits, paper venue, history cache, performance analytics | [crate guide](crates/schwab-rs/README.md) |
+| [`rustyschwab`](crates/schwab-py) (Python) | The same SDK from asyncio or blocking Python, order templates, one strategy for backtest, paper and live, a NautilusTrader adapter | [Python guide](docs/PYTHON.md) |
+| [`schwab-mcp`](crates/schwab-mcp) | LLM agents: 40 tools over the SDK, behind per-principal policy, approvals and a paper mode | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
 
-- **[Paper trading and deterministic replay](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)** — isolated long-equity execution, finite quote liquidity, durable accounting, simulated latency, per-share, notional and sell-only regulatory fees, authenticated gateway support and backtesting over price history under a declared synthetic-quote model. Start with `ops/paper/replay.jsonl`.
+## What it does differently
 
-- **Backtesting and analytics** — `history::HistoryStore` caches price history and recorded quotes and books in SQLite, fetching only the spans it lacks; `performance::analyze` reports return, drawdown, Sharpe, Sortino, Calmar and FIFO round-trip statistics, long and short. In Python, [`rustyschwab.trader`](https://github.com/epistates/rustyschwab/blob/main/docs/PYTHON.md#strategies-backtest-paper-and-live) runs one strategy as a backtest, on live data against the paper venue, or live.
+The hard part of broker automation is what happens when something goes wrong. rustyschwab is built around that:
 
-- **[MCP server for LLM agents](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md)** — `schwab-mcp` exposes market data, accounts and trading to MCP clients under per-principal policy: symbol lists, price collars, daily budgets, defined-risk option spreads, human or client approval, a dead-man switch, a tamper-evident audit log and a paper mode.
+- **An order is sent at most once.** Every submission is journaled before it leaves the process. A timeout or dropped connection becomes `SubmissionUnknown`, never a retry, and the account's next submission waits until the journal reconciles the order against Schwab.
+- **Limits hold outside the strategy.** Risk limits, a daily-loss halt, an operator halt and a dead-man switch that cancels a silent agent's orders are enforced by the SDK and the server, not by the code placing the orders.
+- **Agents get a narrow, checked surface.** MCP write tools are off by default. Each principal is held to its accounts, tools, symbols, price collar and daily budget; orders can require operator or user approval; `check_order` explains every local reason an order would fail before anything reaches Schwab; and every write is recorded, with the model's stated rationale, in a hash-chained audit journal.
+- **Simulation uses the same code path.** The paper venue is deterministic and durable (SQLite), with finite liquidity, latency, fees and settlement in exact decimals. A Python strategy runs unchanged as a backtest, against the paper venue on live data, or live.
+- **Credentials stay out of reach.** Tokens live in the OS keychain or an encrypted file, are zeroized in memory, and never appear in logs, errors or reprs.
 
-- **OAuth2 Authentication**
-  - Authorization code flow with built-in callback server
-  - Automatic token refresh with configurable buffer
-  - 7-day refresh token expiration handling with notifications
-  - HTTPS validation and security enforcement
-  - HTTP client session management
-  - Token file corruption recovery
+## Quickstart
 
-- **Security & Token Storage**
-  - **Memory-safe token handling** with automatic zeroing (SecretString)
-  - **Three storage backends**: File (basic), EncryptedFile (ChaCha20Poly1305), Keychain (OS-native)
-  - **Secure by default**: macOS uses Keychain, other platforms use EncryptedFile
-  - **File permissions**: Unix 0600 enforcement on token files
-  - **Passphrase keys**: `security::derive_key_from_password` (PBKDF2-HMAC-SHA256, 600k iterations) for callers who manage their own encrypted files; the token stores use a random key
-
-- **Market Data APIs**
-  - Real-time quotes and price history
-  - **Advanced quote options**: Filter by fields and enable `indicative` quotes
-  - Option chains with Greeks
-  - Market movers and instruments
-  - WebSocket streaming for live data
-
-- **Trading APIs**
-  - Account management
-  - Order placement and management
-  - **Order Preview**: Validate orders without execution
-  - Position tracking
-  - Transaction history
-
-- **Runtime Resilience**
-  - Rate limiting tuned to Schwab's 120 requests/minute limit (2 req/s, burst of 10)
-  - Exponential backoff retry logic
-  - **WebSocket Ping/Pong heartbeat monitoring** (v0.2.0)
-  - **Timeout detection with automatic reconnection** (v0.2.0)
-  - Field-based subscription batching (scoped)
-  - Token expiry notifications
-  - Comprehensive error handling
-  - Type-safe bindings for commonly used endpoints (OpenAPI coverage in progress)
-
-- **Streaming Advanced Features** (v0.2.0)
-  - **Bounded channels** with explicit gap notifications
-  - Automatic Ping/Pong heartbeat (20s interval, 30s timeout)
-  - Subscription persistence across reconnections
-  - Custom field selection per service
-  - All 13 streaming services fully implemented
-
-## Security
-
-Token handling is layered: secrets are zeroized in memory, encrypted or
-keychain-held at rest, and never written to logs. The table compares the
-defaults with the Python reference client (Schwabdev).
-
-### Security Features Comparison
-
-| Feature | rustyschwab | Python Reference | Advantage |
-|---------|------------|------------------|-----------|
-| **Encryption at Rest** | ✅ ChaCha20Poly1305 AEAD | ❌ Plaintext JSON | **Confidentiality** |
-| **Tamper Detection** | ✅ AEAD authentication tags | ❌ None | **Data integrity** |
-| **Memory Protection** | ✅ SecretString + Zeroize | ❌ Plain strings | **Memory safety** |
-| **Keychain Storage** | ✅ macOS/Windows/Linux | ❌ Not implemented | **OS-managed secrets** |
-| **File Permissions** | ✅ Enforced 0600 (Unix) | ❌ Default perms | **Access control** |
-| **PKCE (RFC 7636)** | ✅ S256 method | ❌ Not implemented | **OAuth 2.1 ready** |
-| **Thread Safety** | ✅ Compile-time safe | ⚠️ GIL-dependent | **Concurrency** |
-| **Secret Logging** | ✅ Redacted in logs | ⚠️ Potential exposure | **Audit safety** |
-
-### Defense-in-Depth Architecture
-
-**Layer 1: Memory Safety**
-```rust,ignore
-// Tokens wrapped in SecretString with automatic zeroization
-pub struct TokenSet {
-    access_token: Option<SecretString>,   // Auto-cleared on drop
-    refresh_token: Option<SecretString>,  // Never logged
-}
-```
-- Token buffers, including the serialized form written to a store, are
-  zeroized when dropped, which shortens how long a memory dump could find them
-- Pages are not locked, so this is not protection from swap or core dumps;
-  disable core dumps and use encrypted swap on hosts that hold credentials
-- Explicit `expose_secret()` required for access
-- `Debug` output of configs and token sets redacts the secrets
-
-**Layer 2: Encryption at Rest**
-```text
-// ChaCha20Poly1305 AEAD (authenticated encryption)
-- Algorithm: ChaCha20Poly1305 (NCC Group audited, 2020)
-- Key: 256-bit random (OS CSPRNG)
-- Nonce: 96-bit random per encryption
-- Authentication: 128-bit tag prevents tampering
-- Key file: next to the token file, 0600 / owner-only ACL
-```
-
-The key lives beside the ciphertext, so encryption protects a token file
-that leaves the machine on its own (a backup, a copied directory). It does
-not protect against a local account that can already read both files; use
-the keychain store for that.
-
-**Layer 3: OS-Native Credential Storage**
-```text
-// Cross-platform secure storage
-- macOS: login Keychain
-- Windows: Credential Manager (DPAPI encryption)
-- Linux: Secret Service API (GNOME Keyring/KWallet)
-```
-
-**Layer 4: File Permissions**
-```text
-// Unix: Enforced 0600 (owner read/write only)
-- Verified before every read
-- Applied after every write
-- Prevents unauthorized access on shared systems
-```
-
-**Layer 5: Transport Security**
-```text
-// TLS/HTTPS enforcement
-- rustls: Memory-safe TLS (no OpenSSL vulnerabilities)
-- HTTPS-only callback URLs (validated at config time)
-- WSS for streaming (TLS over WebSocket)
-```
-
-### PKCE Support (RFC 7636)
-
-PKCE is implemented (S256) but **opt-in** — Schwab's public OAuth docs
-and the Schwabdev Python reference client do not use it, so we default
-to `pkce_enabled: false`. Turn it on only if you've verified your
-Schwab app accepts `code_challenge` / `code_verifier`:
-
-```rust,ignore
-use schwab_rs::auth::OAuthConfig;
-
-let oauth = OAuthConfig {
-    app_key: "YOUR_APP_KEY".into(),
-    app_secret: "YOUR_SECRET".into(),
-    callback_url: "https://127.0.0.1:8080".into(),
-    pkce_enabled: true,  // opt in after verifying Schwab accepts it
-    ..Default::default()
-};
-```
-
-When enabled, the flow uses a cryptographically-random verifier and
-an `S256` (SHA-256) challenge to mitigate authorization-code
-interception.
-
-### Security Best Practices
-
-**1. Choose the Right Token Storage Backend**
-
-```rust,ignore
-use schwab_rs::auth::TokenStoreKind;
-
-// Development: Quick start with basic security
-token_store_kind: TokenStoreKind::File,  // 0600 permissions only
-
-// Production (Recommended): Encrypted file storage
-token_store_kind: TokenStoreKind::EncryptedFile,  // ChaCha20Poly1305 AEAD
-
-// Production (Best): OS-native credential storage
-token_store_kind: TokenStoreKind::Keychain,  // Default on macOS
-```
-
-**Security Levels:**
-- **File:** plaintext JSON, owner-only permissions. Development and testing only.
-- **EncryptedFile:** ChaCha20-Poly1305 with the key beside the file. Protects a
-  copied or backed-up token file; not a local account that can read both. The
-  default off macOS.
-- **Keychain:** the OS credential store. The default on macOS.
-
-**2. Enable Token Notifications**
-
-```rust,ignore
-use schwab_rs::auth::{OAuthConfig, TokenNotification};
-use std::sync::Arc;
-
-let oauth = OAuthConfig {
-    on_token_notification: Some(Arc::new(|notification| {
-        match notification {
-            TokenNotification::RefreshTokenExpiring { hours_remaining } => {
-                eprintln!("⚠️  Refresh token expires in {} hours!", hours_remaining);
-                // Send alert, log to monitoring, etc.
-            }
-            TokenNotification::TokenFileCorrupted => {
-                eprintln!("🔒 Token file was corrupted and recreated");
-            }
-            _ => {}
-        }
-    })),
-    ..Default::default()
-};
-```
-
-**3. Secure Your Credentials**
+Register an app at [developer.schwab.com](https://developer.schwab.com/) with callback URL `https://127.0.0.1:8080`, then:
 
 ```bash
-# NEVER commit credentials to version control
-echo "schwab_tokens.json" >> .gitignore
-echo "schwab_tokens.json.key" >> .gitignore
-echo ".env" >> .gitignore
-
-# Use environment variables
-export SCHWAB_APP_KEY="your_app_key"
-export SCHWAB_APP_SECRET="your_app_secret"
-
-# Or use a secret management service
-# - AWS Secrets Manager
-# - HashiCorp Vault
-# - Azure Key Vault
+git clone https://github.com/epistates/rustyschwab && cd rustyschwab
+cp .env.example .env            # set SCHWAB_APP_KEY, SCHWAB_APP_SECRET
+cargo run -p oauth-flow         # sign in once; tokens are stored securely
 ```
 
-**4. Production Deployment Checklist**
+The [setup guide](docs/SETUP_GUIDE.md) covers each step and the token stores.
 
-- [ ] Use `EncryptedFile` or `Keychain` storage backend
-- [ ] Set up token expiry notifications
-- [ ] Configure proper file permissions (0600 on Unix)
-- [ ] Use HTTPS-only callback URLs
-- [ ] Never log credentials or tokens
-- [ ] Rotate credentials regularly
-- [ ] Monitor for token expiry events
-- [ ] Use rate limiting in production
-- [ ] Enable retry logic with exponential backoff
-
-### Cryptographic Implementation Details
-
-**ChaCha20Poly1305 AEAD (EncryptedFile Backend)**
-
-```text
-// Encryption process
-1. Generate random 256-bit key (once, stored separately)
-2. For each encryption:
-   - Generate random 96-bit nonce (OS CSPRNG)
-   - Encrypt plaintext with ChaCha20
-   - Compute Poly1305 authentication tag
-   - Output: [nonce(12) || ciphertext || tag(16)]
-
-// Security properties
-- Confidentiality: ChaCha20 stream cipher (256-bit key)
-- Authenticity: Poly1305 MAC (128-bit tag)
-- Tamper detection: Any modification causes decryption failure
-```
-
-### Vulnerability Reporting
-
-See [SECURITY.md](SECURITY.md): email `security@epistates.com` or open a private GitHub security advisory. Do not open public issues for security vulnerabilities.
-
-### Security Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `ring` | CSPRNG, SHA-256 (PKCE), TLS crypto provider |
-| `rustls` | TLS for HTTPS, the streamer WebSocket and the callback server |
-| `chacha20poly1305` | Token encryption at rest (RustCrypto; NCC Group audit, 2020) |
-| `keyring` | OS credential storage |
-| `secrecy`, `zeroize` | Secret wrappers and memory clearing |
-
-CI runs `cargo deny` (see `deny.toml`) on every change: any RustSec
-vulnerability, unmaintained or yanked crate, unapproved license or unknown
-source fails the build.
-
-## Installation
+### Rust
 
 ```toml
 [dependencies]
-schwab-rs = { version = "0.2", features = ["callback-server"] }
+schwab-rs = { git = "https://github.com/epistates/rustyschwab" }
 tokio = { version = "1", features = ["full"] }
 ```
 
-`schwab-rs` re-exports the wire types as `schwab_rs::types`, so a separate
-`schwab-types` dependency is only needed by crates that use the types alone.
-
-From Python, `pip install rustyschwab` installs the same SDK as an asyncio
-client (CPython 3.10+, abi3 wheels). See the [Python guide](docs/PYTHON.md);
-the bindings live in [`crates/schwab-py`](crates/schwab-py), outside the Cargo
-workspace.
-
-## Quick Start
-
-[`crates/schwab-rs/README.md`](crates/schwab-rs/README.md) walks through
-configuration, authorization, market data and account reads, placing a
-bracket order and streaming quotes. Its examples are compiled as doctests,
-so they track the API; it is also the crate's page on docs.rs and
-crates.io. The runnable programs under [`examples/`](#examples) cover the
-same ground end to end, and [ORDERS.md](docs/ORDERS.md) and
-[STREAMING.md](docs/STREAMING.md) go deeper.
-
-## OAuth Callback URL
-
-Schwab requires an HTTPS callback URL. For every normal development
-and agent-on-dev-machine setup, use:
-
-```bash
-SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
-```
-
-Register that exact string in the Schwab Developer Portal, enable the
-built-in callback server (`cargo run -p oauth-flow`; the example enables it),
-click through your browser's self-signed-cert warning on first run,
-and you're done. No tunnel, no external binary, no rotating URL.
-
-### Advanced: public HTTPS tunnels
-
-You only need a tunnel (ngrok, cloudflared, a reverse proxy in front
-of a VM, etc.) if the machine running the OAuth flow can't host the
-browser doing the Schwab consent dance — e.g. headless servers, or
-corporate networks that block localhost callbacks.
-
-In that case:
-
-1. Stand up your tunnel however you like, pointing at local port
-   `8080` (or wherever you're binding the callback server).
-2. Register the resulting public HTTPS URL in the Developer Portal.
-   Free `trycloudflare.com` URLs rotate each launch, so prefer a
-   named / stable tunnel.
-3. Set `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true` so the built-in server
-   binds to `0.0.0.0` instead of `127.0.0.1`.
-
-This is genuinely an advanced case — 127.0.0.1 is the supported
-happy path.
-
-## Token Management
-
-### Access Token (30 minutes)
-- Automatically refreshed before expiry
-- Background task handles refresh seamlessly
-
-### Refresh Token (7 days)
-- Must restart OAuth flow when expired
-- SDK detects expiration and returns appropriate error
-- Optional notifications warn before expiry
-
-### Testing Token Scenarios
-
-```bash
-# Run the auth test example
-cargo run -p auth_test -- --app-key YOUR_KEY --app-secret YOUR_SECRET status
-```
-
-## Environment Variables
-
-Required:
-
-```bash
-export SCHWAB_APP_KEY="your_32_character_app_key"
-export SCHWAB_APP_SECRET="your_16_char_secret"
-export SCHWAB_OAUTH_CALLBACK_URL="https://127.0.0.1:8080"
-```
-
-Common optional overrides:
-
-```bash
-# Token persistence (defaults to ./schwab_tokens.json; platform-secure backend chosen automatically)
-export SCHWAB_TOKENS_FILE="$HOME/.config/schwab/tokens.json"
-export SCHWAB_TOKEN_STORE="keychain"   # keychain | encrypted | file
-
-# OAuth tuning
-export SCHWAB_PKCE_ENABLED=false       # Schwab's reference client does not use PKCE
-export SCHWAB_REFRESH_BUFFER=61        # seconds before expiry to refresh
-
-# MCP observability + PII
-export SCHWAB_METRICS_BIND=127.0.0.1:9090
-export SCHWAB_MCP_REDACT_PII=1         # account-number masking (creds/identity always dropped)
-export SCHWAB_MCP_ALLOW_REMOTE=0       # allow non-loopback http/ws bind (bearer policy and TLS proxy required)
-```
-
-See `.env.example` for the full, commented catalog.
-
-## MCP Server (`schwab-mcp`)
-
-The `schwab-mcp` crate wraps the full SDK as a [Model Context Protocol](https://modelcontextprotocol.io/)
-server — every REST endpoint and every streaming subscription becomes a tool
-an LLM agent (Claude Desktop, IDEs, custom clients) can invoke.
-
-### Build & run
-
-```bash
-# STDIO transport (default — for Claude Desktop, mcp-inspector, etc.)
-cargo run -p schwab-mcp --release
-
-# HTTP transport
-SCHWAB_MCP_TRANSPORT=http SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwab-mcp --release
-
-# WebSocket transport
-SCHWAB_MCP_TRANSPORT=websocket SCHWAB_MCP_BIND=127.0.0.1:8765 cargo run -p schwab-mcp --release
-```
-
-Tokens must already exist on disk (run the `oauth_flow` example first, or any
-`AuthManager`-based flow that persists to `SCHWAB_TOKENS_FILE`).
-
-#### Paper mode
-
-```bash
-# The same server over the local paper venue; no Schwab credential needed
-SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json \
-SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
-SCHWAB_MCP_ALLOW_TRADING=1 cargo run -p schwab-mcp --release
-```
-
-With `SCHWAB_MCP_PAPER_CONFIG` set, orders, fills, accounts and quotes are
-the [paper venue's](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md)
-simulation and no Schwab trading endpoint is reachable. Set `SCHWAB_APP_KEY`
-as well and a read-only Schwab client serves price history, option chains,
-movers, instruments, market hours and the stream. The mode is announced in
-`serverInfo.title`, `get_server_status` (`mode`, plus a `paper` section
-describing the venue), `/readyz`, and as `source: "paper"` on every read
-and mutation the venue served. Policy, approval, the trading switches and
-the operator halt gate paper orders exactly as they gate live ones.
-
-To backtest over price history, `schwab-paper --synthesize` turns Schwab
-candles into a quote stream under a declared model (`candle-bbo-v1`: four
-marks per bar, a configured spread and participation, New York dates as
-sessions), and a paced `--commands` replay advances the venue in virtual
-time while the model trades through the server. It is a modeling
-assumption, labeled as such in every session id, not broker conformance;
-see [backtesting over price history](https://github.com/epistates/rustyschwab/blob/main/docs/PAPER_TRADING.md#backtesting-over-price-history).
-
-To score a model against that venue, `schwab-eval serve` is the same
-policy-gated server over a seeded scenario (stale quote, injected
-instruction, wrong account, denied approval, lost acknowledgement, repeated
-submission, tripped daily-loss halt) that records every tool call, and
-`schwab-eval score` replays
-the transcript for a JSON report in which unauthorized executions must be
-zero. See [model evaluation](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md#model-evaluation).
-
-Network transports require `SCHWAB_MCP_POLICY_FILE` and a bearer token on
-every request. Principals have explicit account/tool permissions and isolated
-sessions. Remote access also requires a TLS proxy and
-`SCHWAB_MCP_ALLOW_REMOTE=1` for non-loopback binding. See the
-[policy configuration and migration guide](https://github.com/epistates/rustyschwab/blob/main/docs/ENTERPRISE_REMEDIATION.md).
-
-
-### Guardrail for real trades
-
-Write-side order tools (`place_order`, `cancel_order`, `replace_order`) are
-**disabled by default**. Place/replace require `SCHWAB_MCP_ALLOW_TRADING=1`
-and principal policy approval. Cancellation can be enabled independently with
-`SCHWAB_MCP_ALLOW_CANCEL=1`. All policy-bound tools, including preview,
-require an explicit tool permission.
-
-An account's risk limits (`SCHWAB_RISK_POLICY_FILE`, or the paper
-configuration) may set `max_daily_loss`: once the day's loss exceeds it, the
-venue trips the durable operator halt and every submission answers `halted`
-until an operator clears it, and trips it again while the loss persists. See
-[the risk boundary](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md#risk-boundary).
-
-### Tool surface
-
-- **Market data** — `get_quotes`, `get_quote`, `get_price_history`,
-  `get_option_chain`, `get_option_expiration_chain`, `get_movers`,
-  `search_instruments`, `get_instrument`, `get_markets`, `get_market`
-- **Accounts** — `get_account_numbers`, `get_accounts`, `get_account`,
-  `get_user_preferences`; `get_portfolio_summary(account_hash)` answers
-  "where does this account stand" in one bounded read: typed balances
-  (buying power, available funds, cash, liquidation value, calls), day
-  and open P&L summed over positions, the first page of `get_positions`,
-  the orders Schwab may still change (entered in the last 59 days) and
-  how many of this server's submissions Schwab has not yet answered, with
-  any section whose read failed set to null and explained in `warnings`
-- **Projections** — `get_candles` (`[t,o,h,l,c,v]` rows),
-  `get_option_contracts` (one row per contract, ordered by expiration and
-  strike) and `get_positions` (one row per position) take the same
-  parameters as their raw tools and answer in a fraction of the bytes:
-  rows under a `columns` header, paged within
-  `SCHWAB_MCP_RESPONSE_BUDGET_BYTES` (default 64 KiB) or an explicit
-  `limit`, with `truncated: true` and a `nextCursor` to continue from
-  rather than silent clipping
-- **Orders (read)** — `get_order`, `get_account_orders`, `get_all_orders`;
-  `get_order_status(account_hash, order_id, wait_ms?)` reduces one order to
-  what the next decision needs (`status`, `terminal`, `filled`, `remaining`,
-  quantity-weighted `avgFillPrice` overall and per leg, `lastUpdate`,
-  `replacedBy`, children of trigger and OCO orders) and with `wait_ms` (at
-  most 30 s) re-reads once a second until Schwab cannot change the order
-  again; `get_trade_journal(account_hash, since?, limit?, cursor?)` lists
-  the principal's own write dispatches newest first, each with the
-  `rationale` it was given, how the dispatch ended (`completed`, `error`
-  with the failure code, or `pending`) and the venue's current status of
-  the order it produced, so a model resuming a session sees what it
-  decided, why, and what came of it; `get_performance(account_hash, since?,
-  until?, symbols?)` works out how the account has traded from its own fills
-  in the window (default 30 days, inside Schwab's 60-day order list): round
-  trips matched first in first out, long and short, with realized and
-  unrealized P&L, win rate, profit factor, drawdown and the Sharpe and
-  Sortino ratios, overall and per symbol, so a model reads verified numbers
-  instead of doing the arithmetic; `warnings` names any position that
-  predates the window
-- **Orders (write)** — `build_order(spec)` expands a compact spec
-  (`kind`: `limit`, `bracket`, `oco`, …; option legs by OSI symbol or
-  contract parts) into the exact `order` JSON the write tools accept, locally
-  and without contacting Schwab; `check_order` reports every local reason a
-  submission would fail (validity, policy limits, approval, trading switch,
-  halts) with the intent digest to approve, also without contacting Schwab;
-  `preview_order`, `place_order`, `cancel_order`, `replace_order` *(last
-  three gated)*. `place_order` and `replace_order` take `wait_ms` (at most
-  45 s) to hold the submission while an operator grants the approval it is
-  waiting on, instead of failing and being retried; they hold for nothing
-  else, and a hold that ends unapproved dispatches nothing. A principal
-  with `client_approval` asks the client's user to approve the order (an
-  MCP elicitation) first, and `SCHWAB_MCP_APPROVAL_WEBHOOK` tells operators
-  when an intent starts waiting. Principals can also be held to symbol
-  lists, a price collar and a daily budget, and given a dead-man switch
-  (`dead_man_secs`) that cancels the orders they placed after a silence.
-  The write tools
-  and `check_order` accept an optional
-  `rationale` (at most 2000 characters): the model's reason, kept in the
-  audit journal, never sent to Schwab, and excluded from the intent digest
-- **Transactions** — `get_transactions`, `get_transaction`
-- **Streaming** — `stream_connect`, `stream_disconnect`, `stream_status`,
-  `stream_subscribe(service, keys)`, `stream_unsubscribe(service, keys)`,
-  `stream_set_service_fields(service, fields_csv)`, `stream_snapshot(service, keys?)`
-- **Server** — `get_server_status` reports the mode (`live` or `paper`), the
-  trading switches and whether an operator halt is active (its reason only
-  for a principal granted every account), readiness (the `/readyz` body), this process's
-  request budget, stream health, the principal's own permissions and limits,
-  and the equity session phase from Schwab's calendar (cached per day), so a
-  model can plan a session before spending calls on it
-- **Prompts and resources** — the resource `schwab://order-spec` is the
-  `OrderSpec` grammar as markdown (every kind, the leg and instrument forms,
-  the rules the schema cannot express, what a principal policy accepts,
-  worked examples with their expansions); the prompt
-  `propose_trade(account_hash, symbol?, thesis?)` walks a model from
-  `get_server_status` through the market and account reads, `build_order`,
-  `check_order` with a rationale, and a preview to a proposal it presents
-  and waits on, submitting only where the session can and the user has
-  confirmed. Both name only the tools the session holds, are listed and
-  served only to principals holding an order tool, and the prompt only for
-  the principal's own accounts
-
-The time-windowed reads (`get_account_orders`, `get_all_orders`,
-`get_transactions`, `get_price_history`) take their bounds as a calendar
-date (`YYYY-MM-DD`), RFC 3339, or epoch milliseconds; orders and
-transactions default to the last seven days ending now (transactions to
-`TRADE`), so `params` may be omitted entirely.
-
-### Metrics (Prometheus)
-
-Metrics are **opt-in**. Set `SCHWAB_METRICS_BIND=127.0.0.1:9090` and the
-MCP will spawn a dedicated Prometheus scrape listener on that address;
-unset, no listener and every `metrics::counter!`/`histogram!` call is
-a no-op (the SDK depends only on the `metrics` facade, so library-only
-consumers are free to install their own recorder — StatsD, OTLP, etc.).
-To send the same metrics and traces to an OpenTelemetry collector, build
-with `--features otel` and set `OTEL_EXPORTER_OTLP_ENDPOINT`; see
-[docs/OPERATIONS.md](docs/OPERATIONS.md#observability-opentelemetry).
-
-```bash
-SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
-# in another shell
-curl http://127.0.0.1:9090/metrics
-```
-
-**Metric catalog** (the source of truth is `schwab_rs::metrics::CATALOG` and
-`schwab_mcp::metrics::CATALOG`; a workspace test keeps call sites and docs in
-line with them, and the server registers their help text with Prometheus):
-
-| Name | Kind | Labels | Description |
-|------|------|--------|-------------|
-| `schwab_http_requests_total` | counter | `op`, `method`, `status` | Logical request completions. `status` is a class bucket (`2xx`…`5xx`, `unknown`) or `error` when no response was obtained. |
-| `schwab_http_request_duration_seconds` | histogram | `op`, `method` | Wall-clock per request (includes retries + token refresh). |
-| `schwab_submission_unknown_total` | counter | — | Order submissions sent with an undetermined outcome; each needs reconciliation. |
-| `schwab_retry_attempts_total` | counter | `outcome` | `succeeded` / `exhausted`. Sums the retries that were *actually fired*. |
-| `schwab_circuit_state` | gauge | — | `0=Closed`, `1=HalfOpen`, `2=Open`. |
-| `schwab_circuit_transitions_total` | counter | `from`, `to` | State changes. |
-| `schwab_token_refresh_total` | counter | `outcome`, `grant` | One per `/oauth/token` request: `success`/`failure` × `authorization_code`/`refresh_token`. |
-| `schwab_reconciliation_total` | counter | `outcome` | Account reconciliation runs: `ready` / `unresolved`. |
-| `schwab_pending_submissions` | gauge | — | Submissions awaiting reconciliation at the last readiness probe. |
-| `schwab_unreconciled_accounts` | gauge | — | Required accounts without a fresh baseline at the last readiness probe. |
-| `schwab_baseline_age_seconds` | gauge | — | Age of the oldest required-account baseline at the last readiness probe. |
-| `schwab_trading_ready` | gauge | — | `1` when the last readiness probe found trading admissible. |
-| `schwab_recovery_ready` | gauge | — | `1` while the recovery worker has no accounts left to reconcile. |
-| `schwab_stream_connects_total` | counter | `outcome` | `success` / `failure` per connection attempt. |
-| `schwab_stream_reconnects_total` | counter | — | Reconnect loop iterations. |
-| `schwab_stream_connected` | gauge | — | `1` while authenticated, `0` otherwise. |
-| `schwab_stream_messages_total` | counter | `service`, `kind` | `kind ∈ {data, response, notify, dropped}`. Control frames use `service="_control"`, unparseable ones `"_unparsed"`. |
-| `schwab_stream_dropped_messages_total` | counter | — | Frames dropped because the consumer queue was full or closed. |
-| `schwab_mcp_tool_calls_total` | counter | `tool`, `outcome` | `ok` / `error` per MCP tool invocation. |
-| `schwab_mcp_tool_call_duration_seconds` | histogram | `tool` | End-to-end latency per tool. |
-| `schwab_stream_recovery_seconds` | histogram | — | Stream cache recovery time after a reconnect. |
-| `schwab_stream_recovery_ready` | gauge | — | `1` when the last stream recovery completed within its deadline. |
-| `schwab_mcp_dead_man_firings_total` | counter | `outcome` | Dead-man switch firings that found working orders: `canceled` if every cancel succeeded, `failed` otherwise. |
-
-**Starter PromQL:**
-
-```promql
-# 5xx error rate per operation
-sum by (op) (rate(schwab_http_requests_total{status="5xx"}[5m]))
-
-# p99 latency by op (Prometheus histogram quantile)
-histogram_quantile(0.99,
-  sum by (le, op) (rate(schwab_http_request_duration_seconds_bucket[5m])))
-
-# Tool call error ratio
-sum by (tool) (rate(schwab_mcp_tool_calls_total{outcome="error"}[5m]))
- / sum by (tool) (rate(schwab_mcp_tool_calls_total[5m]))
-
-# Circuit breaker currently open (alert on > 0)
-max_over_time(schwab_circuit_state[1m]) == 2
-
-# Stream healthy (alert on = 0 during market hours)
-schwab_stream_connected
-
-# Token refresh failures — if this is non-zero sustained, wake someone up
-increase(schwab_token_refresh_total{outcome="failure"}[15m])
-```
-
-### Claude Desktop config
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`
-(macOS) — adjust paths to your checkout:
-
-```json
-{
-  "mcpServers": {
-    "schwab": {
-      "command": "/path/to/rustyschwab/target/release/schwab-mcp",
-      "env": {
-        "SCHWAB_APP_KEY": "…",
-        "SCHWAB_APP_SECRET": "…",
-        "SCHWAB_OAUTH_CALLBACK_URL": "https://127.0.0.1:8080",
-        "SCHWAB_TOKENS_FILE": "/Users/you/.config/schwab/tokens.json"
-      }
-    }
-  }
-}
-```
-
-## Examples
-
-See the `examples/` directory for working examples:
-
-- `auth_test/` - OAuth flow testing and token management
-- `oauth_flow/` - Minimal end-to-end OAuth
-- `oauth_callback_server/` - Local callback capture
-- `comprehensive/` - Combined flows and API usage
-
-### Feature flags
-- `callback-server`: runs a local Axum server to capture OAuth callback
-- `otel`: OTLP export of spans and metrics through `schwab_rs::telemetry::init_otel`, off by default; `schwab-mcp --features otel` wires it into the binaries (see [docs/OPERATIONS.md](docs/OPERATIONS.md#observability-opentelemetry))
-
-### Token Storage Backends
-
-The SDK provides three secure token storage options (automatically selected by platform):
-
-1. **File** (Basic security)
-   - Plain JSON with 0600 permissions (owner read/write only)
-   - Useful for quick migration from older versions
-
-2. **EncryptedFile** (High security) ⭐ **Default on Linux/Windows**
-   - ChaCha20Poly1305 authenticated encryption (NCC Group audited)
-   - Tamper detection via AEAD authentication tag
-   - Random key generation with secure storage
-   - 0600 permissions on both token and key files
-
-3. **Keychain** (Best security) ⭐ **Default on macOS**
-   - OS-native secure credential storage
-   - macOS: Keychain, Windows: Credential Manager, Linux: Secret Service
-   - Protected by user authentication
-   - Cross-platform via `keyring` crate
-
-### Configure Token Storage
-
 ```rust,ignore
-use schwab_rs::{SchwabClient, SchwabConfig};
-use schwab_rs::auth::{OAuthConfig, TokenStoreKind};
+use schwab_rs::prelude::*;
 
-let oauth = OAuthConfig {
-    app_key: "YOUR_APP_KEY".into(),
-    app_secret: "YOUR_SECRET".into(),
-    callback_url: "https://127.0.0.1:8080".into(),
-
-    // Choose storage backend (defaults to Keychain on macOS, EncryptedFile elsewhere)
-    token_store_kind: TokenStoreKind::Keychain,        // OS-native (best)
-    // token_store_kind: TokenStoreKind::EncryptedFile, // Encrypted file (recommended)
-    // token_store_kind: TokenStoreKind::File,          // Plain file (basic)
-
-    ..Default::default()
-};
-
-let cfg = SchwabConfig { oauth, ..Default::default() };
-let client = SchwabClient::new(cfg)?;
-client.init().await?; // Tokens automatically use selected storage
+let client = SchwabClient::new(SchwabConfig::from_env()?)?;
+client.init().await?;
+let quotes = client.get_quotes(&["AAPL", "MSFT"]).await?;
 ```
 
-**Security Features:**
-- **Memory safety**: Tokens use `SecretString` with automatic zeroing on drop
-- **Encryption**: ChaCha20Poly1305 AEAD (EncryptedFile backend)
-- **File permissions**: 0600 enforcement on Unix systems
-- **Keychain support**: Cross-platform OS-native storage
-- **No logging**: Tokens never appear in debug/log output
+Placing orders, brackets and options: [ORDERS.md](docs/ORDERS.md). Streaming: [STREAMING.md](docs/STREAMING.md).
 
-## Configuration
-
-The SDK provides sensible defaults that can be customized:
-
-```rust,ignore
-use schwab_rs::config::{SchwabConfig, ClientConfig, RateLimitConfig, RetryConfig};
-use std::time::Duration;
-
-let config = SchwabConfig {
-    client: ClientConfig {
-        timeout: Duration::from_secs(10),
-        rate_limit: RateLimitConfig {
-            enabled: true,
-            // Schwab's documented limit is 120 requests per minute
-            requests_per_second: 2,
-            burst_size: 10,
-        },
-        retry: RetryConfig {
-            max_retries: 3,
-            initial_backoff: Duration::from_secs(1),
-            max_backoff: Duration::from_secs(30),
-            backoff_multiplier: 2.0,
-            retry_on_status: vec![429, 500, 502, 503, 504],
-        },
-        ..Default::default()
-    },
-    ..Default::default()
-};
-```
-
-## Error Handling
-
-The SDK provides comprehensive error types for robust error handling:
-
-```rust,ignore
-use schwab_rs::error::Error;
-
-match client.get_quotes(&["AAPL"]).await {
-    Ok(quotes) => println!("Success: {:?}", quotes),
-    Err(Error::Auth(e)) => println!("Authentication error: {}", e),
-    Err(Error::RateLimit { retry_after }) => println!("Rate limit exceeded, retry after {}s", retry_after),
-    Err(Error::Network(e)) => println!("Network error: {}", e),
-    Err(e) => println!("Other error: {}", e),
-}
-```
-
-## Important Notes
-
-1. **Exact Callback URL Match**: Must exactly match registered URL (HTTPS only, no trailing slash)
-2. **Key Lengths**: Schwab issues several variants; keys/secrets must be even-length and at least 32 chars combined
-3. **Rate Limits**: Schwab allows 120 requests/minute; the SDK defaults to 2 req/s with a burst of 10
-4. **Token Expiration**: Access tokens expire in ~30 minutes; refresh tokens in ~7 days
-5. **Session Management**: HTTP client is recreated after token refresh
-6. **Token Storage**: Defaults to Keychain (macOS) or EncryptedFile (other platforms)
-7. **Token Notifications**: Optional callbacks for expiry warnings and session events
-
-Known limitations and notes:
-- Optional PKCE can be enabled via `OAuthConfig.pkce_enabled` (off by default)
-- `SchwabClient` uses `transport::http::HttpTransport` for REST
-
-## Streaming: Advanced Features (v0.2.0)
-
-### Bounded Channels for Backpressure Control
-
-Control memory usage with bounded channels:
-
-```rust,ignore
-use schwab_rs::{StreamConfig, ChannelKind};
-
-let mut config = StreamConfig::default();
-
-// Legacy compatibility setting (now capped at 65,536 messages)
-config.channel_kind = ChannelKind::Unbounded;
-
-// Bounded (default capacity: 4,096; overflow marks the stream unready until
-// the consumer drains, then resumes under a new generation)
-config.channel_kind = ChannelKind::Bounded(10000); // 10k message buffer
-
-let stream = StreamClient::builder()
-    .config(config)
-    .auth_manager(auth_manager)
-    .customer_id(customer_id)
-    .build()?;
-```
-
-### Custom Field Selection
-
-Request only needed fields for bandwidth optimization:
-
-```rust,ignore
-use schwab_rs::types::streaming::{LevelOneEquityFields as F, StreamService};
-
-// Request a lean field set by name; field 0 is always the key.
-let fields = [F::SYMBOL, F::BID_PRICE, F::ASK_PRICE, F::LAST_PRICE, F::TOTAL_VOLUME]
-    .map(|field| field.to_string())
-    .join(",");
-stream.set_service_fields(StreamService::LeveloneEquities, fields);
-
-stream.subscribe_level_one_equities(&["AAPL", "MSFT"]).await?;
-```
-
-### Heartbeat Monitoring
-
-Automatic Ping/Pong heartbeat with timeout detection (v0.2.0):
-
-```rust,ignore
-let mut config = StreamConfig::default();
-config.heartbeat_interval = Duration::from_secs(20); // Ping every 20s
-config.ping_timeout = Duration::from_secs(30);       // Reconnect if no Pong
-
-// Automatic timeout detection and reconnection!
-```
-
-### Complete Examples
-
-The `streaming-examples` package in `examples/streaming/` has three bins:
-- `streaming_demo` - all 13 services subscribed once
-- `streaming_processing` - decoupled async processing pattern
-- `streaming_quotes` - real-time quotes for a watchlist
+### Python
 
 ```bash
-cargo run -p streaming-examples --bin streaming_quotes
+pip install ./crates/schwab-py   # builds the extension; needs a Rust toolchain
 ```
 
-## Contributing
+```python
+import asyncio
+from rustyschwab import Client, orders
+from rustyschwab.trader import Trader
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/epistates/rustyschwab/blob/main/CONTRIBUTING.md) for guidelines.
+def strategy(tc, events):
+    for event in events:
+        if event["type"] == "candle" and not tc.positions.get(event["symbol"]):
+            tc.order(orders.equity_buy_market(event["symbol"], 1))
+
+async def main():
+    run = await Trader(Client.from_env()).backtest(strategy, ["AAPL"], days=5, cash=10_000)
+    print(run.report())
+
+asyncio.run(main())
+```
+
+`trader.paper(...)` and `trader.live(...)` run the same function. [PYTHON.md](docs/PYTHON.md) has the rest; [coming from Schwabdev](docs/MIGRATING_FROM_SCHWABDEV.md) maps every Schwabdev call to its equivalent.
+
+### MCP
+
+```bash
+cargo build -p schwab-mcp --release
+claude mcp add schwab -e SCHWAB_APP_KEY=… -e SCHWAB_APP_SECRET=… \
+  -e SCHWAB_TOKENS_FILE="$PWD/schwab_tokens.json" \
+  -- "$PWD/target/release/schwab-mcp"
+```
+
+Order tools stay off until you enable them. To let an agent trade without real money, run the server over the paper venue:
+
+```bash
+SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
+SCHWAB_MCP_ALLOW_TRADING=1 target/release/schwab-mcp
+```
+
+Claude Desktop configuration, the tool catalog and the policy model: [MCP guide](docs/MCP_LLM_INTEGRATION.md). Policies, approvals, risk limits, metrics and recovery: [Operations](docs/OPERATIONS.md).
+
+## Documentation
+
+[docs/INDEX.md](docs/INDEX.md) lists every guide. The ones most people need:
+
+- [Setup](docs/SETUP_GUIDE.md) and [callback URLs](docs/APP_CALLBACK.md)
+- [Orders](docs/ORDERS.md) and [streaming](docs/STREAMING.md)
+- [Python](docs/PYTHON.md) and [coming from Schwabdev](docs/MIGRATING_FROM_SCHWABDEV.md)
+- [MCP and LLM integration](docs/MCP_LLM_INTEGRATION.md)
+- [Paper trading](docs/PAPER_TRADING.md) and [what it does not model](docs/PAPER_LIMITATIONS.md)
+- [Operations](docs/OPERATIONS.md) and [shared authority](docs/SHARED_AUTHORITY.md) for multi-process deployments
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Architecture](docs/ARCHITECTURE_OVERVIEW.md), for contributors
+
+Runnable programs are under [`examples/`](examples): `cargo run -p oauth-flow`, `comprehensive`, `auth_test`, and `streaming-examples` (`--bin streaming_quotes`).
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and the [changelog](CHANGELOG.md). Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
-This project is dual-licensed under the MIT License and Apache License 2.0.
-
-## Disclaimer
-
-This SDK is not affiliated with, endorsed by, or officially connected with Charles Schwab & Co., Inc. Use at your own risk. Always test thoroughly with sandbox data before using in production.
-
-## Support
-
-For issues and questions:
-- GitHub Issues: [Project Issues](https://github.com/epistates/rustyschwab/issues)
-- Documentation: [docs.rs/schwab-rs](https://docs.rs/schwab-rs)
-
-## Development
-
-### OAuth setup
-
-Set required environment variables (or place in `.env`):
-
-```bash
-export SCHWAB_APP_KEY=...
-export SCHWAB_APP_SECRET=...
-export SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
-```
-
-Optional:
-
-```bash
-export SCHWAB_PKCE_ENABLED=false
-export SCHWAB_TOKEN_STORE=keychain      # Options: keychain | encrypted | file
-```
-
-### Examples
-
-```bash
-# Basic OAuth flow
-cargo run -p oauth-flow
-
-# Comprehensive SDK demonstration
-cargo run -p comprehensive
-
-# Authenticate and test token management
-cargo run -p auth_test -- --app-key KEY --app-secret SECRET status
-
-# Streaming demos
-cargo run -p streaming-examples --bin streaming_demo
-cargo run -p streaming-examples --bin streaming_quotes
-cargo run -p streaming-examples --bin streaming_processing
-```
-
-See [enterprise remediation and migration notes](https://github.com/epistates/rustyschwab/blob/main/docs/ENTERPRISE_REMEDIATION.md)
-for execution reconciliation, decimal order requests, principal authorization,
-stream freshness, compiler support, and release validation requirements.
-
-
-The 0.2.0 candidate adds transactional state, reconciliation, shared local
-coordination, short-lived identity, portfolio risk integration and operator
-commands. See [enterprise operations](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md) for migration,
-configuration and external release gates. This candidate has not been published.
-
-For multi-host workers, verified operator controls and broker dispatch through a shared authority, see [the shared authority guide](https://github.com/epistates/rustyschwab/blob/main/docs/SHARED_AUTHORITY.md).
-
-See the [MCP and LLM integration review](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md) for client boundaries, paper mode, and the TurboMCP v4 transport notes.
+MIT or Apache-2.0, at your option.

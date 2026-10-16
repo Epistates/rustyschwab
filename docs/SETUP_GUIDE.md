@@ -67,11 +67,21 @@ cargo run -p oauth-flow
 
 ## 5. Token Persistence
 
-By default, the SDK saves tokens to `schwab_tokens.json`.
-- **macOS**: Uses the system **Keychain** by default (highly secure).
-- **Linux/Windows**: Uses **ChaCha20Poly1305** encrypted file storage by default.
+By default, the SDK saves tokens to `schwab_tokens.json` (override with `SCHWAB_TOKENS_FILE`). Choose the backend with `SCHWAB_TOKEN_STORE` or `OAuthConfig::token_store_kind`:
 
-With the encrypted store the key lives next to the tokens as `schwab_tokens.key`. Both, and the `schwab_tokens.orders.store/` state directory the client creates beside them, must stay out of version control; the repo's `.gitignore` covers all of them.
+| Store | `SCHWAB_TOKEN_STORE` | Default on | Protects against |
+| --- | --- | --- | --- |
+| Keychain | `keychain` | macOS | Other local users and copied files. macOS Keychain, Windows Credential Manager, Linux Secret Service. |
+| Encrypted file | `encrypted` | Linux, Windows | A token file that leaves the machine on its own (a backup, a copied directory). ChaCha20-Poly1305 with a random key in `schwab_tokens.key` beside it. It does not protect against a local account that can read both files; use the keychain for that. |
+| File | `file` | — | Nothing beyond owner-only permissions. Development only. |
+
+Token files are written owner-only (0600 on Unix, an owner-only ACL on Windows) and checked before every read. In memory, tokens are `SecretString`s that are zeroized on drop and redacted from `Debug` output and logs. Pages are not locked, so disable core dumps and use encrypted swap on hosts that hold credentials.
+
+The access token lasts about 30 minutes and is refreshed in the background (`SCHWAB_REFRESH_BUFFER` seconds before expiry). The refresh token lasts 7 days; after that, run the authorization flow again. `OAuthConfig::on_token_notification` warns before the refresh token expires (`TokenNotification::RefreshTokenExpiring`).
+
+PKCE (S256) is implemented but off by default, because Schwab's documented flow does not use it. Turn it on with `SCHWAB_PKCE_ENABLED=true` only after verifying your app accepts it.
+
+The token file, its key, and the `schwab_tokens.orders.store/` state directory the client creates beside them must stay out of version control; the repo's `.gitignore` covers all of them.
 
 ## 6. Next Steps
 
