@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Fixed — authorization with real Schwab codes
+
+- **Pasting the redirect failed for every real code.**
+  `AuthManager::exchange_code` (and so Python's `complete_authorization`,
+  `rustyschwab login` and `oauth-flow` without its callback server)
+  accepted only letters, digits, `-` and `_`, but Schwab's codes are dotted
+  (`C0.<base64>.<base64>@`). It now rejects only the signs of a mangled
+  paste, and a bare `code` value copied still percent-encoded (`...%40`) is
+  decoded. A test exchanges a real-shaped redirect, with `session`.
+- **The callback server listened on the wrong port** for a callback URL
+  without one: 8080 instead of 443, where Schwab redirects.
+- The setup guide gains the steps Schwabdev documents and we lacked
+  (requesting Trader API - Individual, the same email as the brokerage
+  account, days for "Ready for Use", enabling thinkorswim, several callback
+  URLs), and troubleshooting the errors that go with them.
+
 ### Changed — documentation for users and agents
 
 - **README** rewritten as a short front page: what the three parts are,

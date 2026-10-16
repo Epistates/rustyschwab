@@ -239,6 +239,49 @@ async fn a_redirect_exchanged_in_another_process_is_checked_against_its_state() 
     let _ = std::fs::remove_file(&config.oauth.tokens_file);
 }
 
+/// Schwab's codes look like `C0.<base64>.<base64>@`: dotted, and
+/// percent-encoded (`%40`) in the redirect, which also carries a `session`.
+/// Pasting the whole redirect or just the code both reach the token endpoint
+/// with the decoded code.
+#[tokio::test]
+async fn real_shaped_codes_are_exchanged_from_a_redirect_or_pasted_alone() {
+    let code = "C0.b2F1dGgyLmJkYy5zY2h3YWIuY29t.Zx9-Ab_cD3ef4GhIjK5lMnOp6QrStUvWx";
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        // The form encoding of the decoded code: `@` is sent as `%40`.
+        .and(wiremock::matchers::body_string_contains(format!(
+            "code={code}%40"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access", "refresh_token": "refresh",
+            "token_type": "Bearer", "expires_in": 1800
+        })))
+        .expect(3)
+        .mount(&mock_server)
+        .await;
+    let mut config = create_test_config(&mock_server.uri());
+    config.oauth.pkce_enabled = false;
+    let auth = AuthManager::new(config.oauth.clone()).unwrap();
+
+    let (url, _) = auth.authorize().await.unwrap();
+    let state = url::Url::parse(&url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let redirect = format!("https://127.0.0.1:8080/?code={code}%40&session=0f1e2d3c&state={state}");
+    auth.exchange_code(redirect).await.unwrap();
+
+    // The `code` value copied out of the address bar, still encoded, and
+    // the same value decoded.
+    auth.exchange_code(format!("{code}%40")).await.unwrap();
+    auth.exchange_code(format!("{code}@")).await.unwrap();
+    let _ = std::fs::remove_file(&config.oauth.tokens_file);
+}
+
 /// A refresh token Schwab refuses means only a new authorization helps:
 /// the error says so, and the endpoint is not asked again for the same
 /// tokens.

@@ -7,13 +7,14 @@ Follow these steps to get your Schwab Rust SDK environment ready for production.
 
 ## 1. Schwab Developer Portal
 
-1.  Go to the [Schwab Developer Portal](https://developer.schwab.com/).
-2.  Create an account and login.
-3.  Go to **"Dashboard"** and click **"Create new app"**.
-4.  **Important**: Select both **"Accounts and Trading Production"** and **"Market Data Production"** APIs.
-5.  Set your **Callback URL** (e.g., `https://127.0.0.1:8080`).
-    *   *Note: Must be HTTPS. For local development, use 127.0.0.1.*
-6.  Wait for your App Status to change from **"Approved - Pending"** to **"Ready for Use"** (usually takes a few minutes, but can take longer).
+1.  [Create a developer account](https://developer.schwab.com/login) with the **same email** as your Schwab brokerage account.
+2.  Request access to the [**Trader API - Individual**](https://developer.schwab.com/products/trader-api--individual) product.
+3.  In the [apps dashboard](https://developer.schwab.com/dashboard/apps), create an app:
+    *   Add **both** API products, **"Accounts and Trading Production"** and **"Market Data Production"**. Without both, some calls answer `401 Client not authorized`. (Added one late? Apps Dashboard → View Details → Modify App → APIs.)
+    *   Set the **Callback URL** to `https://127.0.0.1:8080`. It must be `https`, on `127.0.0.1`, with no trailing `/`, and must match `SCHWAB_OAUTH_CALLBACK_URL` exactly. You can register several, separated by commas (for example `https://127.0.0.1,https://127.0.0.1:8080`), which lets the same app serve other clients too.
+4.  Wait for the app status to read **"Ready for Use"**. This can take a couple of days; **"Approved - Pending" does not work** and fails the sign-in with "We are unable to complete your request".
+5.  Enable thinkorswim for your brokerage account by signing in to a thinkorswim platform once. Orders and some other calls need it.
+6.  Copy the app's **App Key** and **Secret** from the dashboard into your `.env` (next step).
 
 ## 2. Environment Configuration
 
@@ -59,11 +60,12 @@ Run the `oauth-flow` example package to generate your first token:
 cargo run -p oauth-flow
 ```
 
-1.  The program will print an authorization URL.
-2.  Open this URL in your browser and log in to Schwab.
-3.  After authorizing, you will be redirected to your callback URL.
-4.  The example enables the `callback-server` feature by default, so the SDK captures the code automatically.
-5.  With `cargo run -p oauth-flow --no-default-features`, copy the full URL you were redirected to and paste it back into the terminal.
+1.  The program prints an authorization URL and starts a local HTTPS server on the callback URL's port.
+2.  Open the URL, sign in to Schwab, accept the terms and choose the accounts the app may use.
+3.  Schwab redirects to `https://127.0.0.1:8080/?code=...&session=...&state=...`. The browser warns once about the server's self-signed certificate; choose "Advanced → Proceed", and the SDK captures the code and stores the tokens.
+4.  With `cargo run -p oauth-flow --no-default-features` there is no local server: the redirect lands on an error page, which is expected. Copy the whole URL from the address bar and paste it into the terminal. From Python, `client.complete_authorization(url)` does the same.
+
+The code is single-use and expires quickly (Schwab does not document how fast), so paste it promptly. If the refresh token expires (after seven days) or Schwab refuses it, run the flow again.
 
 ## 5. Token Persistence
 

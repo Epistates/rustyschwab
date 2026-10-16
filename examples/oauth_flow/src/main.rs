@@ -65,11 +65,11 @@ async fn main() -> Result<()> {
             println!("\nPlease open this URL in your browser:");
             println!("\n{}\n", auth_url);
 
-            println!("After authorizing, you'll be redirected to your callback URL.");
-            println!("Copy the 'code' parameter from the redirect URL.");
-            println!("Example: https://127.0.0.1:8080?code=YOUR_CODE_HERE\n");
+            println!("After you sign in and choose accounts, the browser goes to your callback");
+            println!("URL and shows an error page: that is expected. Copy the whole URL from the");
+            println!("address bar (https://127.0.0.1...?code=C0....%40&session=...&state=...).\n");
 
-            print!("Enter the authorization code: ");
+            print!("Paste the redirect URL: ");
             io::stdout().flush()?;
 
             let mut code = String::new();

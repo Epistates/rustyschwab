@@ -718,22 +718,32 @@ impl AuthManager {
             ));
         }
 
-        // Extract code from full URL if provided
+        // The whole redirect, or the `code` value copied out of it. Schwab's
+        // codes are dotted (`C0.<base64>.<base64>@`) and arrive
+        // percent-encoded (`...%40`); a bare value is decoded the way the
+        // query parser decodes one taken from the URL.
+        let code = code.trim();
         let extracted_code = if code.starts_with("https://") || code.starts_with("http://") {
-            self.extract_code_from_callback_url(&code)?
+            self.extract_code_from_callback_url(code)?
         } else {
-            code
+            urlencoding::decode(code)
+                .map_err(|_| {
+                    AuthError::OAuthFlow("Authorization code is not valid UTF-8".to_string())
+                })?
+                .into_owned()
         };
 
-        // Validate extracted code format
-        // Authorization codes should be alphanumeric (and may have @ suffix)
+        // Catch a mangled paste (several parameters, a fragment, spaces)
+        // without guessing at Schwab's alphabet.
         let code_without_at = extracted_code.trim_end_matches('@');
-        if !code_without_at
+        if code_without_at
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            .any(|c| c.is_whitespace() || c.is_control() || "&=?#/".contains(c))
         {
             return Err(AuthError::OAuthFlow(
-                "Invalid authorization code format: contains invalid characters".to_string(),
+                "Invalid authorization code format: paste the whole redirect URL or only the \
+                 value of its `code` parameter"
+                    .to_string(),
             ));
         }
 
@@ -818,9 +828,9 @@ impl AuthManager {
                 AuthError::OAuthFlow("Callback URL missing 'code' parameter".to_string())
             })?;
 
-        // Schwab auth codes must be suffixed with `@` for the token
-        // exchange — Schwabdev does not enforce this, but we've verified
-        // via `OAUTH_IMPLEMENTATION.md` that the exchange fails without it.
+        // Schwab's codes end in `@` (`%40` in the redirect), and the token
+        // exchange wants it; Schwabdev's earlier releases re-appended it
+        // after cutting the code at `%40`.
         let decoded = if code.ends_with('@') {
             code
         } else {
@@ -831,7 +841,7 @@ impl AuthManager {
     }
 
     async fn exchange_code_for_tokens(&self, code: &str) -> AuthResult<TokenSet> {
-        // The Python reference adds @ at the end of the code if not present
+        // Every Schwab code ends in `@`; restore one lost in a copy.
         let code_with_at = if !code.ends_with('@') {
             format!("{}@", code)
         } else {
@@ -1069,7 +1079,10 @@ impl AuthManager {
         let callback_url = url::Url::parse(&self.config.callback_url)
             .map_err(|e| AuthError::InvalidCallbackUrl(e.to_string()))?;
 
-        let port = callback_url.port().unwrap_or(8080);
+        // Where Schwab will redirect: `https://127.0.0.1` means 443, which
+        // Linux only lets a privileged process bind; register a URL with a
+        // port (`https://127.0.0.1:8080`) to avoid that.
+        let port = callback_url.port_or_known_default().unwrap_or(443);
 
         // Determine bind address based on security configuration
         let addr = if self.config.allow_external_callback {

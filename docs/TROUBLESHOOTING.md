@@ -14,6 +14,18 @@ Common issues and their solutions when using the Schwab Rust SDK.
 *   **Cause:** Your callback URL in the `.env` file does not *exactly* match what is registered in the Schwab portal.
 *   **Fix:** Check for trailing slashes `/`. If the portal has `https://127.0.0.1:8080`, your code must use exactly that, not `https://127.0.0.1:8080/`.
 
+### "We are unable to complete your request" or a "Whitelabel Error Page" (500) when signing in
+*   **Cause:** The app's status is still **"Approved - Pending"**; it works only once it reads **"Ready for Use"**, which can take a couple of days. Less often, the account type is not supported by the API.
+*   **Fix:** Wait for "Ready for Use". For app registration problems, email `traderapi@schwab.com`.
+
+### The callback never arrives, or `Invalid authorization code format`
+*   **Cause:** The built-in callback server listens on the port in `SCHWAB_OAUTH_CALLBACK_URL` (443 when it has none, which needs privileges on Linux), and the registered URL must name the same one.
+*   **Fix:** Register and use a URL with a port, such as `https://127.0.0.1:8080`. When pasting by hand, paste the whole redirect URL, or only the value of its `code` parameter.
+
+### `ReauthorizationRequired` or a refused refresh token
+*   **Cause:** The refresh token is seven days old, or Schwab refused it (for example, after an authorization from another machine replaced it).
+*   **Fix:** Run the authorization flow again (`cargo run -p oauth-flow`, or `python -m rustyschwab login`). The SDK never retries a refused refresh token.
+
 ### `SSL: CERTIFICATE_VERIFY_FAILED`
 *   **Cause:** Missing root certificates on your system.
 *   **Fix:** Ensure your system's CA certificates are up to date. The SDK uses `rustls-native-certs` or `webpki-roots` depending on features.
