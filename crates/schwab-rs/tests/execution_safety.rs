@@ -161,6 +161,53 @@ async fn an_armed_intent_stays_unresolved() {
     assert!(!report.reconciled);
 }
 
+/// Only the tag the SDK sent resolves an unknown submission. An order that
+/// fits the request but carries another tag (the broker may stamp its own,
+/// such as `API_TRADER`) could be a manual twin, so it stays unresolved for
+/// an operator; under the SDK's tag it resolves.
+#[tokio::test]
+async fn only_our_tag_resolves_an_unknown_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let mut request = serde_json::to_value(order("BUY", "AAPL", 1, "10.00")).unwrap();
+    request["tag"] = json!("rs-ours");
+    let id = journal
+        .begin("A", "place_order", request.clone())
+        .await
+        .unwrap();
+    journal.arm(&id).await.unwrap();
+    age_submissions(&journal, Duration::from_secs(60 * 60));
+    let listed = |tag: &str| {
+        let mut broker = request.clone();
+        broker["tag"] = json!(tag);
+        broker["orderId"] = json!(42);
+        broker["status"] = json!("WORKING");
+        broker
+    };
+    let reconcile = |orders: Vec<Value>| {
+        let database = journal.database().clone();
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis(),
+                    json!({}),
+                    orders,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let report = reconcile(vec![listed("API_TRADER")]).await;
+    assert_eq!(report.unresolved_attempts, vec![id.clone()]);
+    assert!(report.resolved_attempts.is_empty());
+
+    let report = reconcile(vec![listed("rs-ours")]).await;
+    assert_eq!(report.resolved_attempts, vec![id]);
+}
+
 /// An operator settling an unknown submission releases its reservation in
 /// the same transaction; the account's capacity does not leak.
 #[tokio::test]

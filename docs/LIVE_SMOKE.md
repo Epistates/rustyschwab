@@ -38,9 +38,12 @@ The script prints the order it will place and waits for you to type the symbol. 
 | Preview | `preview_order` (a failure here is a warning) | `preview_order` (warning) |
 | Place | `place_order` | `place_order` with a rationale |
 | Working | `order` until it leaves `PENDING_ACTIVATION` | `get_order_status` |
+| Tag kept (a warning if not) | Schwab lists the order under the tag the SDK sent | the same, for the server's tag |
 | Cancel | `cancel_order`, then `order` until `CANCELED` | `cancel_order`, then `get_order_status` until `CANCELED` |
 
 For the MCP half, the script starts `target/release/schwab-mcp` with a temporary principal policy named `live-smoke` (this account, one share, no approval, three orders a day so a rerun works) and risk limits that admit exactly that order, from the repository root so the server reads the same `.env`. The principal's audit journal stays beside your token file, as every principal's does; `schwab-admin` reads it.
+
+The tag check matters beyond this run: after a submission whose outcome is unknown (a timeout, a dropped connection), reconciliation finds the order by its tag, and resolves nothing on a guess. If Schwab drops or replaces tags, such a submission waits for an operator (`schwab-admin`), and that design needs revisiting; say so in the issue.
 
 If anything goes wrong after an order reaches Schwab, the script sends a cancel before it exits and tells you so.
 

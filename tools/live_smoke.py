@@ -253,6 +253,16 @@ def is_open(status: str) -> bool:
     return status not in TERMINAL
 
 
+def compare_tags(sent: str | None, listed: object) -> str:
+    """Whether Schwab lists the order under the tag the SDK sent, which
+    reconciliation of an unknown outcome depends on."""
+    if sent is None:
+        raise RuntimeError("no tag was sent")
+    if listed != sent:
+        raise RuntimeError(f"sent {sent!r}, Schwab lists {listed!r}")
+    return "kept"
+
+
 # ---- the Python path --------------------------------------------------------
 
 
@@ -271,6 +281,7 @@ async def python_path(client: Client, plan: Plan, report: Report) -> None:
     path = report.python
     order = orders.equity_buy_limit(plan.symbol, 1, str(plan.price))
     order_id: str | None = None
+    sent_tag: str | None = None
     final: str | None = None
 
     async def status() -> str | None:
@@ -293,13 +304,19 @@ async def python_path(client: Client, plan: Plan, report: Report) -> None:
             raise NeedsAttention(
                 f"Python place_order outcome unknown (attempt {error.attempt_id})"
             ) from error
-        order_id = submitted["order_id"]
+        nonlocal sent_tag
+        order_id, sent_tag = submitted["order_id"], submitted["tag"]
         if order_id is None:
             raise NeedsAttention(
                 f"Schwab accepted the order without an order id (tag {submitted['tag']}); "
                 "find it in the account and cancel it"
             )
         return "submitted"
+
+    async def tag() -> str:
+        assert order_id is not None
+        listed = (await client.order(plan.account_hash, order_id)).get("tag")
+        return compare_tags(sent_tag, listed)
 
     async def working() -> str:
         nonlocal final
@@ -326,6 +343,7 @@ async def python_path(client: Client, plan: Plan, report: Report) -> None:
         if not await report.step(path, "place_order", place):
             return
         if await report.step(path, "order is working", working):
+            await report.step(path, "tag preserved", tag, required=False)
             await report.step(path, "cancel_order and confirm", cancel)
     finally:
         if order_id is not None and (final is None or is_open(final)):
@@ -483,6 +501,7 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
     )
     order: dict[str, Any] = {}
     order_id: str | None = None
+    sent_tag: str | None = None
     final: str | None = None
     log = workdir / "schwab-mcp.log"
     print(f"  server log: {log}")
@@ -530,7 +549,18 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
             )
             if not verdict.get("allowed"):
                 raise RuntimeError(f"not allowed: {[r.get('code') for r in verdict.get('reasons', [])]}")
+            nonlocal sent_tag
+            # Derived from the intent digest, so place_order sends the same.
+            sent_tag = verdict.get("tag")
             return "allowed"
+
+        async def tag() -> str:
+            answer = data(
+                await mcp.call(
+                    "get_order_status", {"account_hash": plan.account_hash, "order_id": order_id}
+                )
+            )
+            return compare_tags(sent_tag, answer.get("tag") if isinstance(answer, dict) else None)
 
         async def preview() -> str:
             await mcp.call("preview_order", {"account_hash": plan.account_hash, "order": order})
@@ -591,6 +621,7 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
             if not await report.step(path, "place_order", place):
                 return
             if await report.step(path, "order is working", working):
+                await report.step(path, "tag preserved", tag, required=False)
                 await report.step(path, "cancel_order and confirm", cancel)
         finally:
             if order_id is not None and (final is None or is_open(final)):

@@ -274,23 +274,25 @@ impl StateDatabase {
                     report.resolved_attempts.push(id);
                 } else {
                     // Matching by tag is the only safe resolution; an order
-                    // that fits the request but has no tag might be this
-                    // intent or an identical manual one. Count it, so the
-                    // operator knows evidence exists, and leave it pending.
+                    // that fits the request without our tag (none, or one
+                    // the broker stamped itself) might be this intent or an
+                    // identical manual one. Count it, so the operator knows
+                    // evidence exists, and leave it pending.
                     let mut untagged = request.clone();
                     if let Some(fields) = untagged.as_object_mut() {
                         fields.remove("tag");
                     }
                     if candidates.is_empty()
                         && orders.iter().any(|o| {
-                            o.get("tag").is_none_or(Value::is_null) && matches_request(&untagged, o)
+                            o.get("tag").and_then(Value::as_str) != tag
+                                && matches_request(&untagged, o)
                         })
                     {
                         metrics::counter!(crate::metrics::UNTAGGED_MATCHES_TOTAL).increment(1);
                         tracing::warn!(
                             attempt = %id,
-                            "Broker lists an untagged order matching an unresolved submission; \
-                             reconcile it with evidence (schwab-admin)"
+                            "Broker lists an order matching an unresolved submission but \
+                             without its tag; reconcile it with evidence (schwab-admin)"
                         );
                     }
                     report.unresolved_attempts.push(id);

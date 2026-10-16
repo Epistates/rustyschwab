@@ -12,6 +12,7 @@ from live_smoke import (
     ROOT,
     McpError,
     McpStdio,
+    compare_tags,
     far_limit_price,
     held,
     open_buys,
@@ -59,6 +60,13 @@ class HelperTests(unittest.TestCase):
         }
         self.assertEqual(held(account, "F"), Decimal(3))
         self.assertEqual(held({}, "F"), Decimal(0))
+
+    def test_compare_tags_reports_what_schwab_kept(self):
+        self.assertEqual(compare_tags("rs-1", "rs-1"), "kept")
+        with self.assertRaisesRegex(RuntimeError, "API_TRADER"):
+            compare_tags("rs-1", "API_TRADER")
+        with self.assertRaisesRegex(RuntimeError, "None"):
+            compare_tags("rs-1", None)
 
     def test_limits_admit_one_share_and_no_more(self):
         policy = principal_policy("HASH", Decimal("6.18"))[0]
@@ -111,7 +119,17 @@ class McpClientTests(unittest.TestCase):
                 self.assertEqual(refused.exception.code, "invalid_arguments")
 
         with tempfile.TemporaryDirectory() as workdir:
-            asyncio.run(scenario(Path(workdir)))
+            # Python falls back to the working directory when no temp
+            # directory is usable, and the server reads .env from its
+            # directory or any parent: never start it inside the repository.
+            if Path(workdir).resolve().is_relative_to(ROOT):
+                self.skipTest(f"temporary directory {workdir} is inside the repository")
+            try:
+                asyncio.run(scenario(Path(workdir)))
+            except Exception:
+                log = Path(workdir) / "server.log"
+                print(log.read_text() if log.exists() else "no server log")
+                raise
 
 
 def order_spec() -> dict:
