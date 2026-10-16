@@ -37,7 +37,9 @@ and a bearer token on every request.
 |---------|---------|------|
 | `otel` | no | OTLP/HTTP export of spans and metrics from `schwab-mcp` and `schwab-authority`, configured by the standard `OTEL_*` environment (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, ...). Without an endpoint it changes nothing; the Prometheus endpoint (`SCHWAB_METRICS_BIND`) works either way. See [docs/OPERATIONS.md](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md#observability-opentelemetry). |
 
-The repository [README](https://github.com/epistates/rustyschwab#mcp-server-schwab-mcp)
-covers configuration, the tool surface and metrics, and
+[docs/MCP_LLM_INTEGRATION.md](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md)
+covers running the server, client configuration and the tool catalog;
+[docs/OPERATIONS.md](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md)
+covers policy, approvals, risk limits and metrics; and
 [docs/INDEX.md](https://github.com/epistates/rustyschwab/blob/main/docs/INDEX.md)
-lists the operations, paper trading and shared-authority guides.
+lists the rest.

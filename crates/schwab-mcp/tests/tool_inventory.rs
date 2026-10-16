@@ -133,6 +133,28 @@ async fn every_expected_tool_is_registered() {
     );
 }
 
+/// The tool catalog in docs/MCP_LLM_INTEGRATION.md has one row per tool,
+/// so the map an agent or a reader starts from cannot drift from the server.
+#[test]
+fn every_tool_has_one_catalog_row() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/MCP_LLM_INTEGRATION.md");
+    let doc = std::fs::read_to_string(&path).unwrap();
+    let section = doc
+        .split_once("\n## Tool catalog\n")
+        .and_then(|(_, rest)| rest.split("\n## ").next())
+        .expect("a `## Tool catalog` section");
+    let mut rows: Vec<&str> = section
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `")?.split_once("` |"))
+        .map(|(name, _)| name)
+        .collect();
+    rows.sort_unstable();
+    let mut expected = EXPECTED_TOOLS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(rows, expected, "{}", path.display());
+}
+
 /// `build_order` runs locally: its output is the strict `OrderRequest`
 /// JSON the write tools accept, and its input schema exposes the `kind`
 /// discriminator so clients can compose specs from the schema alone.

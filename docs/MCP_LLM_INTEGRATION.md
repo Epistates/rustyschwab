@@ -1,4 +1,4 @@
-# MCP and LLM integration review
+# MCP server and LLM integration
 
 Reviewed 2026-09-10; transport updated 2026-10-11. The MCP server runs on
 TurboMCP 4 (see [TurboMCP v4](#turbomcp-v4)), with
@@ -14,6 +14,131 @@ client hints, not authorization controls. Read-only does not imply public data.
 Server discovery describes untrusted returned text, stale caches, the
 requirement to reconcile uncertain submissions before further action, and
 where to read the execution mode (live or [paper](#paper-mode)).
+
+## Running the server
+
+Authorize once so tokens exist on disk (`cargo run -p oauth-flow`, see the
+[setup guide](SETUP_GUIDE.md)), then build and start the server:
+
+```bash
+cargo build -p schwab-mcp --release
+
+# stdio, for desktop MCP clients (the default)
+target/release/schwab-mcp
+
+# Streamable HTTP or WebSocket; both need SCHWAB_MCP_POLICY_FILE
+SCHWAB_MCP_TRANSPORT=http SCHWAB_MCP_BIND=127.0.0.1:8765 target/release/schwab-mcp
+SCHWAB_MCP_TRANSPORT=websocket SCHWAB_MCP_BIND=127.0.0.1:8765 target/release/schwab-mcp
+```
+
+Claude Desktop reads `~/Library/Application Support/Claude/claude_desktop_config.json`
+on macOS:
+
+```json
+{
+  "mcpServers": {
+    "schwab": {
+      "command": "/path/to/rustyschwab/target/release/schwab-mcp",
+      "env": {
+        "SCHWAB_APP_KEY": "…",
+        "SCHWAB_APP_SECRET": "…",
+        "SCHWAB_OAUTH_CALLBACK_URL": "https://127.0.0.1:8080",
+        "SCHWAB_TOKENS_FILE": "/Users/you/.config/schwab/tokens.json"
+      }
+    }
+  }
+}
+```
+
+Claude Code takes the same settings on the command line:
+
+```bash
+claude mcp add schwab \
+  -e SCHWAB_APP_KEY=… -e SCHWAB_APP_SECRET=… \
+  -e SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080 \
+  -e SCHWAB_TOKENS_FILE=$HOME/.config/schwab/tokens.json \
+  -- /path/to/rustyschwab/target/release/schwab-mcp
+```
+
+To try it without a Schwab account or real money, point it at the
+[paper venue](#paper-mode) instead:
+
+```bash
+SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json \
+SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
+SCHWAB_MCP_ALLOW_TRADING=1 target/release/schwab-mcp
+```
+
+**Write tools are off by default.** `place_order` and `replace_order` need
+`SCHWAB_MCP_ALLOW_TRADING=1` and principal policy approval; cancels alone can
+be enabled with `SCHWAB_MCP_ALLOW_CANCEL=1`. Every policy-bound tool, preview
+included, needs an explicit tool permission. Live trading over stdio also
+needs `SCHWAB_MCP_POLICY_FILE` with `SCHWAB_MCP_PRINCIPAL` naming the
+principal, `SCHWAB_RISK_POLICY_FILE` with limits for each account, and
+`SCHWAB_RECOVERY_ACCOUNTS` listing the account hashes to reconcile; the
+server refuses to start with trading on and any of them missing, and admits
+orders once its first reconciliation has run (`get_server_status` reports
+readiness). Network transports require
+`SCHWAB_MCP_POLICY_FILE` and a bearer token on every request; a non-loopback
+bind also needs a TLS proxy and `SCHWAB_MCP_ALLOW_REMOTE=1`. The policy
+schema, approvals, risk limits and the dead-man switch are in
+[Operations](OPERATIONS.md). `.env.example` lists every setting.
+
+## Tool catalog
+
+Each tool's full description, with its arguments, is in its `tools/list`
+entry; this table is the map. `tests/tool_inventory.rs` fails if a tool is
+added or removed without updating it.
+
+| Tool | Group | What it does |
+| --- | --- | --- |
+| `get_server_status` | Server | Mode (live or paper), trading switches, operator halt, readiness, request budget, stream health, your permissions and limits, and the market session. Call it first. |
+| `get_quotes` | Market data | Quotes for several symbols; optional field sections and indicative quotes. |
+| `get_quote` | Market data | A quote for one symbol. |
+| `get_price_history` | Market data | OHLCV candles in Schwab's shape. |
+| `get_candles` | Market data | Price history as compact `[t,o,h,l,c,v]` rows, paged. |
+| `get_option_chain` | Market data | The option chain, calls and puts across expirations. |
+| `get_option_contracts` | Market data | The option chain as one compact row per contract, paged. |
+| `get_option_expiration_chain` | Market data | Option expiration dates for a symbol. |
+| `get_movers` | Market data | Top movers for an index. |
+| `search_instruments` | Market data | Instruments by symbol, regex, description or fundamentals. |
+| `get_instrument` | Market data | An instrument by CUSIP. |
+| `get_markets` | Market data | Market hours for several markets. |
+| `get_market` | Market data | Market hours for one market. |
+| `get_account_numbers` | Accounts | Linked account numbers and their opaque hashes. |
+| `get_accounts` | Accounts | Every linked account in full. |
+| `get_account` | Accounts | One account by hash. |
+| `get_positions` | Accounts | An account's positions as one compact row each, paged. |
+| `get_portfolio_summary` | Accounts | Balances, day and open P&L, positions, open orders and unanswered submissions in one bounded read. |
+| `get_user_preferences` | Accounts | Linked-account display settings and offers. |
+| `get_order` | Orders (read) | One order by id. |
+| `get_order_status` | Orders (read) | One order reduced to status, fills and average price; can wait until it is final. |
+| `get_account_orders` | Orders (read) | An account's orders in a time window. |
+| `get_all_orders` | Orders (read) | Orders across all accounts in a time window. |
+| `get_trade_journal` | Orders (read) | Your own write dispatches with their rationale and outcome. |
+| `get_performance` | Orders (read) | Round trips, realized and unrealized P&L, win rate, drawdown, Sharpe and Sortino from the account's fills. |
+| `build_order` | Orders (write) | Expand a compact spec (`limit`, `bracket`, `oco`, …) into order JSON, locally. |
+| `check_order` | Orders (write) | Every local reason a submission would fail, and the intent digest to approve, without contacting Schwab. |
+| `preview_order` | Orders (write) | Schwab's dry run: fees, buying-power impact, validation. |
+| `place_order` | Orders (write) | Submit an order. Gated. |
+| `cancel_order` | Orders (write) | Cancel a working order. Gated. |
+| `replace_order` | Orders (write) | Replace a working order. Gated. |
+| `get_transactions` | Transactions | Transactions in a time window. |
+| `get_transaction` | Transactions | One transaction by id. |
+| `stream_connect` | Streaming | Connect the streamer. |
+| `stream_disconnect` | Streaming | Disconnect and clear the cache. |
+| `stream_status` | Streaming | Whether the stream is connected. |
+| `stream_subscribe` | Streaming | Subscribe a service to keys. |
+| `stream_unsubscribe` | Streaming | Unsubscribe keys from a service. |
+| `stream_set_service_fields` | Streaming | Choose the fields a service streams. |
+| `stream_snapshot` | Streaming | The latest cached values for a service. |
+
+The time-windowed reads (`get_account_orders`, `get_all_orders`,
+`get_transactions`, `get_price_history`) take their bounds as a calendar date
+(`YYYY-MM-DD`), RFC 3339 or epoch milliseconds; orders and transactions
+default to the last seven days. The `schwab://order-spec` resource and the
+`propose_trade` prompt are described under
+[Prompts and resources](#prompts-and-resources).
 
 ## Recommended integration boundary
 
