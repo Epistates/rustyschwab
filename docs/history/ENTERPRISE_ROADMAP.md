@@ -1,6 +1,8 @@
 # Enterprise utility implementation status
 
-The repository work from the enterprise follow-up is implemented as a 0.2.0 candidate. This is separate from deployment qualification. See [operations](OPERATIONS.md) and [support policy](SUPPORT.md). Qualification evidence referenced below lives in `docs/audit/`, which is git-ignored: it is produced locally by `tools/` and uploaded as workflow artifacts by `qualification.yml`, not committed.
+**Archived.** The open acceptance gates below are now tracked in the [support policy](../SUPPORT.md#open-acceptance-gates).
+
+The repository work from the enterprise follow-up is implemented as a 0.2.0 candidate. This is separate from deployment qualification. See [operations](../OPERATIONS.md) and [support policy](../SUPPORT.md). Qualification evidence referenced below lives in `docs/audit/`, which is git-ignored: it is produced locally by `tools/` and uploaded as workflow artifacts by `qualification.yml`, not committed.
 
 | Item | Delivered | Validation / deployment boundary |
 | --- | --- | --- |
@@ -25,8 +27,8 @@ The following acceptance gates remain open and must not be represented as comple
 
 Follow-up local qualification and restore corrections are recorded in `docs/audit/enterprise/QUALIFICATION.md`. The extended hosted workflow is prepared; native execution and production acceptance remain open until actual run evidence exists.
 
-The final code-gap pass adds dispatch revalidation, a durable operator halt, bounded history splitting, external-order exposure, deadline/gap tests, canonical digests, verified remote approvals, acknowledged audit delivery and the shared authority/gateway. See [deployment and protocol](SHARED_AUTHORITY.md). Live infrastructure acceptance remains distinct from these implementations.
+The final code-gap pass adds dispatch revalidation, a durable operator halt, bounded history splitting, external-order exposure, deadline/gap tests, canonical digests, verified remote approvals, acknowledged audit delivery and the shared authority/gateway. See [deployment and protocol](../SHARED_AUTHORITY.md). Live infrastructure acceptance remains distinct from these implementations.
 
 Deployment qualification now preserves failed soak diagnostics, rejects RSS sampling gaps, retains full native-suite transcripts and offers a five-hour synthetic profile. See `docs/audit/deployment-qualification/README.md`; hosted execution remains pending.
 
-Paper trading is now available through the SDK, an offline replay CLI and the authenticated authority. Model v2 supports long-equity MARKET/LIMIT/STOP/STOP_LIMIT orders, explicit settlement calendars, dividends, splits, a read-only REST feed, ledger verification and payload archival. See [supported behavior and boundaries](PAPER_TRADING.md) and the [remaining capability checklist](PAPER_LIMITATIONS.md). These are declared simulation assumptions, not live-broker equivalence.
+Paper trading is now available through the SDK, an offline replay CLI and the authenticated authority. Model v2 supports long-equity MARKET/LIMIT/STOP/STOP_LIMIT orders, explicit settlement calendars, dividends, splits, a read-only REST feed, ledger verification and payload archival. See [supported behavior and boundaries](../PAPER_TRADING.md) and the [remaining capability checklist](../PAPER_LIMITATIONS.md). These are declared simulation assumptions, not live-broker equivalence.
