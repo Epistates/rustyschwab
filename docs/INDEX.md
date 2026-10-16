@@ -16,17 +16,18 @@
 - [Shared authority and broker gateway](SHARED_AUTHORITY.md) — `schwab-authority`, `RemoteBackend`, `schwab-remote`, cross-host workers.
 - [MCP and LLM integration](MCP_LLM_INTEGRATION.md) — tool behavior hints, transport choice, what an LLM client may and may not do.
 - [Paper trading](PAPER_TRADING.md) and [paper limitations](PAPER_LIMITATIONS.md) — the deterministic simulator and what it does not model.
-- [Support and compatibility policy](SUPPORT.md)
+- [Support and compatibility policy](SUPPORT.md) — what is core, what is experimental, and what has run against a real account.
 
 ## Contributing
 
 - [Architecture overview](ARCHITECTURE_OVERVIEW.md) — crates, request pipeline, durable state, streaming, MCP authorization boundary, where to look.
-- [Contributing](../CONTRIBUTING.md) — workflow, checks, style.
+- [Contributing](../CONTRIBUTING.md) — workflow, checks, style. Coding agents: [AGENTS.md](../AGENTS.md).
+- [Releasing](RELEASING.md) and the [live smoke](LIVE_SMOKE.md) that precedes a release.
 - [Changelog](../CHANGELOG.md)
 
-## Enterprise readiness record
+## History
 
-- [Enterprise audit](ENTERPRISE_AUDIT.md) (2026-09-09, historical) → [remediation](ENTERPRISE_REMEDIATION.md) (historical) → [implementation status](ENTERPRISE_ROADMAP.md) (current).
+- [Enterprise audit](history/ENTERPRISE_AUDIT.md) (2026-09-09) → [remediation](history/ENTERPRISE_REMEDIATION.md) → [implementation status](history/ENTERPRISE_ROADMAP.md). The open acceptance gates are now tracked in [SUPPORT.md](SUPPORT.md#open-acceptance-gates).
 - `docs/audit/` — probe sources and qualification evidence; git-ignored, produced locally by `tools/` and published as `qualification.yml` artifacts.
 
 ## Quick answers

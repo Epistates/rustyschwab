@@ -94,9 +94,10 @@ Then:
    with the change that explains it.
 2. Add a line under `## [Unreleased]` in `CHANGELOG.md`
    (Keep a Changelog format).
-3. Update `.env.example` and the README "Environment Variables" section if
-   you add or rename a `SCHWAB_*` variable, and
-   `crates/schwab-mcp/tests/tool_inventory.rs` if you add an MCP tool.
+3. Update `.env.example` if you add or rename a `SCHWAB_*` variable. If you
+   add or remove an MCP tool, update `EXPECTED_TOOLS` in
+   `crates/schwab-mcp/tests/tool_inventory.rs` and the tool catalog in
+   `docs/MCP_LLM_INTEGRATION.md`; the test checks both.
 4. Keep commits focused; one concern per commit.
 
 ## Style
@@ -138,5 +139,11 @@ explains why, not what.
    `schwab-rs`, then `schwab-mcp` through crates.io trusted publishing,
    after approval in the `crates-io` environment (configure the trusted
    publisher on crates.io and the environment's reviewers first).
+5. The same tag push starts `publish-python.yml`, which builds the
+   `rustyschwab` abi3 wheels and sdist and, after approval in the `pypi`
+   environment, publishes them through PyPI trusted publishing (register
+   the publisher on PyPI first). Run it by hand before tagging to inspect
+   the artifacts without publishing.
 
-See [docs/SUPPORT.md](docs/SUPPORT.md) for the compatibility policy.
+See [docs/RELEASING.md](docs/RELEASING.md) for the full checklist and
+[docs/SUPPORT.md](docs/SUPPORT.md) for the compatibility policy.

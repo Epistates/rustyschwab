@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Changed — documentation for users and agents
+
+- **README** rewritten as a short front page: what the three parts are,
+  what the SDK does differently, quickstarts for Rust, Python and MCP, and
+  an honest status line. The security comparison table is gone; it
+  misdescribed Schwabdev, which stores tokens in SQLite with optional
+  encryption. Its reference material moved: the MCP run instructions,
+  client configuration and a tool catalog to `docs/MCP_LLM_INTEGRATION.md`,
+  token storage to `docs/SETUP_GUIDE.md`, metrics to `docs/OPERATIONS.md`
+  (pointing at the test-enforced tables in the `metrics` modules).
+- **`docs/SUPPORT.md`** says which parts are core and which experimental
+  (the strategy runner, the NautilusTrader adapter, the history cache and
+  analytics, the shared authority, the network transports on the TurboMCP
+  pre-release), what has run against a live account (nothing recorded
+  yet), and the open acceptance gates.
+- **`AGENTS.md`** (imported by `CLAUDE.md`) gives coding agents the
+  layout, the rules that protect real orders and credentials, and the
+  checks; **`llms.txt`** indexes the docs for models.
+- **`docs/RELEASING.md`** covers the first publish, which crates.io trusted
+  publishing cannot do, and **`docs/LIVE_SMOKE.md`** the supervised live
+  run that precedes it.
+- The enterprise audit, remediation and roadmap moved to `docs/history/`.
+- Tests now run the README's Python example and check the MCP tool catalog
+  against the server's tools.
+
 ### Added — MCP `get_performance`
 
 - **`get_performance`**: an agent's track record from the account's own
@@ -1416,7 +1441,7 @@ the SDK validates before every request.
 - Expose stream loss/freshness and gate subscription restoration on acknowledgements.
 - Require network principal authorization, account/tool policy, risk caps and durable execution audit; keep cancellation separately controllable.
 - Add Windows atomic protected file storage, update dependencies and raise the minimum compiler to Rust 1.89.
-- See [migration and validation notes](docs/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
+- See [migration and validation notes](docs/history/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
 
 ### Changed — error taxonomy (breaking)
 - `schwab_rs::Error`, `AuthError` and `StreamError` are now
