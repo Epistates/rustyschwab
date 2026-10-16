@@ -1,6 +1,6 @@
 # Setup Guide
 
-Follow these steps to get your Schwab Rust SDK environment ready for production.
+From a Schwab developer account to stored tokens: register an app, configure the SDK, choose how the sign-in reaches it, and sign in once. The same tokens serve the Rust SDK, the Python package and the MCP server.
 
 > [!IMPORTANT]
 > **DISCLAIMER**: The contributors to this project are not responsible for any financial losses incurred through the use of this software. By following this guide, you acknowledge that you are using this SDK at your own risk and have thoroughly tested your implementation in a non-production environment.
@@ -16,56 +16,98 @@ Follow these steps to get your Schwab Rust SDK environment ready for production.
 5.  Enable thinkorswim for your brokerage account by signing in to a thinkorswim platform once. Orders and some other calls need it.
 6.  Copy the app's **App Key** and **Secret** from the dashboard into your `.env` (next step).
 
-## 2. Environment Configuration
+## 2. Configure the SDK
 
-Create a `.env` file in your project root with your credentials:
+Copy `.env.example` to `.env` in the repository (or your project) and set at least:
 
 ```bash
-SCHWAB_APP_KEY=your_32_character_app_key
-SCHWAB_APP_SECRET=your_16_character_app_secret
-SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080
+SCHWAB_APP_KEY=your_app_key
+SCHWAB_APP_SECRET=your_app_secret
+SCHWAB_OAUTH_CALLBACK_URL=https://127.0.0.1:8080     # exactly as registered
+SCHWAB_TOKENS_FILE=/Users/you/.config/schwab/tokens.json
 ```
 
-## 3. Local HTTPS for Callbacks
+The Rust examples and the MCP server read `.env` themselves. Python reads only the environment: export the variables, or run `set -a; source .env; set +a` first. `.env.example` lists every setting.
 
-Schwab requires an HTTPS callback URL.
+## 3. Choose how the sign-in comes back
 
-### Option A: Localhost with built-in self-signed cert (Recommended)
+After you sign in, Schwab sends your browser to the callback URL with a one-time code. Something has to collect it. There are four ways:
 
-Register `https://127.0.0.1:8080` in the Schwab portal and set the
-same value in `SCHWAB_OAUTH_CALLBACK_URL`. The SDK's built-in
-callback server (feature `callback-server`) terminates TLS locally;
-your browser will warn about the self-signed cert once — click
-"Advanced" → "Proceed anyway" and you're in. No tunnel, no external
-binary.
+| | What you see | Setup |
+| --- | --- | --- |
+| **A. Built-in server, trusted certificate** (recommended) | "Authorization Successful", nothing to click or paste | mkcert, once |
+| **B. Built-in server, self-signed certificate** (the default) | A certificate warning to click through at each sign-in | None |
+| **C. Paste the redirect** | An error page whose address you paste into the terminal | None |
+| **D. Public tunnel** | As A or B, through your tunnel | A tunnel, for headless machines |
 
-### Option B: Public HTTPS tunnel (advanced)
+Which ones each tool offers:
 
-Only needed when the machine running the OAuth flow can't host the
-browser doing the Schwab consent dance (headless servers, locked-down
-corporate networks). Examples: cloudflared, ngrok, or a reverse proxy
-in front of a VM.
+| Tool | Routes |
+| --- | --- |
+| `cargo run -p oauth-flow` | A when `SCHWAB_CALLBACK_CERT_FILE` is set, otherwise B; C with `--no-default-features` |
+| Your Rust application | A or B with the `callback-server` feature and `capture_callback`, through `AuthManager::authorize_with`; C through `authorize` and `exchange_code` |
+| Python (`python -m rustyschwab login`, `rustyschwab.auth`) | C |
+| The MCP server | None: it uses stored tokens, so sign in with one of the above first |
+
+The built-in server listens on the callback URL's port (`8080` in `https://127.0.0.1:8080`; 443 when the URL has none, which Linux reserves for privileged processes), on `127.0.0.1` only.
+
+### A. A trusted local certificate (macOS)
+
+[mkcert](https://github.com/FiloSottile/mkcert) creates a certificate authority that only your machine trusts, and issues the callback server a certificate from it. Do this once:
+
+```bash
+brew install mkcert
+mkcert -install            # adds mkcert's local CA to your login keychain (asks for your password)
+
+mkdir -p ~/.config/schwab
+mkcert -cert-file ~/.config/schwab/callback.pem \
+       -key-file  ~/.config/schwab/callback-key.pem \
+       127.0.0.1 localhost
+```
+
+Then add the two files to `.env`, with absolute paths:
+
+```bash
+SCHWAB_CALLBACK_CERT_FILE=/Users/you/.config/schwab/callback.pem
+SCHWAB_CALLBACK_KEY_FILE=/Users/you/.config/schwab/callback-key.pem
+```
+
+In Rust code the same settings are `OAuthConfig::callback_cert_file` and `callback_key_file`; set both or neither.
+
+- **Browsers.** Safari and Chrome use the macOS keychain and trust the certificate at once. Firefox keeps its own store: `brew install nss`, run `mkcert -install` again and restart Firefox.
+- **Keep the CA key private.** `mkcert -CAROOT` shows where it lives. Anyone holding `rootCA-key.pem` can make certificates your machine trusts for any site, so never copy or commit it. `mkcert -uninstall` removes the trust.
+- **Renewal.** mkcert's certificates last a little over two years. When the sign-in starts warning again, rerun the `mkcert -cert-file ...` command.
+- **Elsewhere.** mkcert works the same on Linux and Windows.
+
+### B. The built-in self-signed certificate
+
+Nothing to set up. The server makes a new certificate for each sign-in, so the browser warns every time: in Chrome choose **Advanced → Proceed to 127.0.0.1**; in Safari choose **Show Details → visit this website** and confirm.
+
+### C. Paste the redirect
+
+No server and no certificate. After you approve, the browser shows a "can't connect" error page: that is expected. Copy the **whole address** from the address bar (`https://127.0.0.1:8080/?code=C0....%40&session=...&state=...`) and paste it where you are asked, within five minutes. Pasting only the `code` value also works.
+
+### D. A public HTTPS tunnel (headless machines)
+
+Only needed when the machine running the sign-in can't open a browser to it (a headless server, a locked-down network). Use cloudflared, ngrok or a reverse proxy:
 
 1.  Point the tunnel at local port `8080`.
-2.  Register the resulting public HTTPS URL in the Schwab portal and
-    `SCHWAB_OAUTH_CALLBACK_URL`.
-3.  Set `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true` so the callback server
-    binds to `0.0.0.0` instead of `127.0.0.1`.
+2.  Register the tunnel's public HTTPS URL in the Schwab portal and set it as `SCHWAB_OAUTH_CALLBACK_URL`. Prefer a named tunnel: free `trycloudflare.com` URLs change on every launch.
+3.  Set `SCHWAB_ALLOW_EXTERNAL_CALLBACK=true`. The server then listens on `0.0.0.0` over plain HTTP, and the tunnel terminates TLS.
 
-## 4. Your First Authentication
-
-Run the `oauth-flow` example package to generate your first token:
+## 4. Sign in for the first time
 
 ```bash
 cargo run -p oauth-flow
 ```
 
-1.  The program prints an authorization URL and starts a local HTTPS server on the callback URL's port.
-2.  Open the URL, sign in to Schwab, accept the terms and choose the accounts the app may use.
-3.  Schwab redirects to `https://127.0.0.1:8080/?code=...&session=...&state=...`. The browser warns once about the server's self-signed certificate; choose "Advanced → Proceed", and the SDK captures the code and stores the tokens.
-4.  With `cargo run -p oauth-flow --no-default-features` there is no local server: the redirect lands on an error page, which is expected. Copy the whole URL from the address bar and paste it into the terminal. From Python, `client.complete_authorization(url)` does the same.
+1.  It prints the sign-in URL. Open it, sign in to Schwab, accept the terms and choose the accounts the app may use.
+2.  Schwab redirects to `https://127.0.0.1:8080/?code=...`. With route A the page says "Authorization Successful"; with B, click through the warning first; with C, paste the address into the terminal.
+3.  The tokens are stored, and the example fetches a quote to prove they work.
 
-The code is single-use and expires quickly (Schwab does not document how fast), so paste it promptly. If the refresh token expires (after seven days) or Schwab refuses it, run the flow again.
+From Python, run `python -m rustyschwab login` instead.
+
+The access token lasts 30 minutes and refreshes itself; the refresh token lasts seven days. After that, or if Schwab refuses it, sign in again the same way.
 
 ## 5. Token Persistence
 

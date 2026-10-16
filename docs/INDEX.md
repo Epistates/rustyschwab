@@ -3,7 +3,7 @@
 ## Using the SDK
 
 - [Setup guide](SETUP_GUIDE.md) — Schwab portal registration, environment, first authentication.
-- [App callback URLs](APP_CALLBACK.md) — redirect URI requirements and local HTTPS.
+- [Callback URL rules](APP_CALLBACK.md) — what Schwab accepts as a redirect URI; the [setup guide](SETUP_GUIDE.md#3-choose-how-the-sign-in-comes-back) covers local HTTPS, including a trusted certificate.
 - [Placing orders](ORDERS.md) — constructors for single-leg, option, multi-leg and composite orders; the JSON `OrderSpec`.
 - [Real-time streaming](STREAMING.md) — services, field selection, backpressure and reconnect semantics.
 - [Python bindings](PYTHON.md) — `pip install rustyschwab`: authorization, quotes, order templates, streaming (async, blocking, market-hours scheduled), strategies in backtest, paper and live, performance reports, NautilusTrader, and error handling.

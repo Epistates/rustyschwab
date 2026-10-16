@@ -35,7 +35,7 @@ cp .env.example .env            # set SCHWAB_APP_KEY, SCHWAB_APP_SECRET
 cargo run -p oauth-flow         # sign in once; tokens are stored securely
 ```
 
-The [setup guide](docs/SETUP_GUIDE.md) covers each step and the token stores.
+The [setup guide](docs/SETUP_GUIDE.md) covers each step, the token stores, and a one-time [mkcert setup](docs/SETUP_GUIDE.md#a-a-trusted-local-certificate-macos) that removes the browser's certificate warning from sign-in.
 
 ### Rust
 

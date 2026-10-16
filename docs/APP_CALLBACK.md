@@ -1,63 +1,33 @@
-```markdown
-# App Callback URL Requirements and Limitations
+# Schwab's callback URL rules
 
-## What are the requirements for the Callback URL ("redirect_uri")?
+Schwab's own rules for an app's callback URL ("redirect_uri"), as the developer portal states them. To set up the callback for this SDK, including a trusted local certificate, see [the setup guide](SETUP_GUIDE.md#3-choose-how-the-sign-in-comes-back).
 
-A Callback URL ("redirect_uri" parameter) is required when creating an App on the Developer Portal. This URL will be utilized in the OAuth `authorize` step to redirect the User from LMS, for "consent and grant," back to the calling App.
+## Requirements
 
-Per OAuth 2 requirements, a Callback URL is only applicable for the "authorization_code" and implicit flows ("grant_type"). Currently, the only available OAuth flow for Schwab APIs is the "authorization_code" Grant Type.
+A callback URL is required when you create an app. Schwab redirects the user there after consent and grant. The only OAuth flow Schwab offers is the authorization code grant.
 
-## Callback URL Requirements and Recommendations:
+1. **Scheme.** Some lines of business require `https`; others allow `http` or other schemes. Individual Trader API apps use `https`.
+2. Every callback URL is checked for basic URL structure.
+3. Every callback URL is checked for special or unsupported characters.
+4. If the authorization request sends no `redirect_uri`, Schwab uses the URL registered with the app. With several registered, that can fail, because Schwab cannot tell which one to use. This SDK always sends one.
+5. The callback URL sent in the authorization request must be **identical** to one registered with the app.
 
-1. **URL Scheme**: Some LOBs require the Callback URL scheme to be secure (HTTPS). While other support HTTP or other URL schemes depending on specific business requirements.  
-2. All callback URLs will be validated to ensure it meets basic URL structure.  
-3. All callback URLs will be validated to ensure there are no special or unsupported characters in the address.  
-4. If no Callback URL is sent during the OAuth flow, the value will automatically default to the Callback URL registered when the App was created on Schwab’s Dev Portal.  
-   - In this scenario, if multiple Callback URLs were registered with the App, an error may be returned. The reason being the inability to determine which one to use since none was specified in the API request.  
-5. The Callback URL sent during the OAuth flow must be identical to one of the Callback URL(s) registered with the App being used.
+## Several callback URLs for one app
 
-## Adding Multiple Callback URLs for a single App
+An app can have several callback URLs, entered on the Create App or Modify App form:
 
-Multiple URLs are supported for a single app. This can be done on either the Create App form or the Modify App forms.
+1. Separate them with commas and **no spaces**, for example `https://127.0.0.1:8080,https://127.0.0.1`.
+2. The field holds at most 256 characters. Contact Schwab support for more.
 
-**Note**:  
-The table below will highlight some common permutations and the associated error reason information.
+## Common errors
 
-### To add multiple Callback URLs:
-1. Enter Callback URLs by separating each with a comma. **NOTE**: do not separate the comma and the next URL with a space.  
-   Example:  
-   `https://www.example.com/path/page.etc,https://www.example.com/path2/page.etc`  
-2. The field is currently limited at 256 characters max.  
-   - Contact support if a special use-case occurs that exceeds this limitation.
+| Registered URL | URL sent in `authorize` | Result | Reason |
+| --- | --- | --- | --- |
+| `https://host/path` | `https://host/path` | Success | |
+| `https://host/path` | `myapp://blah/bam` | Error: invalid URI specified | The scheme does not match |
+| `myapp://blah/bam` | `https://host/path` | Error: invalid URI specified | The scheme does not match |
+| `https://host/path` | `http://host/path` | Error: invalid URI specified | The scheme does not match (`https` and `http`) |
+| `myapp://this/that` | `myapp://host/path` | Error: invalid URI specified | The path does not match |
+| `myapp://this/that` | `myapp://this/that` | Success | |
 
-## Common Callback URL Errors and Reasons:
-
-| Registered URL             | URL Sent in OAuth `authorize` | Response or Error                                 | Reason                                                                 |
-|---------------------------|-------------------------------|--------------------------------------------------|------------------------------------------------------------------------|
-| `https://host/path`       | `https://host/path`          | Successful response                             |                                                                    |
-| `https://host/path`       | `myapp://blah/bam`           | Error - invalid URI specified                  | Scheme sent does not match registered                                 |
-| `myapp://blah/bam`        | `https://host/path`          | Error - invalid URI specified                  | Scheme sent does not match registered                                 |
-| `https://host/path`       | `http://host/path`           | Error - invalid URI specified                  | Scheme sent does not match registered ("https" vs. "http")            |
-| `myapp://this/that`       | `myapp://host/path`          | Error - invalid URI specified                  | Path sent does not match registered                                   |
-| `myapp://this/that`       | `myapp://this/that`          | Successful response                           |                                                                    |
-
----
-
-**Get Started**  
-**3rd Party Company**  
-**Individual**  
-**Developer**  
-**About the Individual Developer Role**  
-**Become an Individual Developer**  
-**APIs and Apps**  
-**Create an App**  
-**Modify an App**  
-**Test in Sandbox**  
-**Promoting Apps to Production**  
-**OAuth Restart vs. Refresh**
-
----
-
-**Terms of Use | Privacy Notice**  
-© 2025 Charles Schwab & Co., Inc. All rights reserved. Member SIPC. Unauthorized access is prohibited. Usage is monitored.
-```
+A trailing `/` counts: `https://127.0.0.1:8080/` and `https://127.0.0.1:8080` are different URLs, and the mismatch shows up as an "Access Denied" page after sign-in. This SDK refuses a callback URL that ends in `/`.

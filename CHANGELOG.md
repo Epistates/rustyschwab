@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased — 0.2.0 candidate]
 
+### Added — sign-in without a certificate warning
+
+- **`OAuthConfig::callback_cert_file` and `callback_key_file`**
+  (`SCHWAB_CALLBACK_CERT_FILE`, `SCHWAB_CALLBACK_KEY_FILE`): the built-in
+  callback server serves this PEM certificate and key instead of a
+  self-signed one, so with a certificate from `mkcert 127.0.0.1` the
+  browser completes the sign-in without a warning. Set both or neither.
+  Unset, nothing changes. A test completes the redirect over TLS with a
+  client that trusts only the issuing CA.
+- **`AuthManager::authorize_with(on_url)`** hands the consent URL to the
+  application before the callback server waits; `authorize` logs it as
+  before. `oauth-flow` prints it.
+- The setup guide walks through every way the sign-in can come back
+  (trusted certificate, self-signed, pasting the redirect, a tunnel) and
+  which tools offer which, with the mkcert steps for macOS.
+  `docs/APP_CALLBACK.md` is now readable markdown rather than a fenced copy
+  of the portal page.
+
 ### Fixed — authorization with real Schwab codes
 
 - **Pasting the redirect failed for every real code.**

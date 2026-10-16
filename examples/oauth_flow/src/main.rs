@@ -52,19 +52,25 @@ async fn main() -> Result<()> {
     } else {
         info!("No valid tokens found, starting OAuth flow");
 
-        // Start OAuth flow
-        let (auth_url, captured_code) = auth_manager.authorize().await?;
-
-        println!("\n🔐 OAuth Authorization Required");
-        println!("================================");
+        // Start OAuth flow. The URL is printed before the built-in server
+        // (if any) starts waiting for the redirect.
+        let capturing = config.oauth.capture_callback;
+        let (_, captured_code) = auth_manager
+            .authorize_with(|url| {
+                println!("\n🔐 OAuth Authorization Required");
+                println!("================================");
+                println!("\nOpen this URL in your browser, sign in and choose accounts:");
+                println!("\n{url}\n");
+                if capturing {
+                    println!("Waiting for Schwab to redirect back to the built-in server...");
+                }
+            })
+            .await?;
 
         if !captured_code.is_empty() {
             println!("\n✅ Authorization successful!");
             println!("Code captured automatically by built-in server.");
         } else {
-            println!("\nPlease open this URL in your browser:");
-            println!("\n{}\n", auth_url);
-
             println!("After you sign in and choose accounts, the browser goes to your callback");
             println!("URL and shows an error page: that is expected. Copy the whole URL from the");
             println!("address bar (https://127.0.0.1...?code=C0....%40&session=...&state=...).\n");

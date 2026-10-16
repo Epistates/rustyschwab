@@ -80,6 +80,55 @@ struct CallbackParams {
     error: Option<String>,
 }
 
+/// The callback server's certificate chain and key: the configured PEM
+/// files, or a self-signed certificate for `127.0.0.1` and `localhost`
+/// made for this authorization, which the browser warns about once.
+#[cfg(feature = "callback-server")]
+fn callback_tls_identity(
+    config: &OAuthConfig,
+) -> AuthResult<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    if let (Some(cert_file), Some(key_file)) =
+        (&config.callback_cert_file, &config.callback_key_file)
+    {
+        let unreadable = |file: &std::path::Path, e: &dyn std::fmt::Display| {
+            AuthError::OAuthFlow(format!("Cannot read {}: {e}", file.display()))
+        };
+        let chain = CertificateDer::pem_file_iter(cert_file)
+            .and_then(Iterator::collect::<Result<Vec<_>, _>>)
+            .map_err(|e| unreadable(cert_file, &e))?;
+        if chain.is_empty() {
+            return Err(unreadable(cert_file, &"no PEM certificate in it"));
+        }
+        let key = PrivateKeyDer::from_pem_file(key_file).map_err(|e| unreadable(key_file, &e))?;
+        info!(
+            "Callback server uses the certificate in {}",
+            cert_file.display()
+        );
+        return Ok((chain, key));
+    }
+
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+            .map_err(|e| {
+                AuthError::OAuthFlow(format!("Failed to generate TLS certificate: {e}"))
+            })?;
+    info!(
+        "Callback server uses a self-signed certificate — your browser will warn once; \
+         choose 'Advanced → Proceed' to complete the flow, or set SCHWAB_CALLBACK_CERT_FILE \
+         and SCHWAB_CALLBACK_KEY_FILE to a trusted one"
+    );
+    Ok((
+        vec![CertificateDer::from(cert.cert.der().to_vec())],
+        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+    ))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct OAuthConfig {
     pub app_key: String,
@@ -111,6 +160,16 @@ pub struct OAuthConfig {
     /// your LAN/WAN while enabled.
     #[serde(default)]
     pub allow_external_callback: bool,
+    /// PEM certificate chain for the local callback server, with
+    /// [`callback_key_file`](Self::callback_key_file). Give it a
+    /// certificate the browser trusts (for example from `mkcert 127.0.0.1`)
+    /// and the sign-in completes without a certificate warning. Unset, the
+    /// server makes a self-signed certificate for each authorization.
+    #[serde(default)]
+    pub callback_cert_file: Option<PathBuf>,
+    /// PEM private key for [`callback_cert_file`](Self::callback_cert_file).
+    #[serde(default)]
+    pub callback_key_file: Option<PathBuf>,
     /// Callback function when tokens need user intervention (e.g., refresh token expiring)
     #[serde(skip)]
     pub on_token_notification: Option<Arc<dyn Fn(TokenNotification) + Send + Sync>>,
@@ -155,6 +214,8 @@ impl std::fmt::Debug for OAuthConfig {
             .field("capture_callback", &self.capture_callback)
             .field("auto_refresh", &self.auto_refresh)
             .field("refresh_buffer_seconds", &self.refresh_buffer_seconds)
+            .field("callback_cert_file", &self.callback_cert_file)
+            .field("callback_key_file", &self.callback_key_file)
             .field(
                 "on_token_notification",
                 &self.on_token_notification.is_some(),
@@ -178,6 +239,8 @@ impl Default for OAuthConfig {
             pkce_enabled: false,        // Schwab + reference client don't require PKCE
             token_store_kind: TokenStoreKind::default(),
             allow_external_callback: false, // Secure default: localhost only
+            callback_cert_file: None,
+            callback_key_file: None,
             on_token_notification: None,
         }
     }
@@ -490,6 +553,11 @@ impl AuthManager {
                 "Callback URL cannot be path (ends with '/')".to_string(),
             ));
         }
+        if config.callback_cert_file.is_some() != config.callback_key_file.is_some() {
+            return Err(AuthError::MissingConfig(
+                "Set both callback_cert_file and callback_key_file, or neither".to_string(),
+            ));
+        }
 
         let manager = Self {
             config: config.clone(),
@@ -661,7 +729,23 @@ impl AuthManager {
         Ok(())
     }
 
+    /// Start an authorization: log the consent URL and, with
+    /// [`capture_callback`](OAuthConfig::capture_callback), wait for the
+    /// redirect and store the tokens. Returns the URL and the captured code
+    /// (empty without capture). [`authorize_with`](Self::authorize_with)
+    /// hands the URL to you instead of the log.
     pub async fn authorize(&self) -> AuthResult<(String, String)> {
+        self.authorize_with(|url| info!("Open this URL in your browser:\n{url}"))
+            .await
+    }
+
+    /// [`authorize`](Self::authorize), calling `on_url` with the consent URL
+    /// before waiting for the redirect, so the application can show it or
+    /// open a browser while the callback server listens.
+    pub async fn authorize_with(
+        &self,
+        on_url: impl FnOnce(&str) + Send,
+    ) -> AuthResult<(String, String)> {
         // Generate OAuth state parameter for CSRF protection (RFC 6749 Section 10.12)
         // Using UUID v4 provides sufficient entropy for secure state tokens
         let state = uuid::Uuid::new_v4().to_string();
@@ -695,8 +779,7 @@ impl AuthManager {
                 .append_pair("code_challenge_method", "S256");
         }
         let auth_url = url.to_string();
-
-        info!("Open this URL in your browser:\n{}", auth_url);
+        on_url(&auth_url);
 
         if self.config.capture_callback {
             // Start local server to capture callback
@@ -1134,19 +1217,8 @@ impl AuthManager {
             // Schwab requires an https:// callback URL, so the browser
             // opens a TLS connection straight to this server — a plain
             // HTTP listener would fail the handshake and the code would
-            // never arrive. Generate an in-memory self-signed certificate
-            // for loopback; the browser shows a one-time warning the user
-            // can bypass.
-            let cert = rcgen::generate_simple_self_signed(vec![
-                "127.0.0.1".to_string(),
-                "localhost".to_string(),
-            ])
-            .map_err(|e| {
-                AuthError::OAuthFlow(format!("Failed to generate TLS certificate: {e}"))
-            })?;
-
-            let cert_der = cert.cert.der().to_vec();
-            let key_der = cert.key_pair.serialize_der();
+            // never arrive.
+            let (chain, key) = callback_tls_identity(&self.config)?;
 
             // Pick the ring provider explicitly: both ring and aws-lc-rs
             // are in the dependency tree, so rustls cannot auto-select one.
@@ -1155,19 +1227,11 @@ impl AuthManager {
                 .with_safe_default_protocol_versions()
                 .map_err(|e| AuthError::OAuthFlow(format!("TLS config error: {e}")))?
                 .with_no_client_auth()
-                .with_single_cert(
-                    vec![rustls::pki_types::CertificateDer::from(cert_der)],
-                    rustls::pki_types::PrivateKeyDer::Pkcs8(key_der.into()),
-                )
+                .with_single_cert(chain, key)
                 .map_err(|e| AuthError::OAuthFlow(format!("TLS config error: {e}")))?;
 
             let rustls_config =
                 axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
-
-            info!(
-                "Callback server uses a self-signed certificate — your browser will warn once; \
-                 choose 'Advanced → Proceed' to complete the flow"
-            );
 
             let server =
                 axum_server::bind_rustls(addr, rustls_config).serve(app.into_make_service());
@@ -1293,6 +1357,42 @@ mod tests {
             tokens_file: std::env::temp_dir().join("schwab_auth_validation_test.json"),
             ..Default::default()
         }
+    }
+
+    /// A configured certificate and key (as `mkcert 127.0.0.1` writes them)
+    /// replace the self-signed one; a half configuration or an empty file is
+    /// refused with the file named.
+    #[cfg(feature = "callback-server")]
+    #[test]
+    fn callback_server_uses_a_configured_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let (cert_file, key_file) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+        std::fs::write(&cert_file, issued.cert.pem()).unwrap();
+        std::fs::write(&key_file, issued.key_pair.serialize_pem()).unwrap();
+        let mut config = config_with_creds(32, 16);
+
+        let (chain, _) = callback_tls_identity(&config).unwrap();
+        assert_ne!(
+            chain[0].as_ref(),
+            issued.cert.der().as_ref(),
+            "generated when unset"
+        );
+
+        config.callback_cert_file = Some(cert_file.clone());
+        assert!(
+            AuthManager::new(config.clone()).is_err(),
+            "a cert without a key"
+        );
+        config.callback_key_file = Some(key_file);
+        assert!(AuthManager::new(config.clone()).is_ok());
+        let (chain, _) = callback_tls_identity(&config).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].as_ref(), issued.cert.der().as_ref());
+
+        std::fs::write(&cert_file, "").unwrap();
+        let error = callback_tls_identity(&config).unwrap_err().to_string();
+        assert!(error.contains("cert.pem"), "{error}");
     }
 
     /// Schwab issues several credential length variants; since Schwabdev

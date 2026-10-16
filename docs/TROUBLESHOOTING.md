@@ -18,6 +18,14 @@ Common issues and their solutions when using the Schwab Rust SDK.
 *   **Cause:** The app's status is still **"Approved - Pending"**; it works only once it reads **"Ready for Use"**, which can take a couple of days. Less often, the account type is not supported by the API.
 *   **Fix:** Wait for "Ready for Use". For app registration problems, email `traderapi@schwab.com`.
 
+### The browser warns about the certificate at sign-in
+*   **Cause:** Without a configured certificate, the built-in callback server makes a self-signed one for each sign-in.
+*   **Fix:** Give it a certificate your machine trusts, made once with mkcert, through `SCHWAB_CALLBACK_CERT_FILE` and `SCHWAB_CALLBACK_KEY_FILE`; see [the setup guide](SETUP_GUIDE.md#a-a-trusted-local-certificate-macos). If it still warns, the browser does not trust mkcert's CA (Firefox needs `brew install nss` and `mkcert -install` again), or the certificate has expired.
+
+### `Cannot read ...callback.pem` when the sign-in starts
+*   **Cause:** `SCHWAB_CALLBACK_CERT_FILE` or `SCHWAB_CALLBACK_KEY_FILE` points at a missing or non-PEM file, or only one of them is set.
+*   **Fix:** Use absolute paths to the two files mkcert wrote, and set both.
+
 ### The callback never arrives, or `Invalid authorization code format`
 *   **Cause:** The built-in callback server listens on the port in `SCHWAB_OAUTH_CALLBACK_URL` (443 when it has none, which needs privileges on Linux), and the registered URL must name the same one.
 *   **Fix:** Register and use a URL with a port, such as `https://127.0.0.1:8080`. When pasting by hand, paste the whole redirect URL, or only the value of its `code` parameter.

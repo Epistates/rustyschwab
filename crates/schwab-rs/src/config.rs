@@ -334,6 +334,8 @@ impl SchwabConfig {
                 },
             },
             allow_external_callback: env_flag("SCHWAB_ALLOW_EXTERNAL_CALLBACK", false)?,
+            callback_cert_file: env::var_os("SCHWAB_CALLBACK_CERT_FILE").map(PathBuf::from),
+            callback_key_file: env::var_os("SCHWAB_CALLBACK_KEY_FILE").map(PathBuf::from),
             on_token_notification: None,
         };
 

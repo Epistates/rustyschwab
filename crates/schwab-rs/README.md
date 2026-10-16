@@ -17,8 +17,12 @@ tokio = { version = "1", features = ["full"] }
 ```
 
 `callback-server` adds the local HTTPS listener that captures the OAuth
-redirect. Without it, `AuthManager::authorize` returns the URL and you
-pass the code to `exchange_code` yourself.
+redirect. It serves the certificate in `OAuthConfig::callback_cert_file`
+and `callback_key_file` (for example one from `mkcert 127.0.0.1`, which the
+browser trusts), or a self-signed one the browser warns about.
+`AuthManager::authorize_with` hands you the consent URL before it waits.
+Without the feature, `AuthManager::authorize` returns the URL and you pass
+the redirect to `exchange_code` yourself.
 
 ## Configure and authorize
 

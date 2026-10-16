@@ -34,6 +34,8 @@ fn create_test_config(mock_server_uri: &str) -> SchwabConfig {
             pkce_enabled: true,
             token_store_kind: TokenStoreKind::File,
             allow_external_callback: false,
+            callback_cert_file: None,
+            callback_key_file: None,
             on_token_notification: None,
         },
         client: ClientConfig {
@@ -280,6 +282,112 @@ async fn real_shaped_codes_are_exchanged_from_a_redirect_or_pasted_alone() {
     auth.exchange_code(format!("{code}%40")).await.unwrap();
     auth.exchange_code(format!("{code}@")).await.unwrap();
     let _ = std::fs::remove_file(&config.oauth.tokens_file);
+}
+
+/// The callback server serves a configured certificate, as `mkcert` issues
+/// one: a browser that trusts only the issuing CA completes the redirect
+/// without a warning, and the server exchanges the code and stores tokens.
+#[cfg(feature = "callback-server")]
+#[tokio::test]
+async fn the_callback_server_serves_a_configured_trusted_certificate() {
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use std::sync::Arc;
+
+    // A local CA and a 127.0.0.1 certificate it signed, like mkcert's.
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let leaf_key = KeyPair::generate().unwrap();
+    let leaf = CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+        .unwrap()
+        .signed_by(&leaf_key, &ca, &ca_key)
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (cert_file, key_file) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    std::fs::write(&cert_file, leaf.pem()).unwrap();
+    std::fs::write(&key_file, leaf_key.serialize_pem()).unwrap();
+
+    let code = "C0.b2F1dGgyLmJkYy5zY2h3YWIuY29t.trusted-cert-test";
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(wiremock::matchers::body_string_contains(format!(
+            "code={code}%40"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "access", "refresh_token": "refresh",
+            "token_type": "Bearer", "expires_in": 1800
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut config = create_test_config(&mock_server.uri()).oauth;
+    config.pkce_enabled = false;
+    config.capture_callback = true;
+    config.callback_url = format!("https://127.0.0.1:{port}");
+    config.callback_cert_file = Some(cert_file);
+    config.callback_key_file = Some(key_file);
+    let auth = Arc::new(AuthManager::new(config.clone()).unwrap());
+
+    let (url_tx, url_rx) = tokio::sync::oneshot::channel();
+    let flow = tokio::spawn({
+        let auth = auth.clone();
+        async move {
+            auth.authorize_with(|url| {
+                let _ = url_tx.send(url.to_string());
+            })
+            .await
+        }
+    });
+    let consent = url::Url::parse(&url_rx.await.unwrap()).unwrap();
+    let state = consent
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .unwrap()
+        .1
+        .into_owned();
+
+    // A client that trusts the local CA and nothing else (rustls on ring,
+    // as the workspace pins it).
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).unwrap();
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let browser = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls)
+        .build()
+        .unwrap();
+    let redirect = format!("https://127.0.0.1:{port}/?code={code}%40&session=s1&state={state}");
+    let mut answer = Err(String::new());
+    for _ in 0..50 {
+        match browser.get(&redirect).send().await {
+            Ok(response) => {
+                answer = Ok(response);
+                break;
+            }
+            // The server binds after handing out the URL.
+            Err(error) => {
+                answer = Err(format!("{error:?}"));
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    assert!(answer.unwrap().status().is_success());
+    let (_, captured) = flow.await.unwrap().unwrap();
+    assert_eq!(captured, format!("{code}@"));
+    assert!(auth.has_valid_tokens());
+    let _ = std::fs::remove_file(&config.tokens_file);
 }
 
 /// A refresh token Schwab refuses means only a new authorization helps:
