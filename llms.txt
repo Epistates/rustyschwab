@@ -1,0 +1,36 @@
+# rustyschwab
+
+> A Rust SDK (`schwab-rs`), Python package (`rustyschwab`) and MCP server (`schwab-mcp`) for the Charles Schwab Trader and Market Data APIs. Orders are journaled and sent at most once, risk limits and halts are enforced outside the strategy, MCP write tools are off by default and gated by per-principal policy and approvals, and a deterministic local paper venue runs the same strategy code as live trading.
+
+Key facts for a model using or writing code against it:
+
+- Money is decimal: pass prices and quantities as decimal strings (MCP, Python dicts) or `Decimal`, never floats.
+- An order whose outcome is unknown must be reconciled, never resubmitted: `SubmissionUnknown` in Rust and Python, error code `reconciliation_required` (disposition `reconcile`) over MCP. Every MCP failure carries a `disposition` saying what to do next.
+- Over MCP, call `get_server_status` first: it says whether the server is live or paper, which tools the session may use, and whether trading is halted. Use `build_order` and `check_order` before `place_order`.
+- Python request and response values are plain dicts and lists in Schwab's JSON shape.
+- Status: 0.2.0 release candidate; no live-account run recorded yet. The strategy runner and NautilusTrader adapter are experimental.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/epistates/rustyschwab/main/README.md): what it is, quickstart for Rust, Python and MCP
+- [Setup guide](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/SETUP_GUIDE.md): Schwab app registration, OAuth, token storage
+- [MCP server and LLM integration](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/MCP_LLM_INTEGRATION.md): running the server, client config, tool catalog, result contract, pre-flight, approvals, paper mode, model evaluation
+- [Python guide](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/PYTHON.md): client, order templates, streaming, strategies in backtest, paper and live, performance reports, NautilusTrader
+- [Orders](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/ORDERS.md): equity, option, multi-leg and conditional orders; the `OrderSpec` grammar
+- [Streaming](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/STREAMING.md): services, fields, backpressure, reconnects
+- [Paper trading](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/PAPER_TRADING.md): the simulated venue, backtesting over price history, fees
+- [Rust crate guide](https://raw.githubusercontent.com/epistates/rustyschwab/main/crates/schwab-rs/README.md): configure, authorize, read data, place an order, stream quotes
+
+## Operations
+
+- [Operations](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/OPERATIONS.md): principal policy, approvals, risk limits, dead-man switch, audit chain, recovery, metrics, OpenTelemetry
+- [Support policy](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/SUPPORT.md): core versus experimental, live verification status, compatibility
+- [Troubleshooting](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/TROUBLESHOOTING.md): 401s, symbols, TLS, MCP startup errors
+
+## Optional
+
+- [Coming from Schwabdev](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/MIGRATING_FROM_SCHWABDEV.md): every Schwabdev call and its equivalent
+- [Shared authority](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/SHARED_AUTHORITY.md): one broker session serving several processes or hosts
+- [Paper limitations](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/PAPER_LIMITATIONS.md): what the simulator does not model
+- [Architecture](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/ARCHITECTURE_OVERVIEW.md): crates, request pipeline, durable state
+- [Contributing](https://raw.githubusercontent.com/epistates/rustyschwab/main/AGENTS.md): repository rules for coding agents
