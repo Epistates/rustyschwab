@@ -200,7 +200,7 @@ dependencies = [
  "chrono",
  "clap",
  "dotenvy",
- "schwab-rs",
+ "rustyschwab",
  "serde_json",
  "tokio",
  "tracing",
@@ -638,7 +638,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dotenvy",
- "schwab-rs",
+ "rustyschwab",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -985,7 +985,7 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "futures-util",
- "schwab-rs",
+ "rustyschwab",
  "serde_json",
  "tempfile",
  "tokio",
@@ -2408,7 +2408,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dotenvy",
- "schwab-rs",
+ "rustyschwab",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3283,6 +3283,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyschwab"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "axum-server",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "dotenvy",
+ "futures-util",
+ "governor",
+ "humantime-serde",
+ "keyring",
+ "metrics",
+ "metrics-opentelemetry",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "rand 0.10.2",
+ "rcgen",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "rust_decimal",
+ "rustix",
+ "rustls",
+ "rustls-platform-verifier",
+ "rustyschwab-types",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+ "uuid",
+ "windows-sys 0.61.2",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
+name = "rustyschwab-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "futures-util",
+ "governor",
+ "jsonwebtoken",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "parking_lot",
+ "reqwest",
+ "ring",
+ "rust_decimal",
+ "rustyschwab",
+ "rustyschwab-types",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "turbomcp",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "rustyschwab-types"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "proptest",
+ "rust_decimal",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_with",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3343,106 +3443,6 @@ dependencies = [
  "quote",
  "serde_derive_internals",
  "syn 3.0.5",
-]
-
-[[package]]
-name = "schwab-mcp"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "clap",
- "dotenvy",
- "futures-util",
- "governor",
- "jsonwebtoken",
- "metrics",
- "metrics-exporter-prometheus",
- "metrics-util",
- "parking_lot",
- "reqwest",
- "ring",
- "rust_decimal",
- "schemars 1.2.2",
- "schwab-rs",
- "schwab-types",
- "serde",
- "serde_json",
- "subtle",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "tower",
- "tracing",
- "tracing-subscriber",
- "turbomcp",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "schwab-rs"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "axum",
- "axum-server",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "chrono-tz",
- "dotenvy",
- "futures-util",
- "governor",
- "humantime-serde",
- "keyring",
- "metrics",
- "metrics-opentelemetry",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "parking_lot",
- "rand 0.10.2",
- "rcgen",
- "reqwest",
- "ring",
- "rusqlite",
- "rust_decimal",
- "rustix",
- "rustls",
- "rustls-platform-verifier",
- "schwab-types",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "url",
- "urlencoding",
- "uuid",
- "windows-sys 0.61.2",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
-name = "schwab-types"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "proptest",
- "rust_decimal",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "serde_with",
 ]
 
 [[package]]
@@ -3788,7 +3788,7 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "dotenvy",
- "schwab-rs",
+ "rustyschwab",
  "serde_json",
  "tokio",
  "tracing",

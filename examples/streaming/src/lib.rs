@@ -1,6 +1,6 @@
 //! Setup shared by the streaming examples.
 
-use schwab_rs::{SchwabClient, SchwabConfig, StreamClient, config::StreamConfig};
+use rustyschwab::{SchwabClient, SchwabConfig, StreamClient, config::StreamConfig};
 
 /// Build a client from the `SCHWAB_*` environment (`.env` is loaded if
 /// present), make sure it holds tokens, and return a stream client whose

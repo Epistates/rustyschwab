@@ -47,10 +47,10 @@ jobs:
       # Surviving mutants in the code that decides whether an order may go
       # are missing tests. Reported, not gating: review the output.
       - run: >-
-          cargo mutants -p schwab-rs --no-shuffle --timeout 300
-          --file crates/schwab-rs/src/risk.rs
-          --file crates/schwab-rs/src/execution.rs
-          --file crates/schwab-rs/src/reconciliation.rs
+          cargo mutants -p rustyschwab --no-shuffle --timeout 300
+          --file crates/rustyschwab/src/risk.rs
+          --file crates/rustyschwab/src/execution.rs
+          --file crates/rustyschwab/src/reconciliation.rs
           || true
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

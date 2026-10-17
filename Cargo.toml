@@ -1,8 +1,8 @@
 [workspace]
 members = [
-    "crates/schwab-rs",
-    "crates/schwab-types",
-    "crates/schwab-mcp",
+    "crates/rustyschwab",
+    "crates/rustyschwab-types",
+    "crates/rustyschwab-mcp",
     "examples/*",
 ]
 # cargo-fuzz targets build on their own (nightly, sanitizers); the Python
@@ -19,7 +19,7 @@ authors = ["Nick Paterno"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/rustyschwab"
 homepage = "https://github.com/epistates/rustyschwab"
-documentation = "https://docs.rs/schwab-rs"
+documentation = "https://docs.rs/rustyschwab"
 readme = "README.md"
 keywords = ["schwab", "trading", "api", "finance", "market-data"]
 categories = ["api-bindings", "finance"]
@@ -30,7 +30,7 @@ rand = "0.10"
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
-# TLS backends are chosen per crate (schwab-rs `rustls` / `native-tls`
+# TLS backends are chosen per crate (rustyschwab `rustls` / `native-tls`
 # features), never here: a backend listed at the workspace level is on for
 # every consumer and makes the other feature meaningless.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }

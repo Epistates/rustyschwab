@@ -61,7 +61,7 @@ jobs:
         with:
           name: qualification-stream-${{ matrix.delay }}
           path: qualification-soak.json
-  # Read-only sweep of the real Schwab API (crates/schwab-rs/tests/live_conformance.rs).
+  # Read-only sweep of the real Schwab API (crates/rustyschwab/tests/live_conformance.rs).
   # `secrets` is not readable from a job-level `if`, so a preflight job turns
   # their presence into an output and the sweep is skipped, not failed, on
   # forks and repositories without credentials. SCHWAB_TOKENS_JSON is the
@@ -112,7 +112,7 @@ jobs:
           printf '%s' "$SCHWAB_TOKENS_JSON" > "$tokens"
           echo "SCHWAB_TOKENS_FILE=$tokens" >> "$GITHUB_ENV"
       - name: Live read-only conformance sweep
-        run: cargo test -p schwab-rs --test live_conformance --all-features --locked -- --nocapture live_shapes_match_fixtures
+        run: cargo test -p rustyschwab --test live_conformance --all-features --locked -- --nocapture live_shapes_match_fixtures
       - name: Remove the token file
         if: always()
         run: rm -f "$SCHWAB_TOKENS_FILE"

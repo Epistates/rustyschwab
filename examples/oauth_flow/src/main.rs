@@ -1,5 +1,5 @@
 use anyhow::Result;
-use schwab_rs::prelude::*;
+use rustyschwab::prelude::*;
 use std::io::{self, Write};
 use tracing::{Level, info};
 

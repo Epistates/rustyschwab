@@ -14,7 +14,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-schwab-types = { path = "../crates/schwab-types" }
+rustyschwab-types = { path = "../crates/rustyschwab-types" }
 
 [[bin]]
 name = "stream_frame"

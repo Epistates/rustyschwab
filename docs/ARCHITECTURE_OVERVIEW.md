@@ -8,20 +8,20 @@ describes the code as it is; for how to run it see the [README](../README.md),
 ## Workspace
 
 Three published crates plus example packages, all on the workspace version
-(`0.2.0` candidate, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`):
+(`0.2.0`, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`):
 
 | Crate | Role | Key dependencies |
 |---|---|---|
-| `schwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
-| `schwab-rs` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
-| `schwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `rustyschwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
+| `rustyschwab` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
+| `rustyschwab-mcp` | MCP server over the SDK (the `schwab-mcp` command), plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
 
 `examples/` holds workspace packages (`oauth-flow`, `auth_test`,
 `comprehensive`, `streaming-examples`, `enterprise-bench`); run them with
 `cargo run -p <package>`, not `cargo run --example`.
 
 ```
-                 ┌──────────────────────────── schwab-mcp ────────────────────────────┐
+                 ┌───────────────────────── rustyschwab-mcp ──────────────────────────┐
                  │ server.rs (40 tools)  policy.rs  network.rs  identity.rs  redact.rs │
                  │ backend.rs (live | paper)  stream_cache.rs  status.rs               │
                  │ projection.rs  portfolio.rs  order_status.rs  journal.rs             │
@@ -31,7 +31,7 @@ Three published crates plus example packages, all on the workspace version
                  └───────────────┬─────────────────────────────────┬──────────────────┘
                                  │ SchwabClient / StreamClient      │ TradingBackend / PaperBroker
 ┌────────────────────────────────┴─────────────────────────────────┴──────────────────┐
-│ schwab-rs                                                                            │
+│ rustyschwab                                                                            │
 │  auth/        client.rs      streaming/     execution.rs  coordination.rs  risk.rs   │
 │  transport/   retry.rs       reconciliation.rs  recovery.rs  readiness.rs           │
 │  circuit_breaker.rs  request_budget.rs  storage.rs (SQLite)  audit_delivery.rs      │
@@ -39,11 +39,11 @@ Three published crates plus example packages, all on the workspace version
 └──────────────────────────────────────────┬──────────────────────────────────────────┘
                                            │
 ┌──────────────────────────────────────────┴──────────────────────────────────────────┐
-│ schwab-types: market_data  trading (+ builder, spec)  accounts  streaming (+ payload) │
+│ rustyschwab-types: market_data  trading (+ builder, spec)  accounts  streaming (+ payload) │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## schwab-types
+## rustyschwab-types
 
 One module per Schwab API area: `market_data`, `trading`, `accounts`,
 `streaming`, `common`. Design rules:
@@ -60,8 +60,8 @@ One module per Schwab API area: `market_data`, `trading`, `accounts`,
   would replace numbers inside `serde_json::Value` with private maps and
   break `canonical_json` intent digests. Prices become `Decimal` where they
   enter exact accounting (`paper::feed` converts via `to_string().parse()`).
-- **`Decimal` is re-exported** (`schwab_types::Decimal`, also reachable as
-  `schwab_rs::types::Decimal`) so callers do not depend on `rust_decimal`
+- **`Decimal` is re-exported** (`rustyschwab_types::Decimal`, also reachable as
+  `rustyschwab::types::Decimal`) so callers do not depend on `rust_decimal`
   directly. Decimal fields deserialize from strings or numbers and serialize
   as strings.
 - **Order construction** lives in `trading::builder` (constructors such as
@@ -78,7 +78,7 @@ One module per Schwab API area: `market_data`, `trading`, `accounts`,
 - The `schemars` feature derives `JsonSchema` on the input types so the MCP
   crate can publish tool schemas without hand-written JSON.
 
-## schwab-rs
+## rustyschwab
 
 ### Configuration and authentication
 
@@ -219,7 +219,7 @@ tracked bounded queue (`ChannelKind::Bounded(4096)` by default):
 - Field selection per service: `set_service_fields` for later
   subscriptions, `view` (Schwab's `VIEW`) for live ones. Frames are capped
   at 16 MiB and decode to `StreamPayload` through the field tables in
-  `schwab-types`.
+  `rustyschwab-types`.
 
 ### Observability
 
@@ -231,7 +231,7 @@ initialisation helpers. Errors (`error.rs`) are a single `Error` enum with
 `ErrorKind`, `http_status()`, `is_retryable()` and a serializable
 `ErrorEnvelope` for transports.
 
-## schwab-mcp
+## rustyschwab-mcp
 
 ### Server and tools
 
@@ -454,7 +454,7 @@ written to `docs/audit/`, which is git-ignored; the hosted workflows upload
 the same files as artifacts.
 
 Everything above runs against mocks. The one gate that talks to Schwab is
-the **live conformance harness**, `crates/schwab-rs/tests/live_conformance.rs`:
+the **live conformance harness**, `crates/rustyschwab/tests/live_conformance.rs`:
 with `SCHWAB_LIVE_CONFORMANCE=1` and real credentials it `GET`s every
 read-only endpoint through `SchwabClient::get_json`, proves the typed
 binding still decodes the body, and diffs the body's *shape* (key sets and
@@ -472,12 +472,12 @@ harness's own request → decode → diff → record cycle is still covered by a
 
 | Task | Start at |
 |---|---|
-| Add or fix a REST endpoint | `crates/schwab-rs/src/client.rs` (one method per endpoint) and the response type in `crates/schwab-types/src/` |
-| Change an order shape or add a constructor | `crates/schwab-types/src/trading.rs`, `trading/builder.rs`, `trading/spec.rs`; `docs/ORDERS.md` |
-| Add a streaming service or field | `crates/schwab-types/src/streaming/payload.rs` field tables, then `StreamClient::subscribe_*` |
-| Add an MCP tool | `crates/schwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` |
-| Change what a principal may do | `crates/schwab-mcp/src/policy.rs`; runtime policy JSON documented in `docs/OPERATIONS.md` |
-| Durable state, migrations, backup | `crates/schwab-rs/src/storage.rs`, `execution.rs` |
-| Metrics or alerts | `crates/schwab-rs/src/metrics.rs`, `crates/schwab-mcp/src/metrics.rs`, `ops/` dashboards and rules |
-| Paper engine behaviour | `crates/schwab-rs/src/paper/`, `docs/PAPER_TRADING.md`, `docs/PAPER_LIMITATIONS.md` |
-| Add a model-evaluation scenario or check | `crates/schwab-mcp/src/eval.rs` (`Scenario`, `Fixture::open`, `checks`), then `tests/eval_harness.rs`; `docs/MCP_LLM_INTEGRATION.md#model-evaluation` |
+| Add or fix a REST endpoint | `crates/rustyschwab/src/client.rs` (one method per endpoint) and the response type in `crates/rustyschwab-types/src/` |
+| Change an order shape or add a constructor | `crates/rustyschwab-types/src/trading.rs`, `trading/builder.rs`, `trading/spec.rs`; `docs/ORDERS.md` |
+| Add a streaming service or field | `crates/rustyschwab-types/src/streaming/payload.rs` field tables, then `StreamClient::subscribe_*` |
+| Add an MCP tool | `crates/rustyschwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` |
+| Change what a principal may do | `crates/rustyschwab-mcp/src/policy.rs`; runtime policy JSON documented in `docs/OPERATIONS.md` |
+| Durable state, migrations, backup | `crates/rustyschwab/src/storage.rs`, `execution.rs` |
+| Metrics or alerts | `crates/rustyschwab/src/metrics.rs`, `crates/rustyschwab-mcp/src/metrics.rs`, `ops/` dashboards and rules |
+| Paper engine behaviour | `crates/rustyschwab/src/paper/`, `docs/PAPER_TRADING.md`, `docs/PAPER_LIMITATIONS.md` |
+| Add a model-evaluation scenario or check | `crates/rustyschwab-mcp/src/eval.rs` (`Scenario`, `Fixture::open`, `checks`), then `tests/eval_harness.rs`; `docs/MCP_LLM_INTEGRATION.md#model-evaluation` |

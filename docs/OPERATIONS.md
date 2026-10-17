@@ -101,7 +101,7 @@ The switch lives in the `schwab-mcp` process, so it cancels nothing while that p
 
 ## Risk boundary
 
-The SDK accepts any implementation of `RiskProvider`. The bundled `PortfolioRisk` requires a fresh reconciled account and its positions; buys also need available funds (a margin account's `availableFunds`, or a cash account's `cashAvailableForTrading`). It reserves decimal quantity/notional with the symbol and side transactionally and retains reservations across cancellation/unknown outcomes; a definite rejection or an operator resolution releases them in the same transaction. It supports long equity, single-leg limit/stop-limit orders, and defined-risk option strategies (option legs on one underlying and one expiration, priced net), which count as buys of their contracts at the most they can lose at expiration (`schwab_types::trading::defined_risk`); each leg's contract multiplier must be listed in the account's `option_multipliers`, and a working strategy at the broker counts the unfilled share of its risk. Other assets, conditional strategies, shorts and portfolio-margin rules require a deployment-owned risk provider.
+The SDK accepts any implementation of `RiskProvider`. The bundled `PortfolioRisk` requires a fresh reconciled account and its positions; buys also need available funds (a margin account's `availableFunds`, or a cash account's `cashAvailableForTrading`). It reserves decimal quantity/notional with the symbol and side transactionally and retains reservations across cancellation/unknown outcomes; a definite rejection or an operator resolution releases them in the same transaction. It supports long equity, single-leg limit/stop-limit orders, and defined-risk option strategies (option legs on one underlying and one expiration, priced net), which count as buys of their contracts at the most they can lose at expiration (`rustyschwab_types::trading::defined_risk`); each leg's contract multiplier must be listed in the account's `option_multipliers`, and a working strategy at the broker counts the unfilled share of its risk. Other assets, conditional strategies, shorts and portfolio-margin rules require a deployment-owned risk provider.
 
 Network MCP trading requires `SCHWAB_RISK_POLICY_FILE` and `SCHWAB_RECOVERY_ACCOUNTS`, in addition to principal permissions and `SCHWAB_MCP_ALLOW_TRADING=1`. Example risk file:
 
@@ -126,12 +126,12 @@ Import `ops/dashboard.json` into Grafana and select your Prometheus datasource. 
 Metrics are opt-in. Set `SCHWAB_METRICS_BIND=127.0.0.1:9090` and the MCP server starts a Prometheus scrape listener on that address. Unset, there is no listener and every `metrics::counter!`/`histogram!` call is a no-op: the SDK depends only on the `metrics` facade, so a library consumer can install its own recorder.
 
 ```bash
-SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p schwab-mcp --release
+SCHWAB_METRICS_BIND=127.0.0.1:9090 cargo run -p rustyschwab-mcp --release
 # in another shell
 curl http://127.0.0.1:9090/metrics
 ```
 
-Every metric, with its kind, labels and meaning, is listed in the module docs of [`schwab_rs::metrics`](https://docs.rs/schwab-rs/latest/schwab_rs/metrics/) and `schwab_mcp::metrics` (`cargo doc -p schwab-mcp --open`). Those tables and the `CATALOG` constants are the source of truth: a workspace test keeps them, every call site, `ops/alerts.yml` and `ops/dashboard.json` in line, and the server registers the help text with Prometheus.
+Every metric, with its kind, labels and meaning, is listed in the module docs of [`rustyschwab::metrics`](https://docs.rs/rustyschwab/latest/rustyschwab/metrics/) and `rustyschwab_mcp::metrics` (`cargo doc -p rustyschwab-mcp --open`). Those tables and the `CATALOG` constants are the source of truth: a workspace test keeps them, every call site, `ops/alerts.yml` and `ops/dashboard.json` in line, and the server registers the help text with Prometheus.
 
 Starter PromQL:
 
@@ -163,7 +163,7 @@ HTTP/WebSocket process shutdown handles SIGINT and, on Unix, SIGTERM. It permane
 
 ## Observability: OpenTelemetry
 
-Prometheus (`SCHWAB_METRICS_BIND`) and the health probes above need no extra build. Export to an OpenTelemetry collector is opt-in at compile time: build `schwab-mcp` with `--features otel` (it forwards to `schwab-rs/otel`), or call `schwab_rs::telemetry::init_otel` in your own application. Nothing from the OpenTelemetry crates is compiled without the feature, and a build that has it exports nothing until the environment names an endpoint, at which point `schwab-mcp` and `schwab-authority` behave exactly like a build without the feature.
+Prometheus (`SCHWAB_METRICS_BIND`) and the health probes above need no extra build. Export to an OpenTelemetry collector is opt-in at compile time: build `rustyschwab-mcp` with `--features otel` (it forwards to `rustyschwab/otel`), or call `rustyschwab::telemetry::init_otel` in your own application. Nothing from the OpenTelemetry crates is compiled without the feature, and a build that has it exports nothing until the environment names an endpoint, at which point `schwab-mcp` and `schwab-authority` behave exactly like a build without the feature.
 
 The exporter speaks OTLP over HTTP/protobuf only (port 4318 on a stock collector), on the blocking reqwest client and the rustls stack the rest of the workspace uses. A different `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc`, `http/json`) stops the process at startup instead of posting to a port that would not understand it. Configuration is the standard environment:
 

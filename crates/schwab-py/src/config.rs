@@ -9,7 +9,7 @@
 use crate::convert::{from_value, to_json};
 use crate::errors::Failure;
 use pyo3::prelude::*;
-use schwab_rs::{SchwabConfig, StreamConfig};
+use rustyschwab::{SchwabConfig, StreamConfig};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};

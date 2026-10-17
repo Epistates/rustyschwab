@@ -10,13 +10,13 @@ There is no response-time SLA, on-call coverage or regulatory certification. Pro
 
 | Component | Where |
 | --- | --- |
-| Wire types | `schwab-types` |
-| OAuth, token storage and refresh | `schwab_rs::auth` |
-| REST client: accounts, orders, quotes, history, chains, movers, hours, instruments | `schwab_rs::SchwabClient` |
-| Order journal (never-resend), risk limits, operator halt | `schwab_rs` order path |
-| Streaming: connect, subscribe, reconnect, backpressure | `schwab_rs::streaming` |
-| Paper venue v2 (`PaperBroker`) | `schwab_rs::paper`, `schwab-paper` |
-| MCP server, stdio transport, tool surface and policy | `schwab-mcp` |
+| Wire types | `rustyschwab-types` |
+| OAuth, token storage and refresh | `rustyschwab::auth` |
+| REST client: accounts, orders, quotes, history, chains, movers, hours, instruments | `rustyschwab::SchwabClient` |
+| Order journal (never-resend), risk limits, operator halt | `rustyschwab` order path |
+| Streaming: connect, subscribe, reconnect, backpressure | `rustyschwab::streaming` |
+| Paper venue v2 (`PaperBroker`) | `rustyschwab::paper`, `schwab-paper` |
+| MCP server, stdio transport, tool surface and policy | `rustyschwab-mcp` (the `schwab-mcp` command) |
 | Python client, auth, orders, streaming, paper | `rustyschwab` (top-level modules) |
 
 **Experimental.** Usable and tested, but the API may change in any minor release without a deprecation period, and bug reports are handled after core ones.
@@ -25,7 +25,7 @@ There is no response-time SLA, on-call coverage or regulatory certification. Pro
 | --- | --- |
 | Strategy runner, `rustyschwab.trader` (backtest, paper, live) | New in 0.2. The live path has not run against a real account. |
 | NautilusTrader adapter, `rustyschwab.nautilus` | Tracks a fast-moving upstream (developed against 1.231). Not run live. |
-| History cache (`schwab_rs::history`) and performance analytics (`get_performance`, `rustyschwab.performance`) | New in 0.2. |
+| History cache (`rustyschwab::history`) and performance analytics (`get_performance`, `rustyschwab.performance`) | New in 0.2. |
 | Shared authority and broker gateway (`schwab-authority`, `schwab-remote`, `RemoteBackend`) | Single writer; needs deployment and failover qualification. |
 | MCP network transports (HTTP, WebSocket) | Built on TurboMCP `4.0.0-alpha.5`, a pre-release pin. The tool surface is core; the transport moves to stable TurboMCP 4.x when it ships. |
 | OpenTelemetry export (`otel` feature) | Optional; the Prometheus endpoint is the supported metrics path. |

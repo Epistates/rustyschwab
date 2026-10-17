@@ -20,7 +20,7 @@
 /// - ✅ Custom field selection for bandwidth optimization
 /// - ✅ Message handling (Data, Response, Notify)
 /// - ✅ Graceful shutdown after time limit
-use schwab_rs::{StreamMessage, config::StreamConfig, types::streaming::StreamService};
+use rustyschwab::{StreamMessage, config::StreamConfig, types::streaming::StreamService};
 use std::time::Duration;
 use tokio::time::sleep;
 

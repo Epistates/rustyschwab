@@ -1,5 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
-use schwab_rs::{
+use rustyschwab::{
     auth::{AuthManager, FileTokenStore, OAuthConfig, TokenSet, TokenStore, TokenStoreKind},
     config::{ChannelKind, StreamConfig},
     streaming::{StreamClient, StreamerIdentity},

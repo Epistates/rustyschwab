@@ -18,10 +18,13 @@ where to read the execution mode (live or [paper](#paper-mode)).
 ## Running the server
 
 Authorize once so tokens exist on disk (`cargo run -p oauth-flow`, see the
-[setup guide](SETUP_GUIDE.md)), then build and start the server:
+[setup guide](SETUP_GUIDE.md)), then install and start the server. `cargo
+install rustyschwab-mcp` puts the `schwab-mcp` command in `~/.cargo/bin`; from
+a clone, `cargo build -p rustyschwab-mcp --release` builds it as
+`target/release/schwab-mcp`, the path used below.
 
 ```bash
-cargo build -p schwab-mcp --release
+cargo build -p rustyschwab-mcp --release
 
 # stdio, for desktop MCP clients (the default)
 target/release/schwab-mcp
@@ -166,7 +169,7 @@ untrusted data even when authenticated transport supplied them.
 
 ## Result contract
 
-Every tool answers in one of two shapes (`crates/schwab-mcp/src/contract.rs`).
+Every tool answers in one of two shapes (`crates/rustyschwab-mcp/src/contract.rs`).
 
 A success is compact JSON text. Data that came from Schwab, the stream
 cache or the paper venue is wrapped as `{"asOf": <RFC 3339>, "source":
@@ -207,7 +210,7 @@ Client middleware that retries must key on `retryable`, never on `isError`.
 
 The time-windowed reads (`get_account_orders`, `get_all_orders`,
 `get_transactions`, `get_price_history`) take model-facing query types
-(`crates/schwab-mcp/src/query.rs`) rather than the SDK's strict parameter
+(`crates/rustyschwab-mcp/src/query.rs`) rather than the SDK's strict parameter
 structs. A bound may be a calendar date (`YYYY-MM-DD`, covering that whole
 UTC day), an RFC 3339 timestamp, a date-time without an offset (taken as
 UTC), or epoch milliseconds. Orders and transactions default to the last
@@ -226,7 +229,7 @@ journal](#trade-journal)). Transactions reach back a year.
 ## Projections
 
 Three tools answer the bulk reads in a fraction of the raw tools' bytes
-(`crates/schwab-mcp/src/projection.rs`), keeping the raw tools for the
+(`crates/rustyschwab-mcp/src/projection.rs`), keeping the raw tools for the
 full shape. Each takes the same parameters as its raw counterpart plus
 `limit` and `cursor`, and returns, inside the usual envelope:
 
@@ -258,7 +261,7 @@ refuses spread strategies, which need the raw tool.
 ## Portfolio summary
 
 `get_portfolio_summary(account_hash)` answers "where does this account
-stand" in one bounded read (`crates/schwab-mcp/src/portfolio.rs`), so a
+stand" in one bounded read (`crates/rustyschwab-mcp/src/portfolio.rs`), so a
 model does not chain `get_account`, `get_account_orders` and the
 arithmetic between them:
 
@@ -316,7 +319,7 @@ failure shape above. The call is read-only and not audited.
 ## Order status
 
 `get_order_status(account_hash, order_id, wait_ms?)` reduces one order to
-what deciding the next step needs (`crates/schwab-mcp/src/order_status.rs`),
+what deciding the next step needs (`crates/rustyschwab-mcp/src/order_status.rs`),
 so a model neither walks `orderActivityCollection` itself nor polls
 `get_order` in a loop:
 
@@ -452,7 +455,7 @@ words and re-wording an identical order is still a `duplicate_intent`.
 
 `get_trade_journal(account_hash, since?, limit?, cursor?)` reads that
 journal back for one account, newest first, joined to what the venue did
-(`crates/schwab-mcp/src/journal.rs`), so a model resuming a session, or
+(`crates/rustyschwab-mcp/src/journal.rs`), so a model resuming a session, or
 an operator reviewing one, sees each decision, its reason and its outcome
 in one bounded read:
 
@@ -494,8 +497,8 @@ local stdio transport answers `not_permitted`.
 
 `get_performance(account_hash, since?, until?, symbols?)` evaluates how an
 account has traded from its own fills, so a model reads verified numbers
-instead of doing the arithmetic (`crates/schwab-mcp/src/performance.rs`,
-over the SDK's `schwab_rs::performance::analyze`). It is a read tool like
+instead of doing the arithmetic (`crates/rustyschwab-mcp/src/performance.rs`,
+over the SDK's `rustyschwab::performance::analyze`). It is a read tool like
 `get_portfolio_summary`: a principal needs the tool and the account, and
 `symbols` narrows the fills to those symbols and the options on them.
 
@@ -665,7 +668,7 @@ every transport.
 The same server runs over the [paper venue](PAPER_TRADING.md) instead of
 Schwab when `SCHWAB_MCP_PAPER_CONFIG` names a paper configuration and
 `SCHWAB_MCP_PAPER_STATE` the venue's private state database. Every tool
-holds an execution backend (`crates/schwab-mcp/src/backend.rs`), live or
+holds an execution backend (`crates/rustyschwab-mcp/src/backend.rs`), live or
 paper, rather than a Schwab client, so the paper server answers account,
 order and quote reads from the venue's durable state in Schwab's shapes and
 routes `place_order`, `replace_order` and `cancel_order` to the venue. No
@@ -717,7 +720,7 @@ its quotes are synthetic.
 
 ## Model evaluation
 
-`schwab-eval` (`crates/schwab-mcp/src/eval.rs`) scores a model's tool use
+`schwab-eval` (`crates/rustyschwab-mcp/src/eval.rs`) scores a model's tool use
 against the paper venue without embedding a model. A scenario fixes the
 venue's state, the principal's policy and the task the model is given, and
 each probes one behaviour that a trading assistant must get right:

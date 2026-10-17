@@ -7,7 +7,7 @@
 From the repository root:
 
 ```sh
-cargo run -p schwab-mcp --bin schwab-paper --locked -- \
+cargo run -p rustyschwab-mcp --bin schwab-paper --locked -- \
   --config ops/paper/config.json \
   --state ./paper-demo-state/state.sqlite3 \
   --commands ops/paper/replay.jsonl
@@ -48,7 +48,7 @@ Capture is complete only for new runs initialized with capture metadata. Older d
 ## SDK
 
 ```rust,no_run
-use schwab_rs::paper::{PaperBroker, PaperConfig, PaperEvent};
+use rustyschwab::paper::{PaperBroker, PaperConfig, PaperEvent};
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 let config: PaperConfig = serde_json::from_slice(
@@ -141,7 +141,7 @@ schwab-paper --config paper-replay.json --state ./backtest/state.sqlite3 \
 
 ## Performance reports
 
-`schwab_rs::performance::analyze(&fills, &equity, &options)` turns a run's fills, and optionally its mark-to-market equity curve, into a `PerformanceReport`. It is a pure function over decimals: no I/O, no clock, so the same inputs give the same report. A paper venue fill (`PaperFill`) lacks the symbol and side of its order; `performance::Fill` adds them, and accepts a paper fill's `order_id` and `event_sequence` as they are. The Python binding is `rustyschwab.performance` ([PYTHON.md](PYTHON.md#performance-reports)).
+`rustyschwab::performance::analyze(&fills, &equity, &options)` turns a run's fills, and optionally its mark-to-market equity curve, into a `PerformanceReport`. It is a pure function over decimals: no I/O, no clock, so the same inputs give the same report. A paper venue fill (`PaperFill`) lacks the symbol and side of its order; `performance::Fill` adds them, and accepts a paper fill's `order_id` and `event_sequence` as they are. The Python binding is `rustyschwab.performance` ([PYTHON.md](PYTHON.md#performance-reports)).
 
 Accounting rules, all fixed by the module:
 

@@ -18,8 +18,8 @@ use crate::convert::Json;
 use crate::errors::Failure;
 use crate::runtime::awaitable;
 use pyo3::prelude::*;
-use schwab_rs::types::streaming::{StreamMessage, StreamService};
-use schwab_rs::{Error, MessageReceiver, SchwabClient, StreamClient, StreamConfig};
+use rustyschwab::types::streaming::{StreamMessage, StreamService};
+use rustyschwab::{Error, MessageReceiver, SchwabClient, StreamClient, StreamConfig};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
@@ -263,7 +263,7 @@ impl Stream {
     }
 
     /// The stream's current `{"ready", "generation", "lost_messages", "ended"}`.
-    fn status(&self) -> Json<schwab_rs::types::streaming::StreamStatus> {
+    fn status(&self) -> Json<rustyschwab::types::streaming::StreamStatus> {
         Json(self.client.status())
     }
 
@@ -288,7 +288,7 @@ impl Stream {
 pub fn stream_fields(service: &str) -> PyResult<Json<Vec<Value>>> {
     let service =
         parse_service(service).map_err(|f| Python::attach(|py| crate::errors::to_pyerr(py, f)))?;
-    fn rows(table: &[schwab_rs::types::streaming::Field]) -> Vec<Value> {
+    fn rows(table: &[rustyschwab::types::streaming::Field]) -> Vec<Value> {
         table
             .iter()
             .map(|field| {
@@ -308,7 +308,7 @@ pub fn stream_fields(service: &str) -> PyResult<Json<Vec<Value>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schwab_rs::types::streaming::StreamStatus;
+    use rustyschwab::types::streaming::StreamStatus;
 
     /// A data frame as the streamer sends it.
     fn data(service: &str) -> StreamMessage {

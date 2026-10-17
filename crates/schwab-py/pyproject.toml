@@ -6,7 +6,7 @@ build-backend = "maturin"
 
 [project]
 name = "rustyschwab"
-description = "Asyncio-native Python bindings for the rustyschwab Schwab SDK: Trader and Market Data APIs, streaming, journaled orders and an offline paper venue"
+description = "Unofficial asyncio-native Python bindings for the rustyschwab Schwab SDK: Trader and Market Data APIs, streaming, journaled orders and an offline paper venue"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT OR Apache-2.0"

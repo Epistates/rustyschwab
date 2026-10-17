@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CycloneDX 1.5 JSON for what a package ships.
 
-Walks the locked dependency graph from one package (default `schwab-mcp`,
+Walks the locked dependency graph from one package (default `rustyschwab-mcp`,
 whose binaries the release publishes) through normal and build
 dependencies only: dev-dependencies and unrelated workspace members are not
 part of the shipped artifact, so they are not in its bill of materials.
@@ -46,7 +46,7 @@ def shipped(metadata, root_name):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=pathlib.Path)
-    parser.add_argument("--package", default="schwab-mcp")
+    parser.add_argument("--package", default="rustyschwab-mcp")
     args = parser.parse_args()
 
     metadata = json.loads(subprocess.check_output(

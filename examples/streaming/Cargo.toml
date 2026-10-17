@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-schwab-rs = { path = "../../crates/schwab-rs", features = ["full"] }
+rustyschwab = { path = "../../crates/rustyschwab", features = ["full"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -20,7 +20,7 @@ dotenvy = { workspace = true }
 
 [features]
 default = ["callback-server"]
-callback-server = ["schwab-rs/callback-server"]
+callback-server = ["rustyschwab/callback-server"]
 
 [[bin]]
 name = "streaming_demo"

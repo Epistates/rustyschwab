@@ -10,7 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
-schwab-rs = { path = "../../crates/schwab-rs" }
+rustyschwab = { path = "../../crates/rustyschwab" }
 serde_json.workspace = true
 tokio.workspace = true
 chrono.workspace = true

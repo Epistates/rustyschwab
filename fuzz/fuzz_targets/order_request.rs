@@ -3,7 +3,7 @@
 //! must survive its own wire form.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use schwab_types::trading::OrderRequest;
+use rustyschwab_types::trading::OrderRequest;
 
 fuzz_target!(|data: &[u8]| {
     let Ok(order) = serde_json::from_slice::<OrderRequest>(data) else {

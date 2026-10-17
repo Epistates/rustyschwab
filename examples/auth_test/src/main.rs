@@ -8,9 +8,9 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use schwab_rs::auth::{AuthManager, TokenNotification, open_token_store};
-use schwab_rs::client::SchwabClient;
-use schwab_rs::config::SchwabConfig;
+use rustyschwab::auth::{AuthManager, TokenNotification, open_token_store};
+use rustyschwab::client::SchwabClient;
+use rustyschwab::config::SchwabConfig;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -62,7 +62,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("schwab_rs=debug".parse()?)
+                .add_directive("rustyschwab=debug".parse()?)
                 .add_directive("auth_test=debug".parse()?),
         )
         .init();

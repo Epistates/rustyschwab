@@ -10,7 +10,7 @@
 use crate::convert::{Json, from_py, from_value, to_json};
 use crate::errors::{Failure, to_pyerr};
 use pyo3::prelude::*;
-use schwab_rs::performance::{self, EquityPoint, Fill, PerformanceOptions, PerformanceReport};
+use rustyschwab::performance::{self, EquityPoint, Fill, PerformanceOptions, PerformanceReport};
 use serde_json::{Map, Number, Value};
 
 /// `value` as JSON, with an error that names the argument it came from.

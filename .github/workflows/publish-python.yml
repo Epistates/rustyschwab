@@ -27,8 +27,8 @@ jobs:
       - name: Versions agree
         run: |
           bindings=$(cargo metadata --format-version 1 --no-deps --manifest-path crates/schwab-py/Cargo.toml | jq -r '.packages[0].version')
-          sdk=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "schwab-rs") | .version')
-          [ "$bindings" = "$sdk" ] || { echo "::error::schwab-py is $bindings but schwab-rs is $sdk"; exit 1; }
+          sdk=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rustyschwab") | .version')
+          [ "$bindings" = "$sdk" ] || { echo "::error::schwab-py is $bindings but rustyschwab is $sdk"; exit 1; }
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             [ "${GITHUB_REF_NAME#v}" = "$bindings" ] || { echo "::error::tag $GITHUB_REF_NAME is not v$bindings"; exit 1; }
           fi
@@ -101,7 +101,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The sdist bundles schwab-rs and schwab-types, which the bindings
+      # The sdist bundles rustyschwab and rustyschwab-types, which the bindings
       # depend on by path, so it builds on its own.
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:

@@ -15,7 +15,7 @@ The Schwab Rust SDK provides a robust WebSocket client for streaming real-time m
 ### 1. Configure and Build the Client
 
 ```rust
-use schwab_rs::streaming::{StreamClient, StreamConfig, ChannelKind};
+use rustyschwab::streaming::{StreamClient, StreamConfig, ChannelKind};
 use std::time::Duration;
 
 let config = StreamConfig {
@@ -34,7 +34,7 @@ let stream_client = StreamClient::builder()
 ### 2. Connect and Subscribe
 
 ```rust
-use schwab_rs::types::streaming::StreamService;
+use rustyschwab::types::streaming::StreamService;
 
 // Connect to the WebSocket
 stream_client.connect().await?;
@@ -55,8 +55,8 @@ turns each item into a typed payload whose fields are named like the REST
 quote types.
 
 ```rust
-use schwab_rs::streaming::StreamMessage;
-use schwab_rs::types::streaming::StreamPayload;
+use rustyschwab::streaming::StreamMessage;
+use rustyschwab::types::streaming::StreamPayload;
 
 if let Some(mut receiver) = stream_client.get_receiver() {
     while let Some(msg) = receiver.recv().await {
@@ -125,7 +125,7 @@ except for `LEVELONE_EQUITIES`, which starts with a quote-sized subset. Narrow t
 with the service's field table; field 0 is always the key.
 
 ```rust
-use schwab_rs::types::streaming::LevelOneEquityFields as F;
+use rustyschwab::types::streaming::LevelOneEquityFields as F;
 
 // Request only the symbol, bid and ask
 let fields = [F::SYMBOL, F::BID_PRICE, F::ASK_PRICE]

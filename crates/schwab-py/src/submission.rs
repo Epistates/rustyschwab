@@ -7,8 +7,8 @@
 //! tag: the binding assigns one when the caller gave none, exactly as the
 //! SDK would, so it can tell its own journal record from a concurrent one.
 
-use schwab_rs::SchwabClient;
-use schwab_rs::types::trading::{OrderRequest, OrderSubmitResponse};
+use rustyschwab::SchwabClient;
+use rustyschwab::types::trading::{OrderRequest, OrderSubmitResponse};
 use serde::Serialize;
 use serde_json::Value;
 

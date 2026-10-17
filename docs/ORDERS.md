@@ -6,9 +6,9 @@
 > strategies against the paper engine (`docs/PAPER_TRADING.md`) or a test
 > account first; live orders carry real financial risk.
 
-Outbound orders are `schwab_types::trading::OrderRequest`: a strict shape
+Outbound orders are `rustyschwab_types::trading::OrderRequest`: a strict shape
 (unknown fields fail deserialization) whose prices and quantities are
-`rust_decimal::Decimal`, re-exported as `schwab_types::Decimal`. The
+`rust_decimal::Decimal`, re-exported as `rustyschwab_types::Decimal`. The
 constructors below assemble the same JSON trees Schwab's order examples
 show, so you never hand-nest `childOrderStrategies`. `Order` is the tolerant
 type Schwab reports back and is never sent.
@@ -57,8 +57,8 @@ not reinterpretations.
 ## Single-leg orders
 
 ```rust
-use schwab_rs::types::Decimal;
-use schwab_rs::types::trading::{
+use rustyschwab::types::Decimal;
+use rustyschwab::types::trading::{
     OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg, PriceLinkBasis,
     PriceLinkType,
 };
@@ -111,8 +111,8 @@ format cannot represent.
 
 ```rust
 use chrono::NaiveDate;
-use schwab_rs::types::Decimal;
-use schwab_rs::types::trading::{
+use rustyschwab::types::Decimal;
+use rustyschwab::types::trading::{
     ComplexOrderStrategyType, OptionSymbol, OrderInstruction, OrderRequest, OrderRequestLeg,
     PositionEffect,
 };
@@ -147,8 +147,8 @@ already formatted OSI string is also accepted wherever a symbol is.
 ## Composite orders
 
 ```rust
-use schwab_rs::types::Decimal;
-use schwab_rs::types::trading::{OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg};
+use rustyschwab::types::Decimal;
+use rustyschwab::types::trading::{OrderDuration, OrderInstruction, OrderRequest, OrderRequestLeg};
 
 let sell = |symbol: &str| OrderRequestLeg::equity(OrderInstruction::Sell, symbol, 2);
 

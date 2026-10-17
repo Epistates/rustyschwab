@@ -34,7 +34,7 @@ use pyo3::prelude::*;
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     runtime::init();
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
-    module.add("__sdk_version__", schwab_rs::VERSION)?;
+    module.add("__sdk_version__", rustyschwab::VERSION)?;
     module.add_class::<client::Client>()?;
     module.add_class::<stream::Stream>()?;
     module.add_class::<paper::PyPaperBroker>()?;

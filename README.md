@@ -1,19 +1,19 @@
 # rustyschwab
 
-A Rust SDK, Python package and MCP server for the Charles Schwab Trader and Market Data APIs, built for automated strategies and LLM agents that place real orders.
+An unofficial Rust SDK, Python package and MCP server for the Charles Schwab Trader and Market Data APIs, built for automated strategies and LLM agents that place real orders.
 
 > [!WARNING]
-> Automated trading can lose money. This software is provided as is, without warranty. Start with the [paper venue](docs/PAPER_TRADING.md), which runs locally and does not connect to thinkorswim paperMoney. Not affiliated with Charles Schwab & Co., Inc.
+> Automated trading can lose money. This software is provided as is, without warranty. Start with the [paper venue](docs/PAPER_TRADING.md), which runs locally and does not connect to thinkorswim paperMoney. Not affiliated with or endorsed by Charles Schwab & Co., Inc.
 
-**Status:** 0.2.0 release candidate, not yet on crates.io or PyPI; install from this repository. One maintainer. Everything is tested against recorded Schwab responses and local fakes, but no live-account run has been recorded yet, so treat live trading as unproven. See [what is core, what is experimental, and what has run live](docs/SUPPORT.md).
+**Status:** 0.2.0. The Rust crates are on [crates.io](https://crates.io/crates/rustyschwab); the Python package is not on PyPI yet, so build it from this repository. One maintainer. Everything is tested against recorded Schwab responses and local fakes, but no live-account run has been recorded yet, so treat live trading as unproven. See [what is core, what is experimental, and what has run live](docs/SUPPORT.md).
 
 ## What is in it
 
 | Part | For | Docs |
 | --- | --- | --- |
-| [`schwab-rs`](crates/schwab-rs) | Rust applications: OAuth, REST, the streamer, the order journal, risk limits, paper venue, history cache, performance analytics | [crate guide](crates/schwab-rs/README.md) |
+| [`rustyschwab`](crates/rustyschwab) | Rust applications: OAuth, REST, the streamer, the order journal, risk limits, paper venue, history cache, performance analytics | [crate guide](crates/rustyschwab/README.md) |
 | [`rustyschwab`](crates/schwab-py) (Python) | The same SDK from asyncio or blocking Python, order templates, one strategy for backtest, paper and live, a NautilusTrader adapter | [Python guide](docs/PYTHON.md) |
-| [`schwab-mcp`](crates/schwab-mcp) | LLM agents: 40 tools over the SDK, behind per-principal policy, approvals and a paper mode | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
+| [`rustyschwab-mcp`](crates/rustyschwab-mcp) | LLM agents: the `schwab-mcp` server, 40 tools over the SDK behind per-principal policy, approvals and a paper mode | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
 
 ## What it does differently
 
@@ -41,12 +41,12 @@ The [setup guide](docs/SETUP_GUIDE.md) covers each step, the token stores, and a
 
 ```toml
 [dependencies]
-schwab-rs = { git = "https://github.com/epistates/rustyschwab" }
+rustyschwab = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ```rust,ignore
-use schwab_rs::prelude::*;
+use rustyschwab::prelude::*;
 
 let client = SchwabClient::new(SchwabConfig::from_env()?)?;
 client.init().await?;
@@ -58,7 +58,7 @@ Placing orders, brackets and options: [ORDERS.md](docs/ORDERS.md). Streaming: [S
 ### Python
 
 ```bash
-pip install ./crates/schwab-py   # builds the extension; needs a Rust toolchain
+pip install ./crates/schwab-py   # from the clone; builds the extension, needs a Rust toolchain
 ```
 
 ```python
@@ -83,17 +83,17 @@ asyncio.run(main())
 ### MCP
 
 ```bash
-cargo build -p schwab-mcp --release
+cargo install rustyschwab-mcp    # installs the schwab-mcp command
 claude mcp add schwab -e SCHWAB_APP_KEY=… -e SCHWAB_APP_SECRET=… \
   -e SCHWAB_TOKENS_FILE="$PWD/schwab_tokens.json" \
-  -- "$PWD/target/release/schwab-mcp"
+  -- "$(command -v schwab-mcp)"
 ```
 
 Order tools stay off until you enable them. To let an agent trade without real money, run the server over the paper venue:
 
 ```bash
 SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
-SCHWAB_MCP_ALLOW_TRADING=1 target/release/schwab-mcp
+SCHWAB_MCP_ALLOW_TRADING=1 schwab-mcp
 ```
 
 Claude Desktop configuration, the tool catalog and the policy model: [MCP guide](docs/MCP_LLM_INTEGRATION.md). Policies, approvals, risk limits, metrics and recovery: [Operations](docs/OPERATIONS.md).

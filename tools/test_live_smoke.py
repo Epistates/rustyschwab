@@ -80,7 +80,7 @@ class HelperTests(unittest.TestCase):
 BINARY = ROOT / "target" / "debug" / "schwab-mcp"
 
 
-@unittest.skipUnless(BINARY.exists(), "build it with cargo build -p schwab-mcp")
+@unittest.skipUnless(BINARY.exists(), "build it with cargo build -p rustyschwab-mcp")
 class McpClientTests(unittest.TestCase):
     def test_handshake_calls_and_tool_errors_against_paper_mode(self):
         async def scenario(workdir: Path) -> None:

@@ -45,11 +45,11 @@ cargo doc --workspace --no-deps --all-features --locked
 cargo build --workspace --all-targets --locked
 cargo test --workspace --all-targets --all-features --locked
 cargo test --workspace --doc --all-features --locked
-cargo check -p schwab-rs --no-default-features --locked
-cargo check -p schwab-rs --no-default-features --features native-tls --locked
-cargo check -p schwab-rs --no-default-features --features callback-server --locked
-cargo check -p schwab-types --no-default-features --locked
-cargo package -p schwab-types -p schwab-rs -p schwab-mcp --locked
+cargo check -p rustyschwab --no-default-features --locked
+cargo check -p rustyschwab --no-default-features --features native-tls --locked
+cargo check -p rustyschwab --no-default-features --features callback-server --locked
+cargo check -p rustyschwab-types --no-default-features --locked
+cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp --locked
 cargo deny check advisories bans licenses sources
 cargo machete                                     # unused dependencies
 actionlint   # when you change .github/workflows
@@ -81,22 +81,22 @@ Then:
 
 1. Add or update tests. Wire-shape changes need a fixture or `wiremock`
    test; decoding changes should keep
-   `crates/schwab-types/tests/properties.rs` (no panic on arbitrary input)
+   `crates/rustyschwab-types/tests/properties.rs` (no panic on arbitrary input)
    passing. If you have Schwab credentials, also run the read-only live
    sweep so the typed bindings are checked against the real API:
 
    ```bash
-   SCHWAB_LIVE_CONFORMANCE=1 cargo test -p schwab-rs --test live_conformance -- --nocapture
+   SCHWAB_LIVE_CONFORMANCE=1 cargo test -p rustyschwab --test live_conformance -- --nocapture
    ```
 
    It only issues `GET`s. `SCHWAB_LIVE_CONFORMANCE=record` refreshes
-   `crates/schwab-rs/tests/fixtures/conformance/`; commit the fixture diff
+   `crates/rustyschwab/tests/fixtures/conformance/`; commit the fixture diff
    with the change that explains it.
 2. Add a line under `## [Unreleased]` in `CHANGELOG.md`
    (Keep a Changelog format).
 3. Update `.env.example` if you add or rename a `SCHWAB_*` variable. If you
    add or remove an MCP tool, update `EXPECTED_TOOLS` in
-   `crates/schwab-mcp/tests/tool_inventory.rs` and the tool catalog in
+   `crates/rustyschwab-mcp/tests/tool_inventory.rs` and the tool catalog in
    `docs/MCP_LLM_INTEGRATION.md`; the test checks both.
 4. Keep commits focused; one concern per commit.
 
@@ -107,7 +107,7 @@ Then:
 - Prefer typed fields over `String`/`Value`; if Schwab's shape is
   uncertain, say so in a comment and keep the tolerant type on the response
   side only.
-- Errors go through `schwab_rs::Error`; add a variant rather than stringly
+- Errors go through `rustyschwab::Error`; add a variant rather than stringly
   errors, and set `ErrorKind`/`is_retryable` correctly.
 - Every metric is declared in `metrics.rs` with its label set; do not emit
   ad-hoc names.
@@ -135,8 +135,8 @@ explains why, not what.
    SBOM and a provenance attestation, and drafts a GitHub Release with
    them; review and publish it. Verify an artifact with
    `gh attestation verify <file> --repo Epistates/rustyschwab`.
-4. Run `publish.yml` for the tag. It publishes `schwab-types`, then
-   `schwab-rs`, then `schwab-mcp` through crates.io trusted publishing,
+4. Run `publish.yml` for the tag. It publishes `rustyschwab-types`, then
+   `rustyschwab`, then `rustyschwab-mcp` through crates.io trusted publishing,
    after approval in the `crates-io` environment (configure the trusted
    publisher on crates.io and the environment's reviewers first).
 5. The same tag push starts `publish-python.yml`, which builds the

@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased — 0.2.0 candidate]
+## [Unreleased]
+
+## [0.2.0] - 2026-10-17
+
+The first release on crates.io.
+
+### Changed — the crates are named rustyschwab
+
+- `schwab-rs`, `schwab-types` and `schwab-mcp` are published as
+  **`rustyschwab`**, **`rustyschwab-types`** and **`rustyschwab-mcp`**,
+  matching the repository and the Python package, and making plain that the
+  project is not Schwab's own: `use schwab_rs::…` becomes
+  `use rustyschwab::…`. Commands keep their names (`schwab-mcp`,
+  `schwab-admin`, …), as do the `SCHWAB_*` settings and `schwab_*` metrics.
+- Runtime names follow: the User-Agent is `rustyschwab/<version>`, the
+  OpenTelemetry scope `rustyschwab`, the MCP server's advertised name
+  `rustyschwab-mcp`, and the keychain service `rustyschwab` (tokens stored
+  under the old `schwab-rs` service need one new sign-in).
+- Each crate ships the MIT and Apache-2.0 license texts.
 
 ### Added — sign-in without a certificate warning
 
@@ -106,12 +124,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — price history cache, performance analytics, fees
 
-- **`schwab_rs::history::HistoryStore`** (Python `HistoryStore`): a SQLite
+- **`rustyschwab::history::HistoryStore`** (Python `HistoryStore`): a SQLite
   cache of price history that records which spans it holds, fetches only
   the gaps in bounded chunks and marks a span complete only before the
   current New York date. It also stores recorded stream payloads, since
   Schwab has no quote or book history.
-- **`schwab_rs::performance::analyze`** (Python `rustyschwab.performance`):
+- **`rustyschwab::performance::analyze`** (Python `rustyschwab.performance`):
   FIFO round trips at share level, long and short, with fees prorated;
   return, drawdown and its duration, volatility, Sharpe, Sortino, Calmar,
   win rate, profit factor, expectancy, holding time, per-symbol tables and
@@ -203,7 +221,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — OpenTelemetry (OTLP) export
 
-- **Opt-in `otel` feature.** `schwab_rs::telemetry::init_otel` builds an
+- **Opt-in `otel` feature.** `rustyschwab::telemetry::init_otel` builds an
   OTLP/HTTP-protobuf tracer provider from the standard environment
   (`OTEL_EXPORTER_OTLP_ENDPOINT` and the per-signal endpoints, `_HEADERS`,
   `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SDK_DISABLED`),
@@ -248,7 +266,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   get their session through `LegacySessionAdapter`. The WebSocket server
   bounds 32 calls in flight per connection; it no longer caps connections
   per process or times out calls (limit connections at the proxy).
-- `schwab_mcp::testing` (hidden) calls a server in process for tests and
+- `rustyschwab_mcp::testing` (hidden) calls a server in process for tests and
   the evaluation harness; `AuthorizedServer::call`, `dispatcher`,
   `run_stdio` and `offers_guidance` are new.
 
@@ -299,7 +317,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — defined-risk option strategies
 
-- **`schwab_types::trading::defined_risk`** finds the most a strategy of
+- **`rustyschwab_types::trading::defined_risk`** finds the most a strategy of
   option legs on one underlying and one expiration, priced `NET_DEBIT`,
   `NET_CREDIT` or `NET_ZERO`, can lose held to expiration: verticals, iron
   condors, butterflies, put ratios. It refuses a strategy that sells
@@ -362,7 +380,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `serde_urlencoded`, `oauth2`, `pin-project`, `bytes`, `headers`,
   `once_cell`, `config`, and `secrecy` from schwab-mcp), and CI keeps it
   that way with `cargo machete`. `tracing-subscriber` is optional behind a
-  new default `telemetry` feature; `schwab_rs::telemetry` needs it.
+  new default `telemetry` feature; `rustyschwab::telemetry` needs it.
 - **Every public type implements `Debug`**, by hand where it holds a
   secret or a connection, and the workspace warns on one that does not.
   Builders and `RecoveryWorker` are `#[must_use]`.
@@ -456,7 +474,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `replace_order`, `check_order`, the authority gateway), in a new
   `intents` table (state schema 4; `OrderJournal::record_intent`,
   `intents`, `IntentRecord`, `IntentState`). `schwab-admin pending` and
-  `show` list them as orders (`schwab_mcp::approvals::describe`), with the
+  `show` list them as orders (`rustyschwab_mcp::approvals::describe`), with the
   model's rationale apart; `approve` prints the order and asks for
   confirmation (or `--yes`), refuses an intent another principal asked
   for, and needs `--yes` for one it has never seen. The authority's
@@ -474,7 +492,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Authorization files are checked before they are trusted.** Policy,
   grants, identity, risk and paper configuration files are read through
-  `security::read_trusted_file` (`schwab_mcp::read_config`): on Unix the
+  `security::read_trusted_file` (`rustyschwab_mcp::read_config`): on Unix the
   file, followed through symlinks so ConfigMap mounts work, and its
   directory must be owned by this account or root and writable by no one
   else. Another local user who could edit the policy could otherwise grant
@@ -785,7 +803,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Positions whose instrument is missing no longer end paging with an
   unreadable cursor. `get_server_status` lists only the paper accounts the
   principal is granted.
-- `schwab-rs` builds again without a TLS feature (`--no-default-features`,
+- `rustyschwab` builds again without a TLS feature (`--no-default-features`,
   alone or with `callback-server`), which the CI feature job checks; such
   a build connects to `ws://` only and refuses `wss://` with a
   configuration error naming the features that provide it.
@@ -810,7 +828,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — diligence pass
 
-- `schwab-types` and `schwab-mcp` have crate READMEs. `CONTRIBUTING.md`
+- `rustyschwab-types` and `rustyschwab-mcp` have crate READMEs. `CONTRIBUTING.md`
   and the architecture overview list the CI gates as they are.
   `tools/test_sbom.py` covers the SBOM graph walk. The release workflow
   checks the tag against the crate version.
@@ -984,10 +1002,10 @@ the SDK validates before every request.
 ### Fixed — release hygiene
 
 - rustls 0.23.45 (RUSTSEC-2026-0285).
-- `schwab-rs` and `schwab-mcp` can be packaged: `schwab-rs` has its own
+- `rustyschwab` and `schwab-mcp` can be packaged: `rustyschwab` has its own
   README (its examples are doctests, not `ignore` blocks), and `schwab-mcp`
   gives its path dependencies versions. CI builds all three from their
-  tarballs. The unused optional `schemars` dependency of `schwab-rs` is gone.
+  tarballs. The unused optional `schemars` dependency of `rustyschwab` is gone.
 - `deny.toml`: advisories, licenses, bans and sources, checked in CI in
   place of `cargo audit`. Actions are pinned to commit SHAs at their current
   majors, and `ci.yml` runs with a read-only token. A feature job checks
@@ -1086,7 +1104,7 @@ the SDK validates before every request.
 
 ### Added — synthetic quotes from price history for backtesting
 
-- `schwab_rs::paper::synthetic::SyntheticBbo` derives a replay-ready event
+- `rustyschwab::paper::synthetic::SyntheticBbo` derives a replay-ready event
   stream from `PriceHistoryResponse` candles under the declared model
   `candle-bbo-v1`: four evenly spaced marks per bar (open, then low and
   high in the direction the bar closed, then close), a configured spread
@@ -1209,7 +1227,7 @@ the SDK validates before every request.
 - Every report verifies the harness invariant `unauthorized_executions`,
   the count of venue orders no authorized, accepted dispatch explains; it
   must be zero and is reported as a server defect, not a model score.
-- `schwab_mcp::eval` is the library form (`Scenario`, `Fixture`,
+- `rustyschwab_mcp::eval` is the library form (`Scenario`, `Fixture`,
   `Recording`, `Transcript`, `score`); `contract::FailureCode` now
   implements `Deserialize` so a report can parse the code a model saw.
   Documented in `docs/MCP_LLM_INTEGRATION.md#model-evaluation`.
@@ -1303,7 +1321,7 @@ the SDK validates before every request.
   shows as both working and held rather than as neither. The account read
   is essential; a failed orders or journal read leaves a null section
   explained in `warnings`.
-- `schwab_types::accounts::Balance` gains the typed fields Schwab reports
+- `rustyschwab_types::accounts::Balance` gains the typed fields Schwab reports
   for cash accounts and the projected block (`cashAvailableForTrading`,
   `cashAvailableForWithdrawal`, `cashCall`, `unsettledCash`, `totalCash`,
   `isInCall`, `stockBuyingPower`, `marginBalance`, `accountValue`, …)
@@ -1363,7 +1381,7 @@ the SDK validates before every request.
 ### Changed — MCP query windows default and accept dates
 
 - `get_account_orders`, `get_all_orders`, `get_transactions` and
-  `get_price_history` take model-facing query types (`schwab_mcp::query`)
+  `get_price_history` take model-facing query types (`rustyschwab_mcp::query`)
   instead of the SDK parameter structs. Window bounds accept a calendar
   date (`YYYY-MM-DD`, covering the whole UTC day), RFC 3339, a date-time
   without an offset (UTC), or epoch milliseconds. Orders and transactions
@@ -1396,7 +1414,7 @@ the SDK validates before every request.
 
 ### Changed — MCP result contract (breaking for MCP clients)
 
-- Every tool now answers in one shape (`schwab_mcp::contract`). Schwab and
+- Every tool now answers in one shape (`rustyschwab_mcp::contract`). Schwab and
   stream-cache data is wrapped as `{asOf, source, data}` with `data` in
   Schwab's raw, redacted shape; local results stay bare. Success text is
   compact JSON instead of pretty-printed, and a response that would exceed
@@ -1484,7 +1502,7 @@ the SDK validates before every request.
 - See [migration and validation notes](docs/history/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
 
 ### Changed — error taxonomy (breaking)
-- `schwab_rs::Error`, `AuthError` and `StreamError` are now
+- `rustyschwab::Error`, `AuthError` and `StreamError` are now
   `#[non_exhaustive]`; exhaustive matches need a fallback arm.
 - Trading-control outcomes have their own variants instead of sharing
   `InvalidParameter`/`Storage`: `Halted(reason)` (operator halt, drain,
@@ -1568,12 +1586,12 @@ the SDK validates before every request.
   revokes every session the same way an invalid file does.
 
 ### Changed — metric catalog closure
-- `schwab_rs::metrics` gains `Metric`, `MetricKind`, `CATALOG` and
+- `rustyschwab::metrics` gains `Metric`, `MetricKind`, `CATALOG` and
   `describe()` / `describe_all()`: every metric the SDK emits is declared
   once with its kind, unit and help text, and a recorder installed by the
   consumer can register the descriptions in one call. `schwab-mcp` does so
   after installing the Prometheus recorder, so `/metrics` now carries
-  `# HELP` lines. Its own `schwab_mcp::metrics::CATALOG` covers the tool
+  `# HELP` lines. Its own `rustyschwab_mcp::metrics::CATALOG` covers the tool
   and stream-recovery series.
 - The eight metrics that were emitted from string literals
   (`schwab_submission_unknown_total`, `schwab_reconciliation_total`,
@@ -1596,7 +1614,7 @@ the SDK validates before every request.
 
 ### Added — typed streaming payloads (breaking for the `*Fields` helpers)
 - Every streamer data service has a field table and a typed payload in
-  `schwab_types::streaming`: `LevelOneEquity`, `LevelOneOption`,
+  `rustyschwab_types::streaming`: `LevelOneEquity`, `LevelOneOption`,
   `LevelOneFutures`, `LevelOneFuturesOption`, `LevelOneForex`, `Book`
   (with nested `BookLevel` / `BookMarketMaker`), `ChartEquity`,
   `ChartFutures`, `Screener` (with `ScreenerItem`) and `AccountActivity`.
@@ -1665,7 +1683,7 @@ the SDK validates before every request.
   documented examples.
 - `trading::OptionSymbol` formats and parses the 21-character OSI form
   (`AAPL  240517P00190000`), validating the root, right and strike.
-  `schwab_types::Decimal` re-exports `rust_decimal::Decimal` so callers
+  `rustyschwab_types::Decimal` re-exports `rust_decimal::Decimal` so callers
   can write prices without their own dependency.
 - `trading::OrderSpec` is the same composition as JSON, keyed by `kind`
   (`market` … `net_zero`, `oco`, `trigger`, `bracket`) with `LegSpec` /
@@ -1726,7 +1744,7 @@ the SDK validates before every request.
   the preamble, and the MCP dependency review that sat under 0.1.0, now
   live under Unreleased where the work is.
 - README links to `docs/*.md`, `CONTRIBUTING.md` and the issue tracker are
-  absolute GitHub URLs. The README is the `schwab-rs` crate front page on
+  absolute GitHub URLs. The README is the `rustyschwab` crate front page on
   docs.rs, where repository-relative links (`docs/ORDERS.md`,
   `../../issues`) resolved to nothing.
 - The example packages (`auth_test`, `comprehensive`, `oauth-flow`,
@@ -1741,7 +1759,7 @@ the SDK validates before every request.
   budget, circuit-breaker, retry and refresh pipeline as the typed methods.
   It is deliberately `GET`-only so writes stay on the journaled order
   methods.
-- `crates/schwab-rs/tests/live_conformance.rs` is a read-only sweep of the
+- `crates/rustyschwab/tests/live_conformance.rs` is a read-only sweep of the
   real API, skipped unless `SCHWAB_LIVE_CONFORMANCE` is set. It fetches the
   market-data, account, order, transaction and preference endpoints, proves
   each typed binding still decodes the live body, and diffs the body's
@@ -1775,12 +1793,12 @@ the SDK validates before every request.
   (`stopPriceLinkBasis` / `priceLinkBasis`), `PriceLinkType`, `StopType`,
   `TaxLotMethod`, `SpecialInstruction` and `RequestedDestination`, all
   with Schwab's value sets, so a typo is a compile error rather than a
-  400. `schwab_types::common::PutCall` names an option right.
+  400. `rustyschwab_types::common::PutCall` names an option right.
 - The order enums (`OrderSession`, `OrderDuration`, `OrderType`,
   `OrderInstruction`, `ComplexOrderStrategyType`, `OrderStatus`,
   `OrderLegType`, `PositionEffect`) are `Copy`, `Eq` and `Hash`.
 - Asset types are an enum on both sides of the wire.
-  `schwab_types::common::AssetType` carries the Trader API's full
+  `rustyschwab_types::common::AssetType` carries the Trader API's full
   `assetType` set (`EQUITY`, `OPTION`, `INDEX`, `MUTUAL_FUND`,
   `CASH_EQUIVALENT`, `FIXED_INCOME`, `CURRENCY`, `COLLECTIVE_INVESTMENT`,
   `FUTURE`, `FOREX`, `PRODUCT`) and replaces the `String` on
@@ -1868,13 +1886,13 @@ the SDK validates before every request.
 - **User preferences**: `AccountPreferences` field names corrected to
   the wire format (`primaryAccount`, `nickName`, `displayAcctId`);
   `TransactionUser`/`Offer` fields made optional for tolerance.
-- Added `crates/schwab-types/tests/response_shapes.rs` — fixture-based
+- Added `crates/rustyschwab-types/tests/response_shapes.rs` — fixture-based
   deserialization tests so wire-shape regressions fail in CI.
 
 ### Fixed — request-side wire audit (query names and streamer field tables verified against Schwab docs + Schwabdev 3.0.5)
 - **Price history**: `periodType`/`frequencyType` were sent upper-case
   (`DAY`, `MINUTE`); Schwab only accepts lower-case. `PriceHistoryParams`
-  and `OptionChainParams` moved to `schwab_types::market_data` and grew
+  and `OptionChainParams` moved to `rustyschwab_types::market_data` and grew
   `new(symbol)` plus `validate()`, which enforces Schwab's period /
   frequency-type / frequency tables (and the defaulted frequency type)
   before the request is sent. `Candle.volume` is now `i64`.
@@ -1888,7 +1906,7 @@ the SDK validates before every request.
   wire value. The unused `common::MarketType` was removed.
 - **Order and transaction listings** (breaking): `get_account_orders`,
   `get_all_orders` and `get_transactions` take `OrdersParams` /
-  `TransactionsParams` (`schwab_types::trading`) instead of five
+  `TransactionsParams` (`rustyschwab_types::trading`) instead of five
   positional strings. Windows are `DateTime<Utc>` and leave the process
   as `common::schwab_timestamp`, the `yyyy-MM-dd'T'HH:mm:ss.SSSZ`
   spelling Schwab documents (three fractional digits, always). `status`
@@ -1909,10 +1927,10 @@ the SDK validates before every request.
   36 and 40–55 (exchange, 52-week range, indicative quotes, exercise
   type); `LEVELONE_FUTURES_OPTIONS` stops at field 31, which is where
   Schwab's guide ends and past which the streamer rejects the command.
-- Added `crates/schwab-types/tests/request_params.rs` and
-  `crates/schwab-rs/tests/market_data_wire.rs` (wiremock) so the query
+- Added `crates/rustyschwab-types/tests/request_params.rs` and
+  `crates/rustyschwab/tests/market_data_wire.rs` (wiremock) so the query
   strings and local guards are asserted in CI; the wiremock client
-  fixture now lives in `crates/schwab-rs/tests/common/`.
+  fixture now lives in `crates/rustyschwab/tests/common/`.
 
 ### Fixed — streaming protocol & reliability
 - Subscriptions now use the **`ADD`** command (additive) like the
@@ -2016,7 +2034,7 @@ the SDK validates before every request.
   **only un-mask account numbers** for local debugging — streamer
   credentials and user-identity fields are now dropped unconditionally
   and cannot be re-enabled by any env var.
-- `schwab-rs` no longer embeds the absolute token-file path in the
+- `rustyschwab` no longer embeds the absolute token-file path in the
   `TokenFileInsecure` error (it could reach an LLM via an MCP tool
   response); the path is logged for the operator instead.
 
@@ -2073,10 +2091,10 @@ the SDK validates before every request.
 ### Removed
 - Standalone `auth::PkceSession` helper — no remaining callers; the
   PKCE verifier lifecycle lives directly in `AuthManager`.
-- `schwab_rs::utils::{format_time, TimeFormat, format_list,
+- `rustyschwab::utils::{format_time, TimeFormat, format_list,
   format_list_str}` and their crate-root re-exports — ports of the Python
   client's helpers with no callers. The typed query parameters serialize
-  their own dates (`schwab_types::common::schwab_timestamp` is the one
+  their own dates (`rustyschwab_types::common::schwab_timestamp` is the one
   timestamp spelling the Trader API accepts) and symbol lists
   (`std::slice::join(",")`). `utils::canonical_json` stays.
 

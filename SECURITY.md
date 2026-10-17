@@ -17,7 +17,7 @@ Fixes land on `main` and in the next release. See
 
 ## What is in scope
 
-The SDK (`schwab-rs`, `schwab-types`), the MCP server and its operator,
+The SDK (`rustyschwab`, `rustyschwab-types`), the MCP server and its operator,
 authority and paper binaries (`schwab-mcp`), and the release workflow's
 artifacts. Dependency advisories are tracked in CI with `cargo deny`
 (`deny.toml`); release binaries embed their dependency list

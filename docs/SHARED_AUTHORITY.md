@@ -99,10 +99,10 @@ Provision the sink with the organization's immutable retention controls. The cli
 For deployment-owned SDK services requiring shared state APIs, explicitly grant a separate subject `{"subject":"backend-service-subject","role":"backend"}`. This is a privileged identity allowed to mutate execution state and reservations; never grant it to a trading user or strategy that should be confined to the broker gateway.
 
 ```rust,ignore
-let backend = std::sync::Arc::new(schwab_rs::remote::RemoteBackend::new(
+let backend = std::sync::Arc::new(rustyschwab::remote::RemoteBackend::new(
     "https://schwab-authority.example/v1/backend", access_token,
 )?);
-let client = schwab_rs::SchwabClient::new(config)?.with_enterprise_backends(
+let client = rustyschwab::SchwabClient::new(config)?.with_enterprise_backends(
     backend.clone(), backend.clone(), backend.clone(),
 )?;
 ```

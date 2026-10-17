@@ -1994,6 +1994,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rustyschwab"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "chacha20poly1305",
+ "chrono",
+ "chrono-tz",
+ "futures-util",
+ "governor",
+ "humantime-serde",
+ "keyring",
+ "metrics",
+ "parking_lot",
+ "rand 0.10.2",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "rust_decimal",
+ "rustix",
+ "rustls",
+ "rustls-platform-verifier",
+ "rustyschwab-types",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "urlencoding",
+ "uuid",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
+name = "rustyschwab-types"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "serde_with",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2050,60 +2099,11 @@ dependencies = [
  "pyo3-async-runtimes",
  "pythonize",
  "reqwest",
- "schwab-rs",
+ "rustyschwab",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
-]
-
-[[package]]
-name = "schwab-rs"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "base64 0.22.1",
- "chacha20poly1305",
- "chrono",
- "chrono-tz",
- "futures-util",
- "governor",
- "humantime-serde",
- "keyring",
- "metrics",
- "parking_lot",
- "rand 0.10.2",
- "reqwest",
- "ring",
- "rusqlite",
- "rust_decimal",
- "rustix",
- "rustls",
- "rustls-platform-verifier",
- "schwab-types",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "url",
- "urlencoding",
- "uuid",
- "windows-sys 0.61.2",
- "zeroize",
-]
-
-[[package]]
-name = "schwab-types"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "rust_decimal",
- "serde",
- "serde_json",
- "serde_with",
 ]
 
 [[package]]

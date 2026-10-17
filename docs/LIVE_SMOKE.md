@@ -10,17 +10,17 @@ The first check of order placement against a real Schwab account, run by a perso
 - A Schwab app with Accounts and Trading enabled, and tokens from `cargo run -p oauth-flow` (see the [setup guide](SETUP_GUIDE.md)).
 - An account with no other open buy orders. The MCP server's risk limits count every open buy on the account, so the script skips the MCP half when it finds one.
 - A liquid stock priced above $2, such as `F` or `T`.
-- The Python bindings in a virtualenv (`pip install ./crates/schwab-py`) and the server (`cargo build -p schwab-mcp --release`).
+- The Python bindings in a virtualenv (`pip install ./crates/schwab-py`) and the server (`cargo build -p rustyschwab-mcp --release`).
 
 ## 1. Read-only conformance
 
 This issues only `GET`s and checks every typed binding against the live API:
 
 ```bash
-SCHWAB_LIVE_CONFORMANCE=record cargo test -p schwab-rs --test live_conformance -- --nocapture
+SCHWAB_LIVE_CONFORMANCE=record cargo test -p rustyschwab --test live_conformance -- --nocapture
 ```
 
-Review the fixture diff under `crates/schwab-rs/tests/fixtures/conformance/` and keep it for the commit.
+Review the fixture diff under `crates/rustyschwab/tests/fixtures/conformance/` and keep it for the commit.
 
 ## 2. Place and cancel
 

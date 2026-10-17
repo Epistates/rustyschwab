@@ -10,9 +10,9 @@ use crate::convert::{Json, from_py};
 use crate::runtime::awaitable;
 use crate::submission::{Submitted, tagged};
 use pyo3::prelude::*;
-use schwab_rs::broker::TradingBackend;
-use schwab_rs::paper::{PaperBroker, PaperConfig, PaperEvent, PaperEventKind};
-use schwab_rs::types::trading::OrderRequest;
+use rustyschwab::broker::TradingBackend;
+use rustyschwab::paper::{PaperBroker, PaperConfig, PaperEvent, PaperEventKind};
+use rustyschwab::types::trading::OrderRequest;
 use serde_json::Value;
 use std::path::PathBuf;
 

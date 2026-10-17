@@ -15,10 +15,10 @@ use crate::errors::{Failure, to_pyerr};
 use chrono::NaiveDate;
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
-use schwab_rs::Error;
-use schwab_rs::types::Decimal;
-use schwab_rs::types::common::{PutCall, exact_decimal};
-use schwab_rs::types::trading::{OptionSymbol, OrderRequest, OrderSpec};
+use rustyschwab::Error;
+use rustyschwab::types::Decimal;
+use rustyschwab::types::common::{PutCall, exact_decimal};
+use rustyschwab::types::trading::{OptionSymbol, OrderRequest, OrderSpec};
 use serde_json::{Value, json};
 
 /// The checks `place_order` runs, as a failure the binding can raise.

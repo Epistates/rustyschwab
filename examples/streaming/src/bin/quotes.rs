@@ -10,7 +10,7 @@
 /// # from the environment or .env (see .env.example)
 /// cargo run -p streaming-examples --bin streaming_quotes
 /// ```
-use schwab_rs::{
+use rustyschwab::{
     StreamMessage,
     config::StreamConfig,
     types::streaming::{LevelOneEquity, LevelOneEquityFields, StreamService},

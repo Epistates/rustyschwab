@@ -1,6 +1,6 @@
 //! Loopback-only benchmark; never contacts a broker or submits orders.
 mod soak;
-use schwab_rs::{
+use rustyschwab::{
     SchwabClient, SchwabConfig,
     auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
 };

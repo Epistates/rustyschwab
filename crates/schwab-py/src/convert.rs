@@ -212,7 +212,7 @@ pub fn name_of<T: DeserializeOwned>(name: &str, what: &str) -> Result<T, Failure
 mod tests {
     use super::*;
     use pyo3::types::PyDict;
-    use schwab_rs::types::trading::OrderRequest;
+    use rustyschwab::types::trading::OrderRequest;
     use serde_json::json;
 
     fn run<R>(check: impl FnOnce(Python<'_>) -> PyResult<R>) -> R {

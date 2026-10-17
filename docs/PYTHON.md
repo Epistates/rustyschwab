@@ -24,10 +24,11 @@
 ## Install
 
 ```sh
-pip install rustyschwab
+pip install ./crates/schwab-py     # from a clone of the repository, for now
+pip install rustyschwab            # once the package is on PyPI
 ```
 
-Wheels are abi3: one wheel per platform (Linux x86_64 and aarch64, macOS arm64 and x86_64, Windows x86_64) works on CPython 3.10 and every later release. The package is typed (`py.typed`, with stubs for the native module).
+The package is not on PyPI yet. Until it is, install it from a clone: pip builds the extension with maturin, which needs a Rust toolchain ([rustup](https://rustup.rs)). The published wheels will be abi3: one wheel per platform (Linux x86_64 and aarch64, macOS arm64 and x86_64, Windows x86_64) works on CPython 3.10 and every later release. The package is typed (`py.typed`, with stubs for the native module).
 
 ## Authorization
 
@@ -571,7 +572,7 @@ A venue configured with `"clock": "wall"` runs on the system clock instead: `bro
 
 ### Performance reports
 
-`rustyschwab.performance` reports on a run: net return, maximum drawdown and its duration, Sharpe, Sortino and Calmar ratios, and trade statistics (win rate, profit factor, expectancy, holding time) for the whole run and for each symbol. The arithmetic runs in the SDK (`schwab_rs::performance`), in decimals, and takes no I/O.
+`rustyschwab.performance` reports on a run: net return, maximum drawdown and its duration, Sharpe, Sortino and Calmar ratios, and trade statistics (win rate, profit factor, expectancy, holding time) for the whole run and for each symbol. The arithmetic runs in the SDK (`rustyschwab::performance`), in decimals, and takes no I/O.
 
 Closed trades are matched first in first out at the share level, long and short. A sell with nothing long to close opens a short, a fill that crosses through flat closes one position and opens the other, and each match of an entry lot against a closing fill is its own round trip, so partial fills, scale-ins and scale-outs are counted separately. A fill's fee is spread over the quantities it covers. Open lots are valued at `marks` (a symbol to price mapping) or, without one, at the symbol's last fill price.
 
@@ -614,7 +615,8 @@ report = performance.analyze(fills, starting_equity="1000")
 ### Install
 
 ```sh
-pip install "rustyschwab[nautilus]"
+pip install "./crates/schwab-py[nautilus]"   # from a clone, until the PyPI release
+pip install "rustyschwab[nautilus]"          # once it is on PyPI
 ```
 
 The extra installs `nautilus_trader>=1.231,<2`. NautilusTrader supports CPython 3.12 to 3.14 (the rest of `rustyschwab` runs on 3.10 and later) and is licensed LGPL-3.0, so it is an extra and not a dependency. The range stops before 2.0 because its release candidates restructure the live-client interfaces this adapter is written against. Authorize Schwab once as in [Authorization](#authorization); the clients read the same `SCHWAB_*` variables as `Client.from_env()`, which keeps the app secret out of the node's config and logs.

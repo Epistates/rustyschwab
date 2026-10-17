@@ -104,22 +104,22 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo check -p schwab-rs --no-default-features --locked
-      - run: cargo check -p schwab-rs --no-default-features --features native-tls --locked
-      - run: cargo check -p schwab-rs --no-default-features --features callback-server --locked
-      - run: cargo check -p schwab-types --no-default-features --locked
+      - run: cargo check -p rustyschwab --no-default-features --locked
+      - run: cargo check -p rustyschwab --no-default-features --features native-tls --locked
+      - run: cargo check -p rustyschwab --no-default-features --features callback-server --locked
+      - run: cargo check -p rustyschwab-types --no-default-features --locked
       # The OpenTelemetry export is opt-in; the binaries forward the feature.
-      - run: cargo check -p schwab-rs --no-default-features --features rustls,otel --locked
-      - run: cargo check -p schwab-mcp --bins --features otel --locked
+      - run: cargo check -p rustyschwab --no-default-features --features rustls,otel --locked
+      - run: cargo check -p rustyschwab-mcp --bins --features otel --locked
       - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: cargo-hack
       # Every feature on its own, not only the combinations above.
-      - run: cargo hack check -p schwab-rs -p schwab-types --each-feature --no-dev-deps --locked
+      - run: cargo hack check -p rustyschwab -p rustyschwab-types --each-feature --no-dev-deps --locked
       # Choosing native-tls must actually drop rustls from the SDK.
       - name: native-tls build carries no rustls
         run: |
-          if cargo tree -p schwab-rs --no-default-features --features native-tls -e normal --prefix none | grep -E '^rustls '; then
+          if cargo tree -p rustyschwab --no-default-features --features native-tls -e normal --prefix none | grep -E '^rustls '; then
             echo "::error::native-tls build still depends on rustls"
             exit 1
           fi
@@ -185,7 +185,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Builds each crate from its packaged tarball, as crates.io would.
-      - run: cargo package -p schwab-types -p schwab-rs -p schwab-mcp --locked
+      - run: cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp --locked
 
   deny:
     name: cargo deny
@@ -243,8 +243,8 @@ jobs:
       - name: Bindings and SDK ship the same version
         run: |
           bindings=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[0].version')
-          sdk=$(cargo metadata --format-version 1 --no-deps --manifest-path ../../Cargo.toml | jq -r '.packages[] | select(.name == "schwab-rs") | .version')
-          [ "$bindings" = "$sdk" ] || { echo "::error::schwab-py is $bindings but schwab-rs is $sdk"; exit 1; }
+          sdk=$(cargo metadata --format-version 1 --no-deps --manifest-path ../../Cargo.toml | jq -r '.packages[] | select(.name == "rustyschwab") | .version')
+          [ "$bindings" = "$sdk" ] || { echo "::error::schwab-py is $bindings but rustyschwab is $sdk"; exit 1; }
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       # Links the interpreter and runs the conversion and error-mapping unit tests.
@@ -284,7 +284,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The live smoke script's MCP client is tested against this server in
       # paper mode; without the binary that test skips.
-      - run: cargo build -p schwab-mcp --bin schwab-mcp --locked
+      - run: cargo build -p rustyschwab-mcp --bin schwab-mcp --locked
       - run: python3 -m unittest discover -s tools -p 'test_*.py'
       - run: cargo build -p enterprise-bench --release --locked
       - run: python3 tools/soak.py --seconds 60 --output soak-fast.json

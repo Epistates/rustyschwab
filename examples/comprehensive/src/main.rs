@@ -5,11 +5,11 @@
 //! see `.env.example`), including the callback URL and token store.
 
 use anyhow::Result;
-use schwab_rs::auth::TokenNotification;
-use schwab_rs::config::StreamConfig;
-use schwab_rs::prelude::*;
-use schwab_rs::types::streaming::StreamService;
-use schwab_rs::types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
+use rustyschwab::auth::TokenNotification;
+use rustyschwab::config::StreamConfig;
+use rustyschwab::prelude::*;
+use rustyschwab::types::streaming::StreamService;
+use rustyschwab::types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
 
 use std::sync::Arc;
 use tokio::time::Duration;
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("schwab_rs=debug".parse()?)
+                .add_directive("rustyschwab=debug".parse()?)
                 .add_directive("comprehensive=debug".parse()?),
         )
         .init();

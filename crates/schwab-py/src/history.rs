@@ -10,9 +10,9 @@ use crate::convert::{Json, from_py};
 use crate::errors::Failure;
 use crate::runtime::awaitable;
 use pyo3::prelude::*;
-use schwab_rs::history::{BarSize, HistoryRequest, HistoryStore, Recorded};
-use schwab_rs::paper::synthetic::SyntheticBbo;
-use schwab_rs::types::market_data::{Candle, FrequencyType, PriceHistoryResponse};
+use rustyschwab::history::{BarSize, HistoryRequest, HistoryStore, Recorded};
+use rustyschwab::paper::synthetic::SyntheticBbo;
+use rustyschwab::types::market_data::{Candle, FrequencyType, PriceHistoryResponse};
 use std::path::PathBuf;
 
 /// A series request from the keyword arguments every method takes.
@@ -26,7 +26,7 @@ fn request(
 ) -> Result<HistoryRequest, Failure> {
     let frequency_type: FrequencyType =
         serde_json::from_value(frequency_type.into()).map_err(|_| {
-            schwab_rs::Error::InvalidParameter(format!(
+            rustyschwab::Error::InvalidParameter(format!(
                 "frequency_type must be minute, daily, weekly or monthly, not {frequency_type:?}"
             ))
         })?;
@@ -222,7 +222,7 @@ pub fn synthesize_quotes(
     histories: &Bound<'_, PyAny>,
     model: &Bound<'_, PyAny>,
     first_sequence: u64,
-) -> PyResult<Json<Vec<schwab_rs::paper::PaperEvent>>> {
+) -> PyResult<Json<Vec<rustyschwab::paper::PaperEvent>>> {
     let built = (|| {
         let histories = from_py::<Vec<PriceHistoryResponse>>(histories, "price histories")?;
         let model = from_py::<SyntheticBbo>(model, "synthetic quote model")?;

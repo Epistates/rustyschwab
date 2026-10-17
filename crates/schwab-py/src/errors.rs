@@ -2,7 +2,7 @@
 //!
 //! The classes live in `rustyschwab/errors.py` so their attributes, docstrings
 //! and type stubs are plain Python. This module only classifies a failure
-//! (the SDK's stable [`ErrorKind`](schwab_rs::ErrorKind) name) and gathers the
+//! (the SDK's stable [`ErrorKind`](rustyschwab::ErrorKind) name) and gathers the
 //! details each class carries; `rustyschwab.errors.from_native` picks the class.
 //!
 //! Messages are the SDK's own `Display` text, which is written to be safe to
@@ -13,7 +13,7 @@
 use pyo3::exceptions::PyStopAsyncIteration;
 use pyo3::prelude::*;
 use pythonize::pythonize;
-use schwab_rs::Error;
+use rustyschwab::Error;
 use serde_json::{Map, Value, json};
 
 /// Why a call into the SDK did not produce a value.
@@ -140,7 +140,7 @@ pub fn to_pyerr(py: Python<'_>, failure: Failure) -> PyErr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use schwab_rs::error::AuthError;
+    use rustyschwab::error::AuthError;
 
     #[test]
     fn rate_limits_carry_the_wait() {

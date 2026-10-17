@@ -14,12 +14,12 @@ use crate::stream::Stream;
 use crate::submission::{Submitted, journal_window_start, live_attempt, tagged};
 use chrono::NaiveDate;
 use pyo3::prelude::*;
-use schwab_rs::client::{OptionChainParams, PriceHistoryParams};
-use schwab_rs::types::market_data::{
+use rustyschwab::client::{OptionChainParams, PriceHistoryParams};
+use rustyschwab::types::market_data::{
     Market, MoverFrequency, MoverIndex, MoverSort, Projection, QuoteField,
 };
-use schwab_rs::types::trading::{OrderRequest, OrdersParams, TransactionsParams};
-use schwab_rs::{Error, SchwabClient, StreamConfig};
+use rustyschwab::types::trading::{OrderRequest, OrdersParams, TransactionsParams};
+use rustyschwab::{Error, SchwabClient, StreamConfig};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
@@ -580,12 +580,12 @@ impl Client {
     /// This process's use of the request budget as
     /// `{"perMinute", "usedLastMinute", "remaining"}`, or `None` when rate
     /// limiting is off.
-    fn request_budget(&self) -> Json<Option<schwab_rs::RequestBudgetUsage>> {
+    fn request_budget(&self) -> Json<Option<rustyschwab::RequestBudgetUsage>> {
         Json(self.shared.sdk.request_budget())
     }
 
     /// The circuit breaker: `"closed"`, `"open"` or `"half_open"`.
-    fn circuit_state(&self) -> Json<schwab_rs::CircuitState> {
+    fn circuit_state(&self) -> Json<rustyschwab::CircuitState> {
         Json(self.shared.sdk.circuit_state())
     }
 

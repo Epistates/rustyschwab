@@ -1,6 +1,6 @@
 # rustyschwab
 
-> A Rust SDK (`schwab-rs`), Python package (`rustyschwab`) and MCP server (`schwab-mcp`) for the Charles Schwab Trader and Market Data APIs. Orders are journaled and sent at most once, risk limits and halts are enforced outside the strategy, MCP write tools are off by default and gated by per-principal policy and approvals, and a deterministic local paper venue runs the same strategy code as live trading.
+> A Rust SDK (`rustyschwab`), Python package (`rustyschwab`) and MCP server (`schwab-mcp`) for the Charles Schwab Trader and Market Data APIs. Orders are journaled and sent at most once, risk limits and halts are enforced outside the strategy, MCP write tools are off by default and gated by per-principal policy and approvals, and a deterministic local paper venue runs the same strategy code as live trading.
 
 Key facts for a model using or writing code against it:
 
@@ -8,7 +8,7 @@ Key facts for a model using or writing code against it:
 - An order whose outcome is unknown must be reconciled, never resubmitted: `SubmissionUnknown` in Rust and Python, error code `reconciliation_required` (disposition `reconcile`) over MCP. Every MCP failure carries a `disposition` saying what to do next.
 - Over MCP, call `get_server_status` first: it says whether the server is live or paper, which tools the session may use, and whether trading is halted. Use `build_order` and `check_order` before `place_order`.
 - Python request and response values are plain dicts and lists in Schwab's JSON shape.
-- Status: 0.2.0 release candidate; no live-account run recorded yet. The strategy runner and NautilusTrader adapter are experimental.
+- Status: 0.2.0, unofficial (not affiliated with Charles Schwab). Rust crates on crates.io (`rustyschwab`, `rustyschwab-types`, `rustyschwab-mcp`); the Python package is not on PyPI yet. No live-account run recorded yet. The strategy runner and NautilusTrader adapter are experimental.
 
 ## Docs
 
@@ -19,7 +19,7 @@ Key facts for a model using or writing code against it:
 - [Orders](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/ORDERS.md): equity, option, multi-leg and conditional orders; the `OrderSpec` grammar
 - [Streaming](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/STREAMING.md): services, fields, backpressure, reconnects
 - [Paper trading](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/PAPER_TRADING.md): the simulated venue, backtesting over price history, fees
-- [Rust crate guide](https://raw.githubusercontent.com/epistates/rustyschwab/main/crates/schwab-rs/README.md): configure, authorize, read data, place an order, stream quotes
+- [Rust crate guide](https://raw.githubusercontent.com/epistates/rustyschwab/main/crates/rustyschwab/README.md): configure, authorize, read data, place an order, stream quotes
 
 ## Operations
 

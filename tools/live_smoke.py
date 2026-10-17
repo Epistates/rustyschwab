@@ -484,7 +484,7 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
         print(f"  [skip] {path.skipped}")
         return
     if not binary.exists():
-        path.skipped = f"{binary} not found; build it with cargo build -p schwab-mcp --release"
+        path.skipped = f"{binary} not found; build it with cargo build -p rustyschwab-mcp --release"
         print(f"  [skip] {path.skipped}")
         return
     policy_file, risk_file = workdir / "principals.json", workdir / "risk.json"
