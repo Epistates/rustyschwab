@@ -32,6 +32,12 @@ pub struct SchwabConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientConfig {
     pub base_url: String,
+    /// Bounds one call (default 30 s): its retries, the wait for request
+    /// budget and the transfer. A connection that goes silent fails after
+    /// 10 s (or this, if shorter). The first token fetch, and a
+    /// submission's wait for its turn at the credential's order lock (up
+    /// to this long again), come before it; a submission with under 5 s
+    /// (or half this) left is refused unsent.
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
     pub retry: RetryConfig,
@@ -159,7 +165,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             base_url: "https://api.schwabapi.com".to_string(),
-            timeout: Duration::from_secs(10), // Default request timeout
+            timeout: Duration::from_secs(30), // Default request timeout
             retry: RetryConfig::default(),
             rate_limit: RateLimitConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),

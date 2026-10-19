@@ -272,6 +272,12 @@ impl StateDatabase {
                         &serde_json::to_value(&outcome)?,
                     )?;
                     report.resolved_attempts.push(id);
+                } else if unresolved && !armed {
+                    // Still on its way to the broker (waiting for its turn
+                    // at the execution lease, say) but not armed, so not
+                    // sent: Schwab cannot have it, and its reservation still
+                    // counts against the risk limits. It leaves the baseline
+                    // valid, so it is not refused at its own revalidation.
                 } else {
                     // Matching by tag is the only safe resolution; an order
                     // that fits the request without our tag (none, or one

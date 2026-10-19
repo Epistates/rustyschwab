@@ -62,6 +62,7 @@ async fn reconciliation_matches_tag_deduplicates_activity_and_rejects_old_genera
     let journal = OrderJournal::new(dir.path().join("orders.json"));
     let request = json!({"tag":"unique","orderType":"LIMIT","price":"10.00"});
     let id = journal.begin("A", "place_order", request).await.unwrap();
+    journal.arm(&id).await.unwrap();
     let db = journal.database();
     db.invalidate_account("A", 1).await.unwrap();
     let absent = db

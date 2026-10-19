@@ -128,8 +128,13 @@ and calls `execute_resilient`, which runs one logical call as:
    (fenced by a coordination lease when supplied) and the in-process
    submission gate, then the transport call.
 5. A 401 on a read triggers one `refresh_rejected_token` and one replay.
-6. The whole call is bounded by `ClientConfig.timeout` (default 10 s) and
-   recorded in `schwab_http_requests_total` / `schwab_http_request_duration_seconds`.
+6. The call is bounded by `ClientConfig.timeout` (default 30 s; a silent
+   connection fails after 10 s) and recorded in `schwab_http_requests_total` /
+   `schwab_http_request_duration_seconds`. The deadline starts after the
+   first token fetch and, for a submission, once its turn at the execution
+   lease comes (the wait has its own bound of the same length); the lease is
+   released outside it, so an answer that arrived is kept. A submission with
+   under 5 s (or half the timeout) left is refused unsent.
 
 `transport::HttpTransport` wraps `reqwest`; `request_for_location` handles
 Schwab's `201` + `Location` order responses.

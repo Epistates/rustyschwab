@@ -848,6 +848,43 @@ async fn concurrent_submissions_share_the_execution_lease() {
     server.verify().await;
 }
 
+/// A submission's deadline starts when its turn at the execution lease
+/// comes: one that waited behind a slow neighbour still has its whole
+/// timeout to hear Schwab's answer, instead of becoming `SubmissionUnknown`
+/// for an order that landed.
+#[tokio::test]
+async fn waiting_for_the_execution_lease_does_not_shorten_the_deadline() {
+    let server = MockServer::start().await;
+    for account in ["a", "b"] {
+        Mock::given(method("POST"))
+            .and(path(format!("/trader/v1/accounts/{account}/orders")))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header(
+                        "Location",
+                        format!("https://api.schwabapi.com/trader/v1/accounts/{account}/orders/7"),
+                    )
+                    .set_delay(Duration::from_millis(1500)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let (client, _dir, _) = common::mock_client_with(&server, false, |config| {
+        config.client.timeout = Duration::from_secs(2);
+    });
+    let order = limit_order();
+    let first = client.place_order("a", &order);
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.place_order("b", &order).await
+    };
+    let (first, second) = tokio::join!(first, second);
+    assert_eq!(first.unwrap().order_id.as_deref(), Some("7"));
+    assert_eq!(second.unwrap().order_id.as_deref(), Some("7"));
+    server.verify().await;
+}
+
 /// One account's unresolved intent blocks that account, not its neighbours.
 #[tokio::test]
 async fn pending_submissions_are_counted_per_account() {

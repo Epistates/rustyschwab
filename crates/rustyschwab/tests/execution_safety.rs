@@ -89,6 +89,7 @@ async fn an_unarmed_intent_resolves_as_never_dispatched() {
         .unwrap();
 
     // A fresh unarmed intent is left alone: its dispatcher may be running.
+    // Unsent, it cannot be at the broker, so the account stays reconciled.
     let report = journal
         .database()
         .reconcile_snapshot(
@@ -100,7 +101,18 @@ async fn an_unarmed_intent_resolves_as_never_dispatched() {
         )
         .await
         .unwrap();
-    assert_eq!(report.unresolved_attempts, vec![id.clone()]);
+    assert!(report.unresolved_attempts.is_empty());
+    assert!(report.never_dispatched_attempts.is_empty());
+    assert!(report.reconciled);
+    assert!(
+        journal
+            .record(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .is_none()
+    );
 
     age_submissions(&journal, Duration::from_secs(11 * 60));
     let report = journal

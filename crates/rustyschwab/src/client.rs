@@ -28,6 +28,11 @@ use urlencoding;
 
 pub use crate::types::market_data::{OptionChainParams, PriceHistoryParams};
 
+/// The least time a submission must have left on its deadline to be sent
+/// (or half the timeout, if that is less). With less, it is refused unsent:
+/// sending would likely end in `SubmissionUnknown` for an order that landed.
+const MIN_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct SchwabClient {
     inner: Arc<ClientInner>,
@@ -552,7 +557,7 @@ impl SchwabClient {
     ) -> Result<T> {
         self.ensure_live_state().await?;
         let start = std::time::Instant::now();
-        let deadline = tokio::time::Instant::now() + self.inner.config.timeout;
+        let timeout = self.inner.config.timeout;
         let submission = matches!(op, "place_order" | "replace_order");
         // A cancel only ever reduces risk: it must not be refused because
         // read traffic tripped the breaker, and it is never retried, since
@@ -569,109 +574,142 @@ impl SchwabClient {
         };
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let sent = std::sync::atomic::AtomicBool::new(false);
-        let operation = async {
-            let mut refreshed = false;
-            loop {
-                let token = self
-                    .inner
-                    .auth_manager
-                    .get_access_token()
-                    .await
-                    .map_err(Error::Auth)?;
-                let attempt = || async {
-                    if let Some(budget) = &self.inner.rate_limiter {
-                        budget
-                            .admit(self.inner.coordinator.as_ref(), priority)
-                            .await?;
-                    }
-                    if submission {
-                        self.submission_admission().await?;
-                    }
-                    if let Some((account, attempt, order)) = risk_context {
-                        if let Some(risk) = &self.inner.risk {
-                            if let Some(lease) = fence {
-                                risk.revalidate_fenced(account, attempt, order, lease)
-                                    .await?;
-                            } else {
-                                risk.revalidate(account, attempt, order).await?;
-                            }
-                        } else if let Some(lease) = fence
-                            && !self.inner.coordinator.valid(lease).await?
-                        {
-                            return Err(Error::OwnershipLost);
-                        }
-                        // Last step before the request leaves: from here
-                        // on the intent may have reached the broker.
-                        self.inner.execution.arm(attempt).await?;
-                    }
-                    sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                    call(token.clone()).await
-                };
-                let result = if protective {
-                    attempt().await
-                } else {
-                    self.inner
-                        .circuit_breaker
-                        .call(|| async {
-                            if submission {
-                                attempt().await
-                            } else {
-                                self.inner
-                                    .retry_policy
-                                    .execute_until(Some(deadline), attempt)
-                                    .await
-                            }
-                        })
-                        .await
-                };
-                // A write never replays, even on 401. Caller can reconcile and
-                // explicitly submit a new intent after credentials recover.
-                if !submission
-                    && result
-                        .as_ref()
-                        .err()
-                        .is_some_and(|e| e.http_status() == Some(StatusCode::UNAUTHORIZED))
-                    && !refreshed
-                {
-                    self.inner
-                        .auth_manager
-                        .refresh_rejected_token(&token)
-                        .await
-                        .map_err(Error::Auth)?;
-                    refreshed = true;
-                    continue;
-                }
-                return result;
-            }
-        };
-        let guarded = async {
-            if submission {
-                // Submissions sharing the credential take turns; the overall
-                // deadline below bounds the wait.
-                let mut ownership = crate::coordination::LeaseSession::acquire_waiting(
-                    self.inner.coordinator.clone(),
-                    &format!("execution:{}", self.inner.quota_key),
-                    self.inner.config.timeout,
+        let result = async {
+            // Submissions sharing the credential take turns. The wait has its
+            // own bound, and the deadline starts once this one's turn comes:
+            // a queue must not eat the time a submission has to be answered.
+            let mut ownership = if submission {
+                Some(
+                    crate::coordination::LeaseSession::acquire_waiting(
+                        self.inner.coordinator.clone(),
+                        &format!("execution:{}", self.inner.quota_key),
+                        timeout,
+                    )
+                    .await?,
                 )
-                .await?;
-                ownership.run(operation).await
             } else {
-                operation.await
-            }
-        };
-        let result = tokio::time::timeout_at(deadline, guarded)
-            .await
-            .unwrap_or_else(|_| {
-                // A request in flight when the deadline fell went
-                // unanswered: that is the breaker's business, though the
-                // dropped call never told it.
-                if sent.load(std::sync::atomic::Ordering::Relaxed) && !protective {
-                    self.inner.circuit_breaker.record_unanswered();
+                None
+            };
+            // The first token is fetched outside the deadline too: a refresh
+            // has its own timeouts.
+            let first_token = self
+                .inner
+                .auth_manager
+                .get_access_token()
+                .await
+                .map_err(Error::Auth)?;
+            let deadline = tokio::time::Instant::now() + timeout;
+            let operation = async {
+                let mut first_token = Some(first_token);
+                let mut refreshed = false;
+                loop {
+                    let token = match first_token.take() {
+                        Some(token) => token,
+                        None => self
+                            .inner
+                            .auth_manager
+                            .get_access_token()
+                            .await
+                            .map_err(Error::Auth)?,
+                    };
+                    let attempt = || async {
+                        if let Some(budget) = &self.inner.rate_limiter {
+                            budget
+                                .admit(self.inner.coordinator.as_ref(), priority)
+                                .await?;
+                        }
+                        if submission {
+                            self.submission_admission().await?;
+                        }
+                        if let Some((account, attempt, order)) = risk_context {
+                            if let Some(risk) = &self.inner.risk {
+                                if let Some(lease) = fence {
+                                    risk.revalidate_fenced(account, attempt, order, lease)
+                                        .await?;
+                                } else {
+                                    risk.revalidate(account, attempt, order).await?;
+                                }
+                            } else if let Some(lease) = fence
+                                && !self.inner.coordinator.valid(lease).await?
+                            {
+                                return Err(Error::OwnershipLost);
+                            }
+                            // Too little time left to hear the answer: refuse
+                            // unsent rather than risk an unknown outcome.
+                            if deadline.saturating_duration_since(tokio::time::Instant::now())
+                                < MIN_SEND_WINDOW.min(timeout / 2)
+                            {
+                                return Err(Error::Timeout {
+                                    duration: timeout.as_secs(),
+                                });
+                            }
+                            // Last step before the request leaves: from here
+                            // on the intent may have reached the broker.
+                            self.inner.execution.arm(attempt).await?;
+                        }
+                        sent.store(true, std::sync::atomic::Ordering::Relaxed);
+                        call(token.clone()).await
+                    };
+                    let result = if protective {
+                        attempt().await
+                    } else {
+                        self.inner
+                            .circuit_breaker
+                            .call(|| async {
+                                if submission {
+                                    attempt().await
+                                } else {
+                                    self.inner
+                                        .retry_policy
+                                        .execute_until(Some(deadline), attempt)
+                                        .await
+                                }
+                            })
+                            .await
+                    };
+                    // A write never replays, even on 401. Caller can reconcile and
+                    // explicitly submit a new intent after credentials recover.
+                    if !submission
+                        && result
+                            .as_ref()
+                            .err()
+                            .is_some_and(|e| e.http_status() == Some(StatusCode::UNAUTHORIZED))
+                        && !refreshed
+                    {
+                        self.inner
+                            .auth_manager
+                            .refresh_rejected_token(&token)
+                            .await
+                            .map_err(Error::Auth)?;
+                        refreshed = true;
+                        continue;
+                    }
+                    return result;
                 }
-                Err(Error::Timeout {
-                    duration: self.inner.config.timeout.as_secs(),
-                })
-            });
+            };
+            let timed = async {
+                tokio::time::timeout_at(deadline, operation)
+                    .await
+                    .unwrap_or_else(|_| {
+                        // A request in flight when the deadline fell went
+                        // unanswered: that is the breaker's business, though
+                        // the dropped call never told it.
+                        if sent.load(std::sync::atomic::Ordering::Relaxed) && !protective {
+                            self.inner.circuit_breaker.record_unanswered();
+                        }
+                        Err(Error::Timeout {
+                            duration: timeout.as_secs(),
+                        })
+                    })
+            };
+            // The lease is released after the deadline's verdict, outside it,
+            // so an answer that arrived is never discarded while it is.
+            match ownership.as_mut() {
+                Some(ownership) => ownership.run(timed).await,
+                None => timed.await,
+            }
+        }
+        .await;
         let result = result.map_err(|e| {
             let ambiguous = sent.load(std::sync::atomic::Ordering::Relaxed)
                 && ((e.is_retryable() && !matches!(e, Error::RateLimit { .. }))

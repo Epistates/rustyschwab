@@ -63,6 +63,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StreamParameters` and the writer's outgoing frames no longer show the
   LOGIN access token in their `Debug` output.
 
+### Changed — request deadlines
+
+- `ClientConfig::timeout` defaults to 30 s (was 10 s), and a connection
+  that goes silent fails after 10 s, so a large option chain that keeps
+  arriving can finish while a stalled reply still fails fast.
+- A submission's deadline starts once its turn at the credential's
+  execution lease comes, and the lease is released outside it. Before, two
+  orders sent at once on one login shared one 10 s budget: the second
+  could be sent with a second left and come back as `SubmissionUnknown`
+  for an order that landed, and a reply that had arrived could be dropped
+  while the lease was released. The first token fetch is outside the
+  deadline too.
+- A submission with less than 5 s (or half the timeout) left is refused
+  before it is sent, with `Timeout`, instead of risking an unknown outcome.
+- Reconciliation leaves the account reconciled while one of its
+  submissions is journaled but not yet sent (waiting for the lease), since
+  Schwab cannot have it; it used to mark the account unreconciled, and the
+  waiting submission was then refused at its own risk check.
+
 ### Security
 
 - rustls 0.23.46 and quinn-proto 0.11.19 in both lockfiles, for

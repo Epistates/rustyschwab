@@ -45,8 +45,11 @@ impl HttpTransport {
 
         let client = Client::builder()
             .timeout(timeout)
-            // A dead route fails fast instead of spending the whole deadline.
+            // A dead route or a stalled reply fails fast instead of spending
+            // the whole deadline, while a large one that keeps arriving (a
+            // full option chain) may use all of it.
             .connect_timeout(timeout.min(Duration::from_secs(10)))
+            .read_timeout(timeout.min(Duration::from_secs(10)))
             .tcp_keepalive(Duration::from_secs(30))
             .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
