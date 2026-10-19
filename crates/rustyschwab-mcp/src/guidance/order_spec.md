@@ -60,7 +60,8 @@ optional:
 
 `session` defaults to `NORMAL` (`AM`, `PM`, `SEAMLESS`); `duration` to `DAY`
 (`GOOD_TILL_CANCEL`, `FILL_OR_KILL`, `IMMEDIATE_OR_CANCEL`, `END_OF_WEEK`,
-`END_OF_MONTH`, `NEXT_END_OF_MONTH`). Leave `tag` unset: `place_order` and
+`END_OF_MONTH`, `NEXT_END_OF_MONTH`). Equity orders take only `DAY`,
+`GOOD_TILL_CANCEL` or `FILL_OR_KILL`; Schwab refuses the others. Leave `tag` unset: `place_order` and
 `replace_order` then tag the order with its intent digest, so submitting
 the identical order again is refused as `duplicate_intent`. Set a `tag`
 only to place the same order twice on purpose.
@@ -80,6 +81,8 @@ only to place the same order twice on purpose.
   with `BUY_TO_OPEN`, `BUY_TO_CLOSE`, `SELL_TO_OPEN` or `SELL_TO_CLOSE`.
   Symbols are upper case.
 - A `session` other than `NORMAL` takes `limit` orders only.
+- An equity order's `duration` is `DAY`, `GOOD_TILL_CANCEL` or
+  `FILL_OR_KILL`.
 - Trailing stops cannot trail `MANUAL`, and a `PERCENT` offset is below 100.
 - Strategies nest at most eight levels.
 

@@ -232,7 +232,8 @@ impl Client {
 
     /// Candles for a symbol. `params` uses Schwab's query names:
     /// `symbol`, `periodType`, `period`, `frequencyType`, `frequency`,
-    /// `startDate` and `endDate` (epoch milliseconds), `needExtendedHoursData`,
+    /// `startDate` and `endDate` (epoch milliseconds, or an aware
+    /// `datetime`), `needExtendedHoursData`,
     /// `needPreviousClose`. Invalid period/frequency pairs are refused before
     /// anything is sent.
     fn price_history<'py>(

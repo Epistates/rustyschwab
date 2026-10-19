@@ -71,6 +71,19 @@ async def test_price_history_takes_schwabs_query_names(
     assert request.query["periodType"] == ["day"] and request.query["frequency"] == ["5"]
 
 
+async def test_price_history_dates_may_be_datetimes(
+    client: rustyschwab.Client, server: MockSchwab
+) -> None:
+    server.on("GET", "/marketdata/v1/pricehistory", {"symbol": "AAPL", "empty": True, "candles": []})
+    start = datetime(2026, 10, 1, 13, 30, tzinfo=timezone.utc)
+    await client.price_history({"symbol": "AAPL", "startDate": start, "endDate": 1_800_000_000_000})
+    (request,) = server.calls("GET", "/marketdata/v1/pricehistory")
+    assert request.query["startDate"] == [str(int(start.timestamp() * 1000))]
+    assert request.query["endDate"] == ["1800000000000"]
+    with pytest.raises(errors.InvalidParameter):
+        await client.price_history({"symbol": "AAPL", "startDate": datetime(2026, 10, 1)})
+
+
 async def test_invalid_price_history_is_refused_before_anything_is_sent(
     client: rustyschwab.Client, server: MockSchwab
 ) -> None:

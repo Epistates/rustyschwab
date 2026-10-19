@@ -246,6 +246,31 @@ pub fn optional_id<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Str
     }
 }
 
+/// A time as milliseconds since the Unix epoch, from that number or an
+/// RFC 3339 string with an offset. A naive time is refused: which day it
+/// names depends on a zone it does not carry.
+pub fn optional_epoch_millis<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<i64>, D::Error> {
+    match Option::<serde_json::Value>::deserialize(de)? {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("Expected whole epoch milliseconds")),
+        Some(serde_json::Value::String(s)) => DateTime::parse_from_rfc3339(&s)
+            .map(|at| Some(at.timestamp_millis()))
+            .map_err(|_| {
+                serde::de::Error::custom(
+                    "Expected epoch milliseconds or an RFC 3339 time with an offset",
+                )
+            }),
+        Some(_) => Err(serde::de::Error::custom(
+            "Expected epoch milliseconds or an RFC 3339 time",
+        )),
+    }
+}
+
 /// [`optional_id`] for a field that must be present.
 pub fn id<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
     optional_id(de)?.ok_or_else(|| serde::de::Error::custom("Expected an identifier, got null"))

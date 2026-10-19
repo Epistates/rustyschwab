@@ -1143,9 +1143,11 @@ impl SchwabClient {
 
     /// Cancel an order.
     ///
-    /// Unlike placement, a cancellation creates no exposure and asking twice
-    /// is harmless, so it is retried like a read, is allowed while
-    /// submissions are halted, and opens no intent in the execution journal.
+    /// Unlike placement, a cancellation creates no exposure, so it is allowed
+    /// while submissions are halted, passes an open circuit breaker, and
+    /// opens no intent in the execution journal. It is sent once and not
+    /// retried: a retry after a cancel that landed answers 4xx and hides it.
+    /// Only a 401 is answered with one token refresh and one more send.
     /// Record who cancelled what in the calling layer: the MCP server and the
     /// authority audit every cancellation per principal.
     pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {

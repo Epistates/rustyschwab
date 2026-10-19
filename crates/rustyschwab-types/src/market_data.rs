@@ -1113,9 +1113,14 @@ pub struct PriceHistoryParams {
     pub frequency_type: Option<FrequencyType>,
     /// Candles per `frequency_type` unit; see [`FrequencyType::valid_frequencies`].
     pub frequency: Option<i32>,
-    /// Inclusive start, milliseconds since the Unix epoch.
+    /// Inclusive start, milliseconds since the Unix epoch. Decodes from
+    /// that number or an RFC 3339 time with an offset (a Python `datetime`).
+    #[serde(default, deserialize_with = "crate::common::optional_epoch_millis")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<i64>"))]
     pub start_date: Option<i64>,
-    /// Inclusive end, milliseconds since the Unix epoch.
+    /// Inclusive end, as `start_date`.
+    #[serde(default, deserialize_with = "crate::common::optional_epoch_millis")]
+    #[cfg_attr(feature = "schemars", schemars(with = "Option<i64>"))]
     pub end_date: Option<i64>,
     pub need_extended_hours_data: Option<bool>,
     pub need_previous_close: Option<bool>,

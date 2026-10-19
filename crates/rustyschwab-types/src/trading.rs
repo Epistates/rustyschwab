@@ -1607,6 +1607,26 @@ impl OrderRequest {
                 format!("{name} requires the NORMAL session and DAY duration"),
             ));
         }
+        // Measured against Schwab in 2026: an equity order with any other
+        // duration answers 400 "Invalid value".
+        let equity = self.order_leg_collection.iter().all(|leg| {
+            matches!(
+                leg.instrument.asset_type,
+                AssetType::Equity | AssetType::CollectiveInvestment
+            )
+        });
+        if equity
+            && !matches!(
+                duration,
+                OrderDuration::Day | OrderDuration::Gtc | OrderDuration::FillOrKill
+            )
+        {
+            return Err(VE::new(
+                K::Structure,
+                Some("duration"),
+                "Equity orders take DAY, GOOD_TILL_CANCEL or FILL_OR_KILL",
+            ));
+        }
         let single = self.order_leg_collection.len() == 1;
         for (i, leg) in self.order_leg_collection.iter().enumerate() {
             leg.validate()

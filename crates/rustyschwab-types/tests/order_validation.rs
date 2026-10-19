@@ -161,6 +161,41 @@ fn sessions_and_durations_fit_the_order_type() {
     rejects(&moc.with_duration(OrderDuration::Gtc), "DAY duration");
 }
 
+/// Schwab answers 400 to an equity order with any duration but DAY,
+/// GOOD_TILL_CANCEL or FILL_OR_KILL; an option order is not judged.
+#[test]
+fn equity_orders_take_the_durations_schwab_accepts() {
+    let equity = OrderRequest::limit(buy(1), d("150"));
+    for duration in [
+        OrderDuration::Day,
+        OrderDuration::Gtc,
+        OrderDuration::FillOrKill,
+    ] {
+        equity.clone().with_duration(duration).validate().unwrap();
+    }
+    for duration in [
+        OrderDuration::ImmediateOrCancel,
+        OrderDuration::EndOfWeek,
+        OrderDuration::EndOfMonth,
+        OrderDuration::NextEndOfMonth,
+    ] {
+        let err = equity
+            .clone()
+            .with_duration(duration)
+            .validate()
+            .unwrap_err();
+        assert_eq!(err.kind(), ValidationErrorKind::Structure);
+        assert_eq!(err.field(), Some("duration"));
+    }
+    OrderRequest::limit(
+        OrderRequestLeg::option(OrderInstruction::BuyToOpen, "AAPL  240517P00190000", 1),
+        d("1.50"),
+    )
+    .with_duration(OrderDuration::ImmediateOrCancel)
+    .validate()
+    .unwrap();
+}
+
 #[test]
 fn instructions_symbols_and_quantities_fit_the_asset() {
     let equity_with_option_instruction = OrderRequest::market(OrderRequestLeg::equity(

@@ -76,6 +76,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from it. Before, the process it stopped using could cancel orders it was
   still managing through another.
 
+### Changed — orders and history Schwab refuses are caught first
+
+- `OrderRequest::validate` refuses an equity order whose `duration` is
+  not `DAY`, `GOOD_TILL_CANCEL` or `FILL_OR_KILL`; Schwab answers the
+  others (`IMMEDIATE_OR_CANCEL`, `END_OF_WEEK`, `END_OF_MONTH`,
+  `NEXT_END_OF_MONTH`) with 400 for equities. Option orders are not
+  judged.
+- `PriceHistoryParams` reads `startDate`/`endDate` from epoch milliseconds
+  or an RFC 3339 time with an offset, so Python's `price_history` takes an
+  aware `datetime`, which it used to refuse.
+- Troubleshooting covers the 502 `Body buffer overflow` on large option
+  chains (`strikeCount`) and how far back Schwab's price history goes.
+- The `cancel_order` docs said a cancel is retried like a read; it is
+  sent once (only a 401 is answered with a refresh and one more send).
+- `jsonwebtoken` 11 for the MCP server's identity verification.
+
 ### Changed — previews carry the order's tag
 
 - `preview_order` tags the order as `place_order` would (the caller's tag,

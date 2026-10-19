@@ -59,6 +59,8 @@ Order = dict[str, Any]
 """An order in Schwab's JSON shape."""
 
 Session = Literal["NORMAL", "AM", "PM", "SEAMLESS"]
+#: Equity orders take only DAY, GOOD_TILL_CANCEL or FILL_OR_KILL; the others
+#: are refused before anything is sent, as Schwab refuses them.
 Duration = Literal[
     "DAY",
     "GOOD_TILL_CANCEL",

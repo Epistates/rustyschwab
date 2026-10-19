@@ -49,9 +49,13 @@ Common issues and their solutions when using the Schwab Rust SDK.
     *   Month Codes: `F:Jan, G:Feb, H:Mar, J:Apr, K:May, M:Jun, N:Jul, Q:Aug, U:Sep, V:Oct, X:Nov, Z:Dec`
     *   Example: `/ESM24`
 
-### `Body buffer overflow (TooBigBody)`
-*   **Cause:** Requesting too much data at once (e.g., a full option chain for `$SPX` with all strikes).
-*   **Fix:** Use parameters to filter the response (e.g., limit the strike range or expiration dates).
+### `502` with `Body buffer overflow (TooBigBody)`, or a timeout on an option chain
+*   **Cause:** Requesting too much data at once (e.g., a full option chain for `$SPX` with all strikes). Schwab refuses the response with a 502.
+*   **Fix:** Filter the chain: set `strikeCount` (other clients use 50 or fewer for index chains), or narrow `fromDate`/`toDate`. A chain that keeps arriving may take up to `ClientConfig.timeout` (default 30 s); raise it for very large ones.
+
+### Price history starts later than the `startDate` asked for
+*   **Cause:** Schwab keeps a limited depth per frequency. Reported in 2026: 1-minute bars go back about 48 days, 30-minute bars about 9 months. There is no 60-minute frequency and no second bars.
+*   **Fix:** Ask daily bars for longer ranges, or keep your own history as it arrives (`HistoryStore` caches what it fetches).
 
 ## Streaming Issues
 
