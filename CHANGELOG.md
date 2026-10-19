@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minutes, and an account with `max_daily_loss` whose transfers cannot be
   read refuses orders as `BaselineStale` until a reconciliation reads them.
 
+### Fixed — no failed calls in the refresh token's last hour
+
+- With under an hour left on the refresh token, the access token was no
+  longer refreshed, and the error returned did not count as needing a new
+  authorization. For up to an hour every week, calls failed and
+  `ensure_authorized` did not prompt. The access token now refreshes until
+  the refresh token expires; `TokenNotification::RefreshTokenExpiring`
+  still warns ahead of it. **Breaking:** `AuthError::RefreshTokenExpiring`
+  is removed, as nothing returns it.
+- Token lifetimes count from when the token request was sent, not from
+  the reply, so a slow or retried exchange no longer overstates them.
+- The token response accepts `expires_in` as a number or a numeric
+  string, and defaults it to 1800 seconds and `token_type` to `Bearer`
+  when omitted.
+- `SchwabConfig::validate` refuses an `http` or `/`-terminated callback
+  URL, as `AuthManager` already did; Schwab registers only `https`.
+
 ### Security
 
 - rustls 0.23.46 and quinn-proto 0.11.19 in both lockfiles, for

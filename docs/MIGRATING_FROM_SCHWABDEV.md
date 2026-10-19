@@ -49,7 +49,7 @@ client = rustyschwab.Client.from_env()
 
 | Schwabdev | rustyschwab |
 | --- | --- |
-| `app_key`, `app_secret`, `callback_url` arguments, or `save_env_global(...)` | `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`, `SCHWAB_OAUTH_CALLBACK_URL`, or `Client({"oauth": {...}})` |
+| `app_key`, `app_secret`, `callback_url` arguments, or `save_env_global(...)` | `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`, `SCHWAB_OAUTH_CALLBACK_URL`, or `Client({"oauth": {...}})`. The default callback differs: Schwabdev's is `https://127.0.0.1`, ours `https://127.0.0.1:8080`. Set `SCHWAB_OAUTH_CALLBACK_URL` to the URL your app registered, character for character |
 | `tokens_db=` | `SCHWAB_TOKENS_FILE` / `{"oauth": {"tokens_file": ...}}` |
 | `encryption=<Fernet key>` | `SCHWAB_TOKEN_STORE=encrypted` (the default off macOS) or `keychain` (the default on macOS) |
 | `timeout=` | `{"client": {"timeout": 15}}`; `sync.Client(..., timeout=)` bounds a whole call |

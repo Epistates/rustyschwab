@@ -295,15 +295,6 @@ pub enum AuthError {
     #[error("Token expired")]
     TokenExpired,
 
-    /// Refresh token has less runway than our safety threshold (Schwabdev's
-    /// 60.5 min). Callers must run a fresh OAuth flow rather than attempting
-    /// to refresh — Schwab does not renew the refresh token itself; it is
-    /// only issued during the initial auth-code exchange.
-    #[error(
-        "Refresh token expiring soon ({seconds_remaining}s remaining) — full OAuth flow required"
-    )]
-    RefreshTokenExpiring { seconds_remaining: i64 },
-
     #[error("OAuth flow failed: {0}")]
     OAuthFlow(String),
 
@@ -355,7 +346,7 @@ pub enum AuthError {
 impl AuthError {
     /// Whether only a new authorization can restore access, as opposed to a
     /// failure that may pass (a network error, a 5xx from the token
-    /// endpoint) or one about to need it ([`AuthError::RefreshTokenExpiring`]).
+    /// endpoint).
     pub fn requires_reauthorization(&self) -> bool {
         matches!(
             self,

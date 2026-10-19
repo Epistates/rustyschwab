@@ -86,6 +86,43 @@ async fn refresh_preserves_original_refresh_token_expiry() {
     );
 }
 
+/// A refresh token in its last hour still refreshes the access token, so
+/// calls keep working until it expires; only then is a new authorization
+/// required, and Schwab is not asked.
+#[tokio::test]
+async fn a_refresh_token_refreshes_until_it_expires() {
+    let server = MockServer::start().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token":"new_access", "token_type":"Bearer", "expires_in":1800
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let (client, dir, mut tokens) = client(&server, true);
+    let store = FileTokenStore::new(dir.path().join("tokens.json"));
+    tokens.refresh_token_expires_at = Some(chrono::Utc::now() + chrono::Duration::minutes(20));
+    store.save(&tokens).unwrap();
+    client.auth_manager().ensure_valid_tokens().await.unwrap();
+    assert_eq!(
+        client.auth_manager().get_access_token().await.unwrap(),
+        "new_access"
+    );
+
+    let mut expired = store.load().unwrap();
+    expired.expires_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+    expired.refresh_token_expires_at = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+    expired.issued_at += chrono::Duration::seconds(1);
+    store.save(&expired).unwrap();
+    let error = client
+        .auth_manager()
+        .ensure_valid_tokens()
+        .await
+        .unwrap_err();
+    assert!(error.requires_reauthorization(), "{error}");
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn default_breaker_recovers_after_sequential_successful_probes() {
     let breaker = CircuitBreaker::new(CircuitBreakerConfig {

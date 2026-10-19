@@ -458,14 +458,13 @@ impl SchwabConfig {
             ));
         }
         if self.oauth.capture_callback || !self.oauth.callback_url.is_empty() {
+            // Schwab registers only https callbacks, and the redirect must
+            // match the registered URL exactly, which never ends in `/`.
             let callback = Url::parse(&self.oauth.callback_url)
                 .map_err(|e| Error::Config(format!("Invalid callback_url: {e}")))?;
-            let loopback = callback
-                .host_str()
-                .is_some_and(|host| LOOPBACK_HOSTS.contains(&host));
-            if callback.scheme() != "https" && !(loopback && callback.scheme() == "http") {
+            if callback.scheme() != "https" || self.oauth.callback_url.ends_with('/') {
                 return Err(Error::Config(
-                    "callback_url must use https (http only on loopback)".into(),
+                    "callback_url must use https and must not end in '/'".into(),
                 ));
             }
         }
@@ -593,7 +592,7 @@ mod tests {
         let config = ConfigBuilder::new()
             .app_key("test_key")
             .app_secret("test_secret")
-            .callback_url("http://localhost:8080")
+            .callback_url("https://127.0.0.1:8080")
             .timeout(Duration::from_secs(60))
             .build()
             .unwrap();

@@ -246,11 +246,6 @@ impl Default for OAuthConfig {
     }
 }
 
-/// Threshold at which we refuse to refresh the access token and instead
-/// surface an error demanding a fresh OAuth flow — matches Schwabdev's
-/// 60.5 min (3630 s) safety buffer (`tokens.py:293`).
-const REFRESH_TOKEN_MIN_REMAINING_SECS: i64 = 3630;
-
 /// Timeout for POSTs to `/oauth/token`. Matches Schwabdev's `requests`
 /// default of 30 s (`tokens.py:275`); the Schwab token endpoint is
 /// occasionally slow and a 10 s cap was spuriously timing out.
@@ -264,14 +259,44 @@ const OAUTH_TOKEN_RETRY_BASE: std::time::Duration = std::time::Duration::from_mi
 
 /// Tokens decode straight into [`SecretString`]s (whose `Debug` is redacted)
 /// from a body buffer that is wiped on drop; see [`read_token_response`].
+///
+/// `token_type` and `expires_in` fall back to Schwab's `Bearer` and 30
+/// minutes when omitted, and `expires_in` may be a string: Schwab has sent
+/// `"3600"` from the same endpoint.
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: SecretString,
     refresh_token: Option<SecretString>,
     id_token: Option<SecretString>,
+    #[serde(default = "bearer")]
     token_type: String,
+    #[serde(default = "access_token_lifetime", deserialize_with = "seconds")]
     expires_in: u64,
     scope: Option<String>,
+}
+
+fn bearer() -> String {
+    "Bearer".into()
+}
+
+fn access_token_lifetime() -> u64 {
+    1800
+}
+
+fn seconds<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Seconds {
+        Number(u64),
+        Text(String),
+    }
+    match Seconds::deserialize(deserializer)? {
+        Seconds::Number(seconds) => Ok(seconds),
+        Seconds::Text(text) => text
+            .trim()
+            .parse()
+            .map_err(|_| serde::de::Error::custom("expires_in is not a whole number of seconds")),
+    }
 }
 
 impl TokenResponse {
@@ -696,15 +721,14 @@ impl AuthManager {
             .unwrap_or(old.issued_at + Duration::days(7))
             - Utc::now())
         .num_seconds();
+        // A refresh token in its last hour still refreshes: refusing it would
+        // fail every call from the moment the access token lapses until the
+        // refresh token does. `TokenNotification::RefreshTokenExpiring` is the
+        // warning to authorize again before then.
         if remaining <= 0 {
             return Err(AuthError::ReauthorizationRequired(
                 "the refresh token expired (seven days after authorization)".into(),
             ));
-        }
-        if remaining <= REFRESH_TOKEN_MIN_REMAINING_SECS {
-            return Err(AuthError::RefreshTokenExpiring {
-                seconds_remaining: remaining,
-            });
         }
         let refresh_token = old.refresh_token()?;
         if refresh_token.is_empty() {
@@ -963,10 +987,13 @@ impl AuthManager {
         }
 
         let client = self.client.read().clone();
+        // Lifetimes count from the request, not the reply: a slow or retried
+        // exchange must not make the tokens look longer-lived than they are.
+        let requested_at = Utc::now();
         let token_response =
             post_oauth_token(&client, &self.config, &form_params, OAuthGrant::AuthCode).await?;
 
-        let tokens = token_response.into_token_set(Utc::now());
+        let tokens = token_response.into_token_set(requested_at);
 
         let _file_lock = token_store::refresh_lock(&self.config.tokens_file).await?;
         self.store_save(tokens.clone()).await?;
@@ -979,6 +1006,7 @@ impl AuthManager {
         debug!("Refreshing access token");
 
         let client = self.client.read().clone();
+        let requested_at = Utc::now();
         let mut token_response = post_oauth_token(
             &client,
             &self.config,
@@ -995,7 +1023,7 @@ impl AuthManager {
             token_response.refresh_token = Some(SecretString::from(refresh_token));
         }
 
-        let tokens = token_response.into_token_set(Utc::now());
+        let tokens = token_response.into_token_set(requested_at);
 
         info!(
             "Token refreshed successfully, expires at: {}",
@@ -1447,5 +1475,25 @@ mod callback_regressions {
             std::time::Instant::now() - std::time::Duration::from_secs(301),
         ));
         assert!(manager.consume_callback_state(Some(&state)).is_err());
+    }
+
+    /// `expires_in` is read as a number or a numeric string, and the
+    /// lifetime and type default to Schwab's when omitted.
+    #[test]
+    fn token_responses_are_read_leniently() {
+        let lifetime =
+            |body: &str| serde_json::from_str::<TokenResponse>(body).map(|t| t.expires_in);
+        assert_eq!(
+            lifetime(r#"{"access_token":"a","expires_in":1800}"#).unwrap(),
+            1800
+        );
+        assert_eq!(
+            lifetime(r#"{"access_token":"a","expires_in":"3600"}"#).unwrap(),
+            3600
+        );
+        assert_eq!(lifetime(r#"{"access_token":"a"}"#).unwrap(), 1800);
+        assert!(lifetime(r#"{"access_token":"a","expires_in":"soon"}"#).is_err());
+        let defaults: TokenResponse = serde_json::from_str(r#"{"access_token":"a"}"#).unwrap();
+        assert_eq!(defaults.token_type, "Bearer");
     }
 }
