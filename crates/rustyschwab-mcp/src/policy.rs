@@ -1244,7 +1244,7 @@ impl AuthorizedServer {
     ///
     /// The approval is still the operator's: this polls the same durable
     /// store [`effective_policy`](Self::effective_policy) reads, written by
-    /// `schwab-admin` or by the authority against a verified operator
+    /// `rustyschwab-admin` or by the authority against a verified operator
     /// subject. Nothing here grants anything, so a session cannot approve
     /// its own intent by waiting for it. The caller has judged that the
     /// approval is the only thing missing; a denial that appears while

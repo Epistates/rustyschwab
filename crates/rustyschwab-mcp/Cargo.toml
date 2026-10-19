@@ -8,7 +8,7 @@ license = { workspace = true }
 repository = { workspace = true }
 homepage = { workspace = true }
 readme = "README.md"
-description = "Unofficial MCP server (schwab-mcp) exposing the Charles Schwab Trader and Market Data APIs to LLM agents, behind per-principal policy and approvals"
+description = "Unofficial MCP server exposing the Charles Schwab Trader and Market Data APIs to LLM agents, behind per-principal policy and approvals"
 
 [lints]
 workspace = true
@@ -23,7 +23,7 @@ name = "rustyschwab_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "schwab-mcp"
+name = "rustyschwab-mcp"
 path = "src/main.rs"
 
 [dependencies]

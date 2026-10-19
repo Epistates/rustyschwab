@@ -3,7 +3,7 @@
 
 Places an order that should never fill (BUY 1 share, LIMIT at half the bid,
 DAY), confirms Schwab is working it, cancels it and confirms the cancel: once
-through the Python bindings, then once more through the ``schwab-mcp`` server
+through the Python bindings, then once more through the ``rustyschwab-mcp`` server
 over stdio. Writes a JSON report with account numbers, hashes and app
 credentials redacted. See docs/LIVE_SMOKE.md before running it.
 
@@ -503,7 +503,7 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
     order_id: str | None = None
     sent_tag: str | None = None
     final: str | None = None
-    log = workdir / "schwab-mcp.log"
+    log = workdir / "rustyschwab-mcp.log"
     print(f"  server log: {log}")
     async with McpStdio.spawn([str(binary)], env, log, cwd=ROOT) as mcp:
 
@@ -709,8 +709,8 @@ async def run(args: argparse.Namespace) -> int:
             with tempfile.TemporaryDirectory(prefix="live-smoke-") as workdir:
                 await mcp_path(args.mcp, plan, report, Path(workdir))
                 if not report.mcp.passed and report.mcp.skipped is None:
-                    kept = Path(tempfile.mkdtemp(prefix="live-smoke-log-")) / "schwab-mcp.log"
-                    kept.write_bytes((Path(workdir) / "schwab-mcp.log").read_bytes())
+                    kept = Path(tempfile.mkdtemp(prefix="live-smoke-log-")) / "rustyschwab-mcp.log"
+                    kept.write_bytes((Path(workdir) / "rustyschwab-mcp.log").read_bytes())
                     print(f"  server log kept at {kept}")
     except NeedsAttention as error:
         exit_code = 2
@@ -732,7 +732,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     smoke = commands.add_parser("run", help="place and cancel the smoke orders")
     smoke.add_argument("--account", required=True, help="last digits of the account number")
     smoke.add_argument("--symbol", required=True, help="a liquid stock you are happy to hold one share of")
-    smoke.add_argument("--mcp", type=Path, default=ROOT / "target" / "release" / "schwab-mcp")
+    smoke.add_argument("--mcp", type=Path, default=ROOT / "target" / "release" / "rustyschwab-mcp")
     smoke.add_argument("--skip-mcp", action="store_true")
     smoke.add_argument(
         "--report",

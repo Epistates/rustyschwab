@@ -5,7 +5,7 @@
 //! another's digest would get the wrong order approved. So every intent
 //! that needs approval is recorded with its arguments when it is asked for
 //! (by `place_order`, `replace_order` or `check_order`), and the operator
-//! reviews, approves and audits the order itself: `schwab-admin pending`,
+//! reviews, approves and audits the order itself: `rustyschwab-admin pending`,
 //! `show` and `approve`, or the authority's operator API.
 use rustyschwab::execution::{IntentRecord, IntentState};
 use rustyschwab_types::trading::OrderRequest;
@@ -105,7 +105,7 @@ mod erased {
     }
 }
 
-/// An intent as `schwab-admin pending` and `show` print it.
+/// An intent as `rustyschwab-admin pending` and `show` print it.
 pub fn render(intent: &IntentRecord) -> String {
     let state = match &intent.state {
         IntentState::Awaiting => "awaiting approval".to_owned(),
@@ -144,7 +144,7 @@ const NOTICE_RATIONALE_CHARS: usize = 500;
 /// `text` reads as a chat message (Slack and Mattermost incoming webhooks
 /// take it as is); `intent` carries the same facts for a program. Account
 /// numbers are masked, as in [`describe`], and nothing the operator could
-/// approve with is sent: approving still takes `schwab-admin` or the
+/// approve with is sent: approving still takes `rustyschwab-admin` or the
 /// authority's operator API.
 ///
 /// Delivery is best effort, off the request path, bounded at five seconds
@@ -222,8 +222,9 @@ fn notice(principal: &str, digest: &str, tool: &str, arguments: &Value) -> Value
                 .take(NOTICE_RATIONALE_CHARS)
                 .collect::<String>()
         });
-    let mut text =
-        format!("Approval needed: {principal} asks to {order}\nReview: schwab-admin show {digest}");
+    let mut text = format!(
+        "Approval needed: {principal} asks to {order}\nReview: rustyschwab-admin show {digest}"
+    );
     if let Some(rationale) = &rationale {
         let _ = write!(text, "\nThe model says: {rationale:?}");
     }
@@ -279,7 +280,7 @@ mod tests {
             text.starts_with("Approval needed: desk asks to PLACE on account …1234: BUY 10 AAPL"),
             "{text}"
         );
-        assert!(text.contains("schwab-admin show ab12"));
+        assert!(text.contains("rustyschwab-admin show ab12"));
         assert!(!text.contains("HASHVALUE"), "the account is masked");
         assert_eq!(body["intent"]["rationale"].as_str().unwrap().len(), 500);
     }

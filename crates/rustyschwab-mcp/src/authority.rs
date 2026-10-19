@@ -200,7 +200,7 @@ fn load_grants(path: &std::path::Path) -> anyhow::Result<Vec<Grant>> {
             // cannot tell silence; accepting the field would only pretend.
             anyhow::ensure!(
                 policy.dead_man_secs.is_none(),
-                "dead_man_secs is enforced by schwab-mcp principals, not by the authority gateway"
+                "dead_man_secs is enforced by rustyschwab-mcp principals, not by the authority gateway"
             );
             anyhow::ensure!(
                 policy.identity_subject.as_deref() == Some(&grant.subject)

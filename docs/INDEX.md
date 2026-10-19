@@ -13,7 +13,7 @@
 ## Running it in production
 
 - [Operations](OPERATIONS.md) — deployment boundary, principal policy JSON, approvals, risk policy, recovery, health and metrics.
-- [Shared authority and broker gateway](SHARED_AUTHORITY.md) — `schwab-authority`, `RemoteBackend`, `schwab-remote`, cross-host workers.
+- [Shared authority and broker gateway](SHARED_AUTHORITY.md) — `rustyschwab-authority`, `RemoteBackend`, `rustyschwab-remote`, cross-host workers.
 - [MCP and LLM integration](MCP_LLM_INTEGRATION.md) — tool behavior hints, transport choice, what an LLM client may and may not do.
 - [Paper trading](PAPER_TRADING.md) and [paper limitations](PAPER_LIMITATIONS.md) — the deterministic simulator and what it does not model.
 - [Support and compatibility policy](SUPPORT.md) — what is core, what is experimental, and what has run against a real account.

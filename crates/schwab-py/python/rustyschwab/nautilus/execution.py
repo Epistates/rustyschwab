@@ -209,7 +209,7 @@ class SchwabExecutionClient(LiveExecutionClient):
         await self._await_account_registered()
         if isinstance(self._backend, PaperBackend):
             self._msgbus.subscribe(topic=_QUOTE_TOPIC, handler=self._on_quote)
-            self._feeder = self._spawn(self._feed_paper(), "schwab-paper-quote-feed")
+            self._feeder = self._spawn(self._feed_paper(), "rustyschwab-paper-quote-feed")
         self._monitor = self._spawn(self._monitor_orders(), "schwab-order-monitor")
 
     async def _disconnect(self) -> None:
@@ -347,7 +347,7 @@ class SchwabExecutionClient(LiveExecutionClient):
                 f"Outcome of {order.client_order_id!r} is unknown (journal attempt "
                 f"{error.attempt_id}). It will not be sent again; Schwab's orders are "
                 "being read to find it. If it never appears, resolve the attempt with "
-                "`schwab-admin reconcile`."
+                "`rustyschwab-admin reconcile`."
             )
             self._ledger.record(
                 order.client_order_id,
@@ -641,7 +641,7 @@ class SchwabExecutionClient(LiveExecutionClient):
                 self._orphans.add(view.order_id)
                 self._log.error(
                     f"Schwab order {view.order_id} is still working but {order.client_order_id!r} "
-                    "is closed in Nautilus. Cancel it at Schwab or with `schwab-admin`."
+                    "is closed in Nautilus. Cancel it at Schwab or with `rustyschwab-admin`."
                 )
             return False
         ts = self._ts()

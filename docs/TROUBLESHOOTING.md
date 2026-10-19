@@ -86,7 +86,7 @@ tokio::spawn(async move {
 ## MCP Server Issues
 
 ### Tool responses missing account numbers or streamer credentials
-*   **Cause:** `schwab-mcp` redacts PII from every tool response by default — account numbers are masked to the last four digits and `schwabClientCustomerId` / `schwabClientCorrelId` / user-identity fields are stripped.
+*   **Cause:** `rustyschwab-mcp` redacts PII from every tool response by default — account numbers are masked to the last four digits and `schwabClientCustomerId` / `schwabClientCorrelId` / user-identity fields are stripped.
 *   **Fix (local debugging only):** Set `SCHWAB_MCP_REDACT_PII=0` (or `false` / `no`) before starting the server to reveal **full account numbers**. Streamer credentials and identity fields stay dropped regardless — that switch only controls account-number masking. Leave masking enabled anywhere LLM output may be logged.
 
 ### `refusing to start the HTTP/WebSocket transport on non-loopback address`
@@ -105,4 +105,4 @@ tokio::spawn(async move {
 
 ### Metrics endpoint returns 404 or connection refused
 *   **Cause:** `SCHWAB_METRICS_BIND` is unset — the MCP binary skips installing the Prometheus recorder entirely, so no HTTP listener is bound.
-*   **Fix:** Export `SCHWAB_METRICS_BIND=127.0.0.1:9090` (or wherever you want to scrape) before starting `schwab-mcp`. The server logs `metrics: Prometheus scrape endpoint live at http://<bind>/metrics` on startup when the listener is active.
+*   **Fix:** Export `SCHWAB_METRICS_BIND=127.0.0.1:9090` (or wherever you want to scrape) before starting `rustyschwab-mcp`. The server logs `metrics: Prometheus scrape endpoint live at http://<bind>/metrics` on startup when the listener is active.

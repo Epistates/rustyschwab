@@ -1,13 +1,13 @@
 # Paper trading and deterministic replay
 
-`PaperBroker` provides persistent simulated long-equity execution. It owns no HTTP transport or OAuth credentials. `schwab-paper` runs offline command replays, an explicitly enabled read-only market feed, or turns price history into a synthetic quote stream for [backtesting](#backtesting-over-price-history); `schwab-authority --paper` exposes the same engine through verified identity, policy, approval and lease enforcement. Paper execution never routes to Schwab or thinkorswim paperMoney.
+`PaperBroker` provides persistent simulated long-equity execution. It owns no HTTP transport or OAuth credentials. `rustyschwab-paper` runs offline command replays, an explicitly enabled read-only market feed, or turns price history into a synthetic quote stream for [backtesting](#backtesting-over-price-history); `rustyschwab-authority --paper` exposes the same engine through verified identity, policy, approval and lease enforcement. Paper execution never routes to Schwab or thinkorswim paperMoney.
 
 ## Run the included replay
 
 From the repository root:
 
 ```sh
-cargo run -p rustyschwab-mcp --bin schwab-paper --locked -- \
+cargo run -p rustyschwab-mcp --bin rustyschwab-paper --locked -- \
   --config ops/paper/config.json \
   --state ./paper-demo-state/state.sqlite3 \
   --commands ops/paper/replay.jsonl
@@ -19,10 +19,10 @@ A command error stops the CLI with a nonzero exit code. Earlier commands remain 
 
 ## Verify a recorded transcript
 
-Keep the original command JSONL and `schwab-paper` stdout as separate artifacts. Re-execute them with:
+Keep the original command JSONL and `rustyschwab-paper` stdout as separate artifacts. Re-execute them with:
 
 ```sh
-schwab-paper-verify --config ops/paper/config.json \
+rustyschwab-paper-verify --config ops/paper/config.json \
   --commands ops/paper/replay.jsonl --expected recorded-output.jsonl
 ```
 
@@ -35,8 +35,8 @@ This independently re-executes the supplied successful command transcript using 
 New paper databases capture execution mutations in the same transaction as the event/order/ledger change. Capture includes accepted events, order placement/replacement, cancellation, and the committed `reject_next` and lost-acknowledgement outcomes. Capture-write failure rolls back the mutation. Exact event/cancel retries that make no state change do not add a capture record.
 
 ```sh
-schwab-admin --state ./paper-service-state/state.sqlite3 backup ./paper-backups/run.sqlite3
-schwab-paper-verify --config ops/paper/config.json --backup ./paper-backups/run.sqlite3
+rustyschwab-admin --state ./paper-service-state/state.sqlite3 backup ./paper-backups/run.sqlite3
+rustyschwab-paper-verify --config ops/paper/config.json --backup ./paper-backups/run.sqlite3
 ```
 
 Use the exact run configuration. Backup verification requires replay clock mode. It restores into private temporary state, checks capture continuity, replays commands in commit order, compares recorded results (including the two injected fault outcomes), then compares every account snapshot and all historical orders. The original backup is opened read-only by restore. Event payload compaction does not prevent this verification because full captured commands remain in the audit journal.
@@ -100,7 +100,7 @@ Replay callers supply session transitions and normalized quotes. Wall mode also 
 To start the optional REST feed, copy the example configuration to a new file, select `"clock": "wall"`, and configure settlement as required. Supply the usual Schwab read-client environment configuration with **separate live-client state/token paths**. For a feed whose documented sizes are shares:
 
 ```sh
-schwab-paper --config paper-wall.json --state ./paper-service-state/state.sqlite3 \
+rustyschwab-paper --config paper-wall.json --state ./paper-service-state/state.sqlite3 \
   --live-feed --symbols AAPL,MSFT --quote-size-multiplier 1 --poll-seconds 2
 ```
 
@@ -112,7 +112,7 @@ Events start at sequence one and are contiguous across symbols and sessions. Reo
 
 ## Backtesting over price history
 
-The venue is quote-driven and Schwab's price history is OHLCV, so a backtest needs quotes the history never recorded. `schwab-paper --synthesize` derives them under a declared model, `candle-bbo-v1`, and writes them as `event` commands for the replay above. **This is a modeling assumption, not broker conformance**: a candle says where a bar opened, ranged and closed, not what was bid or offered, in what size, or in which order its extremes printed. The model fixes each of those by rule, and every session it emits carries the model's name in its id (`candle-bbo-v1:2024-05-17`), so a run built on synthetic quotes is never mistaken for one fed by observed ones. The engine's own model version is unchanged; fills follow the [execution contract](#execution-and-accounting-contract) exactly as they do for any other event.
+The venue is quote-driven and Schwab's price history is OHLCV, so a backtest needs quotes the history never recorded. `rustyschwab-paper --synthesize` derives them under a declared model, `candle-bbo-v1`, and writes them as `event` commands for the replay above. **This is a modeling assumption, not broker conformance**: a candle says where a bar opened, ranged and closed, not what was bid or offered, in what size, or in which order its extremes printed. The model fixes each of those by rule, and every session it emits carries the model's name in its id (`candle-bbo-v1:2024-05-17`), so a run built on synthetic quotes is never mistaken for one fed by observed ones. The engine's own model version is unchanged; fills follow the [execution contract](#execution-and-accounting-contract) exactly as they do for any other event.
 
 The rules, each an assumption:
 
@@ -126,14 +126,14 @@ An order accepted at one mark fills at a later mark's synthetic bid or ask plus 
 Each input file is one `PriceHistoryResponse` as `SchwabClient::get_price_history` returns it and as the `get_price_history` tool carries under `data`; candles must be in time order at least one candle apart, and no symbol may appear twice. Multiple symbols merge into one time-ordered stream, symbols in name order at a shared instant, numbered contiguously from `--first-sequence` (default 1):
 
 ```sh
-schwab-paper --synthesize aapl.json msft.json \
+rustyschwab-paper --synthesize aapl.json msft.json \
   --candle-ms 60000 --spread-bps 5 --participation-bps 1000 > events.jsonl
 ```
 
 Nothing is opened or written; there is no OAuth and no state. To backtest offline, interleave `place`, `cancel` and `snapshot` commands between the events and replay the file with `--commands` against a fresh replay-mode state, then verify the transcript as usual. To backtest a model, start the MCP server or the authority over that state and replay only the events, paced:
 
 ```sh
-schwab-paper --config paper-replay.json --state ./backtest/state.sqlite3 \
+rustyschwab-paper --config paper-replay.json --state ./backtest/state.sqlite3 \
   --commands events.jsonl --pace-ms 1000
 ```
 
@@ -155,7 +155,7 @@ A paper run's own curve is `PaperSnapshot::equity` after each event, which is `N
 ## Authenticated gateway
 
 ```sh
-schwab-authority --identity identity.json --policy paper-policy.json \
+rustyschwab-authority --identity identity.json --policy paper-policy.json \
   --paper ops/paper/config.json --paper-state ./paper-service-state/state.sqlite3
 ```
 
@@ -185,9 +185,9 @@ The privileged generic `/v1/backend` API is disabled for paper authorities. Pape
 
 ## MCP server
 
-The MCP server runs over the same venue when `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` are set, with the same startup posture as the authority: no Schwab environment configuration is read and no OAuth is initialized unless `SCHWAB_APP_KEY` is present, which adds a read-only market-data client the venue never routes an order through. Every tool then answers from the venue in Schwab's shapes, reports `source: "paper"`, and the mode is published in `serverInfo.title`, `get_server_status` and `/readyz`. The MCP server does not ingest market events: drive the venue from a separate process against the same state and exact configuration, `schwab-paper --live-feed`, a paced `schwab-paper --commands` replay of [synthetic quotes](#backtesting-over-price-history), or the authority's ingestion routes, as the authority itself is driven. The [MCP integration review](MCP_LLM_INTEGRATION.md#paper-mode) lists what the venue answers and what it refuses.
+The MCP server runs over the same venue when `SCHWAB_MCP_PAPER_CONFIG` and `SCHWAB_MCP_PAPER_STATE` are set, with the same startup posture as the authority: no Schwab environment configuration is read and no OAuth is initialized unless `SCHWAB_APP_KEY` is present, which adds a read-only market-data client the venue never routes an order through. Every tool then answers from the venue in Schwab's shapes, reports `source: "paper"`, and the mode is published in `serverInfo.title`, `get_server_status` and `/readyz`. The MCP server does not ingest market events: drive the venue from a separate process against the same state and exact configuration, `rustyschwab-paper --live-feed`, a paced `rustyschwab-paper --commands` replay of [synthetic quotes](#backtesting-over-price-history), or the authority's ingestion routes, as the authority itself is driven. The [MCP integration review](MCP_LLM_INTEGRATION.md#paper-mode) lists what the venue answers and what it refuses.
 
-`schwab-eval` builds on this to score a model's tool use: each of its scenarios seeds a private copy of the venue (a stale quote, a working order whose tag carries an injected instruction, a lost acknowledgement fault) behind the policy-gated server, serves it over stdio while recording the model's calls, and replays the transcript deterministically for the report. See [model evaluation](MCP_LLM_INTEGRATION.md#model-evaluation).
+`rustyschwab-eval` builds on this to score a model's tool use: each of its scenarios seeds a private copy of the venue (a stale quote, a working order whose tag carries an injected instruction, a lost acknowledgement fault) behind the policy-gated server, serves it over stdio while recording the model's calls, and replays the transcript deterministically for the report. See [model evaluation](MCP_LLM_INTEGRATION.md#model-evaluation).
 
 ## Durability, failure tests and audit
 

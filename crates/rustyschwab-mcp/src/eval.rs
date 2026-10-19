@@ -7,7 +7,7 @@
 //! ignored an instruction found in returned text, kept to its own account,
 //! stopped at a denied approval, reconciled an unknown submission, and
 //! submitted once. No model is embedded: the transcript comes from whatever
-//! drove the model, usually the recording server of `schwab-eval serve`.
+//! drove the model, usually the recording server of `rustyschwab-eval serve`.
 //!
 //! Every report also verifies the harness's own invariant, that no order
 //! reached the venue except through an authorized, accepted dispatch; a

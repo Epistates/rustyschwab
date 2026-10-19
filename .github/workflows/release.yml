@@ -8,8 +8,8 @@ permissions:
 env:
   # Every binary the rustyschwab-mcp package ships.
   BINARIES: >-
-    schwab-mcp schwab-admin schwab-authority schwab-remote
-    schwab-paper schwab-paper-verify schwab-eval
+    rustyschwab-mcp rustyschwab-admin rustyschwab-authority rustyschwab-remote
+    rustyschwab-paper rustyschwab-paper-verify rustyschwab-eval
 jobs:
   verify:
     runs-on: ubuntu-latest

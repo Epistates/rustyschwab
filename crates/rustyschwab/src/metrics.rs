@@ -3,7 +3,7 @@
 //!
 //! The SDK depends only on the `metrics` *facade* — every
 //! `counter!`/`histogram!`/`gauge!` call is a no-op unless something
-//! (typically the `schwab-mcp` binary) installs a recorder via
+//! (typically the `rustyschwab-mcp` binary) installs a recorder via
 //! `metrics::set_global_recorder(...)`. Library consumers can install
 //! their own recorder — Prometheus, StatsD, OTLP — without any change
 //! to the SDK surface. Call [`describe`] after installing one to register
@@ -39,7 +39,7 @@
 //! | `schwab_stream_dropped_messages_total` | counter | — | Frames dropped because the consumer queue was full or closed; the stream is unready until reconciled. |
 //!
 //! MCP-side tool metrics (`schwab_mcp_tool_calls_total` etc.) live in
-//! `schwab-mcp` — they're separate because the SDK is transport-agnostic.
+//! `rustyschwab-mcp` — they're separate because the SDK is transport-agnostic.
 
 use metrics::Unit;
 

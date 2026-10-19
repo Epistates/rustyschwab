@@ -18,7 +18,7 @@ Fixes land on `main` and in the next release. See
 ## What is in scope
 
 The SDK (`rustyschwab`, `rustyschwab-types`), the MCP server and its operator,
-authority and paper binaries (`schwab-mcp`), and the release workflow's
+authority and paper binaries (`rustyschwab-mcp`), and the release workflow's
 artifacts. Dependency advisories are tracked in CI with `cargo deny`
 (`deny.toml`); release binaries embed their dependency list
 (`cargo auditable`), so `cargo audit bin <binary>` checks a deployed build.

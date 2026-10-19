@@ -590,7 +590,7 @@ mod tests {
         let principals = network.credentials.principals.clone();
         let router = PrincipalRouter {
             principals: principals.clone(),
-            info: Implementation::new("schwab-mcp", "test"),
+            info: Implementation::new("rustyschwab-mcp", "test"),
             instructions: None,
             versions: ProtocolVersion::SUPPORTED,
         };

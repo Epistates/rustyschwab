@@ -1,4 +1,4 @@
-//! Library surface for `schwab-mcp` — consumed by the binary (`main.rs`)
+//! Library surface for `rustyschwab-mcp` — consumed by the binary (`main.rs`)
 //! and integration tests.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]

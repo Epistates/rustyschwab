@@ -1,6 +1,6 @@
 # rustyschwab
 
-> A Rust SDK (`rustyschwab`), Python package (`rustyschwab`) and MCP server (`schwab-mcp`) for the Charles Schwab Trader and Market Data APIs. Orders are journaled and sent at most once, risk limits and halts are enforced outside the strategy, MCP write tools are off by default and gated by per-principal policy and approvals, and a deterministic local paper venue runs the same strategy code as live trading.
+> A Rust SDK (`rustyschwab`), Python package (`rustyschwab`) and MCP server (`rustyschwab-mcp`) for the Charles Schwab Trader and Market Data APIs. Orders are journaled and sent at most once, risk limits and halts are enforced outside the strategy, MCP write tools are off by default and gated by per-principal policy and approvals, and a deterministic local paper venue runs the same strategy code as live trading.
 
 Key facts for a model using or writing code against it:
 

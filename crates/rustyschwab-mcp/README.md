@@ -1,6 +1,6 @@
 # rustyschwab-mcp
 
-An unofficial [Model Context Protocol](https://modelcontextprotocol.io/) server, the `schwab-mcp` command, over the
+An unofficial [Model Context Protocol](https://modelcontextprotocol.io/) server over the
 [`rustyschwab`](https://docs.rs/rustyschwab) SDK: Schwab's REST endpoints and
 streamer as tools an agent can call, behind per-principal policy, operator
 approval and a durable audit journal. It serves stdio, HTTP and WebSocket
@@ -13,7 +13,7 @@ transports, and a local paper venue for trading without real money.
 
 ```bash
 cargo install rustyschwab-mcp
-schwab-mcp                     # stdio, for desktop MCP clients
+rustyschwab-mcp                     # stdio, for desktop MCP clients
 ```
 
 The server reads the SDK's `SCHWAB_*` settings and expects tokens on disk
@@ -24,18 +24,18 @@ and a bearer token on every request.
 
 | Binary | Role |
 |--------|------|
-| `schwab-mcp` | The MCP server. |
-| `schwab-authority` | Holds the broker session and gates orders for workers that do not. |
-| `schwab-admin` | Operator commands: approvals, halts, reconciliation, audit delivery, backup and restore. |
-| `schwab-remote` | Sends one request to an authority. |
-| `schwab-paper`, `schwab-paper-verify` | Run and verify the paper venue and its replays. |
-| `schwab-eval` | Scores a model against seeded paper scenarios. |
+| `rustyschwab-mcp` | The MCP server. |
+| `rustyschwab-authority` | Holds the broker session and gates orders for workers that do not. |
+| `rustyschwab-admin` | Operator commands: approvals, halts, reconciliation, audit delivery, backup and restore. |
+| `rustyschwab-remote` | Sends one request to an authority. |
+| `rustyschwab-paper`, `rustyschwab-paper-verify` | Run and verify the paper venue and its replays. |
+| `rustyschwab-eval` | Scores a model against seeded paper scenarios. |
 
 ## Features
 
 | Feature | Default | Adds |
 |---------|---------|------|
-| `otel` | no | OTLP/HTTP export of spans and metrics from `schwab-mcp` and `schwab-authority`, configured by the standard `OTEL_*` environment (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, ...). Without an endpoint it changes nothing; the Prometheus endpoint (`SCHWAB_METRICS_BIND`) works either way. See [docs/OPERATIONS.md](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md#observability-opentelemetry). |
+| `otel` | no | OTLP/HTTP export of spans and metrics from `rustyschwab-mcp` and `rustyschwab-authority`, configured by the standard `OTEL_*` environment (`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME`, ...). Without an endpoint it changes nothing; the Prometheus endpoint (`SCHWAB_METRICS_BIND`) works either way. See [docs/OPERATIONS.md](https://github.com/epistates/rustyschwab/blob/main/docs/OPERATIONS.md#observability-opentelemetry). |
 
 [docs/MCP_LLM_INTEGRATION.md](https://github.com/epistates/rustyschwab/blob/main/docs/MCP_LLM_INTEGRATION.md)
 covers running the server, client configuration and the tool catalog;

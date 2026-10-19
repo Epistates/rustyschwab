@@ -292,7 +292,7 @@ impl StateDatabase {
                         tracing::warn!(
                             attempt = %id,
                             "Broker lists an order matching an unresolved submission but \
-                             without its tag; reconcile it with evidence (schwab-admin)"
+                             without its tag; reconcile it with evidence (rustyschwab-admin)"
                         );
                     }
                     report.unresolved_attempts.push(id);

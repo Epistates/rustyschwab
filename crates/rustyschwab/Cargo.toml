@@ -129,7 +129,7 @@ rustls = [
 native-tls = ["reqwest/native-tls", "tokio-tungstenite/native-tls"]
 callback-server = ["dep:axum", "dep:axum-server", "dep:rcgen", "dep:rustls"]
 # JSON-Schema derives on the rustyschwab-types request structs (PriceHistoryParams,
-# OptionChainParams, OrderRequest, ...) so the schwab-mcp crate can expose them
+# OptionChainParams, OrderRequest, ...) so the rustyschwab-mcp crate can expose them
 # as strongly-typed MCP tool arguments.
 schemars = ["rustyschwab-types/schemars"]
 full = ["rustls", "callback-server", "schemars", "telemetry"]

@@ -13,7 +13,7 @@ An unofficial Rust SDK, Python package and MCP server for the Charles Schwab Tra
 | --- | --- | --- |
 | [`rustyschwab`](crates/rustyschwab) | Rust applications: OAuth, REST, the streamer, the order journal, risk limits, paper venue, history cache, performance analytics | [crate guide](crates/rustyschwab/README.md) |
 | [`rustyschwab`](crates/schwab-py) (Python) | The same SDK from asyncio or blocking Python, order templates, one strategy for backtest, paper and live, a NautilusTrader adapter | [Python guide](docs/PYTHON.md) |
-| [`rustyschwab-mcp`](crates/rustyschwab-mcp) | LLM agents: the `schwab-mcp` server, 40 tools over the SDK behind per-principal policy, approvals and a paper mode | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
+| [`rustyschwab-mcp`](crates/rustyschwab-mcp) | LLM agents: an MCP server with 40 tools over the SDK, behind per-principal policy, approvals and a paper mode, plus operator and gateway commands | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
 
 ## What it does differently
 
@@ -83,17 +83,17 @@ asyncio.run(main())
 ### MCP
 
 ```bash
-cargo install rustyschwab-mcp    # installs the schwab-mcp command
+cargo install rustyschwab-mcp    # installs the server and its operator tools
 claude mcp add schwab -e SCHWAB_APP_KEY=… -e SCHWAB_APP_SECRET=… \
   -e SCHWAB_TOKENS_FILE="$PWD/schwab_tokens.json" \
-  -- "$(command -v schwab-mcp)"
+  -- "$(command -v rustyschwab-mcp)"
 ```
 
 Order tools stay off until you enable them. To let an agent trade without real money, run the server over the paper venue:
 
 ```bash
 SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
-SCHWAB_MCP_ALLOW_TRADING=1 schwab-mcp
+SCHWAB_MCP_ALLOW_TRADING=1 rustyschwab-mcp
 ```
 
 Claude Desktop configuration, the tool catalog and the policy model: [MCP guide](docs/MCP_LLM_INTEGRATION.md). Policies, approvals, risk limits, metrics and recovery: [Operations](docs/OPERATIONS.md).

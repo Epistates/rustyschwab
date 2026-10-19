@@ -226,7 +226,7 @@ try:
     placed = await client.place_order(account_hash, order)
 except rustyschwab.SubmissionUnknown as error:
     open_orders = await client.account_orders(account_hash, window)   # as in the previous section
-    # Look for the order by the tag you sent. `schwab-admin reconcile` then
+    # Look for the order by the tag you sent. `rustyschwab-admin reconcile` then
     # resolves error.attempt_id in the journal.
     raise
 ```
@@ -471,7 +471,7 @@ run = await trader.backtest(strategy, ["AMD"], start=date(2026, 9, 1), end=date(
 - **Fills.** Each bar becomes four quotes (open, low and high in the order the bar most likely traded, close) with a synthetic spread and a share of the bar's volume on offer, under the declared `candle-bbo-v1` model. These go through the same paper venue as everything else, so fills have latency, finite liquidity, slippage, fees and settlement, in decimals. The strategy sees a bar after its four quotes have printed, so an order fills no earlier than the next bar. Each New York date is a session; `DAY` orders expire at its end.
 - **Costs and the market model** are a `Simulation`: `spread_bps` (default 2), `participation_bps` (share of bar volume offered, default 1000 = 10%), `slippage_bps`, `fee_per_share`, `execution_latency_ms`, `cancel_latency_ms`, `market_collar_bps` and `regular_hours_only` (default on).
 - **Recorded data.** `level1=True` and `level2=True` replay quotes and books captured with `trader.record` as events. Fills still come from the bars.
-- **Determinism.** The same history, strategy and `Simulation` give the same fills. `keep_state="dir"` keeps the venue's state file, whose audited transcript `schwab-paper-verify` can check.
+- **Determinism.** The same history, strategy and `Simulation` give the same fills. `keep_state="dir"` keeps the venue's state file, whose audited transcript `rustyschwab-paper-verify` can check.
 - **Speed.** A 30-session, three-symbol, one-minute backtest (11,700 bars, 140,000 venue events, every one recorded and audited) takes about 15 seconds on a laptop.
 
 `backtest` returns a `RunResult`: `stats` (the [performance report](#performance-reports): return, drawdown, Sharpe, Sortino, Calmar, buy and hold, round trips, win rate, profit factor, per symbol), `fills`, `orders`, `equity` (one point per bar), `plots`, `candles`, `rejected`, `report()` for the text summary, and `to_html(path)`, which writes the price charts with fills and overlays and the equity curve to one HTML file with no scripts and no network.
@@ -761,7 +761,7 @@ Every order carries its `ClientOrderId` as the Schwab `tag`, and Schwab echoes t
 
 The execution client does not use the streamer, which the data client holds. It reads the account's orders every `poll_interval_secs` (3 seconds), and at once after it places or cancels an order. A working order older than the `order_lookback_hours` window (24) is read individually. Each order read is matched to its Nautilus order by tag and the difference becomes events: accepted, fills, canceled, expired, and a replacement Schwab accepted whose acknowledgement was lost. An execution becomes an `OrderFilled` with trade ID `<order id>-<activityId>` (the execution's position when Schwab gives no `activityId`), so the same execution is the same fill on every read. Schwab's order JSON carries no commission, so live fills report zero commission.
 
-**Uncertain outcomes.** If the SDK raises `SubmissionUnknown`, the order stays `SUBMITTED`, is never sent again, and the polls look for its tag. The `attempt_id` is logged and stored; if the order never appears, resolve the attempt with `schwab-admin reconcile`. Until then the SDK refuses further submissions on the account with `ReconciliationRequired`, which the client reports as `OrderRejected` ("nothing was sent"). If the engine gives up on the order before Schwab shows it and Schwab later does show it working, the client logs an error naming the Schwab order and leaves it alone: it does not cancel orders on its own judgement. The same holds for a replacement: `SubmissionUnknown` on modify leaves the order as it was, and the replacement is applied when its `-R<n>` tag is read.
+**Uncertain outcomes.** If the SDK raises `SubmissionUnknown`, the order stays `SUBMITTED`, is never sent again, and the polls look for its tag. The `attempt_id` is logged and stored; if the order never appears, resolve the attempt with `rustyschwab-admin reconcile`. Until then the SDK refuses further submissions on the account with `ReconciliationRequired`, which the client reports as `OrderRejected` ("nothing was sent"). If the engine gives up on the order before Schwab shows it and Schwab later does show it working, the client logs an error naming the Schwab order and leaves it alone: it does not cancel orders on its own judgement. The same holds for a replacement: `SubmissionUnknown` on modify leaves the order as it was, and the replacement is applied when its `-R<n>` tag is read.
 
 ### Reports and reconciliation
 

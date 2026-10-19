@@ -14,7 +14,7 @@ Three published crates plus example packages, all on the workspace version
 |---|---|---|
 | `rustyschwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
 | `rustyschwab` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
-| `rustyschwab-mcp` | MCP server over the SDK (the `schwab-mcp` command), plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `rustyschwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
 
 `examples/` holds workspace packages (`oauth-flow`, `auth_test`,
 `comprehensive`, `streaming-examples`, `enterprise-bench`); run them with
@@ -158,7 +158,7 @@ at `<tokens_file>.orders.json` is imported once). Tables: `submissions`,
 `reservations`, `intents`, `audit_anchor`, `meta`, `schema_migrations`.
 Migrations, online backup and restore live in `storage.rs`. `audit` rows
 form a SHA-256 hash chain (`audit_chain.rs`, checked by
-`OrderJournal::verify_audit` and `schwab-admin verify-audit`).
+`OrderJournal::verify_audit` and `rustyschwab-admin verify-audit`).
 
 Around the journal:
 
@@ -192,7 +192,7 @@ inputs and reports, `paper/feed.rs` optional read-only REST quote/calendar
 polling, `paper/synthetic.rs` quotes derived from OHLCV candles under the
 declared `candle-bbo-v1` model for backtesting). Paper state is its own
 SQLite file; a live client refuses to open it. `remote::RemoteBackend` implements `ExecutionStore`, `Coordinator` and
-`RiskProvider` over authenticated HTTPS to a `schwab-authority` process so
+`RiskProvider` over authenticated HTTPS to a `rustyschwab-authority` process so
 workers on other hosts share one journal without holding broker credentials.
 
 ### Streaming
@@ -386,22 +386,22 @@ future and stack frame stay small however many tools there are.
   `AuthorizedServer`, refusing an expired credential or one checked under
   a replaced policy. The policy file is re-read every 2 s; any change, or
   an invalid file, retires every earlier credential.
-- `authority.rs` and `bin/schwab-authority.rs` — the shared transactional
+- `authority.rs` and `bin/rustyschwab-authority.rs` — the shared transactional
   authority: `/v1/backend` for privileged SDK workers (`RemoteBackend`),
   `/v1/orders` + `/v1/lease` for trading identities that must not hold
   broker credentials, `/v1/operator` for verified approvals, halts and
   revocations. Single writer over its own SQLite file; default bind
   `127.0.0.1:8766`.
-- `bin/schwab-admin.rs` — trusted local operator commands (digest, approve,
+- `bin/rustyschwab-admin.rs` — trusted local operator commands (digest, approve,
   halt, resume, audit export) that act on the state file directly and are
-  deliberately not MCP tools. `bin/schwab-remote.rs` submits one typed
+  deliberately not MCP tools. `bin/rustyschwab-remote.rs` submits one typed
   request to the authority with a protected token file.
-- `bin/schwab-paper.rs` and `bin/schwab-paper-verify.rs` — deterministic
+- `bin/rustyschwab-paper.rs` and `bin/rustyschwab-paper-verify.rs` — deterministic
   replay (paced with `--pace-ms` when a served venue should advance in
   virtual time), synthetic quote generation from price history, and
   transcript verification for the paper engine (`paper_replay.rs` is the
   shared command decoder).
-- `eval.rs` and `bin/schwab-eval.rs` — model evaluation over the paper
+- `eval.rs` and `bin/rustyschwab-eval.rs` — model evaluation over the paper
   venue. `Scenario` fixes a seeded venue, a principal policy and a task;
   `Fixture::open` builds them under a private directory behind an
   `AuthorizedServer`; `Recording` is the `McpHandler` that appends each

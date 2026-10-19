@@ -1,4 +1,4 @@
-//! `schwab-mcp` — MCP server exposing the rustyschwab SDK as MCP tools.
+//! `rustyschwab-mcp` — MCP server exposing the rustyschwab SDK as MCP tools.
 //!
 //! Live mode reads OAuth credentials + token store path from environment
 //! variables (see README), refreshes tokens on the fly via `AuthManager`,
@@ -28,7 +28,7 @@ use tracing_subscriber::EnvFilter;
 const ALLOW_REMOTE_ENV: &str = "SCHWAB_MCP_ALLOW_REMOTE";
 
 /// Env vars that select paper mode: the venue's configuration and its
-/// durable state file, the same pair `schwab-paper` and `schwab-authority
+/// durable state file, the same pair `rustyschwab-paper` and `rustyschwab-authority
 /// --paper` take.
 const PAPER_CONFIG_ENV: &str = "SCHWAB_MCP_PAPER_CONFIG";
 const PAPER_STATE_ENV: &str = "SCHWAB_MCP_PAPER_STATE";
@@ -140,8 +140,9 @@ async fn main() -> anyhow::Result<()> {
     // when the OTEL_* environment names an endpoint; the guard flushes them
     // when `main` returns.
     #[cfg(feature = "otel")]
-    let mut telemetry = rustyschwab::telemetry::init_otel("schwab-mcp", "info", std::io::stderr)
-        .context("failed to set up OpenTelemetry export")?;
+    let mut telemetry =
+        rustyschwab::telemetry::init_otel("rustyschwab-mcp", "info", std::io::stderr)
+            .context("failed to set up OpenTelemetry export")?;
     #[cfg(not(feature = "otel"))]
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

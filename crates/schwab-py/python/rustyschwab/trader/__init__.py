@@ -165,7 +165,7 @@ class Trader:
         events; fills still come from the bars.
 
         ``keep_state`` keeps the venue's state file (a new directory) for
-        inspection or ``schwab-paper-verify``; otherwise it is deleted.
+        inspection or ``rustyschwab-paper-verify``; otherwise it is deleted.
         ``limits`` overrides the paper account's portfolio limits.
         """
         if minutes not in (1, 5, 10, 15, 30):

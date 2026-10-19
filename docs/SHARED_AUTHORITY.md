@@ -1,6 +1,6 @@
 # Shared authority and broker gateway
 
-The shared backend is now implemented: `RemoteBackend` talks to `schwab-authority`, which owns the transactional journal, reservations, quotas and leases. Workers on different hosts share one authority through authenticated HTTPS. The bundled authority uses SQLite on its own local disk. It is a single-writer service, not an active-active database or an automatically failing-over cluster.
+The shared backend is now implemented: `RemoteBackend` talks to `rustyschwab-authority`, which owns the transactional journal, reservations, quotas and leases. Workers on different hosts share one authority through authenticated HTTPS. The bundled authority uses SQLite on its own local disk. It is a single-writer service, not an active-active database or an automatically failing-over cluster.
 
 Use the broker gateway for trading workers that should not hold broker credentials. Only the authority needs Schwab OAuth credentials. Ordinary trading identities cannot call the privileged backend API or operator API.
 
@@ -9,7 +9,7 @@ Use the broker gateway for trading workers that should not hold broker credentia
 Configure the existing Schwab OAuth environment variables on the authority host and supply three files:
 
 ```json
-{"issuer":"https://identity.example","audience":"https://schwab-authority.example","jwks_uri":"https://identity.example/keys","max_lifetime_seconds":900}
+{"issuer":"https://identity.example","audience":"https://rustyschwab-authority.example","jwks_uri":"https://identity.example/keys","max_lifetime_seconds":900}
 ```
 
 ```json
@@ -29,7 +29,7 @@ Configure the existing Schwab OAuth environment variables on the authority host 
 ```
 
 ```sh
-schwab-authority --identity identity.json --policy authority-policy.json --risk risk.json
+rustyschwab-authority --identity identity.json --policy authority-policy.json --risk risk.json
 ```
 
 A trader's policy may also carry `allowed_symbols`, `denied_symbols`, `price_collar_bps`, `max_daily_orders` and `max_daily_notional`; the gateway enforces them as the MCP server does. A collar refusal answers `422` (`risk_denied`) before any approval is spent, and a submission past the daily budget is journaled as rejected with its approval given back.
@@ -44,7 +44,7 @@ Policy is re-read for each request. Duplicate subjects or principal names, malfo
 
 ## Gateway protocol
 
-All requests carry an issuer-verified, short-lived bearer token. `schwab-remote --endpoint <full-endpoint> --token-file <private-file> --request <json-file>` sends a request without automatic retry. Token files must pass the same private-file checks as other credentials.
+All requests carry an issuer-verified, short-lived bearer token. `rustyschwab-remote --endpoint <full-endpoint> --token-file <private-file> --request <json-file>` sends a request without automatic retry. Token files must pass the same private-file checks as other credentials.
 
 1. Prepare an order with a unique `tag`. Use decimal strings in the JSON. Create the exact approval arguments, for example:
 
@@ -52,7 +52,7 @@ All requests carry an issuer-verified, short-lived bearer token. `schwab-remote 
    {"account_hash":"ACCOUNT_HASH","order":{"tag":"unique-intent-uuid","orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"10","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]}}
    ```
 
-   Run `schwab-admin digest place_order arguments.json`. Object keys are sorted recursively for hashing; array order and scalar representations remain part of the approved intent. Review the actual arguments alongside the digest. Replace approvals additionally include `order_id` and use tool name `replace_order`.
+   Run `rustyschwab-admin digest place_order arguments.json`. Object keys are sorted recursively for hashing; array order and scalar representations remain part of the approved intent. Review the actual arguments alongside the digest. Replace approvals additionally include `order_id` and use tool name `replace_order`.
 
 2. A different, verified operator submits to `/v1/operator`:
 
@@ -60,7 +60,7 @@ All requests carry an issuer-verified, short-lived bearer token. `schwab-remote 
    {"action":"approve","principal":"desk","digest":"<computed-sha256>","expires_at":<unix-seconds>}
    ```
 
-   Expiry must be within one hour. The server derives operator identity from the verified JWT; the request cannot supply an operator name. The local `schwab-admin approve --operator ...` command remains an explicitly trusted filesystem administration path, not verified remote approval.
+   Expiry must be within one hour. The server derives operator identity from the verified JWT; the request cannot supply an operator name. The local `rustyschwab-admin approve --operator ...` command remains an explicitly trusted filesystem administration path, not verified remote approval.
 
 3. The trading identity obtains a lease from `/v1/lease` using `{"action":"acquire"}`. Leases last thirty seconds. Renewal and release use `{"action":"renew","lease":{...}}` and `{"action":"release","lease":{...}}`.
 
@@ -80,19 +80,19 @@ Replies distinguish `accepted`, `rejected` and `unknown` and include the gateway
 
 `/v1/operator` accepts `{"action":"halt","reason":"investigation"}`, `{"action":"resume"}`, `{"action":"status"}` and `{"action":"revoke","principal":"desk","digest":"..."}`. Recovery only clears its temporary gate. The durable operator halt survives client recreation, other workers and process restart; only an explicit operator action clears it remotely. Privileged backend identities can raise a halt but cannot clear it through `/v1/backend`.
 
-For trusted local administration, use `schwab-admin --state <execution-journal> halt <reason> --operator <identity>` and `resume --operator <identity>`. Local filesystem administrators remain trusted; these commands do not claim remote identity verification.
+For trusted local administration, use `rustyschwab-admin --state <execution-journal> halt <reason> --operator <identity>` and `resume --operator <identity>`. Local filesystem administrators remain trusted; these commands do not claim remote identity verification.
 
 Each principal's approval journal keeps its existing path derived from `tokens.orders.<SHA256(principal-name)>.audit.json`. Operator resolution of an unknown principal attempt requires specific evidence; the operator endpoint accepts `{"action":"resolve","principal":"desk","attempt":"...","evidence":"..."}`. Resolving the principal audit does not invent a broker outcome or release SDK risk reservations. Follow the execution reconciliation runbook before allowing trading to resume.
 
 Deliver execution and principal audit journals separately:
 
 ```sh
-schwab-admin --state <journal> deliver-audit <stable-sink-id> https://archive.example/batches --token-file archive-token --limit 100
+rustyschwab-admin --state <journal> deliver-audit <stable-sink-id> https://archive.example/batches --token-file archive-token --limit 100
 ```
 
 The sink receives a stream ID, previous checkpoint/digest, ordered events and batch SHA-256. `audit_digest` in the SDK defines hashing: compact UTF-8 JSON with recursively sorted object keys and an empty `batch_sha256` field. Scalar representations are retained; this is the versioned SDK protocol, not a claim of full RFC 8785 number normalization. The sink must durably retain each batch, deduplicate retries, reject divergent stream histories and acknowledge exactly `{stream_id, through_sequence, batch_sha256}`. Only a matching authenticated acknowledgement advances the local cursor. A sink ID is pinned to its endpoint. A restored database retains stream identity so divergent history can be detected by the archive.
 
-Provision the sink with the organization's immutable retention controls. The client protocol and acknowledged delivery are implemented; filesystem permissions or an append-only API alone do not provide organization-wide immutable retention. Schedule bounded delivery calls with rotated credentials and monitor delivery failures. Preserve the acknowledgement used for retention decisions. Local audit records remain append-only and hash-chained: each delivered event carries `prev_hash` and `hash`, so the sink can check that a batch continues from the last event it stored, and `schwab-admin verify-audit` checks the whole local chain (see [operations](OPERATIONS.md#audit-hash-chain)). A remote authority serves the same check through `ExecutionStore::verify_audit`.
+Provision the sink with the organization's immutable retention controls. The client protocol and acknowledged delivery are implemented; filesystem permissions or an append-only API alone do not provide organization-wide immutable retention. Schedule bounded delivery calls with rotated credentials and monitor delivery failures. Preserve the acknowledgement used for retention decisions. Local audit records remain append-only and hash-chained: each delivered event carries `prev_hash` and `hash`, so the sink can check that a batch continues from the last event it stored, and `rustyschwab-admin verify-audit` checks the whole local chain (see [operations](OPERATIONS.md#audit-hash-chain)). A remote authority serves the same check through `ExecutionStore::verify_audit`.
 
 ## Privileged backend integration
 
@@ -100,7 +100,7 @@ For deployment-owned SDK services requiring shared state APIs, explicitly grant 
 
 ```rust,ignore
 let backend = std::sync::Arc::new(rustyschwab::remote::RemoteBackend::new(
-    "https://schwab-authority.example/v1/backend", access_token,
+    "https://rustyschwab-authority.example/v1/backend", access_token,
 )?);
 let client = rustyschwab::SchwabClient::new(config)?.with_enterprise_backends(
     backend.clone(), backend.clone(), backend.clone(),
@@ -113,4 +113,4 @@ Production acceptance still requires issuer/proxy integration, durable local sto
 
 ## Paper execution
 
-`schwab-authority --paper <config> --paper-state <new-state-path>` uses an isolated `PaperBroker` through the same trading gateway. It does not initialize Schwab OAuth or a live execution client. See [paper execution, ingestion and replay](PAPER_TRADING.md). Paper responses identify their mode, trader account access is scoped by policy, and only operator identities may ingest market events.
+`rustyschwab-authority --paper <config> --paper-state <new-state-path>` uses an isolated `PaperBroker` through the same trading gateway. It does not initialize Schwab OAuth or a live execution client. See [paper execution, ingestion and replay](PAPER_TRADING.md). Paper responses identify their mode, trader account access is scoped by policy, and only operator identities may ingest market events.

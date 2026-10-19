@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // endpoint. The guard flushes them when `main` returns.
     #[cfg(feature = "otel")]
     let _telemetry =
-        rustyschwab::telemetry::init_otel("schwab-authority", "info", std::io::stderr)?;
+        rustyschwab::telemetry::init_otel("rustyschwab-authority", "info", std::io::stderr)?;
     let args = Args::parse();
     anyhow::ensure!(
         args.bind.ip().is_loopback(),

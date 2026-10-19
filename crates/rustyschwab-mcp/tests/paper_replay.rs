@@ -12,7 +12,7 @@ fn verify(dir: &Path, commands: &str, expected: &str) -> Output {
     .unwrap();
     std::fs::write(dir.join("commands.jsonl"), commands).unwrap();
     std::fs::write(dir.join("expected.jsonl"), expected).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_schwab-paper-verify"))
+    Command::new(env!("CARGO_BIN_EXE_rustyschwab-paper-verify"))
         .arg("--config")
         .arg(dir.join("config.json"))
         .arg("--commands")

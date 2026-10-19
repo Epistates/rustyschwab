@@ -33,7 +33,7 @@ rustyschwab-types = "0.2"
 ## Features
 
 - `schemars`: derives `JsonSchema` on the request types, for tool schemas
-  (the `schwab-mcp` server uses it).
+  (the `rustyschwab-mcp` server uses it).
 
 See the repository [README](https://github.com/epistates/rustyschwab) for
 the full documentation set.

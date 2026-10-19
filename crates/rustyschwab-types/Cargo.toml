@@ -29,7 +29,7 @@ schemars = { workspace = true, optional = true }
 
 [features]
 default = []
-# Derive `schemars::JsonSchema` on public input types used by the schwab-mcp crate
+# Derive `schemars::JsonSchema` on public input types used by the rustyschwab-mcp crate
 # so MCP tool parameters get auto-generated JSON schemas.
 schemars = ["dep:schemars"]
 

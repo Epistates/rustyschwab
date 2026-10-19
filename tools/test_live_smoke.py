@@ -77,7 +77,7 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(limits["max_position_quantity"], "4")
 
 
-BINARY = ROOT / "target" / "debug" / "schwab-mcp"
+BINARY = ROOT / "target" / "debug" / "rustyschwab-mcp"
 
 
 @unittest.skipUnless(BINARY.exists(), "build it with cargo build -p rustyschwab-mcp")

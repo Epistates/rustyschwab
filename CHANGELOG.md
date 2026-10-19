@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — the commands are named rustyschwab-*
+
+- The commands `rustyschwab-mcp` installs follow the crates:
+  `schwab-mcp`, `schwab-admin`, `schwab-authority`, `schwab-remote`,
+  `schwab-paper`, `schwab-paper-verify` and `schwab-eval` are now
+  `rustyschwab-mcp`, `rustyschwab-admin`, `rustyschwab-authority`,
+  `rustyschwab-remote`, `rustyschwab-paper`, `rustyschwab-paper-verify` and
+  `rustyschwab-eval`, so none of them reads as a Schwab service.
+  **Migrating:** point MCP client configs (`claude_desktop_config.json`,
+  `claude mcp add`), scripts and service units at the new names after
+  upgrading. Settings (`SCHWAB_*`), metrics (`schwab_*`) and stored state
+  are unchanged; the default OpenTelemetry service name follows the
+  command.
+
 ## [0.2.0] - 2026-10-17
 
 The first release on crates.io.
