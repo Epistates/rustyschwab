@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged; the default OpenTelemetry service name follows the
   command.
 
+### Fixed — the daily-loss limit no longer misses a loss behind a deposit
+
+- When reconciliation could not read the day's cash transfers, the
+  daily-loss control counted them as zero, or reused an older reading from
+  the same day, so a deposit made that day could hide a trading loss of the
+  same size and orders kept passing. A reading now lasts at most five
+  minutes, and an account with `max_daily_loss` whose transfers cannot be
+  read refuses orders as `BaselineStale` until a reconciliation reads them.
+
 ### Security
 
 - rustls 0.23.46 and quinn-proto 0.11.19 in both lockfiles, for

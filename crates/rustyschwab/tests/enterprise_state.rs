@@ -248,7 +248,8 @@ async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
         json!({"securitiesAccount":{
             "initialBalances":{"liquidationValue":start},
             "currentBalances":{"availableFunds":"100","liquidationValue":current},
-            "positions":[]}})
+            "positions":[]},
+            "_dayNetTransfers":"0"})
     };
     let now = chrono::Utc::now().timestamp_millis();
     db.invalidate_account("A", 1).await.unwrap();

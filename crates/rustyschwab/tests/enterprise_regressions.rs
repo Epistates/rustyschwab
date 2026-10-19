@@ -897,6 +897,88 @@ async fn incremental_reconciliation_narrows_the_window_and_skips_listed_targets(
     server.verify().await;
 }
 
+/// The daily-loss limit needs the day's cash transfers: when reconciliation
+/// cannot read them the account refuses orders, since counting them as zero
+/// would let a deposit hide a loss; once they read, the deposit comes out.
+#[tokio::test]
+async fn the_daily_loss_limit_refuses_orders_until_transfers_can_be_read() {
+    use rustyschwab::reconciliation::ReconciliationOptions;
+    use rustyschwab::risk::{PortfolioLimits, PortfolioRisk, RiskProvider};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wiremock::matchers::query_param;
+    let server = MockServer::start().await;
+    let (base, _dir, _) = client(&server, false);
+    let risk = Arc::new(PortfolioRisk {
+        database: base.order_journal().database().clone(),
+        accounts: HashMap::from([(
+            "hash".into(),
+            PortfolioLimits {
+                max_open_quantity: 10.into(),
+                max_open_notional: 1000.into(),
+                max_position_quantity: 10.into(),
+                max_snapshot_age_ms: 60_000,
+                max_daily_loss: Some(500.into()),
+                option_multipliers: Default::default(),
+            },
+        )]),
+    });
+    let client = base.with_risk_provider(risk.clone()).unwrap();
+    Mock::given(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    // A thousand up on its face; nine thousand down once a 10,000 deposit
+    // comes out.
+    Mock::given(path("/trader/v1/accounts/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "securitiesAccount": {"positions": [],
+                "initialBalances": {"liquidationValue": 50000},
+                "currentBalances": {"liquidationValue": 51000, "availableFunds": 1000}}
+        })))
+        .mount(&server)
+        .await;
+    let failing = Mock::given(path("/trader/v1/accounts/hash/transactions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount_as_scoped(&server)
+        .await;
+    let since = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+    let options = || ReconciliationOptions {
+        since,
+        ..Default::default()
+    };
+    client
+        .reconcile_account_with_options("hash", 1, options())
+        .await
+        .unwrap();
+    let order = limit_order();
+    assert!(matches!(
+        risk.reserve("hash", "unread", &order).await,
+        Err(Error::BaselineStale { reason, .. }) if reason.contains("cash transfers")
+    ));
+    drop(failing);
+
+    Mock::given(path("/trader/v1/accounts/hash/transactions"))
+        .and(query_param("types", "ACH_RECEIPT"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {"type": "ACH_RECEIPT", "netAmount": 10000.0}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(path("/trader/v1/accounts/hash/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .mount(&server)
+        .await;
+    client
+        .reconcile_account_with_options("hash", 2, options())
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.reserve("hash", "read", &order).await,
+        Err(Error::Halted(reason)) if reason.contains("Daily loss 9000")
+    ));
+}
+
 /// A replacement reads the order it replaces first, so the risk check judges
 /// an order placed elsewhere and not reconciled yet by its real payload, and
 /// a replacement of an order Schwab no longer has is refused unsent.

@@ -177,12 +177,13 @@ pub(crate) const DAY_TRANSFERS_KEY: &str = "_dayNetTransfers";
 /// start-of-day liquidation value less the current one, with the day's net
 /// transfers taken back out of the current value, so a deposit does not
 /// hide a loss and a withdrawal does not fake one. `None` when the venue
-/// omitted either value.
+/// omitted either value, or reconciliation could not read the transfers:
+/// counting them as zero would let a deposit hide a loss.
 fn daily_loss(snapshot: &serde_json::Value) -> Option<DailyLoss> {
     let account = &snapshot["securitiesAccount"];
     let start = decimal(account.pointer("/initialBalances/liquidationValue"))?;
     let current = decimal(account.pointer("/currentBalances/liquidationValue"))?;
-    let transfers = decimal(snapshot.get(DAY_TRANSFERS_KEY)).unwrap_or(Decimal::ZERO);
+    let transfers = decimal(snapshot.get(DAY_TRANSFERS_KEY))?;
     let traded = current.checked_sub(transfers)?;
     Some(DailyLoss {
         start,
@@ -343,8 +344,12 @@ impl PortfolioRisk {
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
                 let account_value = &snapshot["securitiesAccount"];
                 if let Some(cap) = limits.max_daily_loss {
-                    let day = daily_loss(&snapshot)
-                        .ok_or_else(|| stale("Liquidation values missing from risk baseline"))?;
+                    let day = daily_loss(&snapshot).ok_or_else(|| {
+                        stale(
+                            "The risk baseline lacks the liquidation values or the \
+                                 day's cash transfers the daily-loss limit needs",
+                        )
+                    })?;
                     if day.loss > cap {
                         // The halt outlives this denial: commit it, then fail
                         // closed. A dry run only reports it.

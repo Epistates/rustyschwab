@@ -557,8 +557,9 @@ impl Default for ReconciliationOptions {
 impl SchwabClient {
     /// The account's net cash transfers in (deposits less withdrawals) since
     /// the start of the New York trading day, reused for
-    /// [`DAY_TRANSFERS_TTL`]. A failed read falls back to the day's last
-    /// reading; `None` when there is none.
+    /// [`DAY_TRANSFERS_TTL`]. `None` when it cannot be read: an older
+    /// reading could predate a deposit that hides a loss, so the daily-loss
+    /// control treats the baseline as stale instead.
     async fn day_net_transfers(&self, account: &str) -> Option<rust_decimal::Decimal> {
         let now = chrono::Utc::now();
         let today = crate::paper::feed::trading_date(now);
@@ -582,20 +583,16 @@ impl SchwabClient {
             }
             Some(net)
         };
-        match read.await {
-            Some(net) => {
-                self.day_transfers().lock().insert(
-                    account.to_owned(),
-                    DayTransfers {
-                        date: today,
-                        read_at: std::time::Instant::now(),
-                        net,
-                    },
-                );
-                Some(net)
-            }
-            None => cached.filter(|c| c.date == today).map(|c| c.net),
-        }
+        let net = read.await?;
+        self.day_transfers().lock().insert(
+            account.to_owned(),
+            DayTransfers {
+                date: today,
+                read_at: std::time::Instant::now(),
+                net,
+            },
+        );
+        Some(net)
     }
 
     pub async fn reconcile_account(
