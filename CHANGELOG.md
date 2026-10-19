@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are unchanged; the default OpenTelemetry service name follows the
   command.
 
+### Security
+
+- rustls 0.23.46 and quinn-proto 0.11.19 in both lockfiles, for
+  RUSTSEC-2026-0346 to 0349 (rustls; one let `Debug` output show TLS
+  secrets) and RUSTSEC-2026-0338, 0340 and 0343 (quinn-proto panics). The
+  workspace now requires rustls 0.23.46 or later.
+
 ## [0.2.0] - 2026-10-17
 
 The first release on crates.io.

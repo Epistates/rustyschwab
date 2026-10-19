@@ -108,7 +108,8 @@ ring = "0.17"
 # "ring" feature: lets the callback server pick the ring CryptoProvider
 # explicitly — both ring and aws-lc-rs end up in the dependency tree, so
 # rustls cannot auto-select a process-level provider.
-rustls = { version = "0.23", features = ["ring"] }
+# 0.23.46 fixes RUSTSEC-2026-0346..0349.
+rustls = { version = "0.23.46", features = ["ring"] }
 # The operating system's trust store for the streamer's WebSocket, the same
 # verifier reqwest's rustls backend uses for HTTPS.
 rustls-platform-verifier = "0.7"
