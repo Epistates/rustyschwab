@@ -529,3 +529,102 @@ async fn a_replaced_session_ends_the_stream_and_its_receiver() {
     );
     server.await.unwrap();
 }
+
+/// Request ids count up as numeric strings, as Schwab's guide documents
+/// them, and an acknowledgement that echoes the id as a number resolves.
+#[tokio::test]
+async fn request_ids_count_up_and_a_numeric_echo_resolves() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let login = request(&mut ws).await;
+        assert_eq!(login["requests"][0]["requestid"], "1");
+        ws.send(Message::Text(
+            json!({"response":[ack(&login,0)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let subscribe = request(&mut ws).await;
+        assert_eq!(subscribe["requests"][0]["requestid"], "2");
+        let mut numeric = ack(&subscribe, 0);
+        numeric["requestid"] = 2.into();
+        ws.send(Message::Text(
+            json!({"response":[numeric]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+        let _ = ws.next().await;
+    });
+    client.connect().await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        client.subscribe(StreamService::LeveloneEquities, vec!["AAPL".into()]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    client.disconnect().await;
+    server.await.unwrap();
+}
+
+/// A session-ending code is honoured when Schwab sends it as a `notify`
+/// notice rather than a response.
+#[tokio::test]
+async fn a_replaced_notice_in_a_notify_frame_ends_the_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let server = tokio::spawn(async move {
+        let mut ws = login(&listener).await;
+        ws.send(Message::Text(
+            json!({"notify":[{"service":"ADMIN",
+                "content":{"code":12,"msg":"another session took over"}}]})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+        ws.close(None).await.unwrap();
+    });
+    client.connect().await.unwrap();
+    let mut rx = client.get_receiver().unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(StreamMessage::State(status)) if status.ended.is_some() => {
+                    return status.ended.unwrap();
+                }
+                Some(_) => continue,
+                None => panic!("the end is reported before the receiver ends"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ended, rustyschwab::types::streaming::StreamEnd::Replaced);
+    server.await.unwrap();
+}
+
+/// `max_retries` counts failed attempts in a row: with a limit of one, a
+/// stream that drops twice but logs in again in between keeps going.
+#[tokio::test]
+async fn a_session_that_logs_in_starts_the_retry_count_over() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let (third, logged_in) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        drop(login(&listener).await);
+        drop(login(&listener).await);
+        let mut ws = login(&listener).await;
+        third.send(()).unwrap();
+        let _ = ws.next().await;
+    });
+    client.connect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), logged_in)
+        .await
+        .expect("the stream gave up after its second drop")
+        .unwrap();
+    client.disconnect().await;
+    server.await.unwrap();
+}

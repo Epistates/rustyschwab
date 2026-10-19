@@ -47,6 +47,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SchwabConfig::validate` refuses an `http` or `/`-terminated callback
   URL, as `AuthManager` already did; Schwab registers only `https`.
 
+### Fixed — streaming requests in the shape Schwab documents
+
+- Streamer request ids are numeric strings counting up from `"1"`, as
+  Schwab's Streamer Guide documents them (an integer) and Schwabdev sends
+  them, instead of random UUIDs no reference client sends. An
+  acknowledgement that echoes the id as a number resolves too.
+- A `response` item needs only `content.code`, so a notice without the
+  usual envelope is read instead of dropping the frame. Codes 12 (another
+  login took the streamer) and 30 (nothing subscribed) end the stream
+  when they arrive in a `notify` frame as well.
+- `ReconnectConfig::max_retries` counts failed attempts in a row: a
+  session that logs in starts the count over. Before, a stream that
+  recovered from n drops over its lifetime ended for good on the next one.
+- `StreamParameters` and the writer's outgoing frames no longer show the
+  LOGIN access token in their `Debug` output.
+
 ### Security
 
 - rustls 0.23.46 and quinn-proto 0.11.19 in both lockfiles, for

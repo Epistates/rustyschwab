@@ -64,7 +64,9 @@ pub enum StreamCommand {
     View,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Debug` shows whether `authorization` (the access token a LOGIN carries)
+/// is set, never its value.
+#[derive(Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct StreamParameters {
@@ -86,6 +88,21 @@ pub struct StreamParameters {
     pub schwab_client_function_id: Option<String>,
 }
 
+impl std::fmt::Debug for StreamParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamParameters")
+            .field("keys", &self.keys)
+            .field("fields", &self.fields)
+            .field(
+                "authorization",
+                &self.authorization.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("schwab_client_channel", &self.schwab_client_channel)
+            .field("schwab_client_function_id", &self.schwab_client_function_id)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(untagged)]
@@ -105,16 +122,24 @@ pub struct StreamResponse {
     pub response: Vec<ResponseItem>,
 }
 
+/// One answer in a `response` frame. Only `content.code` is required: a
+/// notice Schwab sends before closing a session (code 12 or 30) is read
+/// even if it lacks the envelope an acknowledgement carries, and
+/// `requestid` may come back as a number or a string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct ResponseItem {
+    #[serde(default)]
     pub service: String,
+    #[serde(default)]
     pub command: String,
+    #[serde(default, deserialize_with = "crate::common::id")]
     pub requestid: String,
-    #[serde(rename = "SchwabClientCorrelId")]
+    #[serde(default, rename = "SchwabClientCorrelId")]
     pub schwab_client_correl_id: String,
+    #[serde(default)]
     pub timestamp: i64,
     pub content: ResponseContent,
 }
@@ -124,6 +149,7 @@ pub struct ResponseItem {
 #[non_exhaustive]
 pub struct ResponseContent {
     pub code: i32,
+    #[serde(default)]
     pub msg: String,
 }
 

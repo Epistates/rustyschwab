@@ -246,6 +246,11 @@ pub fn optional_id<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Str
     }
 }
 
+/// [`optional_id`] for a field that must be present.
+pub fn id<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    optional_id(de)?.ok_or_else(|| serde::de::Error::custom("Expected an identifier, got null"))
+}
+
 /// Decode an optional enum on a broker response, reading values outside
 /// the enum (Schwab's `UNKNOWN`, or a value added after this release) as
 /// `None` instead of failing the whole payload. Pair with

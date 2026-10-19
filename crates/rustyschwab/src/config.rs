@@ -87,6 +87,9 @@ pub struct RetryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconnectConfig {
     pub enabled: bool,
+    /// Reconnect attempts in a row before the stream ends with
+    /// `ReconnectExhausted`; a session that logs in starts the count over.
+    /// `None` (the default) never gives up.
     pub max_retries: Option<usize>,
     #[serde(with = "humantime_serde")]
     pub initial_backoff: Duration,

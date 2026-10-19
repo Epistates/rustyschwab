@@ -406,6 +406,13 @@ struct StreamClientInner {
     /// Counts sessions, so an acknowledgement that times out can only tear
     /// down the session it was sent on.
     session: std::sync::atomic::AtomicU64,
+    /// Counts successful logins, so the reconnect loop can tell a session
+    /// that got in (and starts the retry count over) from one that did not.
+    logins: std::sync::atomic::AtomicU64,
+    /// The last request id sent. Schwab documents `requestid` as an integer
+    /// and its examples send numeric strings, so ids count up from 1 for
+    /// the client's lifetime rather than being random.
+    next_request_id: std::sync::atomic::AtomicU64,
     /// Handle for the outer connection loop task (one per `connect()`
     /// call), so `disconnect()` can abort it cleanly instead of leaking
     /// the task for the lifetime of the process.
@@ -540,6 +547,8 @@ impl StreamClient {
             login_token: parking_lot::Mutex::new(None),
             closing: parking_lot::Mutex::new(None),
             session: std::sync::atomic::AtomicU64::new(0),
+            logins: std::sync::atomic::AtomicU64::new(0),
+            next_request_id: std::sync::atomic::AtomicU64::new(0),
             connection_task: Arc::new(RwLock::new(None)),
         });
         Ok(Self {
@@ -1110,6 +1119,25 @@ fn record_stream_frame(msg: &StreamMessage) {
 }
 
 impl StreamClientInner {
+    /// Schwab says why before it closes a session normally: another login
+    /// took the streamer slot (12) or nothing is subscribed (30). The guide
+    /// does not say which frame carries it, so `response` and `notify`
+    /// frames are both read.
+    fn note_closing(&self, code: i32) {
+        match StreamResponseCode::from_code(code) {
+            Some(StreamResponseCode::CloseConnection) => {
+                *self.closing.lock() = Some(StreamEnd::Replaced)
+            }
+            Some(StreamResponseCode::StopStreaming) => *self.closing.lock() = Some(StreamEnd::Idle),
+            _ => {}
+        }
+    }
+
+    /// The next request id: `"1"`, `"2"`, ...
+    fn request_id(&self) -> String {
+        (self.next_request_id.fetch_add(1, Ordering::Relaxed) + 1).to_string()
+    }
+
     /// Build a streamer request frame carrying the client identity.
     fn build_request(
         &self,
@@ -1118,7 +1146,7 @@ impl StreamClientInner {
         parameters: StreamParameters,
     ) -> StreamRequest {
         StreamRequest {
-            requestid: Uuid::new_v4().to_string(),
+            requestid: self.request_id(),
             service: service.as_str().to_string(),
             command,
             schwab_client_customer_id: self.identity.customer_id.clone(),
@@ -1158,6 +1186,7 @@ impl StreamClientInner {
                 metrics::counter!(crate::metrics::STREAM_RECONNECTS_TOTAL).increment(1);
             }
 
+            let logins = self.logins.load(Ordering::SeqCst);
             let coordinator = self.coordinator.read().clone();
             let ownership = crate::coordination::LeaseSession::acquire(
                 coordinator,
@@ -1178,6 +1207,12 @@ impl StreamClientInner {
             self.cleanup();
             if self.authenticated_once.load(Ordering::SeqCst) && result.is_ok() {
                 login_retried = false;
+            }
+            // `max_retries` bounds consecutive failed attempts: a session
+            // that logged in starts the count over, so a stream that recovers
+            // now and then is not ended after its n-th reconnect in a week.
+            if self.logins.load(Ordering::SeqCst) != logins {
+                retry_count = 0;
             }
             // Schwab said it is ending the session (another login took the
             // streamer slot, or nothing is subscribed): reconnecting would
@@ -1360,6 +1395,7 @@ impl StreamClientInner {
             }
         }
         self.authenticated_once.store(true, Ordering::SeqCst);
+        self.logins.fetch_add(1, Ordering::SeqCst);
         // Login succeeded — the connection is healthy, so the next failure
         // starts from a fresh backoff schedule (the reference client resets
         // its backoff at the same point).
@@ -1511,7 +1547,7 @@ impl StreamClientInner {
                 .or_else(|| StreamService::from_api_str(&service).map(|s| s.default_fields()))
                 .unwrap_or_else(LevelOneEquityFields::default_fields);
             let request = StreamRequest {
-                requestid: Uuid::new_v4().to_string(),
+                requestid: self.request_id(),
                 service: service.clone(),
                 command: subscribe_command(&service),
                 schwab_client_customer_id: self.identity.customer_id.clone(),
@@ -1599,19 +1635,22 @@ impl StreamClientInner {
                     match serde_json::from_str::<StreamMessage>(text.as_ref()) {
                         Ok(stream_msg) => {
                             // Resolve acks for response frames
+                            if let StreamMessage::Notify(notify) = &stream_msg {
+                                for item in &notify.notify {
+                                    if let Some(code) = item
+                                        .extra
+                                        .get("content")
+                                        .and_then(|content| content.get("code"))
+                                        .and_then(serde_json::Value::as_i64)
+                                        .and_then(|code| i32::try_from(code).ok())
+                                    {
+                                        self.note_closing(code);
+                                    }
+                                }
+                            }
                             if let StreamMessage::Response(resp) = &stream_msg {
                                 for item in &resp.response {
-                                    // Schwab says why before it closes a
-                                    // session normally.
-                                    match StreamResponseCode::from_code(item.content.code) {
-                                        Some(StreamResponseCode::CloseConnection) => {
-                                            *self.closing.lock() = Some(StreamEnd::Replaced)
-                                        }
-                                        Some(StreamResponseCode::StopStreaming) => {
-                                            *self.closing.lock() = Some(StreamEnd::Idle)
-                                        }
-                                        _ => {}
-                                    }
+                                    self.note_closing(item.content.code);
                                     let req_id = item.requestid.clone();
                                     if let Some(tx) = self.pending_acks.write().remove(&req_id) {
                                         let outcome = if let Some(code) =
