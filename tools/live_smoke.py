@@ -563,7 +563,10 @@ async def mcp_path(binary: Path, plan: Plan, report: Report, workdir: Path) -> N
             return compare_tags(sent_tag, answer.get("tag") if isinstance(answer, dict) else None)
 
         async def preview() -> str:
-            await mcp.call("preview_order", {"account_hash": plan.account_hash, "order": order})
+            # With the tag place_order will send, so a refusal of the tag
+            # shows here, before anything is placed.
+            tagged = {**order, "tag": sent_tag} if sent_tag else order
+            await mcp.call("preview_order", {"account_hash": plan.account_hash, "order": tagged})
             return "accepted"
 
         async def place() -> str:

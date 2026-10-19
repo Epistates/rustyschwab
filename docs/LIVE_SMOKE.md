@@ -35,7 +35,7 @@ The script prints the order it will place and waits for you to type the symbol. 
 | --- | --- | --- |
 | Ready | | `get_server_status` until trading is ready (first reconciliation done) |
 | Build and check | `orders.equity_buy_limit` | `build_order`, `check_order` with a rationale |
-| Preview | `preview_order` (a failure here is a warning) | `preview_order` (warning) |
+| Preview | `preview_order`, tagged as placement will be (a failure here is a warning) | `preview_order` with the tag `check_order` reported (warning) |
 | Place | `place_order` | `place_order` with a rationale |
 | Working | `order` until it leaves `PENDING_ACTIVATION` | `get_order_status` |
 | Tag kept (a warning if not) | Schwab lists the order under the tag the SDK sent | the same, for the server's tag |
@@ -43,7 +43,7 @@ The script prints the order it will place and waits for you to type the symbol. 
 
 For the MCP half, the script starts `target/release/rustyschwab-mcp` with a temporary principal policy named `live-smoke` (this account, one share, no approval, three orders a day so a rerun works) and risk limits that admit exactly that order, from the repository root so the server reads the same `.env`. The principal's audit journal stays beside your token file, as every principal's does; `rustyschwab-admin` reads it.
 
-The tag check matters beyond this run: after a submission whose outcome is unknown (a timeout, a dropped connection), reconciliation finds the order by its tag, and resolves nothing on a guess. If Schwab drops or replaces tags, such a submission waits for an operator (`rustyschwab-admin`), and that design needs revisiting; say so in the issue.
+The tag check matters beyond this run: after a submission whose outcome is unknown (a timeout, a dropped connection), reconciliation finds the order by its tag, and resolves nothing on a guess. Schwab uses the field itself: other clients report API orders sent without a tag listed under `"tag": "API_TOS:TraderAPI"`, so whether it keeps one the client sets is the open question. A preview that rejects the tag answers it before anything is placed. If Schwab drops or replaces tags, such a submission waits for an operator (`rustyschwab-admin`), and that design needs revisiting; say so in the issue.
 
 If anything goes wrong after an order reaches Schwab, the script sends a cancel before it exits and tells you so.
 

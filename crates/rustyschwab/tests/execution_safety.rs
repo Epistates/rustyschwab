@@ -175,7 +175,7 @@ async fn an_armed_intent_stays_unresolved() {
 
 /// Only the tag the SDK sent resolves an unknown submission. An order that
 /// fits the request but carries another tag (the broker may stamp its own,
-/// such as `API_TRADER`) could be a manual twin, so it stays unresolved for
+/// such as `API_TOS:TraderAPI`) could be a manual twin, so it stays unresolved for
 /// an operator; under the SDK's tag it resolves.
 #[tokio::test]
 async fn only_our_tag_resolves_an_unknown_submission() {
@@ -212,7 +212,7 @@ async fn only_our_tag_resolves_an_unknown_submission() {
         }
     };
 
-    let report = reconcile(vec![listed("API_TRADER")]).await;
+    let report = reconcile(vec![listed("API_TOS:TraderAPI")]).await;
     assert_eq!(report.unresolved_attempts, vec![id.clone()]);
     assert!(report.resolved_attempts.is_empty());
 

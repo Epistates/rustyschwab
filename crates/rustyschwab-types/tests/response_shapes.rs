@@ -820,7 +820,7 @@ fn order_details_decode_the_documented_payload_fully_typed() {
         "status":"CANCELED",
         "enteredTime":"2025-01-15T14:31:22+0000",
         "closeTime":"2025-01-15T14:35:00+0000",
-        "tag":"API_TRADER",
+        "tag":"API_TOS:TraderAPI",
         "accountNumber":12345678,
         "orderActivityCollection":[
             {
@@ -850,7 +850,7 @@ fn order_details_decode_the_documented_payload_fully_typed() {
         Some(RequestedDestination::Auto)
     );
     assert_eq!(order.status, Some(OrderStatus::Canceled));
-    assert_eq!(order.tag.as_deref(), Some("API_TRADER"));
+    assert_eq!(order.tag.as_deref(), Some("API_TOS:TraderAPI"));
     assert!(order.extra.is_empty(), "{:?}", order.extra);
     let leg = &order.order_leg_collection[0];
     assert_eq!(leg.order_leg_type, OrderLegType::Equity);

@@ -152,3 +152,40 @@ async fn invalid_listing_params_never_reach_the_server() {
     ));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+/// A preview carries the tag placement would send, so it judges the order
+/// Schwab will see; a caller's own tag is kept.
+#[tokio::test]
+async fn previews_are_tagged_as_placement_would_tag_them() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/HASH/previewOrder"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "orderStrategy": {"status": "ACCEPTED"}
+        })))
+        .mount(&server)
+        .await;
+    let mut order: rustyschwab::types::trading::OrderRequest = serde_json::from_value(json!({
+        "orderType": "LIMIT", "session": "NORMAL", "duration": "DAY",
+        "orderStrategyType": "SINGLE", "price": "1.00",
+        "orderLegCollection": [{"instruction": "BUY", "quantity": 1,
+            "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+    }))
+    .unwrap();
+    client.preview_order("HASH", &order).await.unwrap();
+    order.tag = Some("desk-7".into());
+    client.preview_order("HASH", &order).await.unwrap();
+    let tags: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["tag"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert!(tags[0].starts_with("rs-"), "{tags:?}");
+    assert_eq!(tags[1], "desk-7");
+}

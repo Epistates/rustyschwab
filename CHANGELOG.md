@@ -76,6 +76,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from it. Before, the process it stopped using could cancel orders it was
   still managing through another.
 
+### Changed — previews carry the order's tag
+
+- `preview_order` tags the order as `place_order` would (the caller's tag,
+  or a new `rs-<uuid>`), so a preview judges what placement sends. Schwab
+  stamps its own tag (`API_TOS:TraderAPI`) on API orders sent without one,
+  so whether it keeps a client's tag is open until a live run shows it; a
+  preview that refuses the tag now says so before anything is placed. The
+  live smoke run previews with the exact tag it then places under.
+- Test fixtures use `API_TOS:TraderAPI`, the value Schwab is reported to
+  stamp, instead of an invented `API_TRADER`.
+
 ### Changed — request deadlines
 
 - `ClientConfig::timeout` defaults to 30 s (was 10 s), and a connection

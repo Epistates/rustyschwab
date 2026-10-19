@@ -33,6 +33,16 @@ pub use crate::types::market_data::{OptionChainParams, PriceHistoryParams};
 /// sending would likely end in `SubmissionUnknown` for an order that landed.
 const MIN_SEND_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `order` with the tag reconciliation finds it by: the caller's, or a new
+/// `rs-<uuid>`.
+fn tagged(order: &OrderRequest) -> OrderRequest {
+    let mut tagged = order.clone();
+    if tagged.tag.is_none() {
+        tagged.tag = Some(format!("rs-{}", uuid::Uuid::new_v4()));
+    }
+    tagged
+}
+
 #[derive(Clone)]
 pub struct SchwabClient {
     inner: Arc<ClientInner>,
@@ -431,10 +441,7 @@ impl SchwabClient {
     ) -> Result<OrderSubmitResponse> {
         self.ensure_live_state().await?;
         order.validate()?;
-        let mut tagged_order = order.clone();
-        if tagged_order.tag.is_none() {
-            tagged_order.tag = Some(format!("rs-{}", uuid::Uuid::new_v4()));
-        }
+        let tagged_order = tagged(order);
         let order = &tagged_order;
         let account = path.split('/').nth(4).unwrap_or_default();
         let replaces = (op == "replace_order").then(|| path.rsplit('/').next().unwrap_or_default());
@@ -1176,6 +1183,8 @@ impl SchwabClient {
     ///
     /// A preview Schwab would refuse still succeeds here; check
     /// [`OrderPreview::is_rejected`](crate::types::trading::OrderPreview::is_rejected).
+    /// The order is tagged as [`place_order`](Self::place_order) would tag
+    /// it, so the preview judges what placement sends.
     pub async fn preview_order(
         &self,
         account_hash: &str,
@@ -1186,7 +1195,7 @@ impl SchwabClient {
             "preview_order",
             Method::POST,
             &account_path(account_hash, "/previewOrder")?,
-            order,
+            &tagged(order),
         )
         .await
     }

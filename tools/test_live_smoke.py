@@ -63,8 +63,8 @@ class HelperTests(unittest.TestCase):
 
     def test_compare_tags_reports_what_schwab_kept(self):
         self.assertEqual(compare_tags("rs-1", "rs-1"), "kept")
-        with self.assertRaisesRegex(RuntimeError, "API_TRADER"):
-            compare_tags("rs-1", "API_TRADER")
+        with self.assertRaisesRegex(RuntimeError, "API_TOS:TraderAPI"):
+            compare_tags("rs-1", "API_TOS:TraderAPI")
         with self.assertRaisesRegex(RuntimeError, "None"):
             compare_tags("rs-1", None)
 
