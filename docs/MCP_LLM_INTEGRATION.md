@@ -568,7 +568,7 @@ what it will let the caller do right now, so a model can plan a session
 instead of discovering the switches one denial at a time:
 
 ```json
-{"mode": "live", "version": "0.2.0",
+{"mode": "live", "version": "0.3.0",
  "serverTime": {"rfc3339": "2026-09-10T14:30:00.000Z", "epochMs": 1789137000000},
  "principal": {"name": "desk", "tools": ["check_order", "get_quotes", "place_order"],
                "accounts": ["…"], "allAccounts": false, "maxQuantity": "2",

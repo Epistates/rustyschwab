@@ -13,7 +13,7 @@ operations and the full documentation set.
 
 ```toml
 [dependencies]
-rustyschwab = { version = "0.2", features = ["callback-server"] }
+rustyschwab = { version = "0.3", features = ["callback-server"] }
 tokio = { version = "1", features = ["full"] }
 ```
 

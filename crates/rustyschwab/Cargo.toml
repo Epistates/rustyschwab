@@ -24,7 +24,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
-rustyschwab-types = { path = "../rustyschwab-types", version = "0.2.0" }
+rustyschwab-types = { path = "../rustyschwab-types", version = "0.3.0" }
 
 # Random number generation (for jitter in backoff)
 rand = { workspace = true }

@@ -5,7 +5,7 @@ An unofficial Rust SDK, Python package and MCP server for the Charles Schwab Tra
 > [!WARNING]
 > Automated trading can lose money. This software is provided as is, without warranty. Start with the [paper venue](docs/PAPER_TRADING.md), which runs locally and does not connect to thinkorswim paperMoney. Not affiliated with or endorsed by Charles Schwab & Co., Inc.
 
-**Status:** 0.2.0. The Rust crates are on [crates.io](https://crates.io/crates/rustyschwab); the Python package is not on PyPI yet, so build it from this repository. One maintainer. Everything is tested against recorded Schwab responses and local fakes, but no live-account run has been recorded yet, so treat live trading as unproven. See [what is core, what is experimental, and what has run live](docs/SUPPORT.md).
+**Status:** 0.3.0. The Rust crates are on [crates.io](https://crates.io/crates/rustyschwab); the Python package is not on PyPI yet, so build it from this repository. One maintainer. Everything is tested against recorded Schwab responses and local fakes, but no live-account run has been recorded yet, so treat live trading as unproven. See [what is core, what is experimental, and what has run live](docs/SUPPORT.md).
 
 ## What is in it
 
@@ -41,7 +41,7 @@ The [setup guide](docs/SETUP_GUIDE.md) covers each step, the token stores, and a
 
 ```toml
 [dependencies]
-rustyschwab = "0.2"
+rustyschwab = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 

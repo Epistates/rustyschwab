@@ -11,7 +11,7 @@ share the types without the HTTP and streaming stack.
 
 ```toml
 [dependencies]
-rustyschwab-types = "0.2"
+rustyschwab-types = "0.3"
 ```
 
 ## Conventions

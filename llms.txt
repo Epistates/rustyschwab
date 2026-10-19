@@ -8,7 +8,7 @@ Key facts for a model using or writing code against it:
 - An order whose outcome is unknown must be reconciled, never resubmitted: `SubmissionUnknown` in Rust and Python, error code `reconciliation_required` (disposition `reconcile`) over MCP. Every MCP failure carries a `disposition` saying what to do next.
 - Over MCP, call `get_server_status` first: it says whether the server is live or paper, which tools the session may use, and whether trading is halted. Use `build_order` and `check_order` before `place_order`.
 - Python request and response values are plain dicts and lists in Schwab's JSON shape.
-- Status: 0.2.0, unofficial (not affiliated with Charles Schwab). Rust crates on crates.io (`rustyschwab`, `rustyschwab-types`, `rustyschwab-mcp`); the Python package is not on PyPI yet. No live-account run recorded yet. The strategy runner and NautilusTrader adapter are experimental.
+- Status: 0.3.0, unofficial (not affiliated with Charles Schwab). Rust crates on crates.io (`rustyschwab`, `rustyschwab-types`, `rustyschwab-mcp`); the Python package is not on PyPI yet. No live-account run recorded yet. The strategy runner and NautilusTrader adapter are experimental.
 
 ## Docs
 

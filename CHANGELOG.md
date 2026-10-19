@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-19
+
+Upgrading from 0.2.0: the commands are renamed (below);
+`AuthError::RefreshTokenExpiring` is removed; `ClientConfig::timeout`
+defaults to 30 s; and validation now refuses an `http` callback URL and an
+equity order with a duration Schwab rejects. The rest of the library API is
+unchanged.
+
 ### Changed — the commands are named rustyschwab-*
 
 - The commands `rustyschwab-mcp` installs follow the crates:

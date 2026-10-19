@@ -1,6 +1,6 @@
 [package]
 name = "schwab-py"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 authors = ["Nick Paterno"]
@@ -24,7 +24,7 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-rustyschwab = { path = "../rustyschwab", version = "0.2.0", default-features = false, features = ["rustls"] }
+rustyschwab = { path = "../rustyschwab", version = "0.3.0", default-features = false, features = ["rustls"] }
 chrono = { version = "0.4", features = ["serde"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }

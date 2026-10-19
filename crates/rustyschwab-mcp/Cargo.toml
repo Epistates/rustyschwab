@@ -35,8 +35,8 @@ reqwest = { workspace = true, features = ["rustls"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 turbomcp = { workspace = true, features = ["http", "websocket"] }
 governor = { workspace = true }
-rustyschwab = { path = "../rustyschwab", version = "0.2.0", features = ["schemars"] }
-rustyschwab-types = { path = "../rustyschwab-types", version = "0.2.0", features = ["schemars"] }
+rustyschwab = { path = "../rustyschwab", version = "0.3.0", features = ["schemars"] }
+rustyschwab-types = { path = "../rustyschwab-types", version = "0.3.0", features = ["schemars"] }
 
 tokio = { workspace = true }
 tracing = { workspace = true }
