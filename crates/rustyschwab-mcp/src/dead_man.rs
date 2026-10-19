@@ -17,6 +17,10 @@
 //!   by the servers a policy reload rebuilds, retires the previous
 //!   generation's beacon as it arms the next, which inherits the timer, so a
 //!   reload neither doubles the watcher nor grants a fresh window.
+//! - **Across processes.** Calls also touch the principal's heartbeat file
+//!   ([`heartbeat_path`]), and a watcher whose window ran out waits out any
+//!   call another process heard since. A stdio server whose client has gone
+//!   stays for the switch ([`Beacon::outlive_client`]).
 //! - **Once per silence.** After it fires the switch stays quiet until the
 //!   principal's next call. A pass that fails (the venue could not be read,
 //!   a cancel was refused) is retried a few times within the same silence.
@@ -99,6 +103,14 @@ struct Pulse {
 pub struct Beacon {
     window: Duration,
     pulse: watch::Sender<Pulse>,
+    /// The principal's heartbeat file, shared with the other processes that
+    /// serve it; see [`heartbeat_path`].
+    heartbeat: std::path::PathBuf,
+    /// When this process last touched `heartbeat`.
+    touched: Mutex<Option<std::time::Instant>>,
+    /// Counts the watcher's firings, so a server whose client has gone can
+    /// wait for the next one ([`Beacon::outlive_client`]).
+    firings: watch::Receiver<u64>,
 }
 
 impl Beacon {
@@ -109,7 +121,57 @@ impl Beacon {
             pulse.at = Instant::now();
             pulse.in_flight += 1;
         });
+        self.touch();
         Call(self.clone())
+    }
+
+    /// Tell the other processes serving the principal that it is alive, at
+    /// most once a second (or a tenth of the window, if less).
+    fn touch_every(&self) -> Duration {
+        HEARTBEAT_EVERY.min(self.window / 10)
+    }
+
+    fn touch(&self) {
+        let mut touched = self.touched.lock();
+        if touched.is_some_and(|at| at.elapsed() < self.touch_every()) {
+            return;
+        }
+        *touched = Some(std::time::Instant::now());
+        if let Err(e) = touch(&self.heartbeat) {
+            tracing::debug!(error = %e, "the dead-man heartbeat was not written");
+        }
+    }
+
+    /// Keep the switch after the client has gone (a stdio client that
+    /// disconnected, or crashed), until it fires, or until another process
+    /// shows the principal is back and takes over its watch. The silence
+    /// that began with the principal's last call runs out as it would have
+    /// with the client connected.
+    pub async fn outlive_client(&self) {
+        let left = self.status().seconds_left;
+        let gone = std::time::SystemTime::now();
+        let mut firings = self.firings.clone();
+        firings.borrow_and_update();
+        tracing::info!(
+            seconds_left = left,
+            "the client disconnected; the dead-man switch keeps the server until it fires"
+        );
+        // Later than this process's own last touch could be.
+        let margin = self.touch_every() * 2;
+        loop {
+            tokio::select! {
+                _ = firings.changed() => return,
+                () = tokio::time::sleep(self.touch_every() * 5) => {
+                    if heard_at(&self.heartbeat).is_some_and(|at| at > gone + margin) {
+                        tracing::info!(
+                            "the principal is back through another server; its switch is that \
+                             server's now"
+                        );
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// The window and what is left of it.
@@ -141,7 +203,41 @@ impl Drop for Call {
             pulse.at = Instant::now();
             pulse.in_flight = pulse.in_flight.saturating_sub(1);
         });
+        self.0.touch();
     }
+}
+
+/// How often a busy principal's heartbeat file is touched.
+const HEARTBEAT_EVERY: Duration = Duration::from_secs(1);
+
+/// The principal's heartbeat: a file beside its audit journal (which is the
+/// principal's own) whose modification time is its last call through any
+/// process sharing that state. A watcher whose window has run out checks
+/// it, so one principal served by two processes (or a client that came back
+/// through a new one) is not cancelled by the process it stopped using.
+pub fn heartbeat_path(audit: &OrderJournal) -> std::path::PathBuf {
+    let mut path = audit.path().as_os_str().to_owned();
+    path.push(".alive");
+    path.into()
+}
+
+fn touch(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .set_modified(std::time::SystemTime::now())
+}
+
+fn heard_at(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// What remains of the window since the principal was last heard from by
+/// any process, if anything does.
+fn heard_within(path: &std::path::Path, window: Duration) -> Option<Duration> {
+    let since = heard_at(path)?.elapsed().unwrap_or_default();
+    window.checked_sub(since).filter(|left| !left.is_zero())
 }
 
 /// The beacons of one process's principals, by name. Servers built over the
@@ -172,11 +268,20 @@ impl Liveness {
             in_flight: 0,
             retired: false,
         });
-        let beacon = Arc::new(Beacon { window, pulse });
+        let (fired, firings) = watch::channel(0);
+        let heartbeat = heartbeat_path(&reaper.audit);
+        let beacon = Arc::new(Beacon {
+            window,
+            pulse,
+            heartbeat: heartbeat.clone(),
+            touched: Mutex::new(None),
+            firings,
+        });
+        beacon.touch();
         beacons.insert(reaper.principal.name.clone(), Arc::downgrade(&beacon));
         match tokio::runtime::Handle::try_current() {
             Ok(runtime) => {
-                runtime.spawn(watch_silence(watching, window, reaper));
+                runtime.spawn(watch_silence(watching, window, reaper, heartbeat, fired));
             }
             Err(_) => tracing::error!(
                 principal = %reaper.principal.name,
@@ -188,8 +293,14 @@ impl Liveness {
 }
 
 /// Wait out the principal's silence and cancel its orders, until its beacon
-/// is retired or dropped.
-async fn watch_silence(mut pulse: watch::Receiver<Pulse>, window: Duration, reaper: Reaper) {
+/// is retired or dropped. Each firing is counted in `fired`.
+async fn watch_silence(
+    mut pulse: watch::Receiver<Pulse>,
+    window: Duration,
+    reaper: Reaper,
+    heartbeat: std::path::PathBuf,
+    fired: watch::Sender<u64>,
+) {
     loop {
         let seen = *pulse.borrow_and_update();
         if seen.retired {
@@ -217,7 +328,22 @@ async fn watch_silence(mut pulse: watch::Receiver<Pulse>, window: Duration, reap
         if !expired || pulse.has_changed().unwrap_or(true) {
             continue;
         }
-        if cancel_in_silence(&mut pulse, &reaper, window).await {
+        // Nor is a call through another process serving the principal:
+        // wait out the window from that one instead.
+        if let Some(left) = heard_within(&heartbeat, window) {
+            tokio::select! {
+                changed = pulse.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep(left) => {}
+            }
+            continue;
+        }
+        let acted = cancel_in_silence(&mut pulse, &reaper, window).await;
+        fired.send_modify(|count| *count += 1);
+        if acted {
             continue;
         }
         // Fired: quiet until the principal next acts.
@@ -551,6 +677,8 @@ mod tests {
     /// The status reports the window and what is left of it.
     #[test]
     fn the_beacon_counts_down_and_resets_on_a_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let heartbeat = dir.path().join("audit.alive");
         let beacon = |silent: u64| {
             let (pulse, _) = watch::channel(Pulse {
                 at: Instant::now() - Duration::from_secs(silent),
@@ -560,6 +688,9 @@ mod tests {
             Arc::new(Beacon {
                 window: Duration::from_secs(60),
                 pulse,
+                heartbeat: heartbeat.clone(),
+                touched: Mutex::new(None),
+                firings: watch::channel(0).1,
             })
         };
         assert_eq!(
@@ -574,5 +705,8 @@ mod tests {
         drop(silent.call());
         assert_eq!(silent.status().seconds_left, 60);
         assert_eq!(beacon(90).status().seconds_left, 0);
+        // The call was heard by every process sharing the heartbeat.
+        assert!(heard_within(&heartbeat, Duration::from_secs(60)).is_some());
+        assert!(heard_within(&heartbeat, Duration::ZERO).is_none());
     }
 }

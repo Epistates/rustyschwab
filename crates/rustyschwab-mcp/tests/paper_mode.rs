@@ -1301,3 +1301,74 @@ async fn one_watcher_serves_a_principal_across_reloads_and_ends_with_its_servers
     let leaving = build("leaving", "b");
     assert!(firings(&leaving).await.is_empty());
 }
+
+/// One principal served by two processes (here, two servers with their own
+/// registries over the same state) is alive while either hears from it: the
+/// one it stopped using does not cancel its orders, and once it is silent
+/// everywhere they are cancelled.
+#[tokio::test]
+async fn a_principal_heard_through_another_process_is_not_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let build = || {
+        AuthorizedServer::new(
+            backend(broker.clone(), None),
+            TRADING,
+            dead_man_desk("paper-desk", "a"),
+        )
+        .with_dead_man_window(WINDOW)
+    };
+    let first = build();
+    let mine = place(&first, "BUY", "1", "9").await;
+    let second = build();
+    for _ in 0..12 {
+        tokio::time::sleep(WINDOW / 5).await;
+        call(&second, "get_server_status", json!({})).await;
+    }
+    assert!(firings(&first).await.is_empty(), "heard through the second");
+    assert_eq!(status_of(&second, &mine).await, "WORKING");
+    let fired = next_firing(&first, 0).await;
+    assert_eq!(fired["orders"][0]["orderId"], mine.as_str());
+}
+
+/// A server whose client has gone (a stdio client that disconnected or
+/// crashed) stays until its principal's switch fires; one whose principal
+/// comes back through another server leaves the watch to that one.
+#[tokio::test]
+async fn a_server_outlives_its_client_until_the_switch_fires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let build = |name: &str, token: &str| {
+        AuthorizedServer::new(
+            backend(broker.clone(), None),
+            TRADING,
+            dead_man_desk(name, token),
+        )
+        .with_dead_man_window(WINDOW)
+    };
+    let desk = build("paper-desk", "a");
+    let mine = place(&desk, "BUY", "1", "9").await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), desk.outlive_client())
+        .await
+        .expect("the server outlived its switch");
+    let fired = next_firing(&desk, 0).await;
+    assert_eq!(fired["orders"][0]["orderId"], mine.as_str());
+
+    let other = build("other-desk", "b");
+    let theirs = place(&other, "BUY", "1", "8").await;
+    let waiting = tokio::spawn({
+        let other = other.clone();
+        async move { other.outlive_client().await }
+    });
+    let back = build("other-desk", "b");
+    for _ in 0..20 {
+        tokio::time::sleep(WINDOW / 4).await;
+        call(&back, "get_server_status", json!({})).await;
+        if waiting.is_finished() {
+            break;
+        }
+    }
+    assert!(waiting.is_finished(), "the watch was handed over");
+    assert!(firings(&other).await.is_empty());
+    assert_eq!(status_of(&back, &theirs).await, "WORKING");
+}

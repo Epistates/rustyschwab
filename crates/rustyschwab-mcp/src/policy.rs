@@ -634,6 +634,14 @@ impl AuthorizedServer {
     pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
         turbomcp::serve_stdio(turbomcp::LegacySessionAdapter::new(self.dispatcher())).await
     }
+    /// After the client has gone, wait for the principal's dead-man switch
+    /// to fire, or for another process to take over its watch; return at
+    /// once without a switch. See [`Beacon::outlive_client`].
+    pub async fn outlive_client(&self) {
+        if let Some(beacon) = &self.dead_man {
+            beacon.outlive_client().await;
+        }
+    }
     /// Call tool `name` with `arguments` in process, as a client with no
     /// elicitation channel would on the current protocol revision: for the
     /// evaluation harness and for tests.

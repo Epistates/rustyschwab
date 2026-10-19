@@ -265,7 +265,15 @@ async fn main() -> anyhow::Result<()> {
             .into_iter()
             .find(|s| s.principal.name == principal)
             .context("Unknown stdio principal")?;
+        // A stdio client that disconnects or crashes takes its session with
+        // it, but not its orders: the process stays until the principal's
+        // dead-man switch has had its say.
+        let watching = server.clone();
         server.run_stdio().await?;
+        tokio::select! {
+            () = watching.outlive_client() => {}
+            () = shutdown_signal() => {}
+        }
     } else {
         anyhow::ensure!(
             matches!(transport.as_str(), "http" | "websocket" | "ws"),

@@ -435,7 +435,10 @@ reports `principal.deadMan` as `{"windowSecs": 300, "secondsLeft": 300}`;
 because the status call is itself a call, the seconds left read the whole
 window and fall only between your calls. Cancels made by the switch do not
 need `cancel_order` or `SCHWAB_MCP_ALLOW_CANCEL`: it is the operator's
-safety control, not one of your tools.
+safety control, not one of your tools. A call through any server process
+that shares the principal's state counts, and a stdio server whose client
+disconnects stays running until the switch fires (see
+[Operations](OPERATIONS.md#dead-man-switch)).
 
 Nothing is audited or approved by checking. Grant `check_order` to any principal that
 holds `place_order` or `replace_order`; without a principal (the local stdio

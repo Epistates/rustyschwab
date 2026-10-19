@@ -63,6 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StreamParameters` and the writer's outgoing frames no longer show the
   LOGIN access token in their `Debug` output.
 
+### Fixed — the dead-man switch outlives a stdio client
+
+- On stdio, a client that disconnected or crashed ended the process, and
+  its dead-man watcher with it, so the orders the agent left working were
+  never cancelled. `rustyschwab-mcp` now stays until the switch fires for
+  that silence, or until the principal comes back through another server,
+  and then exits. `SIGINT`/`SIGTERM` still stop it at once.
+- Liveness is shared across processes through a heartbeat file beside the
+  principal's audit journal (`<journal>.alive`): a principal served by
+  several processes is silent only when all of them have stopped hearing
+  from it. Before, the process it stopped using could cancel orders it was
+  still managing through another.
+
 ### Changed — request deadlines
 
 - `ClientConfig::timeout` defaults to 30 s (was 10 s), and a connection
