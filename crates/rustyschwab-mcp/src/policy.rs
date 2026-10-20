@@ -82,9 +82,61 @@ pub struct PrincipalPolicy {
     /// orders.
     #[serde(default)]
     pub dead_man_secs: Option<std::num::NonZeroU32>,
+    /// With `require_approval`, only an order whose bounded notional is
+    /// over this amount needs approval (see [`crate::delegation`]).
+    #[serde(default)]
+    pub approval_threshold: Option<rust_decimal::Decimal>,
+    /// The widest approval mode an operator may delegate to this principal
+    /// at run time; absent, the policy's own mode, so the operator can only
+    /// tighten it (see [`crate::delegation`]).
+    #[serde(default)]
+    pub max_delegation: Option<crate::delegation::Mode>,
 }
 impl PrincipalPolicy {
+    /// The approval mode this policy sets on its own, before any grant.
+    pub fn approval_mode(&self) -> crate::delegation::Mode {
+        use crate::delegation::Mode;
+        match (self.require_approval, self.approval_threshold) {
+            (false, _) => Mode::Autonomous,
+            (true, None) => Mode::Supervised,
+            (true, Some(above)) => Mode::Threshold { above },
+        }
+    }
+    /// The widest mode an operator may grant: `max_delegation`, or the
+    /// policy's own mode.
+    pub fn delegation_ceiling(&self) -> crate::delegation::Mode {
+        self.max_delegation
+            .clone()
+            .unwrap_or_else(|| self.approval_mode())
+    }
+    /// Set the approval settings to `mode`, for a grant in force.
+    pub fn set_approval_mode(&mut self, mode: &crate::delegation::Mode) {
+        use crate::delegation::Mode;
+        (self.require_approval, self.approval_threshold) = match mode {
+            Mode::Supervised => (true, None),
+            Mode::Threshold { above } => (true, Some(*above)),
+            Mode::Autonomous => (false, None),
+        };
+    }
+    /// Whether submitting `name` with `args` needs an operator's approval
+    /// under this policy (granted or not): what decides whether the
+    /// submission consumes one.
+    pub fn approval_applies(&self, name: &str, args: &Value) -> bool {
+        matches!(name, "place_order" | "replace_order")
+            && self.require_approval
+            && self
+                .approval_mode()
+                .needs_approval(self.bounded_notional(args))
+    }
+    /// The order's bounded notional, when it can be computed.
+    fn bounded_notional(&self, args: &Value) -> Option<rust_decimal::Decimal> {
+        let order = serde_json::from_value(args.get("order")?.clone()).ok()?;
+        exposure(&order, &self.option_multipliers)
+            .ok()
+            .map(|(_, notional)| notional)
+    }
     pub fn validate(&self) -> anyhow::Result<()> {
+        crate::delegation::validate_policy(self)?;
         anyhow::ensure!(!self.name.trim().is_empty(), "Principal name is required");
         anyhow::ensure!(
             (self.token_sha256.len() == 64
@@ -214,7 +266,11 @@ impl PrincipalPolicy {
                 Err(reason) => review.denials.push(ToolFailure::invalid_arguments(reason)),
             }
             let digest = intent_digest(name, args);
-            if self.require_approval && !self.approved_intents.contains(&digest) {
+            let notional = review.exposure.map(|(_, notional)| notional);
+            if self.require_approval
+                && self.approval_mode().needs_approval(notional)
+                && !self.approved_intents.contains(&digest)
+            {
                 review.denials.push(
                     ToolFailure::new(
                         FailureCode::ApprovalRequired,
@@ -888,6 +944,9 @@ impl AuthorizedServer {
         let digest = intent_digest(name, &args);
         let wait = approval_wait(&args)?;
         let effective = self.effective_policy(name, &digest).await?;
+        // Under the mode in force: an order that needs no approval (below a
+        // threshold, or delegated) consumes none.
+        let approval_applies = effective.approval_applies(name, &args);
         let authorized = effective.authorize(name, &args);
         // The price collar reads the market, so it is judged once the
         // policy passes (an approval aside): an operator is never asked to
@@ -934,7 +993,7 @@ impl AuthorizedServer {
         };
         let write = submission || name == "cancel_order";
         let audit_id = if write {
-            let dedup = if self.principal.require_approval && submission {
+            let dedup = if approval_applies {
                 // The audit consumes this one-use approval, so refuse here
                 // what the tool would refuse before sending; a refusal
                 // after it would leave the operator to approve a new intent.
@@ -1126,14 +1185,21 @@ impl AuthorizedServer {
         }
     }
 
-    /// The principal with a durable operator approval of the submission
-    /// intent `digest` merged in, when approvals are required.
+    /// The principal as it stands for a submission: the operator's
+    /// delegation in force applied to its approval mode, and a durable
+    /// operator approval of the intent `digest` merged in, when approvals
+    /// are required.
     async fn effective_policy(
         &self,
         name: &str,
         digest: &str,
     ) -> Result<PrincipalPolicy, ToolFailure> {
         let mut effective = (*self.principal).clone();
+        if matches!(name, "place_order" | "replace_order") {
+            crate::delegation::apply(&mut effective, &self.audit)
+                .await
+                .map_err(|e| ToolFailure::internal("Delegation store unavailable", e))?;
+        }
         if effective.require_approval
             && matches!(name, "place_order" | "replace_order")
             && self
@@ -1310,6 +1376,14 @@ impl AuthorizedServer {
             status.scope_to(&self.principal);
             if let (Some(principal), Some(dead_man)) = (status.principal.as_mut(), &self.dead_man) {
                 principal.dead_man = Some(dead_man.status());
+            }
+            if let Some(principal) = status.principal.as_mut() {
+                let grant = crate::delegation::stored(&self.audit).await?;
+                let now = chrono::Utc::now().timestamp_millis();
+                let mode = crate::delegation::effective(&self.principal, grant.as_ref(), now);
+                let delegated = grant.as_ref().filter(|g| g.active(now) && g.mode == mode);
+                principal.require_approval = mode != crate::delegation::Mode::Autonomous;
+                principal.approval = crate::status::Approval::of(mode, delegated);
             }
             Ok(crate::contract::local(status.into_payload()?))
         })

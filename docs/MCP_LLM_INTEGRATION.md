@@ -406,6 +406,22 @@ delegates approval to whoever answers the client's prompts: an operator
 turns it on for a person at a desktop client, never for an unattended
 agent, and the authority gateway never honors such an approval.
 
+Which orders need approval is the principal's approval mode:
+`supervised` (every order; `require_approval: true`), `threshold` (only an
+order whose bounded notional is over `approval_threshold`, which needs
+`require_approval`), or `autonomous` (none; `require_approval: false`).
+Every other limit applies in every mode. An operator may change the mode
+at run time, from `rustyschwab-dash` or `rustyschwab_mcp::delegation`, for
+a time or until cancelled: always to a tighter mode, and to a wider one only
+up to the policy's `max_delegation` (for example
+`{"mode": "threshold", "above": "2500"}` or `{"mode": "autonomous"}`;
+absent, the policy's own mode). The grant is kept in the principal's
+journal, so every server process serving the principal applies it, and
+each change is audited as `setting_changed`. `get_server_status` reports
+the mode in force as `principal.approval`, with `delegatedBy` and `until`
+while a grant applies, and `check_order`'s `requiresApproval` judges the
+order under it.
+
 When `SCHWAB_MCP_APPROVAL_WEBHOOK` (or `rustyschwab-authority
 --approval-webhook`) is set, the first time an intent needs approval the
 server POSTs `{"text", "intent"}` to it: `text` reads as a chat message

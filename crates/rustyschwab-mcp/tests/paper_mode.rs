@@ -1426,3 +1426,105 @@ async fn every_call_is_noted_in_the_activity_log() {
     );
     assert!(find("place_order", "risk_denied").payload["message"].is_string());
 }
+
+/// An operator's delegation decides which orders need approval, within the
+/// policy's ceiling: widened from supervised to a threshold or autonomy,
+/// lapsing back on time, tightened on an autonomous principal, and shown in
+/// `get_server_status`.
+#[tokio::test]
+async fn delegation_decides_approval_within_the_policys_ceiling() {
+    use rustyschwab_mcp::delegation::{self, Mode};
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut supervised = policy();
+    supervised.require_approval = true;
+    supervised.max_delegation = Some(Mode::Autonomous);
+    let desk = AuthorizedServer::new(backend(broker.clone(), None), TRADING, supervised);
+    let place =
+        |quantity: &str| json!({"account_hash": ACCOUNT, "order": order("BUY", quantity, "9")});
+    let code = |answer: &Value| answer["error"]["code"].as_str().map(str::to_owned);
+    let status = call(&desk, "get_server_status", json!({})).await;
+    assert_eq!(
+        status["principal"]["approval"]["mode"], "supervised",
+        "{status}"
+    );
+    assert_eq!(
+        code(&call(&desk, "place_order", place("1")).await).as_deref(),
+        Some("approval_required")
+    );
+
+    // Orders up to 50 go unapproved; 90 does not.
+    let threshold = Mode::Threshold { above: d("50") };
+    delegation::grant(&desk.audit, &desk.principal, threshold, None, "ops")
+        .await
+        .unwrap();
+    assert_eq!(code(&call(&desk, "place_order", place("2")).await), None);
+    assert_eq!(
+        code(&call(&desk, "place_order", place("10")).await).as_deref(),
+        Some("approval_required")
+    );
+    let checked = call(&desk, "check_order", place("3")).await;
+    assert_eq!(checked["requiresApproval"], false, "{checked}");
+
+    // Autonomous, until a minute from now; then lapsed, back to supervised.
+    let soon = chrono::Utc::now().timestamp_millis() + 60_000;
+    delegation::grant(
+        &desk.audit,
+        &desk.principal,
+        Mode::Autonomous,
+        Some(soon),
+        "ops",
+    )
+    .await
+    .unwrap();
+    assert_eq!(code(&call(&desk, "place_order", place("4")).await), None);
+    let status = call(&desk, "get_server_status", json!({})).await;
+    assert_eq!(status["principal"]["approval"]["mode"], "autonomous");
+    assert_eq!(status["principal"]["approval"]["delegatedBy"], "ops");
+    assert!(status["principal"]["approval"]["until"].is_string());
+    let mut lapsed = delegation::stored(&desk.audit).await.unwrap().unwrap();
+    lapsed.until = Some(chrono::Utc::now().timestamp_millis() - 1);
+    desk.audit
+        .set_setting(
+            delegation::SETTING,
+            Some(serde_json::to_value(&lapsed).unwrap()),
+            "ops",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        code(&call(&desk, "place_order", place("5")).await).as_deref(),
+        Some("approval_required")
+    );
+
+    // An autonomous principal with no ceiling of its own can be tightened,
+    // never widened past its policy.
+    let mut bounded = policy();
+    bounded.name = "bounded".into();
+    bounded.token_sha256 = "b".repeat(64);
+    let other = AuthorizedServer::new(backend(broker, None), TRADING, bounded);
+    delegation::grant(
+        &other.audit,
+        &other.principal,
+        Mode::Supervised,
+        None,
+        "ops",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        code(&call(&other, "place_order", place("1")).await).as_deref(),
+        Some("approval_required")
+    );
+    delegation::cancel(&other.audit, "ops").await.unwrap();
+    assert_eq!(code(&call(&other, "place_order", place("6")).await), None);
+
+    let mut capped = policy();
+    capped.require_approval = true;
+    capped.max_delegation = Some(Mode::Threshold { above: d("100") });
+    assert!(
+        delegation::grant(&desk.audit, &capped, Mode::Autonomous, None, "ops")
+            .await
+            .is_err()
+    );
+}

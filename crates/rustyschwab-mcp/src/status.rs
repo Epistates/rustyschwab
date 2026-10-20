@@ -204,7 +204,11 @@ pub struct Principal {
     pub all_accounts: bool,
     pub max_quantity: Option<Decimal>,
     pub max_notional: Option<Decimal>,
+    /// Whether any order may need an operator's approval now.
     pub require_approval: bool,
+    /// When orders need approval: the policy's own mode, or the one an
+    /// operator delegated, with when it lapses.
+    pub approval: Approval,
     /// The client's user is asked to approve orders before an operator.
     pub client_approval: bool,
     /// Empty: any symbol the other limits allow.
@@ -225,6 +229,35 @@ pub struct Principal {
     pub dead_man: Option<DeadManStatus>,
 }
 
+/// The approval mode in force for a principal.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Approval {
+    #[serde(flatten)]
+    pub mode: crate::delegation::Mode,
+    /// Present while an operator's delegation is in force.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_by: Option<String>,
+    /// When that delegation lapses (RFC 3339); absent, it holds until the
+    /// operator cancels it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
+impl Approval {
+    /// `mode`, as delegated by `grant` when one is in force.
+    pub fn of(mode: crate::delegation::Mode, grant: Option<&crate::delegation::Grant>) -> Self {
+        Self {
+            mode,
+            delegated_by: grant.map(|g| g.operator.clone()),
+            until: grant.and_then(|g| g.until).and_then(|ms| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            }),
+        }
+    }
+}
+
 impl From<&PrincipalPolicy> for Principal {
     fn from(policy: &PrincipalPolicy) -> Self {
         let sorted = |set: &std::collections::HashSet<String>| {
@@ -240,6 +273,7 @@ impl From<&PrincipalPolicy> for Principal {
             max_quantity: policy.max_quantity,
             max_notional: policy.max_notional,
             require_approval: policy.require_approval,
+            approval: Approval::of(policy.approval_mode(), None),
             client_approval: policy.client_approval,
             allowed_symbols: sorted(&policy.allowed_symbols),
             denied_symbols: sorted(&policy.denied_symbols),

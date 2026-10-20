@@ -712,6 +712,10 @@ async fn order(
                 }
             }
             let digest = intent_digest(tool, &args);
+            // The operator's delegation in force, as on the MCP path.
+            if !cancel {
+                crate::delegation::apply(&mut principal, &audit).await?;
+            }
             principal.approved_intents.clear();
             if audit.is_approved(&principal.name, &digest).await? {
                 let operator = audit.approval_operator(&digest).await?;
@@ -765,7 +769,7 @@ async fn order(
             {
                 order.tag = Some(crate::policy::intent_tag(&digest));
             }
-            let consumes_approval = !cancel && principal.require_approval;
+            let consumes_approval = !cancel && principal.approval_applies(tool, &args);
             let key = if consumes_approval {
                 // As on the MCP path: refuse a halted or suspended submission
                 // before the audit consumes its one-use approval.

@@ -33,6 +33,8 @@ pub struct Verdict {
     /// sets one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily_budget: Option<DailyBudget>,
+    /// This order needs an operator's approval under the approval mode in
+    /// force (the policy's, or an operator's delegation).
     pub requires_approval: bool,
     /// The intent digest is approved, whether by policy or durably.
     pub approved: bool,
@@ -159,7 +161,7 @@ pub async fn evaluate(
             (
                 review.exposure,
                 Some(limits),
-                policy.require_approval,
+                policy.approval_applies(name, args),
                 approved,
             )
         }

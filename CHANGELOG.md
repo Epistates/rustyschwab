@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool, arguments (an order's `rationale` with it), outcome, duration and
   the venue order id a write produced. Results are not kept.
 
+### Added — approval modes and run-time delegation
+
+- A principal's approval mode is `supervised`, `threshold` (only orders
+  whose bounded notional is over the new `approval_threshold` need
+  approval) or `autonomous`. An operator can change it at run time
+  (`rustyschwab_mcp::delegation`), until a time or until cancelled: to a
+  tighter mode always, to a wider one only up to the policy's new
+  `max_delegation`. Grants live in the principal's journal and are audited;
+  the MCP server and the authority both apply them.
+- `get_server_status` reports `principal.approval` (the mode in force, and
+  who delegated it until when); `requireApproval` and `check_order`'s
+  `requiresApproval` follow the mode in force. An order that needs no
+  approval under it no longer consumes one.
+- **Breaking:** `PrincipalPolicy` has two new public fields, and
+  `status::Principal` a new `approval` field.
+
 ## [0.3.0] - 2026-10-19
 
 Upgrading from 0.2.0: the commands are renamed (below);
