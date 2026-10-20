@@ -4,6 +4,7 @@ members = [
     "crates/rustyschwab-types",
     "crates/rustyschwab-mcp",
     "crates/rustyschwab-console",
+    "crates/rustyschwab-dash",
     "examples/*",
 ]
 # cargo-fuzz targets build on their own (nightly, sanitizers); the Python

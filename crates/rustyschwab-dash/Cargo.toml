@@ -1,0 +1,36 @@
+[package]
+name = "rustyschwab-dash"
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+readme = "README.md"
+description = "Unofficial terminal dashboard for following and supervising agents that trade through rustyschwab-mcp"
+keywords = ["schwab", "trading", "tui", "dashboard", "mcp"]
+categories = ["command-line-utilities", "finance"]
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "rustyschwab-dash"
+path = "src/main.rs"
+
+[dependencies]
+rustyschwab-console = { path = "../rustyschwab-console", version = "0.3.0" }
+rustyschwab-mcp = { path = "../rustyschwab-mcp", version = "0.3.0" }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+clap = { workspace = true }
+# The same crossterm ratatui drives, with its async event stream.
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = { workspace = true }
+ratatui = "0.30"
+rust_decimal = { version = "1.43", features = ["serde"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

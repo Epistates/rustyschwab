@@ -36,7 +36,7 @@ const RECENT_ORDERS: usize = 20;
 const MAX_QUOTED: usize = 40;
 
 /// Something the operator asks the console to do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// Approve the order `digest` that `principal` is waiting on, for
     /// [`APPROVAL_MINUTES`].
