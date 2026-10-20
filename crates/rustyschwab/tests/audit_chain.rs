@@ -238,7 +238,8 @@ async fn upgrading_a_pre_chain_database_backfills_a_valid_chain() {
                 "DROP TABLE audit_anchor;
                  ALTER TABLE audit DROP COLUMN prev_hash;
                  ALTER TABLE audit DROP COLUMN hash;
-                 DELETE FROM schema_migrations WHERE version=5;
+                 DROP TABLE activity;
+                 DELETE FROM schema_migrations WHERE version>=5;
                  UPDATE meta SET value='4' WHERE key='schema';",
             )
             .unwrap();
@@ -296,4 +297,92 @@ fn events_and_requests_from_older_peers_still_decode() {
         serde_json::from_value(json!({"operation": "verify_audit"})),
         Ok(BackendRequest::VerifyAudit)
     ));
+}
+
+/// The activity log pages by sequence, keeps only its newest entries, and
+/// stays out of the audit chain.
+#[tokio::test]
+async fn activity_pages_in_order_and_keeps_only_the_newest() {
+    use rustyschwab::execution::ACTIVITY_RETAINED;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("activity.json"));
+    let first = journal
+        .record_activity("desk", "tool_call", json!({"tool": "get_quote"}))
+        .await
+        .unwrap();
+    let second = journal
+        .record_activity("desk", "tool_call", json!({"tool": "place_order"}))
+        .await
+        .unwrap();
+    let page = journal.activity_page(0, 10).await.unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].sequence, first);
+    assert_eq!(page[1].payload["tool"], "place_order");
+    assert_eq!(
+        journal.activity_page(first, 10).await.unwrap()[0].sequence,
+        second
+    );
+    assert!(journal.audit_page(0, 10).await.unwrap().is_empty());
+
+    // Past the cap, the oldest entries go.
+    raw(&journal)
+        .execute(
+            "UPDATE sqlite_sequence SET seq=?1 WHERE name='activity'",
+            [ACTIVITY_RETAINED + 5],
+        )
+        .unwrap();
+    let latest = journal
+        .record_activity("desk", "tool_call", json!({}))
+        .await
+        .unwrap();
+    assert_eq!(latest, ACTIVITY_RETAINED + 6);
+    let kept = journal.activity_page(0, 10).await.unwrap();
+    assert_eq!(
+        kept.iter().map(|a| a.sequence).collect::<Vec<_>>(),
+        vec![latest]
+    );
+}
+
+/// A setting is set and cleared with an audited `setting_changed` event,
+/// in a namespace that cannot touch the journal's own entries.
+#[tokio::test]
+async fn settings_are_audited_and_namespaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("settings.json"));
+    assert_eq!(journal.setting("delegation").await.unwrap(), None);
+    journal
+        .set_setting("delegation", Some(json!({"mode": "autonomous"})), "alice")
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.setting("delegation").await.unwrap(),
+        Some(json!({"mode": "autonomous"}))
+    );
+    journal
+        .set_setting("operator_halt", Some(json!("not a halt")), "alice")
+        .await
+        .unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    journal
+        .set_setting("delegation", None, "bob")
+        .await
+        .unwrap();
+    assert_eq!(journal.setting("delegation").await.unwrap(), None);
+    let changes: Vec<_> = journal
+        .audit_page(0, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "setting_changed")
+        .map(|e| (e.subject, e.payload))
+        .collect();
+    assert_eq!(changes.len(), 3);
+    assert_eq!(
+        changes[2],
+        (
+            "bob".to_string(),
+            json!({"key": "delegation", "value": null})
+        )
+    );
+    journal.verify_audit().await.unwrap();
 }

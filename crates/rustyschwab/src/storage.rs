@@ -121,6 +121,15 @@ const MIGRATIONS: &[Migration] = &[
             CREATE TABLE IF NOT EXISTS audit_anchor(id INTEGER PRIMARY KEY CHECK(id=1), sequence INTEGER NOT NULL, hash TEXT NOT NULL);",
         backfill: Some(crate::audit_chain::backfill),
     },
+    // What a client did, call by call, for someone watching it live: a
+    // bounded log beside the audit trail, not part of its hash chain (see
+    // `OrderJournal::record_activity`).
+    Migration {
+        version: 6,
+        name: "activity",
+        sql: "CREATE TABLE IF NOT EXISTS activity(sequence INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, subject TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);",
+        backfill: None,
+    },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 

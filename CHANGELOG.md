@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — an activity log and audited settings in the journal
+
+- `OrderJournal::record_activity` and `activity_page`: a bounded log of
+  what a client did (the newest `ACTIVITY_RETAINED` entries), for someone
+  following it live. It is not evidence: it sits outside the audit hash
+  chain. Schema version 6 adds its table.
+- `OrderJournal::setting` and `set_setting`: named settings an operator
+  changes at run time, each change audited as `setting_changed` in the
+  same transaction, as the operator halt is.
+
 ## [0.3.0] - 2026-10-19
 
 Upgrading from 0.2.0: the commands are renamed (below);

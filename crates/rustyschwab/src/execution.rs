@@ -528,6 +528,114 @@ impl OrderJournal {
             })
             .await
     }
+    /// Note what a client did, for someone following it live (a dashboard,
+    /// a log tail). Unlike [`record_event`](Self::record_event) this is not
+    /// evidence: it is outside the audit hash chain, and only the latest
+    /// [`ACTIVITY_RETAINED`] entries are kept. Returns the entry's sequence.
+    pub async fn record_activity(
+        &self,
+        subject: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<i64> {
+        let subject = subject.to_owned();
+        let kind = kind.to_owned();
+        let payload = serde_json::to_string(&payload)?;
+        self.database
+            .run(move |c| {
+                c.execute(
+                    "INSERT INTO activity(at,subject,kind,payload) VALUES(?1,?2,?3,?4)",
+                    rusqlite::params![
+                        chrono::Utc::now().timestamp_millis(),
+                        subject,
+                        kind,
+                        payload
+                    ],
+                )
+                .map_err(sql)?;
+                let sequence = c.last_insert_rowid();
+                c.execute(
+                    "DELETE FROM activity WHERE sequence<=?1",
+                    [sequence - ACTIVITY_RETAINED],
+                )
+                .map_err(sql)?;
+                Ok(sequence)
+            })
+            .await
+    }
+    /// Activity after sequence `after`, oldest first, at most `limit`
+    /// (1 to 10000) entries: poll with the last sequence seen.
+    pub async fn activity_page(&self, after: i64, limit: u32) -> Result<Vec<Activity>> {
+        self.database
+            .run(move |conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT sequence,at,subject,kind,payload FROM activity \
+                         WHERE sequence>?1 ORDER BY sequence LIMIT ?2",
+                    )
+                    .map_err(sql)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![after, limit.clamp(1, 10000)], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    })
+                    .map_err(sql)?;
+                rows.map(|row| {
+                    let (sequence, at, subject, kind, payload) = row.map_err(sql)?;
+                    Ok(Activity {
+                        sequence,
+                        at,
+                        subject,
+                        kind,
+                        payload: serde_json::from_str(&payload)?,
+                    })
+                })
+                .collect()
+            })
+            .await
+    }
+    /// A named setting stored in this journal, as [`set_setting`](Self::set_setting)
+    /// left it; `None` when unset.
+    pub async fn setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let key = setting_key(key);
+        self.database.run(move |c| meta::get_json(c, &key)).await
+    }
+    /// Set (`Some`) or clear (`None`) a named setting, auditing the change
+    /// as `setting_changed` under `operator` in the same transaction, as the
+    /// operator halt is: for controls an operator changes at run time.
+    pub async fn set_setting(
+        &self,
+        key: &str,
+        value: Option<serde_json::Value>,
+        operator: &str,
+    ) -> Result<()> {
+        let name = key.to_owned();
+        let key = setting_key(key);
+        let operator = operator.to_owned();
+        self.database
+            .run(move |c| {
+                let tx = c
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(sql)?;
+                match &value {
+                    Some(value) => meta::put_json(&tx, &key, value)?,
+                    None => meta::delete(&tx, &key)?,
+                }
+                audit(
+                    &tx,
+                    "setting_changed",
+                    &operator,
+                    &serde_json::json!({"key": name, "value": value}),
+                )?;
+                tx.commit().map_err(sql)
+            })
+            .await
+    }
     /// Ordered, bounded pages for an external immutable audit sink.
     pub async fn audit_page(&self, after: i64, limit: u32) -> Result<Vec<AuditEvent>> {
         self.database
@@ -643,6 +751,28 @@ const SELECT_INTENTS: &str = "SELECT i.digest,i.principal,i.tool,i.arguments,i.f
      EXISTS(SELECT 1 FROM audit WHERE kind='approval_revoked' AND subject=i.digest) \
      FROM intents i LEFT JOIN approvals a ON a.digest=i.digest \
      WHERE (?1 IS NULL OR i.digest=?1) AND i.last_seen>=?2 ORDER BY i.last_seen DESC LIMIT ?3";
+
+/// The `meta` key of a named setting, in its own namespace so a setting can
+/// never overwrite the journal's own entries (schema, operator halt).
+fn setting_key(name: &str) -> String {
+    format!("setting:{name}")
+}
+
+/// One entry of a journal's activity log; see [`OrderJournal::record_activity`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Activity {
+    pub sequence: i64,
+    /// Unix milliseconds.
+    pub at: i64,
+    /// Who acted: a principal, a strategy, a process.
+    pub subject: String,
+    /// What kind of entry, such as `tool_call`.
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+/// Entries an activity log keeps; older ones are dropped as new ones arrive.
+pub const ACTIVITY_RETAINED: i64 = 10_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
