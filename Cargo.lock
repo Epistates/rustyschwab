@@ -3333,6 +3333,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustyschwab-console"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dotenvy",
+ "rust_decimal",
+ "rustyschwab",
+ "rustyschwab-mcp",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rustyschwab-mcp"
 version = "0.3.0"
 dependencies = [
