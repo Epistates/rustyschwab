@@ -1372,3 +1372,57 @@ async fn a_server_outlives_its_client_until_the_switch_fires() {
     assert!(firings(&other).await.is_empty());
     assert_eq!(status_of(&back, &theirs).await, "WORKING");
 }
+
+/// Every tool call lands in the principal's activity log, refusals too,
+/// with the order's rationale and the venue order id a placement produced.
+#[tokio::test]
+async fn every_call_is_noted_in_the_activity_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let desk = AuthorizedServer::new(backend(broker, None), TRADING, policy());
+    call(&desk, "get_server_status", json!({})).await;
+    let placed = call(
+        &desk,
+        "place_order",
+        json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "9"),
+               "rationale": "testing the tape"}),
+    )
+    .await;
+    let order_id = placed["data"]["orderId"].clone();
+    call(
+        &desk,
+        "place_order",
+        json!({"account_hash": ACCOUNT, "order": order("BUY", "11", "9")}),
+    )
+    .await;
+    let notes = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let notes = desk.audit.activity_page(0, 100).await.unwrap();
+            if notes.len() >= 3 {
+                return notes;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("three calls were noted");
+    let find = |tool: &str, outcome: &str| {
+        notes
+            .iter()
+            .find(|n| n.payload["tool"] == tool && n.payload["outcome"] == outcome)
+            .unwrap_or_else(|| panic!("no {tool} {outcome} in {notes:?}"))
+    };
+    assert!(
+        notes
+            .iter()
+            .all(|n| n.subject == "paper-desk" && n.kind == "tool_call")
+    );
+    find("get_server_status", "ok");
+    let placement = find("place_order", "ok");
+    assert_eq!(placement.payload["orderId"], order_id);
+    assert_eq!(
+        placement.payload["arguments"]["rationale"],
+        "testing the tape"
+    );
+    assert!(find("place_order", "risk_denied").payload["message"].is_string());
+}

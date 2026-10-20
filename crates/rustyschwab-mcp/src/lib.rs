@@ -3,6 +3,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod activity;
 pub mod approvals;
 pub mod authority;
 pub mod backend;

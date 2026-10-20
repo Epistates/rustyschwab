@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `OrderJournal::setting` and `set_setting`: named settings an operator
   changes at run time, each change audited as `setting_changed` in the
   same transaction, as the operator halt is.
+- The MCP server notes every tool call a principal makes, refused ones
+  included, in that principal's journal activity log as a `tool_call`:
+  tool, arguments (an order's `rationale` with it), outcome, duration and
+  the venue order id a write produced. Results are not kept.
 
 ## [0.3.0] - 2026-10-19
 

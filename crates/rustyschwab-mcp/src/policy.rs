@@ -719,7 +719,32 @@ impl WithTools for AuthorizedServer {
             .retain(|tool| self.principal.tools.contains(&tool.name));
         Ok(page)
     }
+    /// Every call, answered or refused, is also noted in the principal's
+    /// activity log for whoever follows the agent live (see
+    /// [`crate::activity`]).
     async fn call_tool(
+        &self,
+        ctx: &CallToolContext,
+        params: neutral::CallToolParams,
+    ) -> McpResult<ToolResult> {
+        let started = Instant::now();
+        let name = params.name.clone();
+        let arguments = Value::Object(params.arguments.clone());
+        let result = self.answer(ctx, params).await;
+        crate::activity::note(
+            &self.audit,
+            &self.principal.name,
+            &name,
+            arguments,
+            &result,
+            started.elapsed(),
+        );
+        result
+    }
+}
+impl AuthorizedServer {
+    /// [`call_tool`](WithTools::call_tool) without the activity note.
+    async fn answer(
         &self,
         ctx: &CallToolContext,
         params: neutral::CallToolParams,
