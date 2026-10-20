@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — a dashboard to follow and supervise the agents
+
+- `rustyschwab-dash`: a terminal dashboard (ratatui) run beside the
+  servers. It shows every agent's tool calls as they happen with the
+  model's rationale, orders waiting for approval, each agent's approval
+  mode, delegation, dead-man countdown and daily budget, accounts,
+  positions and P&L, orders attributed to the agent that placed them,
+  quotes, and the operator halt. Its keys approve or refuse an order,
+  delegate an approval mode for a time or until cancelled, end a
+  delegation, halt, resume and kill, each confirmed first and audited
+  under the operator's name. See docs/DASHBOARD.md.
+- `rustyschwab-console`: the dashboard's core, with no user interface: a
+  serializable `Snapshot` of the servers' state and operator `Command`s,
+  for other frontends. It reads the same files as the servers (no network
+  port); watching costs no Schwab request but quotes in live mode.
+- `StateDatabase::known_accounts` and `known_orders` read reconciliation's
+  account list and stored orders; `guardrails::day_usage` is public.
+
 ### Added — an activity log and audited settings in the journal
 
 - `OrderJournal::record_activity` and `activity_page`: a bounded log of

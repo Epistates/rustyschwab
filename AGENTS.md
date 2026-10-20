@@ -9,6 +9,8 @@ Guidance for coding agents (and a short version of [CONTRIBUTING.md](CONTRIBUTIN
 | `crates/rustyschwab-types` | Wire types for Schwab's JSON. Most are `#[non_exhaustive]`, so other crates build them with constructors (`Candle::new`) or serde, and `match` on their enums needs a `_` arm. |
 | `crates/rustyschwab` | The SDK: `auth`, `client`, `streaming`, `execution` (order journal), `risk`, `reconciliation`, `paper` (the venue), `history`, `performance`, `metrics`. |
 | `crates/rustyschwab-mcp` | The MCP server (`src/server.rs` holds every `#[tool]`), its policy layer, and the `rustyschwab-admin`, `rustyschwab-authority`, `rustyschwab-remote`, `rustyschwab-paper`, `rustyschwab-eval` binaries. |
+| `crates/rustyschwab-console` | The operator console core: reads the servers' state into a serializable `Snapshot` and runs operator `Command`s (approve, delegate, halt, kill). No UI code. |
+| `crates/rustyschwab-dash` | The ratatui terminal frontend over the console (`rustyschwab-dash`). Rendering and keys only; anything that reads state or acts belongs in the console. |
 | `crates/schwab-py` | PyO3 bindings, published as `rustyschwab`. **Not a workspace member**: it has its own `Cargo.lock`, and workspace commands do not build it. Python sources are in `python/rustyschwab/`, tests in `tests/`. |
 | `docs/` | User and operator guides; `docs/INDEX.md` lists them. `docs/history/` is archived. `docs/audit/` is git-ignored local evidence. |
 | `examples/`, `fuzz/`, `ops/`, `tools/` | Runnable programs, fuzz targets, paper configs and Prometheus assets, soak and SBOM scripts. |

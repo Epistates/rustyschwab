@@ -6,10 +6,10 @@ on:
 permissions:
   contents: read
 env:
-  # Every binary the rustyschwab-mcp package ships.
+  # Every binary the rustyschwab-mcp and rustyschwab-dash packages ship.
   BINARIES: >-
     rustyschwab-mcp rustyschwab-admin rustyschwab-authority rustyschwab-remote
-    rustyschwab-paper rustyschwab-paper-verify rustyschwab-eval
+    rustyschwab-paper rustyschwab-paper-verify rustyschwab-eval rustyschwab-dash
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -26,7 +26,7 @@ jobs:
           [ "${GITHUB_REF_NAME#v}" = "$version" ] || { echo "::error::tag $GITHUB_REF_NAME is not v$version"; exit 1; }
       - name: The binary list matches the package
         run: |
-          built=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rustyschwab-mcp") | .targets[] | select(.kind[] == "bin") | .name' | sort)
+          built=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rustyschwab-mcp" or .name == "rustyschwab-dash") | .targets[] | select(.kind[] == "bin") | .name' | sort)
           # shellcheck disable=SC2086 # BINARIES is a word list
           listed=$(printf '%s\n' $BINARIES | sort)
           [ "$built" = "$listed" ] || { echo "::error::binaries differ: $built vs $listed"; exit 1; }
@@ -69,7 +69,7 @@ jobs:
           tool: cargo-auditable,cargo-audit
       # Embeds the dependency list in each binary, so `cargo audit bin` can
       # check a deployed artifact against RustSec long after the release.
-      - run: cargo auditable build -p rustyschwab-mcp --bins --release --locked --target ${{ matrix.target }}
+      - run: cargo auditable build -p rustyschwab-mcp -p rustyschwab-dash --bins --release --locked --target ${{ matrix.target }}
       - name: Stage binaries, SBOM and checksums
         env:
           TARGET: ${{ matrix.target }}

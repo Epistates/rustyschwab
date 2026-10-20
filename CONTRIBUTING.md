@@ -49,7 +49,7 @@ cargo check -p rustyschwab --no-default-features --locked
 cargo check -p rustyschwab --no-default-features --features native-tls --locked
 cargo check -p rustyschwab --no-default-features --features callback-server --locked
 cargo check -p rustyschwab-types --no-default-features --locked
-cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp --locked
+cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp -p rustyschwab-console -p rustyschwab-dash --locked
 cargo deny check advisories bans licenses sources
 cargo machete                                     # unused dependencies
 actionlint   # when you change .github/workflows

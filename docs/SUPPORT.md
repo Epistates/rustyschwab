@@ -28,6 +28,7 @@ There is no response-time SLA, on-call coverage or regulatory certification. Pro
 | History cache (`rustyschwab::history`) and performance analytics (`get_performance`, `rustyschwab.performance`) | New in 0.2. |
 | Shared authority and broker gateway (`rustyschwab-authority`, `rustyschwab-remote`, `RemoteBackend`) | Single writer; needs deployment and failover qualification. |
 | MCP network transports (HTTP, WebSocket) | Built on TurboMCP `4.0.0-alpha.5`, a pre-release pin. The tool surface is core; the transport moves to stable TurboMCP 4.x when it ships. |
+| Operator console and dashboard (`rustyschwab-console`, `rustyschwab-dash`) and run-time delegation | New after 0.3.0. The approval and delegation paths are tested over the paper venue; not run against a live account. |
 | OpenTelemetry export (`otel` feature) | Optional; the Prometheus endpoint is the supported metrics path. |
 
 ## Live verification status

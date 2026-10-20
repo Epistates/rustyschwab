@@ -14,6 +14,7 @@ An unofficial Rust SDK, Python package and MCP server for the Charles Schwab Tra
 | [`rustyschwab`](crates/rustyschwab) | Rust applications: OAuth, REST, the streamer, the order journal, risk limits, paper venue, history cache, performance analytics | [crate guide](crates/rustyschwab/README.md) |
 | [`rustyschwab`](crates/schwab-py) (Python) | The same SDK from asyncio or blocking Python, order templates, one strategy for backtest, paper and live, a NautilusTrader adapter | [Python guide](docs/PYTHON.md) |
 | [`rustyschwab-mcp`](crates/rustyschwab-mcp) | LLM agents: an MCP server with 40 tools over the SDK, behind per-principal policy, approvals and a paper mode, plus operator and gateway commands | [MCP guide](docs/MCP_LLM_INTEGRATION.md) |
+| [`rustyschwab-dash`](crates/rustyschwab-dash) | You, watching the agents: a terminal dashboard of every tool call and the model's reasons, with approvals, delegation, halt and kill (on [`rustyschwab-console`](crates/rustyschwab-console), for other frontends) | [Dashboard guide](docs/DASHBOARD.md) |
 
 ## What it does differently
 
@@ -96,6 +97,8 @@ SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json SCHWAB_MCP_PAPER_STATE=state/paper
 SCHWAB_MCP_ALLOW_TRADING=1 rustyschwab-mcp
 ```
 
+To follow the agent while it works, run `rustyschwab-dash` in another terminal with the same settings: every tool call and the model's reasons, orders waiting for your approval, and keys to approve, delegate, halt or kill ([dashboard guide](docs/DASHBOARD.md)).
+
 Claude Desktop configuration, the tool catalog and the policy model: [MCP guide](docs/MCP_LLM_INTEGRATION.md). Policies, approvals, risk limits, metrics and recovery: [Operations](docs/OPERATIONS.md).
 
 ## Documentation
@@ -105,7 +108,7 @@ Claude Desktop configuration, the tool catalog and the policy model: [MCP guide]
 - [Setup](docs/SETUP_GUIDE.md) and [callback URLs](docs/APP_CALLBACK.md)
 - [Orders](docs/ORDERS.md) and [streaming](docs/STREAMING.md)
 - [Python](docs/PYTHON.md) and [coming from Schwabdev](docs/MIGRATING_FROM_SCHWABDEV.md)
-- [MCP and LLM integration](docs/MCP_LLM_INTEGRATION.md)
+- [MCP and LLM integration](docs/MCP_LLM_INTEGRATION.md) and the [dashboard](docs/DASHBOARD.md) for following the agents
 - [Paper trading](docs/PAPER_TRADING.md) and [what it does not model](docs/PAPER_LIMITATIONS.md)
 - [Operations](docs/OPERATIONS.md) and [shared authority](docs/SHARED_AUTHORITY.md) for multi-process deployments
 - [Troubleshooting](docs/TROUBLESHOOTING.md)

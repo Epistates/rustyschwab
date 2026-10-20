@@ -24,6 +24,7 @@ Key facts for a model using or writing code against it:
 ## Operations
 
 - [Operations](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/OPERATIONS.md): principal policy, approvals, risk limits, dead-man switch, audit chain, recovery, metrics, OpenTelemetry
+- [Dashboard](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/DASHBOARD.md): `rustyschwab-dash`, where a person follows the agents and approves, delegates, halts or kills; approval modes (supervised, threshold, autonomous) an operator delegates at run time
 - [Support policy](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/SUPPORT.md): core versus experimental, live verification status, compatibility
 - [Troubleshooting](https://raw.githubusercontent.com/epistates/rustyschwab/main/docs/TROUBLESHOOTING.md): 401s, symbols, TLS, MCP startup errors
 

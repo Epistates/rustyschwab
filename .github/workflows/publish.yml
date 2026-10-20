@@ -40,6 +40,6 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
-          for crate in rustyschwab-types rustyschwab rustyschwab-mcp; do
+          for crate in rustyschwab-types rustyschwab rustyschwab-mcp rustyschwab-console rustyschwab-dash; do
             cargo publish -p "$crate" --locked
           done

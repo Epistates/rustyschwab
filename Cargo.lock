@@ -3952,7 +3952,6 @@ dependencies = [
  "rustyschwab-console",
  "rustyschwab-mcp",
  "tokio",
- "tracing",
  "tracing-subscriber",
 ]
 
