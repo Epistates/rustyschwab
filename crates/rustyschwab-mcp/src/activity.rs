@@ -72,52 +72,37 @@ pub fn describe(
         "arguments": arguments,
         "durationMs": u64::try_from(took.as_millis()).unwrap_or(u64::MAX),
     });
+    let clip = |text: &str| text.chars().take(MAX_MESSAGE_CHARS).collect::<String>();
     match result {
+        // An answer is the envelope as text; a large one (a chain, a
+        // history) is not worth parsing for a note.
+        Ok(result)
+            if !result.is_error
+                && crate::contract::first_text(result)
+                    .is_some_and(|text| text.len() > MAX_PARSED_BYTES) =>
+        {
+            payload["outcome"] = "ok".into();
+        }
         Ok(result) => {
-            let content = result.structured_content.as_ref();
-            if result.is_error {
-                let error = content.and_then(|c| c.get("error"));
-                payload["outcome"] = error
-                    .and_then(|e| e.get("code"))
-                    .cloned()
-                    .unwrap_or_else(|| "error".into());
-                if let Some(message) = error.and_then(|e| e.get("message")).and_then(Value::as_str)
-                {
-                    payload["message"] = message
-                        .chars()
-                        .take(MAX_MESSAGE_CHARS)
-                        .collect::<String>()
-                        .into();
+            let reported = crate::contract::Reported::of(result);
+            match &reported.failure {
+                Some((code, message)) => {
+                    payload["outcome"] = serde_json::to_value(code).unwrap_or(Value::Null);
+                    payload["message"] = clip(message).into();
                 }
-            } else {
-                payload["outcome"] = "ok".into();
-                // An answer is the envelope as text; a large one (a chain,
-                // a history) is not worth parsing for a note.
-                let parsed = content.is_none().then(|| {
-                    crate::contract::first_text(result)
-                        .filter(|text| text.len() <= MAX_PARSED_BYTES)
-                        .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                });
-                let content = content.or(parsed.as_ref().and_then(Option::as_ref));
-                if let Some(source) = content.and_then(|c| c.get("source")) {
-                    payload["source"] = source.clone();
-                }
-                if let Some(order_id) = content
-                    .and_then(|c| c.pointer("/data/orderId"))
-                    .filter(|id| !id.is_null())
-                {
-                    payload["orderId"] = order_id.clone();
-                }
+                None if result.is_error => payload["outcome"] = "error".into(),
+                None => payload["outcome"] = "ok".into(),
+            }
+            if let Some(source) = reported.body.as_ref().and_then(|b| b.get("source")) {
+                payload["source"] = source.clone();
+            }
+            if let Some(order_id) = reported.order_id() {
+                payload["orderId"] = order_id.into();
             }
         }
         Err(error) => {
             payload["outcome"] = "protocol_error".into();
-            payload["message"] = error
-                .to_string()
-                .chars()
-                .take(MAX_MESSAGE_CHARS)
-                .collect::<String>()
-                .into();
+            payload["message"] = clip(&error.to_string()).into();
         }
     }
     payload
@@ -127,10 +112,9 @@ pub fn describe(
 mod tests {
     use super::*;
 
+    /// A success as tools answer one: the envelope as JSON text.
     fn ok(content: Value) -> McpResult<ToolResult> {
-        let mut result = ToolResult::text("ok");
-        result.structured_content = Some(content);
-        Ok(result)
+        Ok(ToolResult::text(content.to_string()))
     }
 
     #[test]

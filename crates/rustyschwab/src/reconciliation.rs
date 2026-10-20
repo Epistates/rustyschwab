@@ -137,6 +137,39 @@ impl StateDatabase {
         })
         .await
     }
+    /// The accounts reconciliation has a baseline for.
+    pub async fn known_accounts(&self) -> Result<Vec<String>> {
+        self.run(|c| {
+            let mut stmt = c
+                .prepare("SELECT account FROM accounts ORDER BY account")
+                .map_err(sql)?;
+            let rows = stmt.query_map([], |r| r.get(0)).map_err(sql)?;
+            rows.collect::<std::result::Result<_, _>>().map_err(sql)
+        })
+        .await
+    }
+    /// Up to `limit` of the orders reconciliation last read for `account`,
+    /// as Schwab reported them, most recently observed first: a view of the
+    /// account's orders that costs no request.
+    pub async fn known_orders(&self, account: &str, limit: u32) -> Result<Vec<Value>> {
+        let account = account.to_owned();
+        self.run(move |c| {
+            let mut stmt = c
+                .prepare(
+                    "SELECT payload FROM orders WHERE account=?1 \
+                     ORDER BY observed_at DESC, order_id DESC LIMIT ?2",
+                )
+                .map_err(sql)?;
+            let rows = stmt
+                .query_map(params![account, limit.clamp(1, 10_000)], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(sql)?;
+            rows.map(|row| Ok(serde_json::from_str(&row.map_err(sql)?)?))
+                .collect()
+        })
+        .await
+    }
     /// Commit only if no newer invalidation or reconciliation superseded this
     /// read; a superseded pass writes nothing and says so in its report.
     pub async fn reconcile_snapshot(

@@ -205,7 +205,7 @@ pub(crate) fn counts(record: &SubmissionRecord) -> bool {
 
 /// The principal's submissions in the current New York trading day, less
 /// `except` (the submission being judged).
-pub(crate) async fn day_usage(
+pub async fn day_usage(
     audit: &OrderJournal,
     policy: &PrincipalPolicy,
     except: Option<&str>,
