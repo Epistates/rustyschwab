@@ -116,7 +116,7 @@ rustls = { version = "0.23.46", features = ["ring"] }
 # verifier reqwest's rustls backend uses for HTTPS.
 rustls-platform-verifier = "0.7"
 # Encryption at rest (ChaCha20Poly1305 AEAD - audited by NCC Group)
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # Cross-platform secure credential storage
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
 # Memory-safe secret handling with automatic zeroization

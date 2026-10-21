@@ -22,7 +22,7 @@
 use crate::error::{AuthError, Error, Result};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
-    aead::{Aead, AeadCore, KeyInit, OsRng},
+    aead::{Aead, Generate, KeyInit},
 };
 use secrecy::{SecretBox, SecretString};
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,7 @@ impl EncryptedToken {
     ///
     /// # Security
     ///
-    /// - Uses OS-provided RNG for nonce generation (`OsRng`)
+    /// - Uses the OS-provided CSPRNG for nonce generation (`getrandom`)
     /// - Each encryption uses a unique random nonce (never reused)
     /// - Provides authenticated encryption (detects tampering)
     ///
@@ -69,8 +69,8 @@ impl EncryptedToken {
         // Create cipher from key
         let cipher = ChaCha20Poly1305::new(key.into());
 
-        // Generate random nonce (CRITICAL: must be unique for each encryption)
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        // Random nonce from the OS CSPRNG (CRITICAL: unique per encryption)
+        let nonce = Nonce::generate();
 
         // Encrypt with AEAD
         let ciphertext = cipher.encrypt(&nonce, plaintext).map_err(|e| {
@@ -115,13 +115,17 @@ impl EncryptedToken {
 
         // Extract nonce and ciphertext
         let (nonce_bytes, ciphertext) = self.data.split_at(NONCE_SIZE);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes).map_err(|_| {
+            Error::Auth(AuthError::DecryptionFailed(
+                "Encrypted data has a malformed nonce".to_string(),
+            ))
+        })?;
 
         // Create cipher from key
         let cipher = ChaCha20Poly1305::new(key.into());
 
         // Decrypt with AEAD authentication
-        let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        let plaintext = cipher.decrypt(&nonce, ciphertext).map_err(|e| {
             Error::Auth(AuthError::DecryptionFailed(format!(
                 "ChaCha20Poly1305 decrypt failed: {}",
                 e
@@ -432,6 +436,20 @@ pub fn read_secret_file(path: &Path) -> Result<SecretString> {
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
+
+    /// A token file written by an earlier release still opens: this blob
+    /// was encrypted by chacha20poly1305 0.10 (key: 32 bytes of 7).
+    #[test]
+    fn a_blob_from_an_earlier_release_decrypts() {
+        let hex = "0edc4b3b89ba0424a6b3799c8d32927b83dc25ae6b83a09044c85616088951f4\
+                   e44b7e1301bb30566f8d50b090be72a693d4795b8dc1";
+        let data = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let plaintext = EncryptedToken { data }.decrypt(&[7u8; 32]).unwrap();
+        assert_eq!(plaintext.expose_secret().as_slice(), b"rustyschwab token store v1");
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
