@@ -25,6 +25,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StateDatabase::known_accounts` and `known_orders` read reconciliation's
   account list and stored orders; `guardrails::day_usage` is public.
 
+### Changed — dependencies
+
+- Every dependency at its latest release: base64 0.23, chacha20poly1305
+  0.11, rcgen 0.14, tokio-tungstenite 0.30, and every compatible update in
+  both lockfiles; every pinned GitHub Action at its latest release.
+- The OS keychain token store moves from keyring 3 to keyring 4's design:
+  `keyring-core` with one store per platform (macOS Keychain, Windows
+  Credential Manager, the Linux kernel keyring). Each is configured to name
+  entries as keyring 3 did, so tokens saved before still load; on Linux it
+  stays on the kernel keyring rather than keyring 4's default Secret
+  Service. The SDK holds its store itself and leaves `keyring_core`'s
+  process-wide default alone.
+- Token files encrypted by earlier releases still decrypt under
+  chacha20poly1305 0.11 (a fixed test vector from 0.10 guards it).
+- PyO3 stays at 0.29: `pythonize` has no release for PyO3 0.30 yet.
+
 ### Added — an activity log and audited settings in the journal
 
 - `OrderJournal::record_activity` and `activity_page`: a bounded log of
