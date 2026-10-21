@@ -117,8 +117,12 @@ rustls = { version = "0.23.46", features = ["ring"] }
 rustls-platform-verifier = "0.7"
 # Encryption at rest (ChaCha20Poly1305 AEAD - audited by NCC Group)
 chacha20poly1305 = "0.11"
-# Cross-platform secure credential storage
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "linux-native"] }
+# The OS credential stores (the keyring 4 design: keyring-core plus one store
+# per platform), configured in auth::token_store to find what keyring 3 wrote.
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+windows-native-keyring-store = { version = "1", default-features = false }
+linux-keyutils-keyring-store = "1"
 # Memory-safe secret handling with automatic zeroization
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive", "aarch64"] }

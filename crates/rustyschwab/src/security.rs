@@ -448,7 +448,10 @@ mod tests {
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect();
         let plaintext = EncryptedToken { data }.decrypt(&[7u8; 32]).unwrap();
-        assert_eq!(plaintext.expose_secret().as_slice(), b"rustyschwab token store v1");
+        assert_eq!(
+            plaintext.expose_secret().as_slice(),
+            b"rustyschwab token store v1"
+        );
     }
 
     #[test]

@@ -82,7 +82,7 @@ ring = { workspace = true }
 rustls = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true }
-keyring = { workspace = true }
+keyring-core = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 
@@ -137,7 +137,14 @@ full = ["rustls", "callback-server", "schemars", "telemetry"]
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { workspace = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 # Used by serde(with) attributes in configuration types.

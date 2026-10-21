@@ -428,6 +428,46 @@ impl KeychainTokenStore {
     }
 }
 
+/// The platform's credential store, opened once and held here rather than
+/// installed as `keyring_core`'s process-wide default, so an application
+/// that chose its own default keeps it. Each store is configured to name
+/// entries as keyring 3 did (macOS: the user keychain by service and
+/// account; Windows: `account.service`; Linux: the kernel keyring under
+/// `keyring-rs:account@service`), so tokens saved before still load.
+fn credential_store() -> AuthResult<std::sync::Arc<keyring_core::CredentialStore>> {
+    use std::sync::{Arc, OnceLock};
+    static STORE: OnceLock<Result<Arc<keyring_core::CredentialStore>, String>> = OnceLock::new();
+    STORE
+        .get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            let store: Arc<keyring_core::CredentialStore> =
+                apple_native_keyring_store::keychain::Store::new().map_err(|e| e.to_string())?;
+            #[cfg(windows)]
+            let store: Arc<keyring_core::CredentialStore> =
+                windows_native_keyring_store::Store::new().map_err(|e| e.to_string())?;
+            #[cfg(target_os = "linux")]
+            let store: Arc<keyring_core::CredentialStore> =
+                linux_keyutils_keyring_store::Store::new_with_configuration(
+                    &std::collections::HashMap::from([("prefix", "keyring-rs:")]),
+                )
+                .map_err(|e| e.to_string())?;
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+            return Ok(store);
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+            Err("this platform has no OS credential store; use an encrypted file".into())
+        })
+        .clone()
+        .map_err(AuthError::KeyringError)
+}
+
+impl KeychainTokenStore {
+    fn entry(&self) -> AuthResult<keyring_core::Entry> {
+        credential_store()?
+            .build(&self.service, &self.account, None)
+            .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))
+    }
+}
+
 impl TokenStore for KeychainTokenStore {
     fn save(&self, tokens: &TokenSet) -> AuthResult<()> {
         let json = token_json(tokens)
@@ -435,8 +475,7 @@ impl TokenStore for KeychainTokenStore {
         let json = std::str::from_utf8(&json)
             .map_err(|e| AuthError::KeyringError(format!("Serialization failed: {}", e)))?;
 
-        let entry = keyring::Entry::new(&self.service, &self.account)
-            .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))?;
+        let entry = self.entry()?;
 
         entry
             .set_password(json)
@@ -451,11 +490,10 @@ impl TokenStore for KeychainTokenStore {
     }
 
     fn load(&self) -> AuthResult<TokenSet> {
-        let entry = keyring::Entry::new(&self.service, &self.account)
-            .map_err(|e| AuthError::KeyringError(format!("Failed to create entry: {}", e)))?;
+        let entry = self.entry()?;
 
         let json = Zeroizing::new(entry.get_password().map_err(|e| match e {
-            keyring::Error::NoEntry => AuthError::TokenStorage(std::io::Error::new(
+            keyring_core::Error::NoEntry => AuthError::TokenStorage(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "no tokens in the keychain",
             )),
