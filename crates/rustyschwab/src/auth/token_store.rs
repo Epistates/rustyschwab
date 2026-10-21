@@ -409,7 +409,7 @@ impl TokenStore for EncryptedFileTokenStore {
     }
 }
 
-/// The OS credential store, through the `keyring` crate.
+/// The OS credential store, through `keyring-core` and its platform stores.
 ///
 /// - macOS: the login Keychain (the default store there).
 /// - Linux: the kernel keyutils keyrings, which do not survive logout or
