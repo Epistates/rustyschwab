@@ -125,7 +125,7 @@ fn callback_tls_identity(
     );
     Ok((
         vec![CertificateDer::from(cert.cert.der().to_vec())],
-        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+        PrivateKeyDer::Pkcs8(cert.signing_key.serialize_der().into()),
     ))
 }
 
@@ -1397,7 +1397,7 @@ mod tests {
         let issued = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let (cert_file, key_file) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
         std::fs::write(&cert_file, issued.cert.pem()).unwrap();
-        std::fs::write(&key_file, issued.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_file, issued.signing_key.serialize_pem()).unwrap();
         let mut config = config_with_creds(32, 16);
 
         let (chain, _) = callback_tls_identity(&config).unwrap();

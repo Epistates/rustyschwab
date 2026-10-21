@@ -290,18 +290,19 @@ async fn real_shaped_codes_are_exchanged_from_a_redirect_or_pasted_alone() {
 #[cfg(feature = "callback-server")]
 #[tokio::test]
 async fn the_callback_server_serves_a_configured_trusted_certificate() {
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
     use std::sync::Arc;
 
     // A local CA and a 127.0.0.1 certificate it signed, like mkcert's.
     let ca_key = KeyPair::generate().unwrap();
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca = ca_params.self_signed(&ca_key).unwrap();
+    let ca = ca_params.clone().self_signed(&ca_key).unwrap();
+    let issuer = Issuer::new(ca_params, &ca_key);
     let leaf_key = KeyPair::generate().unwrap();
     let leaf = CertificateParams::new(vec!["127.0.0.1".to_string(), "localhost".to_string()])
         .unwrap()
-        .signed_by(&leaf_key, &ca, &ca_key)
+        .signed_by(&leaf_key, &issuer)
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let (cert_file, key_file) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));

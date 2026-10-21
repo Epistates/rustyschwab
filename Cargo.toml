@@ -46,7 +46,7 @@ axum = "0.8"
 # TLS for the local OAuth callback server (Schwab requires an https
 # callback URL, so the capture server must terminate TLS itself).
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
-rcgen = "0.13"
+rcgen = "0.14"
 urlencoding = "2.1"
 
 # Serialization
