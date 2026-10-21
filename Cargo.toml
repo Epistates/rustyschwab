@@ -35,7 +35,7 @@ tokio = { version = "1.52", features = ["full"] }
 # TLS backends are chosen per crate (rustyschwab `rustls` / `native-tls`
 # features), never here: a backend listed at the workspace level is on for
 # every consumer and makes the other feature meaningless.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 futures-util = "0.3"
 async-trait = "0.1"
 
