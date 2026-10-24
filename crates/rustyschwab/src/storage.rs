@@ -5,7 +5,7 @@
 //! the pool; a second handle on the same path is a separate opener, so
 //! cross-process safety comes from SQLite's WAL locking, not from this type.
 use crate::error::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, backup::Progress};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -225,7 +225,8 @@ impl StateDatabase {
                 .ok_or_else(|| Error::InvalidParameter("Backup directory required".into()))?;
             crate::security::ensure_private_directory(parent)?;
             let reserved = reserve_backup_file(&destination)?;
-            conn.backup("main", &destination, None).map_err(sql)?;
+            conn.backup("main", &destination, None::<fn(Progress)>)
+                .map_err(sql)?;
             crate::security::verify_file_permissions(&destination)?;
             reserved.sync_all()?;
             Ok(())
@@ -264,7 +265,9 @@ impl StateDatabase {
                 .ok_or_else(|| Error::InvalidParameter("Restore directory required".into()))?;
             crate::security::ensure_private_directory(parent)?;
             let reserved = reserve_backup_file(&target_path)?;
-            source.backup("main", &target_path, None).map_err(sql)?;
+            source
+                .backup("main", &target_path, None::<fn(Progress)>)
+                .map_err(sql)?;
             reserved.sync_all()?;
             Ok::<_, Error>(())
         })

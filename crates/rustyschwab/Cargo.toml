@@ -22,7 +22,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-rusqlite = { version = "0.40", features = ["bundled", "backup"] }
+rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 rust_decimal = { version = "1.43", features = ["serde"] }
 rustyschwab-types = { path = "../rustyschwab-types", version = "0.3.0" }
 
