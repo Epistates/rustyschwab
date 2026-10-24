@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-24
+
+Upgrading from 0.2.0: the commands are renamed (below);
+`AuthError::RefreshTokenExpiring` is removed; `ClientConfig::timeout`
+defaults to 30 s; validation now refuses an `http` callback URL and an
+equity order with a duration Schwab rejects; and `PrincipalPolicy` and
+`status::Principal` have new public fields. The order journal moves to
+schema version 6 the first time 0.3.0 opens it, and 0.2.0 refuses it after
+that, so back it up (`rustyschwab-admin backup`) before upgrading if you may
+roll back. The rest of the library API is unchanged.
+
 ### Added — a dashboard to follow and supervise the agents
 
 - `rustyschwab-dash`: a terminal dashboard (ratatui) run beside the
@@ -28,8 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed — dependencies
 
 - Every dependency at its latest release: base64 0.23, chacha20poly1305
-  0.11, rcgen 0.14, tokio-tungstenite 0.30, and every compatible update in
-  both lockfiles; every pinned GitHub Action at its latest release.
+  0.11, rcgen 0.14, rusqlite 0.41 (bundled SQLite 3.54), tokio-tungstenite
+  0.30, and every compatible update in both lockfiles; every pinned GitHub
+  Action at its latest release.
 - The OS keychain token store moves from keyring 3 to keyring 4's design:
   `keyring-core` with one store per platform (macOS Keychain, Windows
   Credential Manager, the Linux kernel keyring). Each is configured to name
@@ -39,7 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process-wide default alone.
 - Token files encrypted by earlier releases still decrypt under
   chacha20poly1305 0.11 (a fixed test vector from 0.10 guards it).
-- PyO3 stays at 0.29: `pythonize` has no release for PyO3 0.30 yet.
+- Two stay behind. PyO3 stays at 0.29: `pythonize` has no release for PyO3
+  0.30 yet. parking_lot stays at 0.12: 0.13 needs Rust 1.95 (the MSRV is
+  1.89), and tokio and the other dependencies that use it are on 0.12.
 
 ### Added — an activity log and audited settings in the journal
 
@@ -70,14 +84,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   approval under it no longer consumes one.
 - **Breaking:** `PrincipalPolicy` has two new public fields, and
   `status::Principal` a new `approval` field.
-
-## [0.3.0] - 2026-10-19
-
-Upgrading from 0.2.0: the commands are renamed (below);
-`AuthError::RefreshTokenExpiring` is removed; `ClientConfig::timeout`
-defaults to 30 s; and validation now refuses an `http` callback URL and an
-equity order with a duration Schwab rejects. The rest of the library API is
-unchanged.
 
 ### Changed — the commands are named rustyschwab-*
 

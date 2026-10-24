@@ -32,7 +32,7 @@ crates.io trusted publishing cannot create a crate, so the first version of each
 
 Bump the versions, move the changelog section, tag and push. Approve `publish-python.yml` in the `pypi` environment, run `publish.yml` for the tag and approve it in the `crates-io` environment, then publish the GitHub Release.
 
-A release that adds a crate (`rustyschwab-console` and `rustyschwab-dash` arrive after 0.3.0) publishes it the first time with an API token, as above, since trusted publishing cannot create a crate; `cargo publish --workspace --locked` publishes every crate in dependency order. Add the trusted publisher to the new crates afterwards.
+A release that adds a crate (`rustyschwab-console` and `rustyschwab-dash` arrive in 0.3.0) publishes it the first time with an API token, as above, since trusted publishing cannot create a crate; `cargo publish --workspace --locked` publishes every crate in dependency order. Add the trusted publisher to the new crates afterwards.
 
 ## After publishing
 
