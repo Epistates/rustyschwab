@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A token refresh whose result could not be saved (a locked keychain, a full
+  disk) used to discard the new tokens, so the client kept the expired ones
+  and asked Schwab again on every call, and lost a rotated refresh token. The
+  new tokens now stay in use and the failed save is logged.
 - An order submission whose task panicked or was cut off by a runtime
   shutdown after the intent was journaled now returns `SubmissionUnknown`
   with its attempt id, not a `Storage` error. The gateway and the Python

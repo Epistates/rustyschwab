@@ -427,3 +427,62 @@ async fn a_refused_refresh_token_requires_reauthorization_and_is_not_retried() {
     mock_server.verify().await;
     let _ = std::fs::remove_file(&config.oauth.tokens_file);
 }
+
+/// Schwab has issued new tokens; a store that then fails (a locked keychain, a
+/// full disk) must not make the client throw them away and ask again on every
+/// call.
+#[cfg(unix)]
+#[tokio::test]
+async fn refreshed_tokens_stay_in_use_when_they_cannot_be_saved() {
+    use rustyschwab::auth::{FileTokenStore, TokenSet, TokenStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .and(body_string_contains("grant_type=refresh_token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "access_token": "fresh-access",
+            "refresh_token": "fresh-refresh",
+            "token_type": "Bearer",
+            "expires_in": 1800,
+            "scope": "api"
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let mut config = create_test_config(&mock_server.uri());
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("oauth-unsaveable-{}", uuid::Uuid::new_v4()));
+    config.oauth.tokens_file = dir.join("tokens.json");
+    FileTokenStore::new(config.oauth.tokens_file.clone())
+        .save(&TokenSet::new(
+            "stale".into(),
+            "refresh".into(),
+            "".into(),
+            "Bearer".into(),
+            0,
+            "".into(),
+            chrono::Utc::now() - chrono::Duration::hours(1),
+        ))
+        .unwrap();
+    let manager = AuthManager::new(config.oauth.clone()).unwrap();
+    // The refresh lock file exists already; the directory then takes no new
+    // file, so the write of the refreshed tokens fails.
+    let lock = config.oauth.tokens_file.with_extension("refresh.lock");
+    std::fs::File::create(&lock).unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    for _ in 0..2 {
+        manager
+            .ensure_valid_tokens()
+            .await
+            .expect("tokens Schwab just issued stay usable");
+    }
+    assert_eq!(manager.get_access_token().await.unwrap(), "fresh-access");
+
+    mock_server.verify().await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}

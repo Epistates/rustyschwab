@@ -748,8 +748,18 @@ impl AuthManager {
             old.refresh_token_expires_at
                 .unwrap_or(old.issued_at + Duration::days(7)),
         );
-        self.store_save(new_tokens.clone()).await?;
-        *self.tokens.write() = Some(new_tokens);
+        // The tokens are live the moment Schwab issues them: use them now and
+        // persist second. A store that fails (a locked keychain, a full disk)
+        // must not discard a credential that works, or every later call would
+        // refresh again, and a rotated refresh token would be lost.
+        *self.tokens.write() = Some(new_tokens.clone());
+        if let Err(error) = self.store_save(new_tokens).await {
+            warn!(
+                %error,
+                "refreshed tokens are in use but could not be saved; \
+                 they will be lost at restart unless the next save succeeds"
+            );
+        }
         Ok(())
     }
 
