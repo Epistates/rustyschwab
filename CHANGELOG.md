@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `stream_connect` (and the implicit connect in `stream_subscribe`) held the
+  stream's write lock through the whole handshake, up to tens of seconds, so
+  `get_server_status`, `stream_status` and `stream_snapshot` hung behind it.
+  A separate connect lock now serializes connects and disconnects, and the
+  stream lock is held only to look at or swap the slot.
 - `check_order` queued an approval request, and fired the approval webhook,
   for a principal that did not hold the tool the approval was for, so a
   principal granted only `check_order` could fill the operator's queue with

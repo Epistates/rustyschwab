@@ -138,6 +138,10 @@ pub fn recovery_accounts() -> Vec<String> {
 #[derive(Clone, Default)]
 pub struct StreamHub {
     stream: Arc<AsyncRwLock<Option<StreamClient>>>,
+    /// Held for the whole of a connect or disconnect, so the slow steps of
+    /// one (the handshake runs up to tens of seconds) do not hold `stream`,
+    /// which every status and snapshot read needs.
+    connecting: Arc<tokio::sync::Mutex<()>>,
     cache: StreamCache,
     feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
@@ -152,7 +156,9 @@ impl StreamHub {
     }
     /// Disconnect the stream and stop its feeder. Idempotent.
     pub async fn shutdown(&self) {
-        if let Some(client) = self.stream.write().await.take() {
+        let _connecting = self.connecting.lock().await;
+        let taken = self.stream.write().await.take();
+        if let Some(client) = taken {
             client.disconnect().await;
         }
         if let Some(handle) = self.feeder.write().await.take() {
@@ -172,6 +178,7 @@ pub struct SchwabMcp {
     backend: Backend,
     switches: Switches,
     stream: Arc<AsyncRwLock<Option<StreamClient>>>,
+    connecting: Arc<tokio::sync::Mutex<()>>,
     cache: StreamCache,
     feeder: Arc<AsyncRwLock<Option<tokio::task::JoinHandle<()>>>>,
     stream_config: StreamConfig,
@@ -211,6 +218,7 @@ impl SchwabMcp {
             backend,
             switches,
             stream: hub.stream,
+            connecting: hub.connecting,
             cache: hub.cache,
             feeder: hub.feeder,
             stream_config: StreamConfig::default(),
@@ -221,6 +229,7 @@ impl SchwabMcp {
     pub fn stream_hub(&self) -> StreamHub {
         StreamHub {
             stream: self.stream.clone(),
+            connecting: self.connecting.clone(),
             cache: self.cache.clone(),
             feeder: self.feeder.clone(),
         }
@@ -1214,6 +1223,7 @@ impl SchwabMcp {
             // tokio tasks are aborted — previously we just dropped the
             // Arc, leaving the background connection loop running until
             // the process exited.
+            let _connecting = self.connecting.lock().await;
             let taken = self.stream.write().await.take();
             let existed = taken.is_some();
             if let Some(client) = taken {
@@ -1478,11 +1488,21 @@ impl SchwabMcp {
         // market-data client, and its recovery feeder only ever gates that
         // client's (unused) submissions.
         let schwab = self.backend.market_data("stream_connect")?;
-        let mut guard = self.stream.write().await;
-        if guard.as_ref().is_some_and(|s| s.is_running()) {
+        // One connect at a time. The `stream` lock is held only to look at or
+        // swap the slot, never across the network: status and snapshot reads
+        // take it and must not wait out a handshake.
+        let _connecting = self.connecting.lock().await;
+        if self
+            .stream
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.is_running())
+        {
             return Ok(());
         }
-        if let Some(old) = guard.take() {
+        let old = self.stream.write().await.take();
+        if let Some(old) = old {
             old.disconnect().await;
         }
         if let Some(handle) = self.feeder.write().await.take() {
@@ -1521,7 +1541,7 @@ impl SchwabMcp {
             spawn_recovering_cache_feeder(rx, self.cache.clone(), schwab.clone(), client.clone());
         *self.feeder.write().await = Some(handle);
 
-        *guard = Some(client);
+        *self.stream.write().await = Some(client);
         Ok(())
     }
 }
