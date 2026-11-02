@@ -515,6 +515,22 @@ impl StreamClient {
                     .into(),
             ));
         }
+        let reconnect = &config.reconnect;
+        // The backoff is computed in the connection task: a NaN or negative
+        // multiplier panics `Duration::mul_f64` there and kills the task
+        // without ending the stream, and a zero backoff is a hot loop.
+        if reconnect.enabled
+            && (!(1.0..=100.0).contains(&reconnect.backoff_multiplier)
+                || reconnect.initial_backoff.is_zero()
+                || reconnect.max_backoff < reconnect.initial_backoff
+                || !(0.0..=1.0).contains(&reconnect.jitter))
+        {
+            return Err(Error::Config(
+                "Stream reconnect needs a backoff multiplier from 1 to 100, a positive initial \
+                 backoff no longer than the maximum, and a jitter from 0 to 1"
+                    .into(),
+            ));
+        }
         let capacity = match config.channel_kind {
             ChannelKind::Bounded(0) => {
                 return Err(Error::Config(
@@ -2458,6 +2474,49 @@ mod tests {
             receiver.recv().await,
             Some(StreamMessage::State(s)) if s.lost_messages == 0 && s.generation == 2
         ));
+    }
+
+    #[test]
+    fn unusable_reconnect_settings_are_refused_up_front() {
+        let build = |tweak: &dyn Fn(&mut StreamConfig)| {
+            let mut config = StreamConfig::default();
+            tweak(&mut config);
+            StreamClient::new(
+                config,
+                create_test_auth_manager(),
+                StreamerIdentity::new("c".to_string(), "correl"),
+            )
+        };
+        build(&|_| {}).expect("the defaults are valid");
+        for (name, tweak) in [
+            (
+                "NaN multiplier",
+                (&|c: &mut StreamConfig| c.reconnect.backoff_multiplier = f64::NAN)
+                    as &dyn Fn(&mut StreamConfig),
+            ),
+            ("negative multiplier", &|c| {
+                c.reconnect.backoff_multiplier = -2.0
+            }),
+            ("huge multiplier", &|c| {
+                c.reconnect.backoff_multiplier = 1e300
+            }),
+            ("zero initial backoff", &|c| {
+                c.reconnect.initial_backoff = Duration::ZERO
+            }),
+            ("max below initial", &|c| {
+                c.reconnect.max_backoff = c.reconnect.initial_backoff / 2
+            }),
+            ("jitter above 1", &|c| c.reconnect.jitter = 1.5),
+        ] {
+            let error = build(tweak).expect_err(name);
+            assert!(matches!(error, Error::Config(_)), "{name}: {error:?}");
+        }
+        // Reconnect off: its numbers are never used.
+        build(&|c| {
+            c.reconnect.enabled = false;
+            c.reconnect.backoff_multiplier = f64::NAN;
+        })
+        .unwrap();
     }
 
     #[test]

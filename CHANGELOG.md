@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An `expires_in` of absurd size from the token endpoint panicked `chrono`
+  inside the refresh path. The access-token lifetime is now bounded at one
+  day (Schwab's is 30 minutes).
+- `StreamClient::new` now refuses reconnect settings that panic or spin: a
+  backoff multiplier that is NaN, negative or above 100 panicked
+  `Duration::mul_f64` in the connection task, which died without ending the
+  stream so its receiver waited forever; a zero initial backoff reconnected
+  in a hot loop.
 - Python: a `decimal.Decimal` in exponent form (`Decimal("1E-7")`, or
   `Decimal("100").normalize()`, which is `1E+2`) was refused as "not a plain
   decimal number". It is now sent fixed-point. `HistoryStore.path` is typed

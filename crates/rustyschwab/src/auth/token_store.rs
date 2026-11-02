@@ -79,6 +79,11 @@ where
     Ok(Option::<String>::deserialize(de)?.map(SecretString::from))
 }
 
+/// The longest access-token lifetime taken from the token endpoint, in
+/// seconds. Schwab's is 1800; the bound only keeps a hostile or broken reply
+/// from overflowing date arithmetic.
+const MAX_ACCESS_TOKEN_LIFETIME_SECS: i64 = 86_400;
+
 /// Token set with secure memory handling.
 ///
 /// Tokens are wrapped in [`SecretString`] which zeroizes its contents on drop.
@@ -157,6 +162,9 @@ impl TokenSet {
         scope: String,
         issued_at: DateTime<Utc>,
     ) -> Self {
+        // `chrono` panics on a duration or sum out of range, and the lifetime
+        // comes from the token endpoint: bound it. Schwab's is 30 minutes.
+        let expires_in = expires_in.min(MAX_ACCESS_TOKEN_LIFETIME_SECS);
         Self {
             access_token: Some(access_token),
             refresh_token: Some(refresh_token),
@@ -633,6 +641,35 @@ pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    /// `expires_in` comes from the network; an absurd one must not panic the
+    /// date arithmetic.
+    #[test]
+    fn an_absurd_token_lifetime_is_bounded_not_a_panic() {
+        for expires_in in [i64::MAX, 9_000_000_000_000_000, 1_000_000_000_000] {
+            let tokens = TokenSet::new(
+                "a".into(),
+                "r".into(),
+                String::new(),
+                "Bearer".into(),
+                expires_in,
+                String::new(),
+                Utc::now(),
+            );
+            assert_eq!(tokens.expires_in, MAX_ACCESS_TOKEN_LIFETIME_SECS);
+            assert!(tokens.is_valid());
+        }
+        let ordinary = TokenSet::new(
+            "a".into(),
+            "r".into(),
+            String::new(),
+            "Bearer".into(),
+            1800,
+            String::new(),
+            Utc::now(),
+        );
+        assert_eq!(ordinary.expires_in, 1800);
+    }
 
     /// A missing token directory is created owner-only.
     #[cfg(unix)]
