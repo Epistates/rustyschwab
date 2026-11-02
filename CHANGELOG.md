@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An order submission whose task panicked or was cut off by a runtime
+  shutdown after the intent was journaled now returns `SubmissionUnknown`
+  with its attempt id, not a `Storage` error. The gateway and the Python
+  trader had read that error as a definite refusal, recorded the order as
+  rejected (out of the daily budget and the dead-man switch's reach) and
+  could refund its approval while it was live at Schwab.
+
 ### Changed — dependencies
 
 - Every compatible update in both lockfiles (rusqlite 0.41.1, rustix 1.1.6,

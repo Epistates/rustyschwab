@@ -43,6 +43,24 @@ fn tagged(order: &OrderRequest) -> OrderRequest {
     tagged
 }
 
+/// The error for a submission task that did not finish (a panic, or the
+/// runtime shutting down). Once the intent is journaled (`attempt` is set)
+/// the request may have left the process, so the outcome is unknown, never a
+/// definite failure; reconciliation settles it. Before that, nothing was sent.
+fn submission_task_failed(
+    attempt: &std::sync::OnceLock<String>,
+    cause: &dyn std::fmt::Display,
+) -> Error {
+    let error = Error::Storage(format!("Submission task failed: {cause}"));
+    match attempt.get() {
+        Some(attempt_id) => Error::SubmissionUnknown {
+            attempt_id: attempt_id.clone(),
+            source: Box::new(error),
+        },
+        None => error,
+    }
+}
+
 #[derive(Clone)]
 pub struct SchwabClient {
     inner: Arc<ClientInner>,
@@ -422,13 +440,18 @@ impl SchwabClient {
         let path = path.to_owned();
         let order = order.clone();
         let fence = fence.cloned();
+        // The task records its attempt id here as soon as the intent is
+        // journaled, so a task that dies afterwards (a panic, or the runtime
+        // shutting down) can still be reported against that attempt.
+        let attempt = Arc::new(std::sync::OnceLock::<String>::new());
+        let task_attempt = Arc::clone(&attempt);
         tokio::spawn(async move {
             client
-                .submit_detached(op, method, &path, &order, fence.as_ref())
+                .submit_detached(op, method, &path, &order, fence.as_ref(), &task_attempt)
                 .await
         })
         .await
-        .map_err(|e| Error::Storage(format!("Submission task failed: {e}")))?
+        .map_err(|e| submission_task_failed(&attempt, &e))?
     }
 
     async fn submit_detached(
@@ -438,6 +461,7 @@ impl SchwabClient {
         path: &str,
         order: &OrderRequest,
         fence: Option<&crate::coordination::Lease>,
+        attempt: &std::sync::OnceLock<String>,
     ) -> Result<OrderSubmitResponse> {
         self.ensure_live_state().await?;
         order.validate()?;
@@ -462,6 +486,7 @@ impl SchwabClient {
             .execution
             .begin_once(account, op, serde_json::to_value(order)?, None)
             .await?;
+        let _ = attempt.set(attempt_id.clone());
         let reserved = match (&self.inner.risk, replaces) {
             (None, _) => Ok(()),
             (Some(risk), None) => risk.reserve(account, &attempt_id, order).await,
@@ -1373,6 +1398,24 @@ impl Default for SchwabClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_submission_task_lost_after_journaling_is_unknown_not_failed() {
+        let attempt = std::sync::OnceLock::new();
+        // Before the intent exists nothing could have been sent.
+        assert!(matches!(
+            submission_task_failed(&attempt, &"panicked"),
+            Error::Storage(_)
+        ));
+        attempt.set("attempt-1".to_owned()).unwrap();
+        let Error::SubmissionUnknown { attempt_id, source } =
+            submission_task_failed(&attempt, &"panicked")
+        else {
+            panic!("a journaled submission must report SubmissionUnknown");
+        };
+        assert_eq!(attempt_id, "attempt-1");
+        assert!(source.to_string().contains("panicked"));
+    }
 
     #[test]
     fn account_path_accepts_hashes_and_rejects_numbers_and_separators() {
