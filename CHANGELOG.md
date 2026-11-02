@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — dependencies
+
+- Every compatible update in both lockfiles (rusqlite 0.41.1, rustix 1.1.6,
+  openssl 0.10.82 and others), and the pinned GitHub Actions: setup-python
+  7.1.0, codeql-action 4.39.1, install-action 2.87.30, crates-io-auth-action
+  1.0.6. PyO3 and parking_lot stay behind for the reasons given under 0.3.0;
+  Dependabot is told to skip parking_lot 0.13 until the MSRV reaches 1.95.
+
 ## [0.3.0] - 2026-10-24
 
 Upgrading from 0.2.0: the commands are renamed (below);
