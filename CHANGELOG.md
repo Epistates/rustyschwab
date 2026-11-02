@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `HistoryStore` stored a weekly or monthly bar that began before today as
+  final, so the week's or month's partial bar was never fetched again and a
+  backtest read it truncated. Those bars are now final only once their week
+  (from Monday) or month is over. A cache already holding weekly or monthly
+  series keeps the bars it stored: delete those series (or the file) to
+  refetch them.
 - A stream frame that could not be parsed was dropped with only a metric:
   `lost_messages` and readiness stayed as they were, so a consumer of
   level-one deltas kept stale fields while the stream reported itself

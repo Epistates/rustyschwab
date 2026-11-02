@@ -288,7 +288,9 @@ impl HistoryStore {
     /// `request`'s candles, fetching the spans the cache lacks from
     /// `source` first, at most one chunk per request. Fetched bars before
     /// the current New York date are marked complete; today's are stored
-    /// and fetched again next time. The span's end is clamped to now.
+    /// and fetched again next time. (A weekly or monthly bar is final only
+    /// once its week or month is over, so those are fetched again until then.)
+    /// The span's end is clamped to now.
     pub async fn load(
         &self,
         source: &dyn HistorySource,
@@ -307,7 +309,7 @@ impl HistoryStore {
         request.validate()?;
         let mut bounded = request.clone();
         bounded.end_ms = bounded.end_ms.min(now_ms);
-        let settled = new_york_midnight(now_ms)?;
+        let settled = settled_before(bounded.bars, now_ms)?;
         if bounded.start_ms <= bounded.end_ms {
             for (gap_start, gap_end) in self.missing(&bounded).await? {
                 let mut start = gap_start;
@@ -447,17 +449,43 @@ fn initialize(path: &Path) -> Result<Connection> {
 }
 
 /// Midnight in New York on the date `at_ms` falls on, in epoch milliseconds.
+#[cfg(test)]
 fn new_york_midnight(at_ms: i64) -> Result<i64> {
     let date = New_York
         .timestamp_millis_opt(at_ms)
         .single()
         .ok_or_else(|| Error::InvalidParameter(format!("time {at_ms} is out of range")))?
         .date_naive();
+    midnight_of(date)
+}
+
+fn midnight_of(date: chrono::NaiveDate) -> Result<i64> {
     New_York
         .from_local_datetime(&date.and_time(chrono::NaiveTime::MIN))
         .earliest()
         .map(|midnight| midnight.timestamp_millis())
         .ok_or_else(|| Error::InvalidParameter(format!("no New York midnight on {date}")))
+}
+
+/// The instant before which `bars` are final at `now_ms`: the start of the
+/// New York day for minute and daily bars, but of the week (Monday) or the
+/// month for weekly and monthly ones, since a weekly or monthly bar that
+/// began before today is still accumulating.
+fn settled_before(bars: BarSize, now_ms: i64) -> Result<i64> {
+    use chrono::Datelike;
+    let today = New_York
+        .timestamp_millis_opt(now_ms)
+        .single()
+        .ok_or_else(|| Error::InvalidParameter(format!("time {now_ms} is out of range")))?
+        .date_naive();
+    let first_open_day = match bars.frequency_type {
+        FrequencyType::Weekly => {
+            today - chrono::Duration::days(i64::from(today.weekday().num_days_from_monday()))
+        }
+        FrequencyType::Monthly => today.with_day(1).unwrap_or(today),
+        _ => today,
+    };
+    midnight_of(first_open_day)
 }
 
 fn read_candles(c: &Connection, series: &str, start: i64, end: i64) -> Result<Vec<Candle>> {
@@ -703,6 +731,42 @@ mod tests {
         let asked = fake.asked.lock().clone();
         assert_eq!(asked.len(), 2);
         assert_eq!(asked[1].0, new_york_midnight(now).unwrap());
+    }
+
+    /// A weekly or monthly bar that began before today is still taking in
+    /// days. Stored as final it would never be repaired: Schwab returns no bar
+    /// stamped before the start of the next request.
+    #[tokio::test]
+    async fn a_weekly_or_monthly_bar_is_fetched_again_until_its_period_ends() {
+        let (_dir, store) = store().await;
+        let fake = Fake::default();
+        // Wednesday 2026-01-07 09:30 New York.
+        let wednesday = OPEN + 2 * DAY_MS;
+        let weekly = HistoryRequest::new("ABC", BarSize::WEEKLY, OPEN - 21 * DAY_MS, wednesday);
+        store.load_at(&fake, &weekly, wednesday).await.unwrap();
+        assert_eq!(
+            store.missing(&weekly).await.unwrap()[0].0,
+            new_york_midnight(OPEN).unwrap(),
+            "this week's bar starts Monday and is not final"
+        );
+
+        // Thursday 2026-01-15; the month began 2026-01-01.
+        let mid_month = OPEN + 10 * DAY_MS;
+        let monthly = HistoryRequest::new("ABC", BarSize::MONTHLY, OPEN - 90 * DAY_MS, mid_month);
+        store.load_at(&fake, &monthly, mid_month).await.unwrap();
+        assert_eq!(
+            store.missing(&monthly).await.unwrap()[0].0,
+            new_york_midnight(OPEN - 4 * DAY_MS).unwrap(),
+            "this month's bar starts on the 1st and is not final"
+        );
+
+        // Daily and minute bars still settle at the start of today.
+        let daily = HistoryRequest::new("ABC", BarSize::DAILY, OPEN - 21 * DAY_MS, wednesday);
+        store.load_at(&fake, &daily, wednesday).await.unwrap();
+        assert_eq!(
+            store.missing(&daily).await.unwrap()[0].0,
+            new_york_midnight(wednesday).unwrap()
+        );
     }
 
     #[tokio::test]
