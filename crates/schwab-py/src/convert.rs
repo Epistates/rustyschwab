@@ -144,7 +144,12 @@ fn scalar_object(obj: &Bound<'_, PyAny>, path: &str) -> Result<Value, Failure> {
     let python = |error: PyErr| Failure::field(path, error.to_string());
 
     if is_instance(&DECIMAL, obj, "decimal", "Decimal").map_err(python)? {
-        let text: String = obj.str().and_then(|s| s.extract()).map_err(python)?;
+        // Fixed-point, not `str()`: `str(Decimal("100").normalize())` is
+        // `1E+2` and `str(Decimal("1E-7"))` is `1E-7`, neither a plain number.
+        let text: String = obj
+            .call_method1("__format__", ("f",))
+            .and_then(|s| s.extract())
+            .map_err(python)?;
         return Ok(Value::String(text));
     }
     if is_instance(&DATETIME, obj, "datetime", "datetime").map_err(python)? {
@@ -254,6 +259,25 @@ mod tests {
                 to_json(&value).unwrap(),
                 json!({"d": "150.25", "when": "2026-01-02T03:04:05+00:00", "day": "2026-01-02",
                        "side": "BUY", "p": "/tmp/t.json"})
+            );
+            Ok(())
+        });
+    }
+
+    /// `str()` of a Decimal can be `1E+2` or `1E-7`; the wire wants a plain
+    /// number, and the same value must not be refused for how it was made.
+    #[test]
+    fn decimals_are_spelled_fixed_point_whatever_their_exponent() {
+        run(|py| {
+            let value = py.eval(
+                c"[__import__('decimal').Decimal(s) for s in ('100', '1E+2', '1E-7', '-0.50', '12.340')]\
+                  + [__import__('decimal').Decimal('100').normalize()]",
+                None,
+                None,
+            )?;
+            assert_eq!(
+                to_json(&value).unwrap(),
+                json!(["100", "100", "0.0000001", "-0.50", "12.340", "100"])
             );
             Ok(())
         });

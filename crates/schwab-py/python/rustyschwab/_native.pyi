@@ -1,6 +1,7 @@
 """Type stubs for the native extension. Docstrings live in the Rust source."""
 
 import os
+import pathlib
 from datetime import date
 from decimal import Decimal
 from types import TracebackType
@@ -203,7 +204,7 @@ class HistoryStore:
     @staticmethod
     async def open(path: str | os.PathLike[str]) -> HistoryStore: ...
     @property
-    def path(self) -> str: ...
+    def path(self) -> pathlib.Path: ...
     async def load(
         self,
         client: Client,
