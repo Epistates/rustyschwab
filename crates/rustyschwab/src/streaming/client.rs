@@ -151,6 +151,22 @@ impl MessageSender {
         self.record_loss();
     }
 
+    /// A frame arrived that could not be parsed, so its data is lost. The
+    /// connection is sound, so unlike an overflow nothing is waiting to turn
+    /// the stream ready again: count the loss and start a new generation, ready
+    /// if the session is, which tells the consumer to re-baseline (level-one
+    /// updates are deltas, and the lost frame may have carried one).
+    pub(crate) fn record_unparsed(&self) {
+        let ready =
+            self.session_ready.load(Ordering::Acquire) && !self.overflowed.load(Ordering::Acquire);
+        self.state.send_modify(|s| {
+            s.lost_messages += 1;
+            s.generation += 1;
+            s.ready = ready;
+        });
+        metrics::counter!(crate::metrics::STREAM_DROPPED_MESSAGES_TOTAL).increment(1);
+    }
+
     fn record_loss(&self) {
         self.state.send_modify(|s| {
             s.lost_messages += 1;
@@ -1205,14 +1221,14 @@ impl StreamClientInner {
                 Err(error) => Err(error),
             };
             self.cleanup();
-            if self.authenticated_once.load(Ordering::SeqCst) && result.is_ok() {
-                login_retried = false;
-            }
             // `max_retries` bounds consecutive failed attempts: a session
             // that logged in starts the count over, so a stream that recovers
             // now and then is not ended after its n-th reconnect in a week.
+            // The same goes for the one login retry on a fresh token: it is
+            // for a denial that persists, not a budget for the stream's life.
             if self.logins.load(Ordering::SeqCst) != logins {
                 retry_count = 0;
+                login_retried = false;
             }
             // Schwab said it is ending the session (another login took the
             // streamer slot, or nothing is subscribed): reconnecting would
@@ -1576,6 +1592,7 @@ impl StreamClientInner {
                                     frame_bytes = text.len(),
                                     "dropping unparseable stream frame"
                                 );
+                                self.message_tx.record_unparsed();
                                 continue;
                             };
                             let code = match &message {
@@ -1707,6 +1724,9 @@ impl StreamClientInner {
                                 "kind" => "dropped",
                             )
                             .increment(1);
+                            // Its data is lost: say so, rather than let the
+                            // consumer keep stale deltas as if loss-free.
+                            self.message_tx.record_unparsed();
                         }
                     }
                 }
@@ -2350,6 +2370,43 @@ mod tests {
             }
             other => panic!("expected the current-generation heartbeat, got {other:?}"),
         }
+    }
+
+    /// A frame that cannot be parsed is lost data. The consumer is told (a
+    /// count and a new generation) and the stream stays ready, so what
+    /// follows is delivered; nothing else would ever turn it back on.
+    #[tokio::test]
+    async fn an_unparseable_frame_is_reported_as_a_gap_and_delivery_continues() {
+        let (tx, rx) = mpsc::channel(8);
+        let (status, state) = tokio::sync::watch::channel(StreamStatus::default());
+        let sender = MessageSender::new(tx, status);
+        let mut receiver = MessageReceiver::new(rx, state);
+        sender.begin_session();
+        sender.session_ready();
+        assert!(matches!(
+            receiver.recv().await,
+            Some(StreamMessage::State(s)) if s.ready && s.lost_messages == 0
+        ));
+
+        sender.send(heartbeat("before")).unwrap();
+        sender.record_unparsed();
+        sender.send(heartbeat("after")).unwrap();
+        // What arrived before the lost frame comes first, then the gap...
+        assert_eq!(
+            heartbeat_id(receiver.recv().await).as_deref(),
+            Some("before")
+        );
+        let Some(StreamMessage::State(gap)) = receiver.recv().await else {
+            panic!("the lost frame must be reported");
+        };
+        assert!(gap.ready, "the connection is sound; delivery continues");
+        assert_eq!(gap.lost_messages, 1);
+        assert_eq!(gap.generation, 2);
+        // ...and what follows the gap is delivered.
+        assert_eq!(
+            heartbeat_id(receiver.recv().await).as_deref(),
+            Some("after")
+        );
     }
 
     #[tokio::test]

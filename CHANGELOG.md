@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A stream frame that could not be parsed was dropped with only a metric:
+  `lost_messages` and readiness stayed as they were, so a consumer of
+  level-one deltas kept stale fields while the stream reported itself
+  loss-free. It now counts as a lost message and starts a new generation
+  (still ready), which tells the consumer to re-baseline.
+- The stream's one login retry on a fresh token was never given back, so
+  after one refreshed login the next denial, days later, ended the stream
+  with `LoginDenied`. A session that logs in restores it.
 - What an operator approves could be repainted by the model. The tag, the
   symbols and the order id in the approval line (`rustyschwab-admin show`
   and `pending`, the webhook, the elicitation, the authority's pending

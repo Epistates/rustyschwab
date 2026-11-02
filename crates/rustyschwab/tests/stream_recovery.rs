@@ -628,3 +628,63 @@ async fn a_session_that_logs_in_starts_the_retry_count_over() {
     client.disconnect().await;
     server.await.unwrap();
 }
+
+/// The one retry on a fresh token is for a denial that persists, not a budget
+/// for the stream's whole life: a stream that logs in again in between gets
+/// it again the next time Schwab refuses a token.
+#[tokio::test]
+async fn a_second_login_denial_much_later_is_retried_too() {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
+    let tokens = MockServer::start().await;
+    Mock::given(path("/oauth/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "new_access", "refresh_token": "refresh",
+            "token_type": "Bearer", "expires_in": 1800
+        })))
+        .expect(2)
+        .mount(&tokens)
+        .await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = refreshing_client(
+        format!("ws://{}", listener.local_addr().unwrap()),
+        format!("{}/oauth/token", tokens.uri()),
+    );
+    async fn deny(listener: &TcpListener) {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let req = request(&mut ws).await;
+        ws.send(Message::Text(
+            json!({"response":[ack(&req,3)]}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    }
+    let server = tokio::spawn(async move {
+        drop(login(&listener).await); // healthy, then dropped
+        deny(&listener).await; // denied: refresh and retry
+        drop(login(&listener).await); // logged in again, then dropped
+        deny(&listener).await; // denied again, much later: refresh and retry
+        let _ws = login(&listener).await;
+        std::future::pending::<()>().await;
+    });
+    client.connect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = client.status();
+            assert!(
+                status.ended.is_none(),
+                "the stream must not end: {:?}",
+                status.ended
+            );
+            if status.ready && status.generation >= 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    client.disconnect().await;
+    server.abort();
+    tokens.verify().await;
+}
