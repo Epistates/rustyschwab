@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `check_order` queued an approval request, and fired the approval webhook,
+  for a principal that did not hold the tool the approval was for, so a
+  principal granted only `check_order` could fill the operator's queue with
+  approvals nobody could spend. It now records an intent only for a
+  principal holding that tool.
 - `HistoryStore` stored a weekly or monthly bar that began before today as
   final, so the week's or month's partial bar was never fetched again and a
   backtest read it truncated. Those bars are now final only once their week

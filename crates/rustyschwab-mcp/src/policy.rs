@@ -1231,10 +1231,14 @@ impl AuthorizedServer {
                 &args,
             )
             .await?;
-            if verdict
-                .reasons
-                .iter()
-                .any(|r| r.code == FailureCode::ApprovalRequired)
+            // Only for a principal that could use the approval: one holding
+            // just `check_order` would otherwise fill the operator's queue,
+            // and fire the webhook, with approvals that can never be spent.
+            if self.principal.tools.contains(name)
+                && verdict
+                    .reasons
+                    .iter()
+                    .any(|r| r.code == FailureCode::ApprovalRequired)
             {
                 self.note_intent(name, &digest, &args).await;
             }
@@ -1696,6 +1700,11 @@ mod tests {
             codes(&replacement),
             ["not_permitted", "approval_required", "not_permitted"]
         );
+        // The operator's queue holds what this principal could spend: the
+        // placement it holds the tool for, not the replacement it lacks.
+        let queued = server.audit.intents(None, 0, 10).await.unwrap();
+        assert_eq!(queued.len(), 1, "{queued:?}");
+        assert_eq!(queued[0].tool, "place_order");
 
         // The tool's own arguments are the caller's problem, not a verdict.
         let denied = crate::testing::call_tool(
