@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- What an operator approves could be repainted by the model. The tag, the
+  symbols and the order id in the approval line (`rustyschwab-admin show`
+  and `pending`, the webhook, the elicitation, the authority's pending
+  reply) were printed raw, so a carriage return or ANSI sequence in a tag
+  could replace the line with a different order. They are now escaped, and
+  `OrderRequest::validate` refuses a tag with a control character or over
+  128 characters and a symbol with a control character. The line also
+  shows the fields the digest binds that it left out: a trailing stop's
+  offset and links, special instruction, destination, activation price,
+  release and cancel times, stop type, tax-lot method, position effect and
+  complex strategy.
 - A token refresh whose result could not be saved (a locked keychain, a full
   disk) used to discard the new tokens, so the client kept the expired ones
   and asked Schwab again on every call, and lost a rotated refresh token. The

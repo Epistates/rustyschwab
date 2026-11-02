@@ -473,3 +473,23 @@ fn a_reported_order_becomes_its_request() {
     assert_eq!(wire["price"], "149.50");
     assert_eq!(wire["releaseTime"], "2030-01-02T14:30:00.000Z");
 }
+
+/// A tag and a symbol are shown to a person approving the order, and a tag
+/// is stored in the journal: neither may carry control characters (an escape
+/// sequence can repaint a terminal), and a tag is bounded.
+#[test]
+fn tags_and_symbols_refuse_control_characters_and_tags_are_bounded() {
+    let order = || OrderRequest::limit(buy(1), d("10"));
+    order().with_tag("rs-ok_1").validate().unwrap();
+    order().with_tag("x".repeat(128)).validate().unwrap();
+    for bad in ["a\nb", "a\r", "\x1b[2Ka", "a\u{7}", "\0"] {
+        rejects(&order().with_tag(bad), "tag");
+    }
+    rejects(&order().with_tag("x".repeat(129)), "tag");
+
+    let spoofed = OrderRequest::limit(
+        OrderRequestLeg::equity(OrderInstruction::Buy, "AA\x1b[2KPL", 1),
+        d("10"),
+    );
+    rejects(&spoofed, "control characters");
+}

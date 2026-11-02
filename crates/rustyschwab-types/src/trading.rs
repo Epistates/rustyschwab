@@ -1315,6 +1315,11 @@ crate::common::wire_enum!(
 /// Strategies nest at most this many levels, the root counting as one.
 const MAX_STRATEGY_DEPTH: usize = 8;
 
+/// The longest `tag` an order may carry, in characters. Generous (the SDK's
+/// own tags are 39); the bound keeps a model-supplied tag from flooding the
+/// journal and the operator's approval view.
+const MAX_TAG_CHARS: usize = 128;
+
 /// What an executable order type takes. `true` means required, `false`
 /// forbidden; the trailing link fields are required together.
 struct TypeRules {
@@ -1416,6 +1421,17 @@ impl OrderRequest {
         known("specialInstruction", self.special_instruction.as_ref())?;
         known("requestedDestination", self.requested_destination.as_ref())?;
         known("orderStrategyType", Some(&self.order_strategy_type))?;
+        if let Some(tag) = &self.tag
+            && (tag.chars().any(char::is_control) || tag.chars().count() > MAX_TAG_CHARS)
+        {
+            return Err(VE::new(
+                K::Structure,
+                Some("tag"),
+                format!(
+                    "tag must be at most {MAX_TAG_CHARS} characters and free of control characters"
+                ),
+            ));
+        }
         for (name, value) in [
             ("quantity", self.quantity),
             ("price", self.price),
@@ -1840,11 +1856,15 @@ impl OrderRequestLeg {
         if symbol.trim().is_empty()
             || symbol.trim() != symbol
             || symbol.bytes().any(|b| b.is_ascii_lowercase())
+            || symbol.chars().any(char::is_control)
         {
             return Err(VE::new(
                 K::Symbol,
                 Some("instrument.symbol"),
-                format!("Instrument symbol {symbol:?} must be non-empty, upper case and unpadded"),
+                format!(
+                    "Instrument symbol {symbol:?} must be non-empty, upper case, unpadded and \
+                     free of control characters"
+                ),
             ));
         }
         if self.quantity <= rust_decimal::Decimal::ZERO {

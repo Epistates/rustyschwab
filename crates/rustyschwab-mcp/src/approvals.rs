@@ -20,14 +20,17 @@ pub fn describe(tool: &str, arguments: &Value) -> String {
         .get("account_hash")
         .and_then(Value::as_str)
         .map(rustyschwab::utils::mask_account)
+        .map(|account| shown(&account))
         .unwrap_or_else(|| "?".into());
     let mut line = match tool {
         "replace_order" => format!(
             "REPLACE order {} on account {account}:",
-            arguments
-                .get("order_id")
-                .and_then(Value::as_str)
-                .unwrap_or("?")
+            shown(
+                arguments
+                    .get("order_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+            )
         ),
         _ => format!("PLACE on account {account}:"),
     };
@@ -52,8 +55,11 @@ fn describe_order(out: &mut String, order: &OrderRequest, depth: usize) {
                 if i == 0 { "" } else { " +" },
                 wire(&leg.instruction),
                 leg.quantity,
-                leg.instrument.symbol
+                shown(&leg.instrument.symbol)
             );
+            if let Some(effect) = &leg.position_effect {
+                let _ = write!(out, " {}", wire(effect));
+            }
         }
         if let Some(kind) = &order.order_type {
             let _ = write!(out, " {}", wire(kind));
@@ -73,6 +79,46 @@ fn describe_order(out: &mut String, order: &OrderRequest, depth: usize) {
     } else {
         let _ = write!(out, " {}", wire(&order.order_strategy_type));
     }
+    // The digest binds every field below; the person approving sees the ones
+    // that change what the order does, when they are set.
+    let extras: [(&str, Option<String>); 11] = [
+        ("qty", order.quantity.map(|v| v.to_string())),
+        ("activation", order.activation_price.map(|v| v.to_string())),
+        ("offset", order.stop_price_offset.map(|v| v.to_string())),
+        (
+            "stop-basis",
+            order.stop_price_link_basis.as_ref().map(wire_of),
+        ),
+        (
+            "stop-link",
+            order.stop_price_link_type.as_ref().map(wire_of),
+        ),
+        ("price-basis", order.price_link_basis.as_ref().map(wire_of)),
+        ("price-link", order.price_link_type.as_ref().map(wire_of)),
+        ("stop-type", order.stop_type.as_ref().map(wire_of)),
+        ("special", order.special_instruction.as_ref().map(wire_of)),
+        ("to", order.requested_destination.as_ref().map(wire_of)),
+        (
+            "strategy",
+            order.complex_order_strategy_type.as_ref().map(wire_of),
+        ),
+    ];
+    for (name, value) in extras {
+        if let Some(value) = value {
+            let _ = write!(out, " {name} {value}");
+        }
+    }
+    for (name, time) in [
+        ("release", order.release_time),
+        ("cancel", order.cancel_time),
+    ] {
+        if let Some(time) = time {
+            let _ = write!(out, " {name} {}", time.to_rfc3339());
+        }
+    }
+    if let Some(method) = &order.tax_lot_method {
+        let _ = write!(out, " lots {}", wire(method));
+    }
     for (i, child) in order.child_order_strategies.iter().enumerate() {
         let _ = write!(
             out,
@@ -86,8 +132,32 @@ fn describe_order(out: &mut String, order: &OrderRequest, depth: usize) {
     if depth == 0
         && let Some(tag) = &order.tag
     {
-        let _ = write!(out, " (tag {tag})");
+        let _ = write!(out, " (tag {})", shown(tag));
     }
+}
+
+/// `text` safe to print where a person reads it. The strings the model
+/// chooses (a tag, a symbol, an order id) could otherwise carry a carriage
+/// return, an ANSI sequence or a bidirectional override that repaints the
+/// line an operator is about to approve. Control and format characters are
+/// shown as `\u{..}`.
+fn shown(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let hidden = c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}');
+        if hidden {
+            let _ = write!(out, "\\u{{{:x}}}", c as u32);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn wire_of<T: serde::Serialize>(value: &T) -> String {
+    erased::Wire::wire(value)
 }
 
 /// Serialize an enum to its wire spelling for display.
@@ -262,6 +332,51 @@ mod tests {
         );
         let replace = json!({"account_hash": "A", "order_id": "77", "order": args["order"]});
         assert!(describe("replace_order", &replace).starts_with("REPLACE order 77"));
+    }
+
+    #[test]
+    fn what_the_model_chooses_cannot_repaint_the_line_an_operator_approves() {
+        let args = json!({
+            "account_hash": "HASHVALUE1234",
+            "order_id": "77\r\x1b[2KREPLACE order 1",
+            "order": {"orderStrategyType": "SINGLE", "orderType": "LIMIT",
+                "session": "NORMAL", "duration": "DAY", "price": "150.25",
+                "orderLegCollection": [{"quantity": "100000", "instruction": "BUY",
+                    "instrument": {"symbol": "TSLA\u{202e}", "assetType": "EQUITY"}}],
+                "tag": "ok\n\x1b[1A\x1b[2KPLACE BUY 1 AAPL"},
+        });
+        for line in [
+            describe("place_order", &args),
+            describe("replace_order", &args),
+        ] {
+            assert!(
+                !line.chars().any(|c| c.is_control() || c == '\u{202e}'),
+                "{line:?}"
+            );
+        }
+        assert!(describe("place_order", &args).contains("(tag ok\\u{a}\\u{1b}[1A"));
+    }
+
+    #[test]
+    fn the_fields_a_digest_binds_that_change_the_order_are_shown() {
+        let args = json!({
+            "account_hash": "HASHVALUE1234",
+            "order": {"orderStrategyType": "SINGLE", "orderType": "TRAILING_STOP",
+                "session": "NORMAL", "duration": "DAY",
+                "stopPriceLinkBasis": "BID", "stopPriceLinkType": "VALUE",
+                "stopPriceOffset": "0.01", "specialInstruction": "ALL_OR_NONE",
+                "orderLegCollection": [{"quantity": "10", "instruction": "SELL",
+                    "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]},
+        });
+        let line = describe("place_order", &args);
+        for needle in [
+            "offset 0.01",
+            "stop-basis BID",
+            "stop-link VALUE",
+            "special ALL_OR_NONE",
+        ] {
+            assert!(line.contains(needle), "{line}");
+        }
     }
 
     #[test]
