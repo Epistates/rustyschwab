@@ -74,8 +74,9 @@ breaks need a CHANGELOG entry with migration notes.
 Protect `main` by requiring the CI and Security checks to pass before a
 merge (the `rustfmt`, `clippy`, `rustdoc`, `test`, `SDK feature
 combinations`, `coverage`, `unused dependencies`, `fuzz smoke`,
-`publishable crates`, `cargo deny` and `workflow lint` jobs, plus `secret
-scan` and `CodeQL`).
+`publishable crates`, `cargo deny` and `workflow lint` jobs, the `python`
+matrix, `compatibility` (the semver check, on pull requests) and `soak`,
+plus `secret scan` and `CodeQL`).
 
 Then:
 

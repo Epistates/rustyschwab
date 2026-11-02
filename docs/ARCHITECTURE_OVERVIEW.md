@@ -7,14 +7,18 @@ describes the code as it is; for how to run it see the [README](../README.md),
 
 ## Workspace
 
-Three published crates plus example packages, all on the workspace version
-(`0.2.0`, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`):
+Five published crates plus example packages, all on the workspace version
+(`0.3.0`, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`). The Python
+bindings (`crates/schwab-py`) are outside the workspace, with their own
+lockfile:
 
 | Crate | Role | Key dependencies |
 |---|---|---|
 | `rustyschwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
-| `rustyschwab` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring`, `secrecy` |
-| `rustyschwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `rustyschwab` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring-core` (one store per OS), `secrecy` |
+| `rustyschwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. Its policy, approval, delegation, dead-man and guardrail modules are domain code the console reuses. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `rustyschwab-console` | The operator console core, with no user interface: reads the servers' state into a serializable `Snapshot` and runs operator `Command`s (approve, delegate, halt, kill). | `rustyschwab`, `rustyschwab-mcp` |
+| `rustyschwab-dash` | The ratatui terminal dashboard over the console. Rendering and keys only. | `ratatui`, `rustyschwab-console` |
 
 `examples/` holds workspace packages (`oauth-flow`, `auth_test`,
 `comprehensive`, `streaming-examples`, `enterprise-bench`); run them with
@@ -91,7 +95,7 @@ timeout, retry, rate limit, circuit breaker) and an optional `StreamConfig`;
 and refresh. Tokens are `SecretString`s held in a `TokenSet`; persistence
 goes through the `TokenStore` trait with three backends
 (`FileTokenStore` 0600 JSON, `EncryptedFileTokenStore` ChaCha20-Poly1305,
-`KeychainTokenStore` via `keyring`). Refresh is serialized across processes
+`KeychainTokenStore` via `keyring-core`). Refresh is serialized across processes
 with a lock file next to the token file, and a rejected access token is
 refreshed once and retried by the client. The optional `callback-server`
 feature adds an axum/rustls HTTPS listener that captures the redirect
@@ -483,6 +487,11 @@ harness's own request → decode → diff → record cycle is still covered by a
 | Add an MCP tool | `crates/rustyschwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` |
 | Change what a principal may do | `crates/rustyschwab-mcp/src/policy.rs`; runtime policy JSON documented in `docs/OPERATIONS.md` |
 | Durable state, migrations, backup | `crates/rustyschwab/src/storage.rs`, `execution.rs` |
+| Cached or recorded price history | `crates/rustyschwab/src/history.rs` |
+| Performance reports (P&L, drawdown, ratios) | `crates/rustyschwab/src/performance.rs` |
+| Operator delegation, the dead-man switch, daily budgets | `crates/rustyschwab-mcp/src/delegation.rs`, `dead_man.rs`, `guardrails.rs` |
+| The operator console (state snapshot, approve/halt/kill commands) | `crates/rustyschwab-console/src/` (`console.rs`, `read.rs`, `snapshot.rs`) |
+| The terminal dashboard (rendering and keys only) | `crates/rustyschwab-dash/src/` (`app.rs`, `ui.rs`); anything that reads state or acts belongs in the console |
 | Metrics or alerts | `crates/rustyschwab/src/metrics.rs`, `crates/rustyschwab-mcp/src/metrics.rs`, `ops/` dashboards and rules |
 | Paper engine behaviour | `crates/rustyschwab/src/paper/`, `docs/PAPER_TRADING.md`, `docs/PAPER_LIMITATIONS.md` |
 | Add a model-evaluation scenario or check | `crates/rustyschwab-mcp/src/eval.rs` (`Scenario`, `Fixture::open`, `checks`), then `tests/eval_harness.rs`; `docs/MCP_LLM_INTEGRATION.md#model-evaluation` |

@@ -185,7 +185,7 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Builds each crate from its packaged tarball, as crates.io would.
-      - run: cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp --locked
+      - run: cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp -p rustyschwab-console -p rustyschwab-dash --locked
 
   deny:
     name: cargo deny
