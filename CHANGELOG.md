@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Python: a `decimal.Decimal` in exponent form (`Decimal("1E-7")`, or
+  `Decimal("100").normalize()`, which is `1E+2`) was refused as "not a plain
+  decimal number". It is now sent fixed-point. `HistoryStore.path` is typed
+  `pathlib.Path`, which it always returned.
+- Python: after `fork()` (the default `multiprocessing` start method on Linux
+  before Python 3.14) every call into rustyschwab hung forever, because the
+  runtime's threads do not exist in the child. It now raises a
+  `RuntimeError` that says to use `spawn` or `forkserver`.
+- `serde_json` is built with `float_roundtrip` everywhere, so a float in
+  Schwab's JSON parses to the nearest `f64` in the Python wheel and for
+  anyone using `rustyschwab` on its own, not only where another dependency
+  happened to enable it.
+- `docs/PYTHON.md` called `asyncio.wait_for(anext(stream), timeout)` safe. It
+  cancels the pending read on timeout, and a message that arrived in that
+  instant is discarded without being counted in `lost_messages`.
 - `stream_connect` (and the implicit connect in `stream_subscribe`) held the
   stream's write lock through the whole handshake, up to tens of seconds, so
   `get_server_status`, `stream_status` and `stream_snapshot` hung behind it.

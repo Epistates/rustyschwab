@@ -272,7 +272,7 @@ Content fields arrive under their names (`bidPrice`) by default. Pass `named_fie
 
 Schwab allows one streaming session per user. Opening a second one ends the first with `ended: {"reason": "replaced"}`.
 
-`stream.subscriptions()`, `stream.status()` and `stream.is_authenticated` read the session; `asyncio.wait_for(anext(stream), timeout)` waits with a deadline and leaves the stream intact on timeout.
+`stream.subscriptions()`, `stream.status()` and `stream.is_authenticated` read the session. `asyncio.wait_for(anext(stream), timeout)` waits with a deadline and leaves the stream open, but it cancels the pending read on timeout, and a message that arrived in that instant is discarded without being counted in `lost_messages`. A consumer that cannot lose a message should wait without a deadline (`async for`), and recover the state it needs by reading it (`orders`, `quote`) after a quiet period.
 
 ## Synchronous use
 
