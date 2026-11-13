@@ -219,17 +219,19 @@ except rustyschwab.ValidationError as error:
 
 **The result.** `place_order` and `replace_order` return `order_id` (`None` if Schwab accepted the order without a `Location` header), `location`, `tag` and `attempt_id`. The tag is yours if the order carried one, and a generated `rs-<uuid>` otherwise. `attempt_id` is the execution-journal record of this submission, the same ID a `SubmissionUnknown` error carries, so store it with your own order record.
 
-**Uncertain outcomes.** If a request may have reached Schwab but no answer came back (a timeout, a 5xx, a dropped connection), the call raises `SubmissionUnknown` and never retries. The journal then holds the attempt, and the next submission on that account raises `ReconciliationRequired` until it is resolved. Resolve it by reading the account's orders, not by resending:
+**Uncertain outcomes.** If a request may have reached Schwab but no answer came back (a timeout, a 5xx, a dropped connection), the call raises `SubmissionUnknown` and never retries. The journal then holds the attempt, and the next submission on that account raises `ReconciliationRequired` until it is resolved. Every failure of `place_order` and `replace_order` carries the order's `tag`, the one Schwab lists it under. Resolve it by reading the account's orders, not by resending:
 
 ```python
 try:
     placed = await client.place_order(account_hash, order)
 except rustyschwab.SubmissionUnknown as error:
     open_orders = await client.account_orders(account_hash, window)   # as in the previous section
-    # Look for the order by the tag you sent. `rustyschwab-admin reconcile` then
+    # Look for the order by error.tag. `rustyschwab-admin reconcile` then
     # resolves error.attempt_id in the journal.
     raise
 ```
+
+**Bounding the wait.** Pass `timeout=` (seconds) to `place_order` or `replace_order` rather than wrapping the call in `asyncio.wait_for` or `asyncio.timeout`. Past it the submission is not cancelled, and the call raises `SubmissionUnknown` with `cause == "timeout"`, the order's `tag`, and its `attempt_id` once journaled. A call you cancel yourself raises only `CancelledError` or `TimeoutError`, which tell you nothing about the order, so if you do cancel calls, set the order's own `tag` so you can look it up.
 
 **Controls.** `client.halt(reason, operator)` stops new submissions for every client sharing the journal; cancellations still work. `client.clear_halt(operator)` lifts it and `client.halted()` reads it. `client.readiness(account_hashes)` reports reads and trading readiness from local evidence. `client.request_budget()` and `client.circuit_state()` are synchronous.
 
@@ -272,7 +274,7 @@ Content fields arrive under their names (`bidPrice`) by default. Pass `named_fie
 
 Schwab allows one streaming session per user. Opening a second one ends the first with `ended: {"reason": "replaced"}`.
 
-`stream.subscriptions()`, `stream.status()` and `stream.is_authenticated` read the session. `asyncio.wait_for(anext(stream), timeout)` waits with a deadline and leaves the stream open, but it cancels the pending read on timeout, and a message that arrived in that instant is discarded without being counted in `lost_messages`. A consumer that cannot lose a message should wait without a deadline (`async for`), and recover the state it needs by reading it (`orders`, `quote`) after a quiet period.
+`stream.subscriptions()`, `stream.status()` and `stream.is_authenticated` read the session. `asyncio.wait_for(anext(stream), timeout)` (or `asyncio.timeout`) waits with a deadline and leaves the stream open. A read cancelled this way loses no message: one that arrived as the read was cancelled is returned by the next read.
 
 ## Synchronous use
 
@@ -298,13 +300,13 @@ with sync.Client.from_env() as client:
     stream.close()                                   # log out and disconnect
 ```
 
-**Streams.** `sync.Stream` has `subscribe`, `unsubscribe`, `view`, `subscriptions`, `status` and `close`, and reads three ways. `for message in stream` blocks for each message and ends with the final `state` message. `stream.recv(timeout)` returns the next message, `None` once the stream has ended, or raises `TimeoutError` and leaves the stream usable. `stream.start(receiver, *, daemon=True, on_error="log", **kwargs)` calls `receiver(message, **kwargs)` on a background thread, in order, until `stop()`. Only one reader at a time: a started stream refuses `recv` and iteration. `stop()` is idempotent and joins the thread; `start()` may be called again afterwards, and messages that arrive in between queue up to the SDK's limit and are counted in `lost_messages` beyond it. A receiver must be a plain function. For a coroutine, use the async client with `rustyschwab.streaming.dispatch`.
+**Streams.** `sync.Stream` has `subscribe`, `unsubscribe`, `view`, `subscriptions`, `status` and `close`, and reads three ways. `for message in stream` blocks for each message and ends with the final `state` message. `stream.recv(timeout)` returns the next message, `None` once the stream has ended, or raises `TimeoutError` and leaves the stream usable, with no message lost to the timeout. `stream.start(receiver, *, daemon=True, on_error="log", **kwargs)` calls `receiver(message, **kwargs)` on a background thread, in order, until `stop()`. Only one reader at a time: a started stream refuses `recv` and iteration. `stop()` is idempotent and joins the thread; `start()` may be called again afterwards, and messages that arrive in between queue up to the SDK's limit and are counted in `lost_messages` beyond it. A receiver must be a plain function. For a coroutine, use the async client with `rustyschwab.streaming.dispatch`.
 
 **Errors in the receiver.** With `on_error="log"` an exception is logged to `rustyschwab.sync` and the next message is delivered, so one bad tick does not end the stream. With `on_error="raise"` the thread stops, `stream.error` holds the exception, and the next `stop()` or `join()` raises it once.
 
 **One event loop thread.** Calls wait on one private asyncio event loop that runs on a daemon thread named `rustyschwab-sync`. It is created by the first blocking call and shared by every client, stream and schedule in the process, so any number of threads can call at once. It stops at interpreter exit, which first stops started streams and schedules, or earlier with `rustyschwab.sync.shutdown()`; the next call starts a new one. It is not inherited across `fork`. Do not call blocking methods from inside a running event loop of your own, which they would block, nor from a receiver on the loop thread, which raises `RuntimeError` instead of deadlocking.
 
-**Timeouts.** `sync.Client(config, timeout=...)` bounds how long each call waits and raises `TimeoutError` after cancelling it. The default is no limit beyond the SDK's own request timeouts. As with a cancelled coroutine, a timed-out `place_order` still leaves its journal record resolved.
+**Timeouts.** `sync.Client(config, timeout=...)` bounds how long each call waits and raises `TimeoutError` after cancelling it. The default is no limit beyond the SDK's own request timeouts. Order submissions are the exception: past the timeout, `place_order` and `replace_order` raise `SubmissionUnknown` with the order's `tag` and are not cancelled (see [Orders](#orders)). Their own `timeout=` argument overrides the client's for one call.
 
 **Reauthorization.** `sync.Client(..., call_on_auth=hook)` calls `hook(consent_url)` when a call fails because the refresh token is missing or expired, completes the authorization with the redirect URL it returns, and retries the call once. `rustyschwab.auth.terminal_prompt()` is the terminal flow: print the URL, open the browser, read the pasted address. Several threads waiting on a refresh share one prompt. Order placement, replacement and cancellation never prompt or retry this way; call `client.authorize()` first (it runs the flow explicitly and returns whether it completed).
 
@@ -862,7 +864,7 @@ Every failure is a `rustyschwab.SchwabError`. The subclasses mirror the SDK's `E
 | `RateLimited` | Rate limit hit | `retry_after` (seconds) |
 | `Timeout` (also a `TimeoutError`), `NetworkError`, `CircuitOpen` | Transport trouble | `duration` |
 | `Halted`, `Suspended`, `RiskDenied`, `BaselineStale`, `DuplicateRequest`, `ApprovalInvalid`, `OwnershipLost`, `LeaseBusy` | Trading controls: resolve the condition, then submit a new intent | `account`, `reason` |
-| `SubmissionUnknown`, `ReconciliationRequired` (both `PendingSubmissionError`) | An order may have reached Schwab | `attempt_id` |
+| `SubmissionUnknown`, `ReconciliationRequired` (both `PendingSubmissionError`) | An order may have reached Schwab | `attempt_id`, `tag`, `cause` (`SubmissionUnknown`) |
 | `StreamError`, `SubscriptionError`, `WebSocketError`, `ConnectionClosed` | The streamer | |
 | `StorageError`, `IoError`, `SerializationError`, `InvalidUrl`, `UnknownError` | Local state and everything else | |
 
@@ -889,7 +891,7 @@ Messages are safe to log. They never contain tokens, the app secret or broker re
 
 - Calls return coroutines, so `await`, `asyncio.create_task`, `gather` and `wait_for` all work, and nothing is sent until the coroutine runs. Awaiting one twice raises `RuntimeError`.
 - One multi-threaded tokio runtime serves the whole process, whichever event loop awaits (asyncio, uvloop, or several loops in turn). Python's event loop only waits for results; the GIL is not held while a request is in flight, and slow requests overlap rather than queue. The SDK's request budget (Schwab's 120 requests a minute by default) still paces them, with a share kept for order submissions and cancels.
-- Cancelling a task awaiting a call cancels the Rust future. The exception is order submission: it runs to its outcome on its own task, so a cancelled or timed-out `place_order` still leaves its journal record resolved, and an attempt you stopped waiting for is reconciled like any other.
+- Cancelling a task awaiting a call cancels the Rust future. The exception is order submission: it runs to its outcome on its own task, so a cancelled or timed-out `place_order` still leaves its journal record resolved, and an attempt you stopped waiting for is reconciled like any other. Bound a submission with its `timeout=` argument instead, which reports the order's tag. A cancelled stream read loses no message.
 - Code without asyncio uses the blocking [`rustyschwab.sync`](#synchronous-use), which runs these same coroutines on one private event loop thread.
 - Results are converted to Python objects under the GIL when a call completes. Very large responses (full option chains) cost milliseconds of GIL time.
 - The SDK's `tracing` events are not forwarded to Python `logging`.

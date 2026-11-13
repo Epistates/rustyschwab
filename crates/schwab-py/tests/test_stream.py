@@ -165,6 +165,66 @@ async def test_a_timeout_on_the_iterator_leaves_the_stream_intact(
         assert (await next_of_type(stream, "data"))["type"] == "data"
 
 
+async def test_reads_cancelled_by_timeouts_lose_no_message(
+    client: rustyschwab.Client, server: MockSchwab, streamer: Streamer
+) -> None:
+    advertise(server, streamer.url)
+    async with await client.open_stream() as stream:
+        await next_of_type(stream, "state")
+        await stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
+        frames = 300
+
+        async def produce() -> None:
+            for number in range(frames):
+                await streamer.push(level_one(**{"1": number}))
+                if number % 10 == 0:
+                    await asyncio.sleep(0.001)
+
+        producer = asyncio.create_task(produce())
+        seen: list[int] = []
+        timeouts = 0
+        deadline = asyncio.get_running_loop().time() + 20
+        while len(seen) < frames and asyncio.get_running_loop().time() < deadline:
+            try:
+                message = await asyncio.wait_for(anext(stream), timeout=0.001)
+            except asyncio.TimeoutError:
+                timeouts += 1
+                continue
+            if message["type"] == "data":
+                seen.extend(int(c["bidPrice"]) for c in message["data"][0]["content"])
+            elif message["type"] == "state":
+                assert message["lost_messages"] == 0, message
+        await producer
+        assert timeouts > 0, "the reads were never cancelled"
+        assert seen == list(range(frames))
+
+
+async def test_a_wait_whose_read_is_dropped_leaves_the_message_for_the_next(
+    client: rustyschwab.Client, server: MockSchwab, streamer: Streamer
+) -> None:
+    advertise(server, streamer.url)
+    async with await client.open_stream() as stream:
+        await next_of_type(stream, "state")
+        await stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
+        await streamer.push(level_one(**{"1": 7.0}))
+        # As a read cancelled between its wait and its take: the message
+        # the wait took off the receiver is not lost.
+        while True:
+            await asyncio.wait_for(stream._wait(), timeout=5)
+            queued = stream._take()
+            assert queued is not None
+            if queued["type"] == "data":
+                break
+        await streamer.push(level_one(**{"1": 8.0}))
+        await asyncio.wait_for(stream._wait(), timeout=5)
+        reader = asyncio.create_task(anext(stream))
+        reader.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reader
+        data = await next_of_type(stream, "data")
+        assert data["data"][0]["content"][0]["bidPrice"] == 8.0
+
+
 async def test_bad_subscriptions_raise_before_anything_is_sent(
     client: rustyschwab.Client, server: MockSchwab, streamer: Streamer
 ) -> None:

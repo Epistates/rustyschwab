@@ -182,6 +182,30 @@ def test_a_call_timeout_cancels_and_the_client_stays_usable(
     assert client.quotes(["AAPL"])["AAPL"]["symbol"] == "AAPL"
 
 
+def test_a_submission_past_the_timeout_is_unknown_with_its_tag_not_a_bare_timeout(
+    server: MockSchwab, tokens: Path
+) -> None:
+    server.on(
+        "POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/7"}, delay=1.5
+    )
+    client = sync.Client(client_config(server, tokens), timeout=0.3)
+    with pytest.raises(errors.SubmissionUnknown) as caught:
+        client.place_order(ACCOUNT_HASH, limit_order(tag="slow"))
+    assert caught.value.tag == "slow" and caught.value.cause == "timeout"
+    # A call's own timeout overrides the client's.
+    server.on("POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/8"})
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            placed = client.place_order(ACCOUNT_HASH, limit_order(tag="next"), timeout=5)
+            break
+        except errors.ReconciliationRequired:
+            assert time.monotonic() < deadline, "the slow submission never settled"
+            time.sleep(0.1)
+    assert placed["order_id"] == "8"
+    client.close()
+
+
 def test_context_manager_loads_tokens_and_closes_streams(
     server: MockSchwab, tokens: Path
 ) -> None:
@@ -417,6 +441,41 @@ def test_recv_timeout_leaves_the_stream_usable(
         stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
         streamer.push(level_one(**{"1": 1.0}))
         assert next_of_type(stream, "data")["type"] == "data"
+
+
+def test_recv_timeouts_lose_no_message(
+    blocking: sync.Client, server: MockSchwab, streamer: StreamerThread
+) -> None:
+    advertise(server, streamer.url)
+    with blocking.open_stream() as stream:
+        next_of_type(stream, "state")
+        stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
+        frames = 300
+
+        def produce() -> None:
+            for number in range(frames):
+                streamer.push(level_one(**{"1": number}))
+                time.sleep(0.001)
+
+        producer = threading.Thread(target=produce)
+        producer.start()
+        seen: list[int] = []
+        timeouts = 0
+        deadline = time.monotonic() + 20
+        while len(seen) < frames and time.monotonic() < deadline:
+            try:
+                message = stream.recv(0.001)
+            except TimeoutError:
+                timeouts += 1
+                continue
+            assert message is not None
+            if message["type"] == "data":
+                seen.extend(int(c["bidPrice"]) for c in message["data"][0]["content"])
+            elif message["type"] == "state":
+                assert message["lost_messages"] == 0, message
+        producer.join(10)
+        assert timeouts > 0, "the reads never timed out"
+        assert seen == list(range(frames))
 
 
 def test_start_calls_the_receiver_on_a_background_thread(

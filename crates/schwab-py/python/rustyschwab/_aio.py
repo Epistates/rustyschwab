@@ -13,3 +13,16 @@ async def run(start: Callable[[], Awaitable[Any]]) -> Any:
     broker until the coroutine is actually awaited.
     """
     return await start()
+
+
+async def next_message(stream: Any) -> Any:
+    """The next message of a native ``Stream``: wait, then take, until one comes.
+
+    ``_wait`` can be cancelled without losing a message, and ``_take`` runs
+    with no ``await`` between it and the ``return``, so a cancellation can
+    only land while nothing has been taken. ``_take`` raises
+    ``StopAsyncIteration`` once the stream has ended.
+    """
+    while (message := stream._take()) is None:
+        await stream._wait()
+    return message

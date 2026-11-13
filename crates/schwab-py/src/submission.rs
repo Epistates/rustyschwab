@@ -7,10 +7,13 @@
 //! tag: the binding assigns one when the caller gave none, exactly as the
 //! SDK would, so it can tell its own journal record from a concurrent one.
 
+use crate::errors::Failure;
 use rustyschwab::SchwabClient;
 use rustyschwab::types::trading::{OrderRequest, OrderSubmitResponse};
 use serde::Serialize;
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 
 /// The outcome of a place or replace that reached an accepting answer.
 #[derive(Debug, Clone, Serialize)]
@@ -78,9 +81,77 @@ impl Submitted {
     }
 }
 
+/// `seconds` as the bound on a submission's answer: positive and finite.
+pub fn answer_timeout(seconds: Option<f64>) -> Result<Option<Duration>, Failure> {
+    seconds
+        .map(|seconds| {
+            Duration::try_from_secs_f64(seconds)
+                .ok()
+                .filter(|limit| !limit.is_zero())
+                .ok_or_else(|| {
+                    Failure::field("timeout", "timeout must be a positive number of seconds")
+                })
+        })
+        .transpose()
+}
+
+/// Await `submission`, the `operation` (`place_order` or `replace_order`) of
+/// the order tagged `tag` on `account`, as Python sees it.
+///
+/// A failure carries the tag. With a `timeout`, an answer that has not come
+/// by then is [`Failure::Unanswered`]: the submission is not cancelled (the
+/// SDK runs it on its own task, journaled), so its outcome is unknown, and
+/// the caller gets the tag to find it by instead of a bare timeout.
+pub async fn settle(
+    sdk: &SchwabClient,
+    account: &str,
+    operation: &str,
+    tag: String,
+    timeout: Option<Duration>,
+    submission: impl Future<Output = rustyschwab::Result<OrderSubmitResponse>>,
+) -> Result<Submitted, Failure> {
+    let since = journal_window_start();
+    let answer = match timeout {
+        None => submission.await,
+        Some(after) => match tokio::time::timeout(after, submission).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let attempt_id = live_attempt(sdk, account, operation, &tag, since).await;
+                return Err(Failure::Unanswered {
+                    tag,
+                    attempt_id,
+                    after,
+                });
+            }
+        },
+    };
+    match answer {
+        Ok(response) => {
+            let attempt = live_attempt(sdk, account, operation, &tag, since).await;
+            Ok(Submitted::new(response, tag, attempt))
+        }
+        Err(error) => Err(Failure::Submission {
+            tag,
+            failure: Box::new(error.into()),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_timeout_is_a_positive_number_of_seconds() {
+        assert_eq!(answer_timeout(None).unwrap(), None);
+        assert_eq!(
+            answer_timeout(Some(1.5)).unwrap(),
+            Some(Duration::from_millis(1500))
+        );
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(answer_timeout(Some(bad)).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn an_existing_tag_is_kept_and_a_missing_one_assigned() {

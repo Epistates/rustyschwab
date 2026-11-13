@@ -39,6 +39,7 @@ import os
 import threading
 import weakref
 from datetime import date, time, timedelta, tzinfo
+from time import monotonic
 from types import TracebackType
 from typing import (
     TYPE_CHECKING,
@@ -222,10 +223,13 @@ class Client:
     Every method of the async client exists here with the same arguments and
     result, minus the ``await``. ``timeout`` (seconds, default none) bounds how
     long a call waits for its result; a call that exceeds it is cancelled and
-    raises ``TimeoutError``. The SDK's own request timeouts apply regardless,
-    and a cancelled order submission is resolved by the execution journal
-    exactly as for a cancelled coroutine, so leave the default for trading
-    code.
+    raises ``TimeoutError``. The SDK's own request timeouts apply regardless.
+    An order submission is never cancelled this way: past ``timeout``,
+    :meth:`place_order` and :meth:`replace_order` raise
+    :class:`~rustyschwab.errors.SubmissionUnknown` with the order's ``tag``
+    (and its ``attempt_id`` once journaled), and the submission runs on, so
+    find the order by its tag before sending it again. Their own ``timeout``
+    argument overrides the client's for one call.
 
     ``call_on_auth`` is a function from the consent URL to the redirect URL
     (see :mod:`rustyschwab.auth`). When it is set and a call fails because the
@@ -424,15 +428,36 @@ class Client:
     def preview_order(self, account_hash: str, order: Mapping[str, Any]) -> JsonObject:
         return self._call(lambda: self._native.preview_order(account_hash, order))
 
-    def place_order(self, account_hash: str, order: Mapping[str, Any]) -> Submitted:
-        return self._call(lambda: self._native.place_order(account_hash, order), reauth=False)
+    def place_order(
+        self, account_hash: str, order: Mapping[str, Any], *, timeout: float | None = None
+    ) -> Submitted:
+        return self._submit(
+            self._native.place_order(account_hash, order, timeout=self._bound(timeout))
+        )
 
     def replace_order(
-        self, account_hash: str, order_id: str, order: Mapping[str, Any]
+        self,
+        account_hash: str,
+        order_id: str,
+        order: Mapping[str, Any],
+        *,
+        timeout: float | None = None,
     ) -> Submitted:
-        return self._call(
-            lambda: self._native.replace_order(account_hash, order_id, order), reauth=False
+        return self._submit(
+            self._native.replace_order(
+                account_hash, order_id, order, timeout=self._bound(timeout)
+            )
         )
+
+    def _bound(self, timeout: float | None) -> float | None:
+        """A submission's own ``timeout``, else the client's."""
+        return self.timeout if timeout is None else timeout
+
+    def _submit(self, submission: Awaitable[Submitted]) -> Submitted:
+        # The native call bounds its own wait, so that past it the caller gets
+        # the order's tag; cancelling it here could only raise a bare
+        # TimeoutError. Submissions never prompt or retry.
+        return _runner().run(submission, None)
 
     def cancel_order(self, account_hash: str, order_id: str) -> None:
         self._call(lambda: self._native.cancel_order(account_hash, order_id), reauth=False)
@@ -611,10 +636,6 @@ def _require_plain_function(receiver: Receiver) -> None:
         )
 
 
-async def _next_message(native: _NativeStream) -> StreamMessage:
-    return await anext(native)
-
-
 class Stream:
     """A streamer session with blocking methods; get one from :meth:`Client.open_stream`.
 
@@ -632,7 +653,7 @@ class Stream:
     def __init__(self, native: _NativeStream) -> None:
         self._native = native
         self._lock = threading.Lock()
-        self._pending: concurrent.futures.Future[StreamMessage] | None = None
+        self._pending: concurrent.futures.Future[None] | None = None
         self._thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
         self._error: BaseException | None = None
@@ -677,23 +698,31 @@ class Stream:
     # reading
 
     def _recv(self, timeout: float | None) -> StreamMessage:
-        future = _runner().submit(_next_message(self._native))
-        with self._lock:
-            self._pending = future
-        if self._stop_requested.is_set() and self._thread is threading.current_thread():
-            future.cancel()
-        try:
-            return future.result(timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"no stream message within {timeout} seconds") from None
-        except BaseException:
-            future.cancel()
-            raise
-        finally:
+        # Messages are taken here, in the calling thread, and only waited for
+        # on the loop. A wait that times out or is cancelled by stop() leaves
+        # any message it took queued in the native stream for the next read,
+        # so neither loses one. _take raises StopAsyncIteration at the end.
+        deadline = None if timeout is None else monotonic() + timeout
+        while (message := self._native._take()) is None:
+            left = None if deadline is None else max(0.0, deadline - monotonic())
+            future = _runner().submit(self._native._wait())
             with self._lock:
-                if self._pending is future:
-                    self._pending = None
+                self._pending = future
+            if self._stop_requested.is_set() and self._thread is threading.current_thread():
+                future.cancel()
+            try:
+                future.result(left)
+            except concurrent.futures.TimeoutError:
+                future.cancel()
+                raise TimeoutError(f"no stream message within {timeout} seconds") from None
+            except BaseException:
+                future.cancel()
+                raise
+            finally:
+                with self._lock:
+                    if self._pending is future:
+                        self._pending = None
+        return message
 
     def _check_not_started(self) -> None:
         if self.running:

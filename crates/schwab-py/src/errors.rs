@@ -29,6 +29,18 @@ pub enum Failure {
     },
     /// An async iterator has nothing more to deliver.
     EndOfStream,
+    /// A place or replace failed. `tag` is the tag its order carried, so the
+    /// caller can look for the order at the broker whatever the failure.
+    Submission { tag: String, failure: Box<Failure> },
+    /// A place or replace gave no answer within the caller's timeout. It was
+    /// not cancelled: it runs on and the journal records how it ends, so its
+    /// outcome is unknown. `attempt_id` is its journal attempt, once the
+    /// journal has it.
+    Unanswered {
+        tag: String,
+        attempt_id: Option<String>,
+        after: std::time::Duration,
+    },
 }
 
 impl From<Error> for Failure {
@@ -62,6 +74,31 @@ fn describe(failure: &Failure) -> (&'static str, String, Map<String, Value>) {
             ("validation", message.clone(), details)
         }
         Failure::EndOfStream => ("end_of_stream", String::new(), details),
+        Failure::Submission { tag, failure } => {
+            let (kind, message, mut details) = describe(failure);
+            details.insert("tag".into(), json!(tag));
+            (kind, message, details)
+        }
+        Failure::Unanswered {
+            tag,
+            attempt_id,
+            after,
+        } => {
+            details.insert("retryable".into(), json!(false));
+            details.insert("attempt_id".into(), json!(attempt_id));
+            details.insert("tag".into(), json!(tag));
+            details.insert("cause".into(), json!("timeout"));
+            (
+                rustyschwab::ErrorKind::SubmissionUnknown.as_str(),
+                format!(
+                    "No answer within {} s. The submission was not cancelled and may \
+                     still reach the broker: find the order by its tag before sending \
+                     it again",
+                    after.as_secs_f64()
+                ),
+                details,
+            )
+        }
         Failure::Sdk(error) => {
             details.insert("retryable".into(), json!(error.is_retryable()));
             match error {
@@ -181,6 +218,36 @@ mod tests {
         let (kind, _, details) = describe(&Failure::Sdk(error));
         assert_eq!(kind, "auth");
         assert_eq!(details["reauthorization_required"], json!(true));
+    }
+
+    #[test]
+    fn a_submission_failure_carries_its_tag() {
+        let failure = Failure::Submission {
+            tag: "rs-1".into(),
+            failure: Box::new(Failure::Sdk(Error::ReconciliationRequired {
+                attempt_id: "a-1".into(),
+            })),
+        };
+        let (kind, _, details) = describe(&failure);
+        assert_eq!(kind, "reconciliation_required");
+        assert_eq!(details["attempt_id"], json!("a-1"));
+        assert_eq!(details["tag"], json!("rs-1"));
+    }
+
+    #[test]
+    fn an_unanswered_submission_is_unknown_with_its_tag() {
+        let failure = Failure::Unanswered {
+            tag: "rs-1".into(),
+            attempt_id: Some("a-1".into()),
+            after: std::time::Duration::from_millis(2500),
+        };
+        let (kind, message, details) = describe(&failure);
+        assert_eq!(kind, "submission_unknown");
+        assert!(message.contains("2.5 s"), "{message}");
+        assert_eq!(details["tag"], json!("rs-1"));
+        assert_eq!(details["attempt_id"], json!("a-1"));
+        assert_eq!(details["cause"], json!("timeout"));
+        assert_eq!(details["retryable"], json!(false));
     }
 
     #[test]

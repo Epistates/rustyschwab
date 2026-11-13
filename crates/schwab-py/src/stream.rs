@@ -13,6 +13,14 @@
 //!   as a gap: data from before it is stale, so re-baseline from REST.
 //!
 //! The iterator finishes after the `"state"` message that carries `ended`.
+//!
+//! A read survives being cancelled (`asyncio.wait_for`, `asyncio.timeout`, a
+//! task group shutting down) without losing a message. It is two steps: a
+//! wait, which takes a message off the SDK's receiver into a hand-off queue
+//! and can be cancelled at any point without losing one, and a take, which
+//! pops the queue synchronously in Python, where no cancellation can land.
+//! A read cancelled after its message arrived leaves it in the queue for the
+//! next read.
 
 use crate::convert::Json;
 use crate::errors::Failure;
@@ -21,7 +29,8 @@ use pyo3::prelude::*;
 use rustyschwab::types::streaming::{StreamMessage, StreamService};
 use rustyschwab::{Error, MessageReceiver, SchwabClient, StreamClient, StreamConfig};
 use serde_json::{Map, Value, json};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// A connected streamer session.
 ///
@@ -33,7 +42,17 @@ use std::sync::Arc;
 pub struct Stream {
     client: StreamClient,
     receiver: Arc<tokio::sync::Mutex<MessageReceiver>>,
+    /// Messages a wait took off the receiver that no take has popped yet.
+    delivered: Arc<Mutex<VecDeque<Delivery>>>,
     named_fields: bool,
+}
+
+/// What a wait hands over to the next take.
+#[derive(Debug)]
+enum Delivery {
+    Message(Value),
+    /// The stream ended; every later take reports it.
+    End,
 }
 
 impl Stream {
@@ -62,6 +81,7 @@ impl Stream {
         Ok(Self {
             client,
             receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            delivered: Arc::default(),
             named_fields,
         })
     }
@@ -157,15 +177,51 @@ impl Stream {
     }
 
     /// The next message; raises `StopAsyncIteration` once the stream ended.
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Cancelling it loses no message (see the module documentation).
+    fn __anext__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        next_message(slf.py())?.call1((slf,))
+    }
+
+    /// Wait until `_take` has something to return: a message, or the end.
+    /// Cancel-safe: a message it took off the receiver stays queued.
+    fn _wait<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
+        let delivered = self.delivered.clone();
         let named = self.named_fields;
         awaitable(py, async move {
-            match receiver.lock().await.recv().await {
-                Some(message) => Ok(Json(render(message, named))),
-                None => Err(Failure::EndOfStream),
+            let ready = || !lock(&delivered).is_empty();
+            if ready() {
+                return Ok(());
             }
+            let mut receiver = receiver.lock().await;
+            // Another wait may have delivered while this one queued for the
+            // receiver.
+            if ready() {
+                return Ok(());
+            }
+            // The receiver is cancel-safe, and nothing awaits between its
+            // answer and the queue, so no message is lost here either.
+            let delivery = match receiver.recv().await {
+                Some(message) => Delivery::Message(render(message, named)),
+                None => Delivery::End,
+            };
+            lock(&delivered).push_back(delivery);
+            Ok(())
         })
+    }
+
+    /// The next delivered message, `None` if there is none yet; raises
+    /// `StopAsyncIteration` once the stream ended.
+    fn _take(&self, py: Python<'_>) -> PyResult<Option<Json<Value>>> {
+        let mut delivered = lock(&self.delivered);
+        match delivered.pop_front() {
+            Some(Delivery::Message(message)) => Ok(Some(Json(message))),
+            Some(Delivery::End) => {
+                delivered.push_front(Delivery::End);
+                Err(crate::errors::to_pyerr(py, Failure::EndOfStream))
+            }
+            None => Ok(None),
+        }
     }
 
     fn __aenter__<'py>(slf: Py<Self>, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -281,6 +337,24 @@ impl Stream {
             Ok(Json(Value::Null))
         })
     }
+}
+
+/// The hand-off queue, whatever a panic elsewhere left it as.
+fn lock(delivered: &Mutex<VecDeque<Delivery>>) -> std::sync::MutexGuard<'_, VecDeque<Delivery>> {
+    delivered.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `async def next_message(stream)` from `rustyschwab._aio`: waits, then
+/// takes, until a message comes.
+fn next_message(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    static NEXT: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    NEXT.get_or_try_init(py, || {
+        Ok(py
+            .import("rustyschwab._aio")?
+            .getattr("next_message")?
+            .unbind())
+    })
+    .map(|next| next.bind(py))
 }
 
 /// The field table of a streamer service: `[{"number": 1, "name": "bidPrice"}, ...]`.

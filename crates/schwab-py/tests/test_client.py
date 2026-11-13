@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
@@ -364,10 +366,49 @@ async def test_a_definite_rejection_is_not_an_unknown_outcome(
     client: rustyschwab.Client, server: MockSchwab
 ) -> None:
     server.on("POST", f"{ACCOUNT_PATH}/orders", {"message": "bad"}, status=400)
-    with pytest.raises(errors.BrokerError):
+    with pytest.raises(errors.BrokerError) as refused:
         await client.place_order(ACCOUNT_HASH, limit_order(tag="refused"))
+    assert refused.value.tag == "refused", "every submission failure names its order's tag"
     server.on("POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/2"})
     assert (await client.place_order(ACCOUNT_HASH, limit_order(tag="next")))["order_id"] == "2"
+
+
+async def test_a_placement_unanswered_within_its_timeout_is_unknown_and_not_cancelled(
+    client: rustyschwab.Client, server: MockSchwab
+) -> None:
+    server.on(
+        "POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/3"}, delay=2.0
+    )
+    started = time.monotonic()
+    with pytest.raises(errors.SubmissionUnknown) as caught:
+        await client.place_order(ACCOUNT_HASH, limit_order(), timeout=0.5)
+    assert time.monotonic() - started < 1.5
+    error = caught.value
+    assert error.cause == "timeout" and error.retryable is False
+    assert error.tag is not None and error.tag.startswith("rs-"), "the tag it was sent under"
+    assert error.attempt_id, "journaled before it was sent"
+    # The submission ran on: Schwab gets it under that tag, the journal
+    # records the answer, and the account takes the next order.
+    deadline = time.monotonic() + 5
+    while not server.calls("POST", f"{ACCOUNT_PATH}/orders") and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    (request,) = server.calls("POST", f"{ACCOUNT_PATH}/orders")
+    assert request.json()["tag"] == error.tag
+    server.on("POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/4"})
+    while time.monotonic() < deadline:
+        try:
+            placed = await client.place_order(ACCOUNT_HASH, limit_order(tag="after"))
+            break
+        except errors.ReconciliationRequired:
+            await asyncio.sleep(0.1)
+    assert placed["order_id"] == "4"
+
+
+async def test_a_submission_timeout_must_be_positive(client: rustyschwab.Client) -> None:
+    for bad in (0, -1, float("nan")):
+        with pytest.raises(errors.ValidationError) as caught:
+            await client.place_order(ACCOUNT_HASH, limit_order(), timeout=bad)
+        assert caught.value.field == "timeout"
 
 
 # ---- controls ---------------------------------------------------------------------------

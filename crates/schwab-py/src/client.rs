@@ -11,7 +11,7 @@ use crate::convert::{Json, from_py, from_value, name_of, to_json};
 use crate::errors::Failure;
 use crate::runtime::{awaitable, enter};
 use crate::stream::Stream;
-use crate::submission::{Submitted, journal_window_start, live_attempt, tagged};
+use crate::submission::{answer_timeout, settle, tagged};
 use chrono::NaiveDate;
 use pyo3::prelude::*;
 use rustyschwab::client::{OptionChainParams, PriceHistoryParams};
@@ -23,6 +23,7 @@ use rustyschwab::{Error, SchwabClient, StreamConfig};
 use serde_json::Value;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct Shared {
@@ -37,6 +38,25 @@ impl Shared {
     pub(crate) async fn ready(&self) -> Result<&SchwabClient, Failure> {
         self.initialized.get_or_try_init(|| self.sdk.init()).await?;
         Ok(&self.sdk)
+    }
+
+    /// [`ready`](Self::ready) for a submission bounded by `timeout`, and the
+    /// time left for its answer. Running out here is a plain timeout:
+    /// nothing has been sent.
+    async fn ready_to_submit(
+        &self,
+        timeout: Option<Duration>,
+    ) -> Result<(&SchwabClient, Option<Duration>), Failure> {
+        let Some(timeout) = timeout else {
+            return Ok((self.ready().await?, None));
+        };
+        let started = tokio::time::Instant::now();
+        let sdk = tokio::time::timeout(timeout, self.ready())
+            .await
+            .map_err(|_| Error::Timeout {
+                duration: timeout.as_secs(),
+            })??;
+        Ok((sdk, Some(timeout.saturating_sub(started.elapsed()))))
     }
 }
 
@@ -522,43 +542,58 @@ impl Client {
 
     /// Place an order (Schwab's JSON shape) through the journaled path.
     ///
-    /// Returns `{"order_id", "location", "attempt_id", "tag"}`. If the outcome
-    /// is uncertain this raises `SubmissionUnknown` with the same
-    /// `attempt_id`; reconcile before sending the order again.
+    /// Returns `{"order_id", "location", "attempt_id", "tag"}`, and a failure
+    /// carries the order's `tag`. If the outcome is uncertain this raises
+    /// `SubmissionUnknown` with the same `attempt_id`; reconcile before
+    /// sending the order again.
+    ///
+    /// `timeout` (seconds) bounds the wait. Past it the submission is not
+    /// cancelled, and the call raises `SubmissionUnknown` with the tag (and
+    /// the attempt, once journaled) rather than leaving the caller a bare
+    /// timeout and no way to find the order. Cancelling the call yourself
+    /// (`asyncio.wait_for`, `asyncio.timeout`) gives no tag, so set the
+    /// order's own `tag` when you do.
+    #[pyo3(signature = (account_hash, order, *, timeout=None))]
     fn place_order<'py>(
         &self,
         py: Python<'py>,
         account_hash: String,
         order: &Bound<'py, PyAny>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let order = from_py::<OrderRequest>(order, "order");
+        let timeout = answer_timeout(timeout);
         self.run(py, |shared| async move {
             let (order, tag) = tagged(order?);
-            let sdk = shared.ready().await?;
-            let since = journal_window_start();
-            let response = sdk.place_order(&account_hash, &order).await?;
-            let attempt = live_attempt(sdk, &account_hash, "place_order", &tag, since).await;
-            Ok(Json(Submitted::new(response, tag, attempt)))
+            let (sdk, left) = shared.ready_to_submit(timeout?).await?;
+            let submission = sdk.place_order(&account_hash, &order);
+            let submitted =
+                settle(sdk, &account_hash, "place_order", tag, left, submission).await?;
+            Ok(Json(submitted))
         })
     }
 
-    /// Replace a working order; the result is as for `place_order`. Schwab
-    /// cancels the old order and creates a new one with a new ID.
+    /// Replace a working order; the result, the failures and `timeout` are
+    /// as for `place_order`. Schwab cancels the old order and creates a new
+    /// one with a new ID.
+    #[pyo3(signature = (account_hash, order_id, order, *, timeout=None))]
     fn replace_order<'py>(
         &self,
         py: Python<'py>,
         account_hash: String,
         order_id: String,
         order: &Bound<'py, PyAny>,
+        timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let order = from_py::<OrderRequest>(order, "order");
+        let timeout = answer_timeout(timeout);
         self.run(py, |shared| async move {
             let (order, tag) = tagged(order?);
-            let sdk = shared.ready().await?;
-            let since = journal_window_start();
-            let response = sdk.replace_order(&account_hash, &order_id, &order).await?;
-            let attempt = live_attempt(sdk, &account_hash, "replace_order", &tag, since).await;
-            Ok(Json(Submitted::new(response, tag, attempt)))
+            let (sdk, left) = shared.ready_to_submit(timeout?).await?;
+            let submission = sdk.replace_order(&account_hash, &order_id, &order);
+            let submitted =
+                settle(sdk, &account_hash, "replace_order", tag, left, submission).await?;
+            Ok(Json(submitted))
         })
     }
 

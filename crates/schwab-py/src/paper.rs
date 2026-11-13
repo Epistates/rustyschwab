@@ -7,6 +7,7 @@
 //! so no float ever stands in for money.
 
 use crate::convert::{Json, from_py};
+use crate::errors::Failure;
 use crate::runtime::awaitable;
 use crate::submission::{Submitted, tagged};
 use pyo3::prelude::*;
@@ -116,8 +117,9 @@ impl PyPaperBroker {
     }
 
     /// Place an order (Schwab's JSON shape) on `account`. Returns
-    /// `{"order_id", "location", "attempt_id", "tag"}`. Paper orders need a
-    /// tag; one is assigned when the order has none.
+    /// `{"order_id", "location", "attempt_id", "tag"}`, and a failure carries
+    /// the `tag`, as for `Client.place_order`. Paper orders need a tag; one
+    /// is assigned when the order has none.
     fn place_order<'py>(
         &self,
         py: Python<'py>,
@@ -128,7 +130,13 @@ impl PyPaperBroker {
         let broker = self.broker.clone();
         awaitable(py, async move {
             let (order, tag) = tagged(order?);
-            let response = broker.place_order(&account, &order).await?;
+            let response = broker
+                .place_order(&account, &order)
+                .await
+                .map_err(|error| Failure::Submission {
+                    tag: tag.clone(),
+                    failure: Box::new(error.into()),
+                })?;
             let attempt = paper_attempt(&response.order_id);
             Ok(Json(Submitted::new(response, tag, attempt)))
         })
@@ -147,7 +155,13 @@ impl PyPaperBroker {
         let broker = self.broker.clone();
         awaitable(py, async move {
             let (order, tag) = tagged(order?);
-            let response = broker.replace_order(&account, &order_id, &order).await?;
+            let response = broker
+                .replace_order(&account, &order_id, &order)
+                .await
+                .map_err(|error| Failure::Submission {
+                    tag: tag.clone(),
+                    failure: Box::new(error.into()),
+                })?;
             let attempt = paper_attempt(&response.order_id);
             Ok(Json(Submitted::new(response, tag, attempt)))
         })

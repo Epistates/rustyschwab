@@ -268,14 +268,23 @@ class PendingSubmissionError(SchwabError):
     """An order may have reached the broker.
 
     Reconcile ``attempt_id`` (check the account's orders) before submitting
-    anything for the same intent.
+    anything for the same intent. ``tag`` is the order's tag, which the
+    account's orders list it under; every failure of ``place_order`` and
+    ``replace_order`` carries it, this one included.
     """
 
     attempt_id: str | None = None
+    tag: str | None = None
 
 
 class SubmissionUnknown(PendingSubmissionError):
-    """The submission may or may not have been accepted (a lost acknowledgement)."""
+    """The submission may or may not have been accepted.
+
+    Either its acknowledgement was lost, or (``cause`` is ``"timeout"``) no
+    answer came within the call's ``timeout``. In the second case the
+    submission was not cancelled and ``attempt_id`` is ``None`` until the
+    journal has it; find the order by ``tag``.
+    """
 
     kind = "submission_unknown"
     cause: str | None = None

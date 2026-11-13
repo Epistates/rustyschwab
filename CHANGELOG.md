@@ -62,9 +62,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Schwab's JSON parses to the nearest `f64` in the Python wheel and for
   anyone using `rustyschwab` on its own, not only where another dependency
   happened to enable it.
-- `docs/PYTHON.md` called `asyncio.wait_for(anext(stream), timeout)` safe. It
-  cancels the pending read on timeout, and a message that arrived in that
-  instant is discarded without being counted in `lost_messages`.
+- Python: a stream read cancelled by a timeout (`asyncio.wait_for`,
+  `asyncio.timeout`, `sync.Stream.recv(timeout)`) or by `stop()` could lose
+  the message that arrived as it was cancelled, uncounted in
+  `lost_messages`. A read is now a cancel-safe wait and a separate take, and
+  a message a cancelled read already had is returned by the next one.
+- Python: a `place_order` or `replace_order` that the caller timed out, or
+  that the blocking client's `timeout` cut off, raised a bare `TimeoutError`
+  and the caller never learned the generated tag, so it could not find the
+  order and a retry could place it twice. Both now take `timeout=`: past it
+  the submission is not cancelled and the call raises `SubmissionUnknown`
+  with `cause="timeout"`, the order's `tag` and its `attempt_id` once
+  journaled. Every failure of either call (and of the paper broker's)
+  carries `tag`. **Behavior change:** `sync.Client` with a `timeout` now
+  raises `SubmissionUnknown`, not `TimeoutError`, for a submission past it.
 - `stream_connect` (and the implicit connect in `stream_subscribe`) held the
   stream's write lock through the whole handshake, up to tens of seconds, so
   `get_server_status`, `stream_status` and `stream_snapshot` hung behind it.
