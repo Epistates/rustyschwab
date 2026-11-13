@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A system clock that stepped backwards (an NTP correction, a VM resumed
+  from suspend) made every request fail with `Storage("Clock moved
+  backwards; quota denied")` until the clock caught up, cancels included.
+  Request attempts the shared quota ledger dated after now are now counted
+  from now, so requests wait at most one rate window and the limit is never
+  exceeded.
 - `rustyschwab-authority` gave a request one of its sixteen general slots
   before checking its token, and the slot was held while the body was read,
   so anyone who could reach the port could fill all sixteen with slow bodies

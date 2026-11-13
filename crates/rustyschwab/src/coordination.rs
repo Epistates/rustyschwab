@@ -126,14 +126,24 @@ impl Coordinator for StateDatabase {
                     )?;
                 }
             }
+            // The ledger is shared between processes, so it keeps wall-clock
+            // times. After the clock steps back, attempts dated after now are
+            // counted from now: each still counts for a whole window, so the
+            // rate can only be overstated, and the waits below stay within a
+            // window instead of growing with the step. Refusing instead would
+            // stop every request, cancels included, until the clock caught up.
             let now = chrono::Utc::now().timestamp_millis();
-            let last: Option<i64> = tx
-                .query_row("SELECT MAX(at) FROM quota WHERE key=?1", [&key], |r| {
-                    r.get(0)
-                })
+            let ahead = tx
+                .execute(
+                    "UPDATE quota SET at=?2 WHERE key=?1 AND at>?2",
+                    params![key, now],
+                )
                 .map_err(sql)?;
-            if last.is_some_and(|last| last > now) {
-                return Err(Error::Storage("Clock moved backwards; quota denied".into()));
+            if ahead > 0 {
+                tracing::warn!(
+                    attempts = ahead,
+                    "The clock moved backwards; request attempts dated after now are counted from now"
+                );
             }
             tx.execute(
                 "DELETE FROM quota WHERE key=?1 AND at<=?2",

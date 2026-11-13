@@ -517,6 +517,34 @@ async fn leases_reacquire_for_their_owner_and_quotas_follow_configuration() {
     );
 }
 
+/// A clock that steps back does not refuse requests (cancels included) for
+/// the length of the step: attempts dated after now count from now, so the
+/// next request waits at most a window, and a burst that was full stays full.
+#[tokio::test]
+async fn a_clock_step_back_delays_requests_by_a_window_at_most() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let db = journal.database();
+    assert_eq!(db.quota("credential", 2, 2).await.unwrap(), Duration::ZERO);
+    // As if the clock had been ten minutes ahead when two attempts were made.
+    let ahead = chrono::Utc::now().timestamp_millis() + 600_000;
+    let connection = rusqlite::Connection::open(journal.path()).unwrap();
+    connection
+        .execute(
+            "INSERT INTO quota VALUES('credential',?1),('credential',?1)",
+            [ahead],
+        )
+        .unwrap();
+    drop(connection);
+    let wait = db.quota("credential", 2, 2).await.unwrap();
+    assert!(
+        wait > Duration::ZERO && wait <= Duration::from_secs(1),
+        "the full burst is still counted, for one second from now: {wait:?}"
+    );
+    tokio::time::sleep(wait + Duration::from_millis(50)).await;
+    assert_eq!(db.quota("credential", 2, 2).await.unwrap(), Duration::ZERO);
+}
+
 /// A restored backup trusts none of its account baselines.
 #[tokio::test]
 async fn a_restore_invalidates_every_baseline() {
