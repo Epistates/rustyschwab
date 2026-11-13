@@ -69,10 +69,14 @@ pub struct Authority {
     pub risk: Option<Arc<dyn RiskProvider>>,
     pub identity: Arc<dyn IdentityVerifier>,
     pub policy_file: PathBuf,
+    /// For callers whose token verifies; see [`admit`].
     capacity: Arc<tokio::sync::Semaphore>,
     /// Reserved for `/v1/operator`, so a halt still gets through when trading
-    /// traffic (or unauthenticated noise) holds every general slot.
+    /// traffic holds every general slot.
     operator_capacity: Arc<tokio::sync::Semaphore>,
+    /// For the unauthenticated `/livez` and `/readyz`, so probes neither
+    /// crowd out traders nor fail because traders are busy.
+    probe_capacity: Arc<tokio::sync::Semaphore>,
     pub required_accounts: Vec<String>,
     notifier: Option<crate::approvals::Notifier>,
 }
@@ -101,6 +105,7 @@ impl Authority {
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
             operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
+            probe_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             notifier: None,
         }
     }
@@ -119,6 +124,7 @@ impl Authority {
             required_accounts,
             capacity: Arc::new(tokio::sync::Semaphore::new(16)),
             operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
+            probe_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             notifier: None,
         }
     }
@@ -135,11 +141,10 @@ impl Authority {
     fn grants(&self) -> anyhow::Result<Vec<Grant>> {
         load_grants(&self.policy_file)
     }
-    async fn authenticate(
-        &self,
-        headers: &HeaderMap,
-        role: Role,
-    ) -> Result<(ServiceIdentity, Vec<Grant>), StatusCode> {
+    /// The identity a request's bearer token proves, if it is current. Says
+    /// nothing of what the identity may do; [`authenticate`](Self::authenticate)
+    /// checks that against the grants.
+    async fn verify_bearer(&self, headers: &HeaderMap) -> Result<ServiceIdentity, StatusCode> {
         let token = headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
@@ -155,6 +160,14 @@ impl Authority {
         if identity.expires_at <= now {
             return Err(StatusCode::UNAUTHORIZED);
         }
+        Ok(identity)
+    }
+    async fn authenticate(
+        &self,
+        headers: &HeaderMap,
+        role: Role,
+    ) -> Result<(ServiceIdentity, Vec<Grant>), StatusCode> {
+        let identity = self.verify_bearer(headers).await?;
         // Read per request, so a revoked grant takes effect at once; off
         // the async workers, since the file may be up to a megabyte.
         let path = self.policy_file.clone();
@@ -232,16 +245,25 @@ async fn admit(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let lane = if request.uri().path() == "/v1/operator" {
-        // Only a verified operator may hold a reserved permit: anyone else
-        // could fill the lane with slow bodies and lock out a halt. The
-        // handler authenticates again, against the grants as they then are.
-        if let Err(code) = state.authenticate(request.headers(), Role::Operator).await {
-            return response(Err(code.into()));
+    // A permit is held while the handler reads the body, so a lane open to
+    // anyone could be filled with slow bodies and lock out every caller.
+    // Only the probes, which take no body, are admitted unauthenticated;
+    // every handler authenticates again, for its role and against the
+    // grants as they then are.
+    let lane = match request.uri().path() {
+        "/livez" | "/readyz" => &state.probe_capacity,
+        "/v1/operator" => {
+            if let Err(code) = state.authenticate(request.headers(), Role::Operator).await {
+                return response(Err(code.into()));
+            }
+            &state.operator_capacity
         }
-        &state.operator_capacity
-    } else {
-        &state.capacity
+        _ => {
+            if let Err(code) = state.verify_bearer(request.headers()).await {
+                return response(Err(code.into()));
+            }
+            &state.capacity
+        }
     };
     let Ok(_permit) = lane.clone().try_acquire_owned() else {
         return response(Err(StatusCode::SERVICE_UNAVAILABLE.into()));

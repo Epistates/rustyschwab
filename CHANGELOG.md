@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `rustyschwab-authority` gave a request one of its sixteen general slots
+  before checking its token, and the slot was held while the body was read,
+  so anyone who could reach the port could fill all sixteen with slow bodies
+  and lock every trader out for up to 35 seconds at a time. A request now
+  needs a verified token before it takes a slot, and `/livez` and `/readyz`
+  have a lane of their own, so probes no longer fail when traders are busy.
 - An `expires_in` of absurd size from the token endpoint panicked `chrono`
   inside the refresh path. The access-token lifetime is now bounded at one
   day (Schwab's is 30 minutes).

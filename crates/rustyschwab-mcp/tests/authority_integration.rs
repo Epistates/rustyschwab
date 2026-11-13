@@ -170,6 +170,46 @@ async fn approve(s: &Setup, order: &Value) {
     );
     assert_eq!(post(s,"/v1/operator",'o',json!({"action":"approve","principal":"desk","digest":digest,"expires_at":chrono::Utc::now().timestamp()+60})).await.status(),200);
 }
+/// A caller without a valid token cannot hold the general lane: before its
+/// body arrives it is refused, so sixteen connections that send headers and
+/// then stall leave every slot to the traders, and the probes keep a lane of
+/// their own.
+#[tokio::test]
+async fn unauthenticated_slow_bodies_do_not_hold_the_traders_lane() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let s = setup().await;
+    let address = s.url.trim_start_matches("http://").to_owned();
+    let mut stalled = Vec::new();
+    for _ in 0..16 {
+        let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+        let head = format!(
+            "POST /v1/orders HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n",
+            "x".repeat(32)
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stalled.push(stream);
+    }
+    for stream in &mut stalled {
+        let mut reply = [0u8; 12];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+            .await
+            .expect("refused before its body arrives")
+            .unwrap();
+        assert_eq!(
+            &reply,
+            b"HTTP/1.1 401",
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    let lease = post(&s, "/v1/lease", 't', json!({"action":"acquire"})).await;
+    assert_eq!(lease.status(), 200, "a trader still gets a slot");
+    let live = reqwest::get(format!("{}/livez", s.url)).await.unwrap();
+    assert_eq!(live.status(), 200);
+    drop(stalled);
+}
+
 #[tokio::test]
 async fn two_remote_clients_share_intents_quotas_and_fencing() {
     let s = setup().await;
