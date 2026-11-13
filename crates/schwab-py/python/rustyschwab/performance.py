@@ -201,7 +201,9 @@ def analyze(
     buy-and-hold return. ``marks`` maps a symbol to the price that values its
     open lots; without one they are valued at the symbol's last fill price.
 
-    Ratios are computed on the curve's last value per New York trading date.
+    Ratios are computed on the curve's last value per New York trading date;
+    two or more weekdays in a row without a point carry the last value, so a
+    weekly or sparse curve is annualized as the daily curve it stands for.
     Raises :class:`rustyschwab.InvalidParameter` for out-of-order fills or
     points, a non-positive quantity or price, a negative fee and the like.
     """

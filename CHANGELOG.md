@@ -25,6 +25,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Performance ratios on a sparse equity curve were annualized as if each
+  gap between points were one trading day: a weekly backtest's Sharpe was
+  overstated by about the square root of five (roughly 2.2x), and the
+  annualized return compounded too far. The same held for the curve
+  `get_performance` builds from fills. Two or more weekdays in a row
+  without a point now carry the last value forward, so the series is daily;
+  a single missing weekday is taken for a market holiday. **Behavior
+  change:** `daily` in the report includes the filled weekdays, and ratios
+  on sparse curves are lower.
 - `PortfolioRisk` refused every order on an account whose baseline had no
   `positions` array as stale. An account that holds nothing may come back
   without it, so its first buy could never be made. A missing array now

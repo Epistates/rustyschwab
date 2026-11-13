@@ -30,8 +30,13 @@
 //!   not an observation; pass `marks` for a real valuation.
 //!
 //! Ratios are computed from the equity curve resampled to one value per New
-//! York calendar date (the last point of the date). Drawdown uses the curve at
-//! full resolution. When no curve is supplied, the curve is built from the
+//! York calendar date (the last point of the date), so each return spans one
+//! trading session, as `periods_per_year` assumes. Where the curve skips two
+//! or more weekdays in a row (a weekly curve, or one built from fills on a
+//! few days) the skipped weekdays carry the last value forward, so a sparse
+//! curve is not annualized as if each of its gaps were a day; a single
+//! skipped weekday is taken for a market holiday and left out. Drawdown uses
+//! the curve at full resolution. When no curve is supplied, the curve is built from the
 //! fills: one point per fill at the realized P&L less fees paid so far, with
 //! the final point carrying the open lots' valuation. The report says which
 //! curve it used in [`PerformanceReport::equity_source`].
@@ -41,7 +46,7 @@
 
 use crate::types::trading::OrderInstruction;
 use crate::{Error, Result};
-use chrono::{DateTime, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, Weekday};
 use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -54,6 +59,10 @@ pub const DEFAULT_PERIODS_PER_YEAR: u32 = 252;
 
 /// A deviation below this is zero: the series is constant up to rounding.
 const MIN_DEVIATION: f64 = 1e-12;
+
+/// The most dates the daily series may hold, filled ones included: a
+/// century of weekdays, so a mistyped timestamp cannot make it enormous.
+const MAX_DAILY_POINTS: usize = 100 * 262;
 
 /// Which way a fill moves the position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -257,7 +266,8 @@ pub struct SymbolReport {
 }
 
 /// The last equity of one New York calendar date and the return from the
-/// date before (or from the starting equity, for the first).
+/// date before (or from the starting equity, for the first). A weekday the
+/// curve skipped, in a run of two or more, carries the equity before it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DailyPoint {
     pub date: NaiveDate,
@@ -700,14 +710,34 @@ fn drawdown(start: Decimal, curve: &[EquityPoint]) -> Result<Drawdown> {
 }
 
 /// The last equity of each New York date, with the return from the date
-/// before.
+/// before; see the module documentation for the weekdays filled in.
 fn daily_series(start: Decimal, curve: &[EquityPoint]) -> Result<Vec<DailyPoint>> {
     let mut closes: Vec<(NaiveDate, Decimal)> = Vec::new();
     for point in curve {
         let date = new_york_date(point.at_ms)?;
-        match closes.last_mut() {
-            Some((last, equity)) if *last == date => *equity = point.equity,
-            _ => closes.push((date, point.equity)),
+        if let Some((last, equity)) = closes.last_mut()
+            && *last == date
+        {
+            *equity = point.equity;
+            continue;
+        }
+        if let Some(&(last, equity)) = closes.last() {
+            let skipped: Vec<NaiveDate> = last
+                .iter_days()
+                .skip(1)
+                .take_while(|day| *day < date)
+                .filter(|day| !matches!(day.weekday(), Weekday::Sat | Weekday::Sun))
+                .take(MAX_DAILY_POINTS + 1)
+                .collect();
+            if skipped.len() >= 2 {
+                closes.extend(skipped.into_iter().map(|day| (day, equity)));
+            }
+        }
+        closes.push((date, point.equity));
+        if closes.len() > MAX_DAILY_POINTS {
+            return Err(invalid(
+                "the curve spans more than a century of trading days",
+            ));
         }
     }
     let mut previous = start;
@@ -1306,6 +1336,53 @@ mod tests {
             1030.0 / 1020.0 - 1.0,
             1e-12,
         );
+    }
+
+    /// A weekly curve is annualized as the daily curve it stands for: the
+    /// skipped weekdays carry the week's value, so its ratios equal those of
+    /// the same curve written out day by day, where before they were
+    /// overstated by about the square root of five. A lone missing weekday
+    /// is a holiday, not a gap.
+    #[test]
+    fn a_sparse_curve_is_annualized_as_the_daily_curve_it_stands_for() {
+        let weeks = [
+            "1010", "1005", "1030", "1020", "1045", "1050", "1040", "1070",
+        ];
+        let weekly: Vec<_> = weeks
+            .iter()
+            .enumerate()
+            .map(|(week, equity)| point(noon(7 * week as i64 + 4), equity))
+            .collect();
+        let mut daily = Vec::new();
+        let mut held = "1000";
+        for (week, equity) in weeks.iter().enumerate() {
+            for weekday in 0..4 {
+                daily.push(point(noon(7 * week as i64 + weekday), held));
+            }
+            daily.push(point(noon(7 * week as i64 + 4), equity));
+            held = equity;
+        }
+        let sparse = analyze(&[], &weekly, &options()).unwrap();
+        let dense = analyze(&[], &daily[4..], &options()).unwrap();
+        assert_eq!(sparse.daily.len(), dense.daily.len());
+        close(sparse.sharpe.unwrap(), dense.sharpe.unwrap(), 1e-9);
+        close(sparse.volatility.unwrap(), dense.volatility.unwrap(), 1e-9);
+        close(
+            sparse.annualized_return.unwrap(),
+            dense.annualized_return.unwrap(),
+            1e-9,
+        );
+
+        // Monday, then Wednesday: Tuesday is taken for a holiday.
+        let holiday = [point(noon(0), "1010"), point(noon(2), "1020")];
+        assert_eq!(analyze(&[], &holiday, &options()).unwrap().daily.len(), 2);
+
+        // A mistyped year cannot make the series enormous.
+        let far = [
+            point(noon(0), "1010"),
+            point(noon(0) + 200 * 366 * 86_400_000, "1020"),
+        ];
+        assert!(invalid_message(analyze(&[], &far, &options())).contains("century"));
     }
 
     #[test]
