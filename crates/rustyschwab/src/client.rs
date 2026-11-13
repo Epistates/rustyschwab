@@ -397,14 +397,15 @@ impl SchwabClient {
         Ok(())
     }
 
-    /// Borrow the client's shared `AuthManager` (Arc-backed).
-    ///
-    /// Useful when building ancillary clients — e.g. a `StreamClient` — that
-    /// need to reuse the same token refresh loop and on-disk token store.
+    /// The execution journal this client records every order submission in.
     pub fn order_journal(&self) -> &crate::execution::OrderJournal {
         &self.inner.journal
     }
 
+    /// Borrow the client's shared `AuthManager` (Arc-backed).
+    ///
+    /// Useful when building ancillary clients — e.g. a `StreamClient` — that
+    /// need to reuse the same token refresh loop and on-disk token store.
     pub fn auth_manager(&self) -> AuthManager {
         self.inner.auth_manager.clone()
     }
