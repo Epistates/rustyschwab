@@ -517,6 +517,43 @@ async fn leases_reacquire_for_their_owner_and_quotas_follow_configuration() {
     );
 }
 
+/// An account that holds nothing may come back without `positions`. Its
+/// first buy goes when the balances agree it holds nothing; when they show
+/// a holding, or do not say, the missing positions still fail closed.
+#[tokio::test]
+async fn an_empty_account_without_positions_can_make_its_first_buy() {
+    async fn reserve(account: Value) -> rustyschwab::Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = OrderJournal::new(dir.path().join("orders.json"));
+        baseline(&journal, account, vec![]).await;
+        let buy = order("BUY", "AAPL", 1, "10");
+        let id = journal
+            .begin("A", "place_order", serde_json::to_value(&buy).unwrap())
+            .await
+            .unwrap();
+        risk(&journal, limits()).reserve("A", &id, &buy).await
+    }
+    reserve(
+        json!({"currentBalances": {"availableFunds": 1000, "longMarketValue": 0,
+        "shortMarketValue": 0, "moneyMarketFund": 0}}),
+    )
+    .await
+    .unwrap();
+    for account in [
+        json!({"currentBalances": {"availableFunds": 1000, "longMarketValue": 250}}),
+        json!({"currentBalances": {"availableFunds": 1000, "longMarketValue": 0,
+            "mutualFundValue": 40}}),
+        json!({"currentBalances": {"availableFunds": 1000}}),
+    ] {
+        let refused = reserve(account.clone()).await.unwrap_err();
+        assert!(
+            matches!(&refused, rustyschwab::Error::BaselineStale { reason, .. }
+                if reason.contains("Positions missing")),
+            "{account}: {refused:?}"
+        );
+    }
+}
+
 /// A clock that steps back does not refuse requests (cancels included) for
 /// the length of the step: attempts dated after now count from now, so the
 /// next request waits at most a window, and a burst that was full stays full.

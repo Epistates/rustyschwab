@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `PortfolioRisk` refused every order on an account whose baseline had no
+  `positions` array as stale. An account that holds nothing may come back
+  without it, so its first buy could never be made. A missing array now
+  means no positions when the balances agree: `longMarketValue` and every
+  other holdings value reported are zero. Otherwise it still fails closed.
 - A system clock that stepped backwards (an NTP correction, a VM resumed
   from suspend) made every request fail with `Storage("Clock moved
   backwards; quota denied")` until the clock caught up, cancels included.

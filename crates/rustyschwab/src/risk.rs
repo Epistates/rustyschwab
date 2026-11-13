@@ -169,6 +169,38 @@ fn decimal(value: Option<&serde_json::Value>) -> Option<Decimal> {
         })
         .and_then(|v| v.parse().ok())
 }
+/// The `currentBalances` fields that value what an account holds, in a cash
+/// or a margin account.
+const HOLDINGS_VALUES: &[&str] = &[
+    "longMarketValue",
+    "shortMarketValue",
+    "longOptionMarketValue",
+    "shortOptionMarketValue",
+    "longStockValue",
+    "shortStockValue",
+    "longNonMarginableMarketValue",
+    "mutualFundValue",
+    "bondValue",
+    "moneyMarketFund",
+];
+/// The positions of a baseline's `securitiesAccount`, read with
+/// `fields=positions`. An account that holds nothing may come without the
+/// key; that is taken as no positions only when the balances agree (a
+/// `longMarketValue` and every other holdings value reported are zero), so
+/// a response that lost the positions of an account with any still fails
+/// closed.
+fn baseline_positions(account: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    if let Some(positions) = account.get("positions") {
+        return positions.as_array().map(Vec::as_slice);
+    }
+    let balances = account.get("currentBalances")?;
+    let zero = |field: &str| decimal(balances.get(field)) == Some(Decimal::ZERO);
+    let holds_nothing = zero("longMarketValue")
+        && HOLDINGS_VALUES
+            .iter()
+            .all(|field| balances.get(*field).is_none() || zero(field));
+    holds_nothing.then_some(&[])
+}
 /// Where reconciliation records the day's net cash transfers into the
 /// account (deposits less withdrawals) beside Schwab's snapshot.
 pub(crate) const DAY_TRANSFERS_KEY: &str = "_dayNetTransfers";
@@ -368,9 +400,7 @@ impl PortfolioRisk {
                         return Err(Error::Halted(reason));
                     }
                 }
-                let position = account_value
-                    .get("positions")
-                    .and_then(serde_json::Value::as_array)
+                let position = baseline_positions(account_value)
                     .ok_or_else(|| stale("Positions missing from risk baseline"))?
                     .iter()
                     .filter(|p| {
