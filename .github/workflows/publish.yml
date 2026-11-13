@@ -1,8 +1,10 @@
 name: Publish crates
 
-# Run by hand for a release tag that `release.yml` has verified. Publishing
-# needs approval in the `crates-io` environment and uses crates.io trusted
-# publishing (OIDC), so no long-lived registry token exists.
+# Run by hand for a release tag. Publishing needs approval in the `crates-io`
+# environment and uses crates.io trusted publishing (OIDC), so no long-lived
+# registry token exists. Once approved it refuses a tag whose commit has not
+# passed CI and `release.yml`, and packages every crate before publishing
+# any, so a crate that cannot be packaged leaves nothing half-published.
 on:
   workflow_dispatch:
     inputs:
@@ -19,11 +21,21 @@ jobs:
     environment: crates-io
     permissions:
       contents: read
+      actions: read
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
+      - name: The tagged commit passed CI and the release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for workflow in ci.yml release.yml; do
+            passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --commit "$sha" --status success --json databaseId --jq length)
+            [ "$passed" -gt 0 ] || { echo "::error::$workflow has not passed on $sha"; exit 1; }
+          done
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -33,6 +45,8 @@ jobs:
         run: |
           version=$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name == "rustyschwab") | .version')
           [ "${TAG#v}" = "$version" ] || { echo "::error::tag $TAG is not v$version"; exit 1; }
+      - name: Every crate packages
+        run: cargo package -p rustyschwab-types -p rustyschwab -p rustyschwab-mcp -p rustyschwab-console -p rustyschwab-dash --locked
       - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
         id: auth
       # Dependency order; each publish waits for the index to see the last.

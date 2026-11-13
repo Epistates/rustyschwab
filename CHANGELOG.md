@@ -122,6 +122,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
 
+### Changed — release gating
+
+- `publish.yml` and the PyPI job of `publish-python.yml` now refuse a tag
+  whose commit has not passed CI and `release.yml`, checked once the
+  environment approval is given. `publish.yml` packages all five crates
+  before it publishes any, and `publish-python.yml` runs the test suite and
+  `mypy` against the Linux wheel it publishes.
+- The live conformance jobs in `qualification.yml` run in a `live-schwab`
+  environment, so their Schwab credentials can be limited to `main` (move
+  the three secrets there; see `docs/RELEASING.md`).
+- `docs/RELEASING.md` is rewritten for releases after the first: the
+  repository settings a release depends on, every version to bump, and the
+  order of tagging, approval and publishing.
+
 ### Changed — dependencies
 
 - Every compatible update in both lockfiles (rusqlite 0.41.1, rustix 1.1.6,

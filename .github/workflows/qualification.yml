@@ -67,9 +67,13 @@ jobs:
   # forks and repositories without credentials. SCHWAB_TOKENS_JSON is the
   # contents of a `schwab_tokens.json` produced by `cargo run -p oauth-flow`;
   # Schwab refresh tokens expire after seven days, so rotate it at least weekly.
+  # Keep the three secrets in the `live-schwab` environment, limited to `main`,
+  # and not as repository secrets: a repository secret reaches a workflow run
+  # from any branch, so anyone who can push one could print the credentials.
   live-preflight:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+    environment: live-schwab
     outputs:
       ready: ${{ steps.check.outputs.ready }}
     env:
@@ -88,6 +92,7 @@ jobs:
   live-conformance:
     needs: live-preflight
     if: needs.live-preflight.outputs.ready == 'true'
+    environment: live-schwab
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:

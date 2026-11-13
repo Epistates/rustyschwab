@@ -114,21 +114,54 @@ jobs:
           path: crates/schwab-py/dist/*.tar.gz
           if-no-files-found: error
 
+  # The test suite against the wheel that is published, not a local build.
+  test:
+    name: test the Linux wheel
+    needs: wheels
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: crates/schwab-py
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: python-wheel-linux-x86_64
+          path: crates/schwab-py/dist
+      - name: Install the wheel with the test extras
+        run: python -m pip install "$(echo dist/*.whl)[test]" mypy
+      - run: python -m pytest
+      - run: python -m mypy --strict python/rustyschwab
+
   publish:
     name: publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheels, sdist]
+    needs: [wheels, sdist, test]
     runs-on: ubuntu-latest
-    # Approval here is the release gate. Register this workflow and the
-    # `pypi` environment as the trusted publisher of the `rustyschwab`
-    # project on PyPI.
+    # Approval here is the release gate: approve once CI and `release.yml`
+    # have passed on the tagged commit, which the first step checks.
+    # Register this workflow and the `pypi` environment as the trusted
+    # publisher of the `rustyschwab` project on PyPI.
     environment:
       name: pypi
       url: https://pypi.org/project/rustyschwab/
     permissions:
       contents: read
+      actions: read
       id-token: write
     steps:
+      - name: The tagged commit passed CI and the release build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for workflow in ci.yml release.yml; do
+            passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --commit "$GITHUB_SHA" --status success --json databaseId --jq length)
+            [ "$passed" -gt 0 ] || { echo "::error::$workflow has not passed on $GITHUB_SHA"; exit 1; }
+          done
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: python-*

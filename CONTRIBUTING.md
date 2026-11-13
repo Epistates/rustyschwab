@@ -130,21 +130,23 @@ explains why, not what.
 
 ## Releases
 
-1. Bump `version` in the workspace `Cargo.toml`.
+1. Bump the version in the workspace `Cargo.toml`, the internal path
+   dependencies and `crates/schwab-py/Cargo.toml` together.
 2. Move the `[Unreleased]` section in `CHANGELOG.md` to a dated version.
-3. Tag `vX.Y.Z` and push the tag. `release.yml` builds the binaries, an
-   SBOM and a provenance attestation, and drafts a GitHub Release with
-   them; review and publish it. Verify an artifact with
+3. Tag `vX.Y.Z` on a `main` commit that passed CI, and push the tag.
+   `release.yml` tests the tag, builds the binaries, an SBOM and a
+   provenance attestation, and drafts a GitHub Release with them; review
+   and publish it. Verify an artifact with
    `gh attestation verify <file> --repo Epistates/rustyschwab`.
-4. Run `publish.yml` for the tag. It publishes `rustyschwab-types`, then
-   `rustyschwab`, then `rustyschwab-mcp` through crates.io trusted publishing,
-   after approval in the `crates-io` environment (configure the trusted
-   publisher on crates.io and the environment's reviewers first).
+4. Run `publish.yml` for the tag. After approval in the `crates-io`
+   environment it checks that CI and `release.yml` passed on the tagged
+   commit, packages the five crates, and publishes them in dependency
+   order through crates.io trusted publishing.
 5. The same tag push starts `publish-python.yml`, which builds the
-   `rustyschwab` abi3 wheels and sdist and, after approval in the `pypi`
-   environment, publishes them through PyPI trusted publishing (register
-   the publisher on PyPI first). Run it by hand before tagging to inspect
-   the artifacts without publishing.
+   `rustyschwab` abi3 wheels and sdist, tests the Linux wheel, and after
+   approval in the `pypi` environment (and the same check) publishes them
+   through PyPI trusted publishing. Run it by hand before tagging to
+   inspect the artifacts without publishing.
 
 See [docs/RELEASING.md](docs/RELEASING.md) for the full checklist and
 [docs/SUPPORT.md](docs/SUPPORT.md) for the compatibility policy.
