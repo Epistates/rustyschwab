@@ -15,6 +15,7 @@
 //! pricing model and are refused.
 use super::{OptionSymbol, OrderRequest, OrderType};
 use crate::common::{AssetType, PutCall};
+use crate::validation::{ValidationError, ValidationErrorKind as K};
 use rust_decimal::Decimal;
 
 /// What [`defined_risk`] finds an option strategy can lose.
@@ -35,38 +36,72 @@ pub struct DefinedRisk {
 /// to expiration. `multiplier` gives each leg's deliverable per contract
 /// (100 for a standard contract); every leg must have the same one.
 ///
-/// Refused, with the reason: a leg that is not an option or not in OSI
-/// form, mixed underlyings or expirations, fractional or mixed
-/// multipliers, a missing or non-positive net price, an instruction that
-/// neither buys nor sells, and a strategy whose loss has no bound.
+/// Refused, with the reason and the field at fault where there is one: a
+/// leg that is not an option or not in OSI form, mixed underlyings or
+/// expirations, fractional or mixed multipliers, a missing or non-positive
+/// net price, an instruction that neither buys nor sells, and a strategy
+/// whose loss has no bound.
 pub fn defined_risk(
     order: &OrderRequest,
     multiplier: impl Fn(&str) -> Option<Decimal>,
-) -> Result<DefinedRisk, String> {
+) -> Result<DefinedRisk, ValidationError> {
+    let refuse =
+        |kind, field: Option<&str>, message: &str| Err(ValidationError::new(kind, field, message));
     let legs = &order.order_leg_collection;
     if legs.is_empty() {
-        return Err("A strategy needs legs".into());
+        return refuse(
+            K::Missing,
+            Some("orderLegCollection"),
+            "A strategy needs legs",
+        );
     }
     let mut parsed = Vec::with_capacity(legs.len());
     let mut contract = None;
-    for leg in legs {
+    for (index, leg) in legs.iter().enumerate() {
+        let at = |field: &str| format!("orderLegCollection[{index}].{field}");
         if leg.instrument.asset_type != AssetType::Option {
-            return Err("Defined risk is computed for option legs only".into());
+            return refuse(
+                K::Unsupported,
+                Some(&at("instrument.assetType")),
+                "Defined risk is computed for option legs only",
+            );
         }
-        let symbol: OptionSymbol = leg.instrument.symbol.parse()?;
-        let size = multiplier(&leg.instrument.symbol)
-            .filter(|m| *m > Decimal::ZERO)
-            .ok_or("Option contract requires an operator-verified multiplier")?;
+        let symbol: OptionSymbol = leg
+            .instrument
+            .symbol
+            .parse()
+            .map_err(|e: ValidationError| e.within(&at("instrument.symbol")))?;
+        let Some(size) = multiplier(&leg.instrument.symbol).filter(|m| *m > Decimal::ZERO) else {
+            return refuse(
+                K::Missing,
+                None,
+                "Option contract requires an operator-verified multiplier",
+            );
+        };
         if *contract.get_or_insert(size) != size {
-            return Err("A strategy's legs must share one contract multiplier".into());
+            return refuse(
+                K::Structure,
+                None,
+                "A strategy's legs must share one contract multiplier",
+            );
         }
         let sign = match leg.instruction.buys() {
             Some(true) => Decimal::ONE,
             Some(false) => Decimal::NEGATIVE_ONE,
-            None => return Err("A leg must buy or sell".into()),
+            None => {
+                return refuse(
+                    K::Unsupported,
+                    Some(&at("instruction")),
+                    "A leg must buy or sell",
+                );
+            }
         };
         if leg.quantity <= Decimal::ZERO || !leg.quantity.fract().is_zero() {
-            return Err("Leg quantities must be whole contracts".into());
+            return refuse(
+                K::NotWhole,
+                Some(&at("quantity")),
+                "Leg quantities must be whole contracts",
+            );
         }
         parsed.push((symbol, sign, leg.quantity));
     }
@@ -75,16 +110,24 @@ pub fn defined_risk(
         .iter()
         .any(|(s, _, _)| s.underlying() != first.underlying())
     {
-        return Err("A strategy's legs must share one underlying".into());
+        return refuse(
+            K::Structure,
+            Some("orderLegCollection"),
+            "A strategy's legs must share one underlying",
+        );
     }
     if parsed
         .iter()
         .any(|(s, _, _)| s.expiration() != first.expiration())
     {
-        return Err("Legs at different expirations need a pricing model to bound".into());
+        return refuse(
+            K::Unsupported,
+            Some("orderLegCollection"),
+            "Legs at different expirations need a pricing model to bound",
+        );
     }
     let multiplier = contract.unwrap_or(Decimal::ONE);
-    let overflow = || "Strategy arithmetic overflow".to_owned();
+    let overflow = || ValidationError::new(K::OutOfRange, None, "Strategy arithmetic overflow");
 
     // Net premium: positive when paid.
     let units = parsed
@@ -95,17 +138,26 @@ pub fn defined_risk(
     let per_unit = match order.order_type {
         Some(OrderType::NetZero) => Decimal::ZERO,
         Some(kind @ (OrderType::NetDebit | OrderType::NetCredit)) => {
-            let price = order
-                .price
-                .filter(|p| *p > Decimal::ZERO)
-                .ok_or("A net-priced strategy needs a positive price")?;
+            let Some(price) = order.price.filter(|p| *p > Decimal::ZERO) else {
+                return refuse(
+                    K::OutOfRange,
+                    Some("price"),
+                    "A net-priced strategy needs a positive price",
+                );
+            };
             if kind == OrderType::NetDebit {
                 price
             } else {
                 -price
             }
         }
-        _ => return Err("A strategy is priced NET_DEBIT, NET_CREDIT or NET_ZERO".into()),
+        _ => {
+            return refuse(
+                K::Unsupported,
+                Some("orderType"),
+                "A strategy is priced NET_DEBIT, NET_CREDIT or NET_ZERO",
+            );
+        }
     };
     let premium = per_unit
         .checked_mul(units)
@@ -119,11 +171,15 @@ pub fn defined_risk(
         .map(|(_, sign, q)| sign * q)
         .sum();
     if call_slope < Decimal::ZERO {
-        return Err("The strategy sells more calls than it buys; its loss has no bound".into());
+        return refuse(
+            K::Unsupported,
+            Some("orderLegCollection"),
+            "The strategy sells more calls than it buys; its loss has no bound",
+        );
     }
 
     // The payoff at expiration, at zero and at every strike.
-    let payoff = |price: Decimal| -> Result<Decimal, String> {
+    let payoff = |price: Decimal| -> Result<Decimal, ValidationError> {
         parsed.iter().try_fold(Decimal::ZERO, |sum, (s, sign, q)| {
             let intrinsic = match s.put_call() {
                 PutCall::Call => (price - s.strike()).max(Decimal::ZERO),
@@ -283,11 +339,9 @@ mod tests {
             Some("1"),
             &[("SELL_TO_OPEN", C100, 2), ("BUY_TO_OPEN", C105, 1)],
         );
-        assert!(
-            defined_risk(&naked, hundred)
-                .unwrap_err()
-                .contains("no bound")
-        );
+        let unbounded = defined_risk(&naked, hundred).unwrap_err();
+        assert!(unbounded.message().contains("no bound"), "{unbounded}");
+        assert_eq!(unbounded.kind(), K::Unsupported);
         let calendar = spread(
             "NET_DEBIT",
             Some("1"),
@@ -299,6 +353,7 @@ mod tests {
         assert!(
             defined_risk(&calendar, hundred)
                 .unwrap_err()
+                .message()
                 .contains("different expirations")
         );
         let unpriced = spread(
@@ -306,7 +361,10 @@ mod tests {
             None,
             &[("BUY_TO_OPEN", C100, 1), ("SELL_TO_OPEN", C105, 1)],
         );
-        assert!(defined_risk(&unpriced, hundred).is_err());
+        assert_eq!(
+            defined_risk(&unpriced, hundred).unwrap_err().field(),
+            Some("price")
+        );
         let mixed = |symbol: &str| {
             (symbol == C105)
                 .then(|| Decimal::from(10))

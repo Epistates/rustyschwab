@@ -68,8 +68,7 @@ fn expiration(obj: &Bound<'_, PyAny>) -> Result<NaiveDate, Failure> {
 /// An order from an `OrderSpec` dict.
 fn build(spec: &Bound<'_, PyAny>) -> Result<OrderRequest, Failure> {
     let spec: OrderSpec = from_py(spec, "order spec")?;
-    spec.build()
-        .map_err(|message| Failure::input(format!("invalid order spec: {message}")))
+    spec.build().map_err(|invalid| Failure::Sdk(invalid.into()))
 }
 
 /// Expand an order spec into the Schwab order JSON that `place_order` takes.
@@ -167,7 +166,7 @@ pub fn bracket_order(
                 decimal(take_profit, "take_profit")?,
                 decimal(stop_loss, "stop_loss")?,
             )
-            .map_err(Failure::input)?;
+            .map_err(|invalid| Failure::Sdk(invalid.into()))?;
         validated(bracketed)
     })()
     .map(Json)
@@ -187,7 +186,7 @@ fn format_option(
         put_call,
         decimal(strike, "strike")?,
     )
-    .map_err(Failure::input)?;
+    .map_err(|invalid| Failure::Sdk(invalid.into()))?;
     Ok(symbol.to_string())
 }
 
@@ -212,7 +211,9 @@ pub fn option_symbol(
 }
 
 fn parse_option(symbol: &str) -> Result<Value, Failure> {
-    let parsed: OptionSymbol = symbol.parse().map_err(Failure::input)?;
+    let parsed: OptionSymbol = symbol
+        .parse()
+        .map_err(|invalid: rustyschwab::types::ValidationError| Failure::Sdk(invalid.into()))?;
     Ok(json!({
         "underlying": parsed.underlying(),
         "expiration": parsed.expiration().to_string(),
@@ -284,7 +285,14 @@ mod tests {
                 None,
                 None,
             )?;
-            assert!(message(build(&zero).unwrap_err()).contains("positive"));
+            // A spec that expands to an invalid order names the field.
+            match build(&zero).unwrap_err() {
+                Failure::Sdk(rustyschwab::Error::Validation(invalid)) => {
+                    assert_eq!(invalid.field(), Some("price"));
+                    assert!(invalid.message().contains("positive"), "{invalid}");
+                }
+                other => panic!("expected a validation failure, got {other:?}"),
+            }
             Ok(())
         });
     }

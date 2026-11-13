@@ -8,6 +8,7 @@ use super::{
     StopType, TaxLotMethod,
 };
 use crate::common::{AssetType, PutCall};
+use crate::validation::{ValidationError, ValidationErrorKind as K};
 use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 use std::{fmt, str::FromStr};
@@ -40,30 +41,31 @@ impl OptionSymbol {
     /// underlying longer than six ASCII letters or digits, an expiration
     /// outside 2000–2099 (the symbol keeps two year digits, read as 20YY),
     /// a strike that is not positive, above 99999.999, or finer than a
-    /// tenth of a cent.
+    /// tenth of a cent. A refusal is a [`ValidationErrorKind::Symbol`](K::Symbol).
     pub fn new(
         underlying: impl AsRef<str>,
         expiration: NaiveDate,
         put_call: PutCall,
         strike: Decimal,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ValidationError> {
+        let invalid = |message: String| Err(ValidationError::new(K::Symbol, None, message));
         let underlying = underlying.as_ref().trim().to_ascii_uppercase();
         if underlying.is_empty()
             || underlying.len() > 6
             || !underlying.bytes().all(|b| b.is_ascii_alphanumeric())
         {
-            return Err(format!(
+            return invalid(format!(
                 "Option underlying must be one to six letters or digits, got {underlying:?}"
             ));
         }
         if !(2000..=2099).contains(&expiration.year()) {
-            return Err(format!(
+            return invalid(format!(
                 "Option expiration must be in 2000-2099, got {expiration}"
             ));
         }
         let strike = strike.normalize();
         if strike <= Decimal::ZERO || strike.scale() > 3 || strike >= Decimal::from(100_000) {
-            return Err(format!(
+            return invalid(format!(
                 "Option strike must be positive, below 100000, \
                  and a multiple of 0.001, got {strike}"
             ));
@@ -81,7 +83,7 @@ impl OptionSymbol {
         underlying: impl AsRef<str>,
         expiration: NaiveDate,
         strike: Decimal,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ValidationError> {
         Self::new(underlying, expiration, PutCall::Call, strike)
     }
 
@@ -90,7 +92,7 @@ impl OptionSymbol {
         underlying: impl AsRef<str>,
         expiration: NaiveDate,
         strike: Decimal,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ValidationError> {
         Self::new(underlying, expiration, PutCall::Put, strike)
     }
 
@@ -129,14 +131,20 @@ impl fmt::Display for OptionSymbol {
 }
 
 impl FromStr for OptionSymbol {
-    type Err = String;
+    type Err = ValidationError;
 
     /// Parses exactly the canonical form [`Display`](fmt::Display) writes:
     /// an upper-case root padded on the right to six characters, so a symbol
     /// round-trips unchanged. The two-digit year is 20YY: listed options do
     /// not expire in the last century, and `%y` would read 70–99 as 19YY.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let invalid = || format!("Expected a 21-character OSI option symbol, got {s:?}");
+        let invalid = || {
+            ValidationError::new(
+                K::Symbol,
+                None,
+                format!("Expected a 21-character OSI option symbol, got {s:?}"),
+            )
+        };
         if s.len() != 21 || !s.is_ascii() {
             return Err(invalid());
         }
@@ -170,9 +178,13 @@ impl FromStr for OptionSymbol {
             Decimal::new(thousandths, 3),
         )?;
         if symbol.to_string() != s {
-            return Err(format!(
-                "{s:?} is not in canonical OSI form; expected {:?}",
-                symbol.to_string()
+            return Err(ValidationError::new(
+                K::Symbol,
+                None,
+                format!(
+                    "{s:?} is not in canonical OSI form; expected {:?}",
+                    symbol.to_string()
+                ),
             ));
         }
         Ok(symbol)
@@ -457,26 +469,32 @@ impl OrderRequest {
     /// `STOP` entry its trigger. A long entry at 150 needs its stop below
     /// 150 and its target above; otherwise an exit is marketable the moment
     /// the entry fills. A market entry has no price to compare, so only the
-    /// ordering of the exits is checked.
-    pub fn bracket(self, take_profit: Decimal, stop_loss: Decimal) -> Result<Self, String> {
+    /// ordering of the exits is checked. A refusal is a
+    /// [`ValidationErrorKind::Structure`](K::Structure).
+    pub fn bracket(
+        self,
+        take_profit: Decimal,
+        stop_loss: Decimal,
+    ) -> Result<Self, ValidationError> {
+        let refuse = |message: String| Err(ValidationError::new(K::Structure, None, message));
         if self.order_strategy_type != OrderStrategyType::Single
             || !self.child_order_strategies.is_empty()
         {
-            return Err("A bracket entry must be a SINGLE order without children".into());
+            return refuse("A bracket entry must be a SINGLE order without children".into());
         }
         let [leg] = self.order_leg_collection.as_slice() else {
-            return Err("A bracket entry must have exactly one leg".into());
+            return refuse("A bracket entry must have exactly one leg".into());
         };
         let (Some(closing), Some(long)) = (leg.instruction.closing(), leg.instruction.opens_long())
         else {
-            return Err(format!(
+            return refuse(format!(
                 "{:?} does not open a position, so it cannot be bracketed",
                 leg.instruction
             ));
         };
         if (long && take_profit <= stop_loss) || (!long && take_profit >= stop_loss) {
             let side = if long { "long" } else { "short" };
-            return Err(format!(
+            return refuse(format!(
                 "Bracket exits are inverted for a {side} entry: \
                  take profit {take_profit}, stop loss {stop_loss}"
             ));
@@ -489,7 +507,7 @@ impl OrderRequest {
             };
             if !(below < entry && entry < above) {
                 let side = if long { "long" } else { "short" };
-                return Err(format!(
+                return refuse(format!(
                     "Bracket exits must straddle a {side} entry at {entry}: \
                      take profit {take_profit}, stop loss {stop_loss}"
                 ));

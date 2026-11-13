@@ -122,6 +122,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
 
+### Changed — typed errors from the order builders
+
+- **Breaking (Rust API):** `OptionSymbol::new`, `call`, `put` and its
+  `FromStr`, `OrderRequest::bracket`, `defined_risk`, `OrderSpec::build` and
+  `TryFrom<OrderSpec> for OrderRequest` return
+  `rustyschwab_types::ValidationError` instead of `String`, with a `kind`
+  and, where there is one, the `field` at fault in Schwab's spelling
+  (`price`, `orderLegCollection[1].quantity`). `OrderSpec::build` used to
+  flatten the validator's typed error into text and lose the field; the MCP
+  `build_order` tool now names it, and Python's `build_order`,
+  `bracket_order`, `option_symbol` and `parse_option_symbol` raise
+  `ValidationError` with `field` set. Migration: where you matched or
+  printed the `String`, use `error.message()` (or `to_string()`), and
+  `error.kind()` / `error.field()` to branch; `?` into `rustyschwab::Error`
+  now works directly through its `Validation` variant.
+
 ### Changed — a smaller public API for rustyschwab-mcp
 
 - **Breaking (Rust API):** eight modules of `rustyschwab-mcp` that served

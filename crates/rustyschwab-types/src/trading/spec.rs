@@ -9,6 +9,7 @@ use super::{
     PriceLinkType, RequestedDestination, SpecialInstruction, StopType, TaxLotMethod,
 };
 use crate::common::PutCall;
+use crate::validation::{ValidationError, ValidationErrorKind as K};
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -250,7 +251,7 @@ impl OrderSettings {
 }
 
 impl InstrumentSpec {
-    fn build(self) -> Result<OrderRequestInstrument, String> {
+    fn build(self) -> Result<OrderRequestInstrument, ValidationError> {
         match self {
             Self::Equity { symbol } => Ok(OrderRequestInstrument::equity(symbol)),
             Self::Option {
@@ -272,15 +273,18 @@ impl InstrumentSpec {
             } => Ok(OrderRequestInstrument::option(OptionSymbol::new(
                 underlying, expiration, right, strike,
             )?)),
-            Self::Option { .. } => Err("An option instrument takes either an OSI symbol \
-                 or all of underlying, expiration, right and strike"
-                .into()),
+            Self::Option { .. } => Err(ValidationError::new(
+                K::Structure,
+                None,
+                "An option instrument takes either an OSI symbol \
+                 or all of underlying, expiration, right and strike",
+            )),
         }
     }
 }
 
 impl LegSpec {
-    fn build(self) -> Result<OrderRequestLeg, String> {
+    fn build(self) -> Result<OrderRequestLeg, ValidationError> {
         let leg = OrderRequestLeg::new(self.instruction, self.instrument.build()?, self.quantity);
         Ok(match self.position_effect {
             Some(effect) => leg.with_position_effect(effect),
@@ -289,19 +293,21 @@ impl LegSpec {
     }
 }
 
-fn build_legs(legs: Vec<LegSpec>) -> Result<Vec<OrderRequestLeg>, String> {
+fn build_legs(legs: Vec<LegSpec>) -> Result<Vec<OrderRequestLeg>, ValidationError> {
     legs.into_iter().map(LegSpec::build).collect()
 }
 
 impl OrderSpec {
-    /// Expand into a validated [`OrderRequest`].
-    pub fn build(self) -> Result<OrderRequest, String> {
+    /// Expand into a validated [`OrderRequest`]. A refusal names the field
+    /// of the expanded request at fault, when there is one, as
+    /// [`OrderRequest::validate`] does.
+    pub fn build(self) -> Result<OrderRequest, ValidationError> {
         let order = self.expand()?;
-        order.validate().map_err(|e| e.to_string())?;
+        order.validate()?;
         Ok(order)
     }
 
-    fn expand(self) -> Result<OrderRequest, String> {
+    fn expand(self) -> Result<OrderRequest, ValidationError> {
         Ok(match self {
             Self::Market { leg, settings } => settings.apply(OrderRequest::market(leg.build()?)),
             Self::Limit {
@@ -350,12 +356,16 @@ impl OrderSpec {
             }
             Self::Trigger { entry, children } => {
                 if children.is_empty() {
-                    return Err("A trigger needs at least one child order".into());
+                    return Err(ValidationError::new(
+                        K::Missing,
+                        Some("childOrderStrategies"),
+                        "A trigger needs at least one child order",
+                    ));
                 }
                 children
                     .into_iter()
                     .try_fold(entry.expand()?, |order, child| {
-                        Ok::<_, String>(order.triggers(child.expand()?))
+                        Ok::<_, ValidationError>(order.triggers(child.expand()?))
                     })?
             }
             Self::Bracket {
@@ -368,7 +378,7 @@ impl OrderSpec {
 }
 
 impl TryFrom<OrderSpec> for OrderRequest {
-    type Error = String;
+    type Error = ValidationError;
 
     fn try_from(spec: OrderSpec) -> Result<Self, Self::Error> {
         spec.build()
@@ -382,7 +392,23 @@ mod tests {
 
     fn build(spec: serde_json::Value) -> Result<serde_json::Value, String> {
         let spec: OrderSpec = serde_json::from_value(spec).map_err(|e| e.to_string())?;
-        Ok(serde_json::to_value(spec.build()?).unwrap())
+        Ok(serde_json::to_value(spec.build().map_err(|e| e.to_string())?).unwrap())
+    }
+
+    #[test]
+    fn a_refusal_names_the_field_of_the_expanded_request() {
+        let spec: OrderSpec = serde_json::from_value(json!({"kind": "limit", "price": "0",
+            "leg": {"instruction": "BUY", "quantity": "1",
+                "instrument": {"asset_type": "EQUITY", "symbol": "AMD"}}}))
+        .unwrap();
+        let refused = spec.build().unwrap_err();
+        assert_eq!(refused.field(), Some("price"), "{refused}");
+        assert_eq!(refused.kind(), K::OutOfRange);
+        let symbol: OrderSpec = serde_json::from_value(json!({"kind": "market",
+            "leg": {"instruction": "BUY_TO_OPEN", "quantity": "1",
+                "instrument": {"asset_type": "OPTION", "symbol": "AMD 1"}}}))
+        .unwrap();
+        assert_eq!(symbol.build().unwrap_err().kind(), K::Symbol);
     }
 
     #[test]

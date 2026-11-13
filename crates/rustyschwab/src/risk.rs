@@ -587,7 +587,7 @@ impl Proposed {
             let risk = crate::types::trading::defined_risk(order, |symbol| {
                 limits.option_multipliers.get(symbol).copied()
             })
-            .map_err(Error::RiskDenied)?;
+            .map_err(|refused| Error::RiskDenied(refused.to_string()))?;
             return Ok(Self {
                 symbol: order.order_leg_collection[0].instrument.symbol.clone(),
                 sell: false,

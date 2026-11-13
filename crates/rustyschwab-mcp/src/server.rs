@@ -984,7 +984,7 @@ impl SchwabMcp {
     )]
     async fn build_order(&self, spec: OrderSpec) -> McpResult<ToolResult> {
         contract::run("build_order", async {
-            let order = spec.build().map_err(ToolFailure::invalid_arguments)?;
+            let order = spec.build().map_err(ToolFailure::from)?;
             let json = serde_json::to_value(order)
                 .map_err(|e| ToolFailure::internal("Order serialization failed", e))?;
             Ok(contract::local(json))

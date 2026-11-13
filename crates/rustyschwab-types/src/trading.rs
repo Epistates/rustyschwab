@@ -1913,7 +1913,7 @@ impl OrderRequestLeg {
                 )?;
                 symbol
                     .parse::<OptionSymbol>()
-                    .map_err(|e| VE::new(K::Symbol, Some("instrument.symbol"), e))?;
+                    .map_err(|e| e.within("instrument.symbol"))?;
                 if !whole {
                     return Err(not_whole("Option orders are for whole contracts"));
                 }

@@ -400,7 +400,8 @@ fn exposure_under(
         // An option strategy is bounded by what it can lose at expiration.
         let risk = rustyschwab_types::trading::defined_risk(order, |symbol| {
             multipliers.get(symbol).copied()
-        })?;
+        })
+        .map_err(|refused| refused.to_string())?;
         quantity = quantity
             .checked_add(risk.contracts)
             .ok_or("Quantity overflow")?;
