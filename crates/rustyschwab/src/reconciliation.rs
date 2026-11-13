@@ -1,6 +1,7 @@
 //! Broker reconciliation is conservative: absence never proves rejection.
 use crate::{
     SchwabClient,
+    client::Op,
     error::{Error, Result},
     storage::{StateDatabase, audit, sql},
     types::trading::OrdersParams,
@@ -701,7 +702,7 @@ impl SchwabClient {
                 }
                 let page: Vec<Value> = self
                     .request_with_query(
-                        "reconcile_orders",
+                        Op::recovery("reconcile_orders"),
                         reqwest::Method::GET,
                         &crate::client::account_path(account, "/orders")?,
                         &OrdersParams {
@@ -746,7 +747,7 @@ impl SchwabClient {
                 }
                 let order: Value = match self
                     .request(
-                        "reconcile_order",
+                        Op::recovery("reconcile_order"),
                         reqwest::Method::GET,
                         &crate::client::order_path(account, &id)?,
                     )
@@ -773,7 +774,7 @@ impl SchwabClient {
             // window. Broker reads are still not an atomic account snapshot.
             let mut snapshot: Value = self
                 .request_with_query(
-                    "reconcile_account",
+                    Op::recovery("reconcile_account"),
                     reqwest::Method::GET,
                     &crate::client::account_path(account, "")?,
                     &[("fields", "positions")],

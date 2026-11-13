@@ -61,6 +61,94 @@ fn submission_task_failed(
     }
 }
 
+/// How the request pipeline treats an operation: whether a failure may be
+/// sent again, which share of the request budget it draws on, and whether an
+/// open circuit breaker refuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpClass {
+    /// Changes nothing at Schwab: retried within its deadline, refused by an
+    /// open breaker.
+    Read,
+    /// A read that keeps the risk baseline fresh: as [`Read`](Self::Read),
+    /// from the share of the budget reads cannot take.
+    Recovery,
+    /// Places or replaces an order: sent once under the execution lease and
+    /// never retried; an ambiguous failure is `SubmissionUnknown`.
+    Submission,
+    /// Cancels an order: sent once, and let through an open breaker, since
+    /// it only reduces risk.
+    Cancel,
+}
+
+/// An operation: the name that labels its metrics, spans and journal
+/// records, and the [`OpClass`] that decides how it is sent. Each request
+/// states both where it is made, so no name decides whether a write is
+/// retried.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Op {
+    name: &'static str,
+    class: OpClass,
+}
+
+impl Op {
+    pub(crate) const fn read(name: &'static str) -> Self {
+        Self {
+            name,
+            class: OpClass::Read,
+        }
+    }
+    pub(crate) const fn recovery(name: &'static str) -> Self {
+        Self {
+            name,
+            class: OpClass::Recovery,
+        }
+    }
+    const fn submission(name: &'static str) -> Self {
+        Self {
+            name,
+            class: OpClass::Submission,
+        }
+    }
+    const fn cancel(name: &'static str) -> Self {
+        Self {
+            name,
+            class: OpClass::Cancel,
+        }
+    }
+}
+
+/// One order placement or replacement, as the detached submission task
+/// sends it.
+struct Submission {
+    op: Op,
+    method: Method,
+    path: String,
+    account: String,
+    /// The order a replacement replaces; `None` for a placement.
+    replaces: Option<String>,
+}
+
+impl Submission {
+    fn place(account: &str) -> Result<Self> {
+        Ok(Self {
+            op: Op::submission("place_order"),
+            method: Method::POST,
+            path: account_path(account, "/orders")?,
+            account: account.to_owned(),
+            replaces: None,
+        })
+    }
+    fn replace(account: &str, order_id: &str) -> Result<Self> {
+        Ok(Self {
+            op: Op::submission("replace_order"),
+            method: Method::PUT,
+            path: order_path(account, order_id)?,
+            account: account.to_owned(),
+            replaces: Some(order_id.to_owned()),
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct SchwabClient {
     inner: Arc<ClientInner>,
@@ -326,7 +414,7 @@ impl SchwabClient {
         &self.inner.config
     }
 
-    pub(crate) async fn request<T>(&self, op: &'static str, method: Method, path: &str) -> Result<T>
+    pub(crate) async fn request<T>(&self, op: Op, method: Method, path: &str) -> Result<T>
     where
         T: DeserializeOwned,
     {
@@ -336,7 +424,7 @@ impl SchwabClient {
 
     pub(crate) async fn request_with_query<T, Q>(
         &self,
-        op: &'static str,
+        op: Op,
         method: Method,
         path: &str,
         query: &Q,
@@ -351,7 +439,7 @@ impl SchwabClient {
 
     pub(crate) async fn request_with_body<T, B>(
         &self,
-        op: &'static str,
+        op: Op,
         method: Method,
         path: &str,
         body: &B,
@@ -366,7 +454,7 @@ impl SchwabClient {
 
     pub(crate) async fn request_with_options<T, Q>(
         &self,
-        op: &'static str,
+        op: Op,
         method: Method,
         path: &str,
         query: Option<&Q>,
@@ -377,7 +465,7 @@ impl SchwabClient {
         Q: Serialize + ?Sized + Sync,
     {
         let method_label = method_label(&method);
-        debug!(op, "Making API request");
+        debug!(op = op.name, "Making API request");
         let method = &method;
         self.execute_resilient(op, method_label, None, None, move |token: String| {
             Box::pin(async move {
@@ -409,7 +497,7 @@ impl SchwabClient {
             return Err(Error::InvalidParameter("path must start with '/'".into()));
         }
         self.request_with_options::<serde_json::Value, [(&str, &str)]>(
-            "get_json",
+            Op::read("get_json"),
             Method::GET,
             path,
             (!query.is_empty()).then_some(query),
@@ -430,14 +518,11 @@ impl SchwabClient {
     /// behind it.
     async fn submit_order_request(
         &self,
-        op: &'static str,
-        method: Method,
-        path: &str,
+        submission: Submission,
         order: &OrderRequest,
         fence: Option<&crate::coordination::Lease>,
     ) -> Result<OrderSubmitResponse> {
         let client = self.clone();
-        let path = path.to_owned();
         let order = order.clone();
         let fence = fence.cloned();
         // The task records its attempt id here as soon as the intent is
@@ -447,7 +532,7 @@ impl SchwabClient {
         let task_attempt = Arc::clone(&attempt);
         tokio::spawn(async move {
             client
-                .submit_detached(op, method, &path, &order, fence.as_ref(), &task_attempt)
+                .submit_detached(&submission, &order, fence.as_ref(), &task_attempt)
                 .await
         })
         .await
@@ -456,9 +541,7 @@ impl SchwabClient {
 
     async fn submit_detached(
         &self,
-        op: &'static str,
-        method: Method,
-        path: &str,
+        submission: &Submission,
         order: &OrderRequest,
         fence: Option<&crate::coordination::Lease>,
         attempt: &std::sync::OnceLock<String>,
@@ -467,8 +550,14 @@ impl SchwabClient {
         order.validate()?;
         let tagged_order = tagged(order);
         let order = &tagged_order;
-        let account = path.split('/').nth(4).unwrap_or_default();
-        let replaces = (op == "replace_order").then(|| path.rsplit('/').next().unwrap_or_default());
+        let Submission {
+            op,
+            method,
+            path,
+            account,
+            replaces,
+        } = submission;
+        let (op, account, replaces) = (*op, account.as_str(), replaces.as_deref());
         if let Some(order_id) = replaces {
             // Risk judges a replacement against the order it replaces, and
             // one this client has not reconciled yet has no exposure it can
@@ -484,7 +573,7 @@ impl SchwabClient {
         let attempt_id = self
             .inner
             .execution
-            .begin_once(account, op, serde_json::to_value(order)?, None)
+            .begin_once(account, op.name, serde_json::to_value(order)?, None)
             .await?;
         let _ = attempt.set(attempt_id.clone());
         let reserved = match (&self.inner.risk, replaces) {
@@ -502,9 +591,8 @@ impl SchwabClient {
                 .await?;
             return Err(error);
         }
-        let method_label = method_label(&method);
-        debug!(op, "Submitting order");
-        let method = &method;
+        let method_label = method_label(method);
+        debug!(op = op.name, "Submitting order");
         let result = self
             .execute_resilient(
                 op,
@@ -577,11 +665,11 @@ impl SchwabClient {
     #[tracing::instrument(
         name = "schwab.request",
         skip_all,
-        fields(op = op, http.request.method = method_label)
+        fields(op = op.name, http.request.method = method_label)
     )]
     async fn execute_resilient<'a, T>(
         &'a self,
-        op: &'static str,
+        op: Op,
         method_label: &'static str,
         risk_context: Option<(&str, &str, &OrderRequest)>,
         fence: Option<&crate::coordination::Lease>,
@@ -590,19 +678,17 @@ impl SchwabClient {
         self.ensure_live_state().await?;
         let start = std::time::Instant::now();
         let timeout = self.inner.config.timeout;
-        let submission = matches!(op, "place_order" | "replace_order");
+        let submission = op.class == OpClass::Submission;
         // A cancel only ever reduces risk: it must not be refused because
         // read traffic tripped the breaker, and it is never retried, since
         // a retry after a cancel that landed answers 4xx and hides it.
-        let protective = op == "cancel_order";
+        let protective = op.class == OpClass::Cancel;
         // Writes and the reconciliation that keeps the risk baseline fresh
         // keep a share of the request budget reads cannot take.
-        let priority = if submission || protective {
-            crate::request_budget::Priority::Critical
-        } else if op.starts_with("reconcile_") {
-            crate::request_budget::Priority::Recovery
-        } else {
-            crate::request_budget::Priority::Normal
+        let priority = match op.class {
+            OpClass::Submission | OpClass::Cancel => crate::request_budget::Priority::Critical,
+            OpClass::Recovery => crate::request_budget::Priority::Recovery,
+            OpClass::Read => crate::request_budget::Priority::Normal,
         };
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let sent = std::sync::atomic::AtomicBool::new(false);
@@ -765,14 +851,14 @@ impl SchwabClient {
         };
         metrics::counter!(
             crate::metrics::HTTP_REQUESTS_TOTAL,
-            "op" => op,
+            "op" => op.name,
             "method" => method_label,
             "status" => status
         )
         .increment(1);
         metrics::histogram!(
             crate::metrics::HTTP_REQUEST_DURATION,
-            "op" => op,
+            "op" => op.name,
             "method" => method_label
         )
         .record(start.elapsed().as_secs_f64());
@@ -812,7 +898,7 @@ impl SchwabClient {
             params.push(("indicative", i.to_string()));
         }
         self.request_with_query(
-            "get_quotes_with_options",
+            Op::read("get_quotes_with_options"),
             Method::GET,
             "/marketdata/v1/quotes",
             &params,
@@ -848,7 +934,7 @@ impl SchwabClient {
         let encoded_symbol = urlencoding::encode(symbol);
         let response: QuotesResponse = self
             .request_with_query(
-                "get_quote_with_options",
+                Op::read("get_quote_with_options"),
                 Method::GET,
                 &format!("/marketdata/v1/{}/quotes", encoded_symbol),
                 &params,
@@ -878,7 +964,7 @@ impl SchwabClient {
     ) -> Result<PriceHistoryResponse> {
         params.validate()?;
         self.request_with_query(
-            "get_price_history",
+            Op::read("get_price_history"),
             Method::GET,
             "/marketdata/v1/pricehistory",
             params,
@@ -896,7 +982,7 @@ impl SchwabClient {
     ) -> Result<OptionChainResponse> {
         params.validate()?;
         self.request_with_query(
-            "get_option_chain",
+            Op::read("get_option_chain"),
             Method::GET,
             "/marketdata/v1/chains",
             params,
@@ -914,7 +1000,7 @@ impl SchwabClient {
         }
         let params = [("symbol", symbol)];
         self.request_with_query(
-            "get_option_expiration_chain",
+            Op::read("get_option_expiration_chain"),
             Method::GET,
             "/marketdata/v1/expirationchain",
             &params,
@@ -939,7 +1025,7 @@ impl SchwabClient {
 
         let encoded_index = urlencoding::encode(index.as_str());
         self.request_with_query(
-            "get_movers",
+            Op::read("get_movers"),
             Method::GET,
             &format!("/marketdata/v1/movers/{}", encoded_index),
             &params,
@@ -958,7 +1044,7 @@ impl SchwabClient {
         }
         let params = [("symbol", symbol), ("projection", projection.as_str())];
         self.request_with_query(
-            "search_instruments",
+            Op::read("search_instruments"),
             Method::GET,
             "/marketdata/v1/instruments",
             &params,
@@ -974,7 +1060,7 @@ impl SchwabClient {
         let encoded_cusip = urlencoding::encode(cusip);
         let response: InstrumentsResponse = self
             .request(
-                "get_instrument",
+                Op::read("get_instrument"),
                 Method::GET,
                 &format!("/marketdata/v1/instruments/{}", encoded_cusip),
             )
@@ -1011,7 +1097,7 @@ impl SchwabClient {
             params.push(("date", date.to_string()));
         }
         self.request_with_query(
-            "get_markets",
+            Op::read("get_markets"),
             Method::GET,
             "/marketdata/v1/markets",
             &params,
@@ -1034,7 +1120,7 @@ impl SchwabClient {
             params.push(("date", date.to_string()));
         }
         self.request_with_query(
-            "get_market",
+            Op::read("get_market"),
             Method::GET,
             &format!("/marketdata/v1/markets/{}", market.as_str()),
             &params,
@@ -1047,7 +1133,7 @@ impl SchwabClient {
     /// Get all linked account numbers
     pub async fn get_account_numbers(&self) -> Result<Vec<AccountNumberHash>> {
         self.request(
-            "get_account_numbers",
+            Op::read("get_account_numbers"),
             Method::GET,
             "/trader/v1/accounts/accountNumbers",
         )
@@ -1061,8 +1147,13 @@ impl SchwabClient {
         } else {
             vec![]
         };
-        self.request_with_query("get_accounts", Method::GET, "/trader/v1/accounts", &params)
-            .await
+        self.request_with_query(
+            Op::read("get_accounts"),
+            Method::GET,
+            "/trader/v1/accounts",
+            &params,
+        )
+        .await
     }
 
     /// Get specific account details
@@ -1077,7 +1168,7 @@ impl SchwabClient {
             vec![]
         };
         self.request_with_query(
-            "get_account",
+            Op::read("get_account"),
             Method::GET,
             &account_path(account_hash, "")?,
             &params,
@@ -1096,7 +1187,7 @@ impl SchwabClient {
     ) -> Result<Vec<Order>> {
         params.validate()?;
         self.request_with_query(
-            "get_account_orders",
+            Op::read("get_account_orders"),
             Method::GET,
             &account_path(account_hash, "/orders")?,
             params,
@@ -1113,14 +1204,8 @@ impl SchwabClient {
         account_hash: &str,
         order: &OrderRequest,
     ) -> Result<OrderSubmitResponse> {
-        self.submit_order_request(
-            "place_order",
-            Method::POST,
-            &account_path(account_hash, "/orders")?,
-            order,
-            None,
-        )
-        .await
+        self.submit_order_request(Submission::place(account_hash)?, order, None)
+            .await
     }
 
     /// Dispatch through a gateway-owned lease, checked after queue/auth waits.
@@ -1130,14 +1215,8 @@ impl SchwabClient {
         order: &OrderRequest,
         lease: &crate::coordination::Lease,
     ) -> Result<OrderSubmitResponse> {
-        self.submit_order_request(
-            "place_order",
-            Method::POST,
-            &account_path(account, "/orders")?,
-            order,
-            Some(lease),
-        )
-        .await
+        self.submit_order_request(Submission::place(account)?, order, Some(lease))
+            .await
     }
     pub async fn replace_order_fenced(
         &self,
@@ -1146,20 +1225,14 @@ impl SchwabClient {
         order: &OrderRequest,
         lease: &crate::coordination::Lease,
     ) -> Result<OrderSubmitResponse> {
-        self.submit_order_request(
-            "replace_order",
-            Method::PUT,
-            &order_path(account, id)?,
-            order,
-            Some(lease),
-        )
-        .await
+        self.submit_order_request(Submission::replace(account, id)?, order, Some(lease))
+            .await
     }
 
     /// Get a specific order
     pub async fn get_order(&self, account_hash: &str, order_id: &str) -> Result<Order> {
         self.request(
-            "get_order",
+            Op::read("get_order"),
             Method::GET,
             &order_path(account_hash, order_id)?,
         )
@@ -1177,7 +1250,7 @@ impl SchwabClient {
     /// authority audit every cancellation per principal.
     pub async fn cancel_order(&self, account_hash: &str, order_id: &str) -> Result<()> {
         self.request(
-            "cancel_order",
+            Op::cancel("cancel_order"),
             Method::DELETE,
             &order_path(account_hash, order_id)?,
         )
@@ -1195,14 +1268,8 @@ impl SchwabClient {
         order_id: &str,
         order: &OrderRequest,
     ) -> Result<OrderSubmitResponse> {
-        self.submit_order_request(
-            "replace_order",
-            Method::PUT,
-            &order_path(account_hash, order_id)?,
-            order,
-            None,
-        )
-        .await
+        self.submit_order_request(Submission::replace(account_hash, order_id)?, order, None)
+            .await
     }
 
     /// Preview an order without submitting it: Schwab's validation
@@ -1219,7 +1286,7 @@ impl SchwabClient {
     ) -> Result<crate::types::trading::OrderPreview> {
         order.validate()?;
         self.request_with_body(
-            "preview_order",
+            Op::read("preview_order"),
             Method::POST,
             &account_path(account_hash, "/previewOrder")?,
             &tagged(order),
@@ -1233,8 +1300,13 @@ impl SchwabClient {
     /// sent; see [`OrdersParams::validate`].
     pub async fn get_all_orders(&self, params: &OrdersParams) -> Result<Vec<Order>> {
         params.validate()?;
-        self.request_with_query("get_all_orders", Method::GET, "/trader/v1/orders", params)
-            .await
+        self.request_with_query(
+            Op::read("get_all_orders"),
+            Method::GET,
+            "/trader/v1/orders",
+            params,
+        )
+        .await
     }
 
     /// Get account transactions.
@@ -1248,7 +1320,7 @@ impl SchwabClient {
     ) -> Result<Vec<Transaction>> {
         params.validate()?;
         self.request_with_query(
-            "get_transactions",
+            Op::read("get_transactions"),
             Method::GET,
             &account_path(account_hash, "/transactions")?,
             params,
@@ -1264,7 +1336,7 @@ impl SchwabClient {
     ) -> Result<Transaction> {
         path_segment("transaction_id", transaction_id)?;
         self.request(
-            "get_transaction",
+            Op::read("get_transaction"),
             Method::GET,
             &account_path(account_hash, &format!("/transactions/{transaction_id}"))?,
         )
@@ -1274,7 +1346,7 @@ impl SchwabClient {
     /// Get user preferences
     pub async fn get_user_preferences(&self) -> Result<UserPreferences> {
         self.request(
-            "get_user_preferences",
+            Op::read("get_user_preferences"),
             Method::GET,
             "/trader/v1/userPreference",
         )
