@@ -353,8 +353,9 @@ future and stack frame stay small however many tools there are.
   valid `order` first normalized to its `OrderRequest` wire form so the
   digest binds the order Schwab would receive, not one JSON spelling of
   it). `authorize` is the first denial of `review`, which keeps them all.
-  `AuthorizedServer` wraps `SchwabMcp` as an `McpHandler`, writes the
-  principal's audit journal and hands write tools to a `TradingBackend`.
+- `authorized.rs` — `AuthorizedServer` (public as `policy::AuthorizedServer`)
+  wraps `SchwabMcp` as an `McpHandler`, writes the principal's audit journal
+  and hands write tools to a `TradingBackend`.
   When that single denial is the approval and the submission asked for
   `wait_ms`, `await_approval` polls the same durable store for up to
   `MAX_APPROVAL_WAIT_MS` and judges again; it holds for no other denial,
@@ -485,7 +486,7 @@ harness's own request → decode → diff → record cycle is still covered by a
 | Add or fix a REST endpoint | `crates/rustyschwab/src/client.rs` (one method per endpoint) and the response type in `crates/rustyschwab-types/src/` |
 | Change an order shape or add a constructor | `crates/rustyschwab-types/src/trading.rs`, `trading/builder.rs`, `trading/spec.rs`; `docs/ORDERS.md` |
 | Add a streaming service or field | `crates/rustyschwab-types/src/streaming/payload.rs` field tables, then `StreamClient::subscribe_*` |
-| Add an MCP tool | `crates/rustyschwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` |
+| Add an MCP tool | `crates/rustyschwab-mcp/src/server.rs`, then `tests/tool_inventory.rs`; policy-gated tools also need `policy.rs` (the policy) and `authorized.rs` (its dispatch) |
 | Change what a principal may do | `crates/rustyschwab-mcp/src/policy.rs`; runtime policy JSON documented in `docs/OPERATIONS.md` |
 | Durable state, migrations, backup | `crates/rustyschwab/src/storage.rs`, `execution.rs` |
 | Cached or recorded price history | `crates/rustyschwab/src/history.rs` |

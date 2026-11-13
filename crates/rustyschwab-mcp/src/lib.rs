@@ -6,6 +6,7 @@
 mod activity;
 pub mod approvals;
 pub mod authority;
+mod authorized;
 pub mod backend;
 pub mod contract;
 pub mod dead_man;
