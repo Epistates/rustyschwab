@@ -1,5 +1,7 @@
 # Rust build artifacts
 target/
+# A target directory a disk-cleaning tool renamed for deletion and left behind.
+.carwash-trash-*/
 **/*.rs.bk
 *.pdb
 
