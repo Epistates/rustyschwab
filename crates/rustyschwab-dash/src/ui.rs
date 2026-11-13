@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Cell, Clear, Paragraph, Row, Table, TableState, Wrap};
-use rustyschwab_mcp::delegation::Mode;
+use rustyschwab_console::Mode;
 
 use crate::app::{App, Modal, ModeChoice, Pane, Purpose};
 

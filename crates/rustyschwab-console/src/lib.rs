@@ -34,4 +34,7 @@ pub use config::{ConsoleConfig, PaperFiles};
 pub use console::{
     ACTIVITY_SHOWN, APPROVAL_MINUTES, Command, Console, Handle, describe_mode, unapproved_reach,
 };
+/// The approval modes the snapshot reports and [`Command`] sets, so a user
+/// interface can name them without depending on `rustyschwab-mcp`.
+pub use rustyschwab_mcp::delegation::Mode;
 pub use snapshot::Snapshot;

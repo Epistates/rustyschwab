@@ -4050,7 +4050,6 @@ dependencies = [
  "ratatui",
  "rust_decimal",
  "rustyschwab-console",
- "rustyschwab-mcp",
  "tokio",
  "tracing-subscriber",
 ]

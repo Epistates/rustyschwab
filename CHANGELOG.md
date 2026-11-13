@@ -148,6 +148,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `check_order`, `get_order_status` and the rest) rather than the modules;
   for redaction and performance in your own code, `rustyschwab::performance`
   and the SDK types are the supported API.
+- `rustyschwab-console` re-exports `Mode`, the approval mode its snapshot
+  and commands use, and `rustyschwab-dash` no longer depends on
+  `rustyschwab-mcp` directly: a user interface reaches the servers' state
+  through the console only.
 
 ### Changed — release gating
 

@@ -8,8 +8,8 @@ use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use chrono_tz::America::New_York;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rust_decimal::Decimal;
+use rustyschwab_console::Mode;
 use rustyschwab_console::{Command, Snapshot};
-use rustyschwab_mcp::delegation::Mode;
 
 /// The panes the selection keys move in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
