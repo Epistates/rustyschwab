@@ -122,6 +122,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
 
+### Changed — a smaller public API for rustyschwab-mcp
+
+- **Breaking (Rust API):** eight modules of `rustyschwab-mcp` that served
+  only its own tools are private: `activity`, `order_status`, `performance`,
+  `portfolio`, `preflight`, `projection`, `query` and `redact`. Nothing in
+  this repository outside the crate used them. Migration: call the MCP tools
+  they implement (`get_portfolio_summary`, `get_performance`,
+  `check_order`, `get_order_status` and the rest) rather than the modules;
+  for redaction and performance in your own code, `rustyschwab::performance`
+  and the SDK types are the supported API.
+
 ### Changed — release gating
 
 - `publish.yml` and the PyPI job of `publish-python.yml` now refuse a tag

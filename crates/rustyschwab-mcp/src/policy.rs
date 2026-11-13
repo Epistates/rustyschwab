@@ -788,8 +788,8 @@ impl WithTools for AuthorizedServer {
         Ok(page)
     }
     /// Every call, answered or refused, is also noted in the principal's
-    /// activity log for whoever follows the agent live (see
-    /// [`crate::activity`]).
+    /// activity log for whoever follows the agent live (the `activity`
+    /// module).
     async fn call_tool(
         &self,
         ctx: &CallToolContext,

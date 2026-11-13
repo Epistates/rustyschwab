@@ -3,7 +3,7 @@
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub mod activity;
+mod activity;
 pub mod approvals;
 pub mod authority;
 pub mod backend;
@@ -17,15 +17,15 @@ pub mod identity;
 pub mod journal;
 pub mod metrics;
 pub mod network;
-pub mod order_status;
+mod order_status;
 pub mod paper_replay;
-pub mod performance;
+mod performance;
 pub mod policy;
-pub mod portfolio;
-pub mod preflight;
-pub mod projection;
-pub mod query;
-pub mod redact;
+mod portfolio;
+mod preflight;
+mod projection;
+mod query;
+mod redact;
 pub mod server;
 pub mod status;
 pub mod stream_cache;

@@ -25,7 +25,7 @@
 //!   principal's next call. A pass that fails (the venue could not be read,
 //!   a cancel was refused) is retried a few times within the same silence.
 //! - **Attribution.** Only orders this principal placed are cancelled,
-//!   found from its audit records over [`ORDER_LOOKBACK_DAYS`]: the venue
+//!   found from its audit records over the last 59 days: the venue
 //!   order id a completed dispatch recorded, or, for a dispatch that
 //!   recorded none (a lost acknowledgement, a process that died
 //!   mid-dispatch), the order tag in the arguments it dispatched. Those are
