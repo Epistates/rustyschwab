@@ -222,7 +222,7 @@ mod tests {
         let policy = |extra: serde_json::Value| -> anyhow::Result<PrincipalPolicy> {
             let mut value = serde_json::json!({"name": "desk", "token_sha256": "a".repeat(64),
                 "tools": ["place_order"], "accounts": ["A"], "max_quantity": "1",
-                "max_notional": "100", "require_approval": true});
+                "max_notional": "100", "price_collar_bps": 500, "require_approval": true});
             value
                 .as_object_mut()
                 .unwrap()

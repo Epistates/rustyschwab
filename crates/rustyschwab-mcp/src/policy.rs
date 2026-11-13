@@ -67,7 +67,9 @@ pub struct PrincipalPolicy {
     #[serde(default)]
     pub denied_symbols: HashSet<String>,
     /// Refuse a limit order priced more than this many basis points through
-    /// the far side of the market; absent, no collar.
+    /// the far side of the market (see [`crate::guardrails`]). Required for
+    /// a principal that can place or replace orders: the notional caps value
+    /// an order at its limit, which only the collar keeps near the market.
     #[serde(default)]
     pub price_collar_bps: Option<std::num::NonZeroU32>,
     /// Submissions this principal may start in a New York trading day.
@@ -156,6 +158,13 @@ impl PrincipalPolicy {
                         .max_notional
                         .is_some_and(|v| v > rust_decimal::Decimal::ZERO),
                 "Trading principals require positive finite quantity/notional limits"
+            );
+            // A sell's limit only floors its proceeds, so without a collar a
+            // sell of the whole position at a penny passes every notional cap.
+            anyhow::ensure!(
+                self.price_collar_bps.is_some(),
+                "Trading principals require price_collar_bps, the most a limit order \
+                 may be priced through the market, in basis points (500 is 5%)"
             );
         }
         anyhow::ensure!(
@@ -435,7 +444,10 @@ fn exposure_under(
             )
         );
         let price = match (bounded, order.price) {
-            (true, Some(price)) => price,
+            // A stop-limit counts at the higher of its prices: a sell's
+            // limit only floors what it fills at, and it triggers near its
+            // stop.
+            (true, Some(price)) => order.stop_price.map_or(price, |stop| price.max(stop)),
             _ => entry
                 .filter(|(opened, _)| closes(leg, opened))
                 .map(|(_, price)| price)
@@ -2190,6 +2202,21 @@ mod tests {
         }
         assert!(exposure(&OrderRequest::market(entry()).triggers(stop()), &none).is_err());
     }
+    /// A stop-limit counts at the higher of its prices, so a sell stop at 45
+    /// with a penny limit counts what it sells near 45, not a penny; a buy's
+    /// limit is already its ceiling.
+    #[test]
+    fn a_stop_limit_counts_at_its_higher_price() {
+        use rust_decimal::Decimal;
+        use rustyschwab_types::trading::{OrderInstruction, OrderRequest, OrderRequestLeg};
+        let d = |s: &str| s.parse::<Decimal>().unwrap();
+        let none = Default::default();
+        let leg = |instruction| OrderRequestLeg::equity(instruction, "AAPL", 10);
+        let sell = OrderRequest::stop_limit(leg(OrderInstruction::Sell), d("45"), d("0.01"));
+        assert_eq!(exposure(&sell, &none).unwrap(), (d("10"), d("450")));
+        let buy = OrderRequest::stop_limit(leg(OrderInstruction::Buy), d("55"), d("56"));
+        assert_eq!(exposure(&buy, &none).unwrap(), (d("10"), d("560")));
+    }
     /// Prompts and resources follow the principal's tools and accounts: a
     /// principal with `check_order` is offered both, rendered for the tools
     /// and switches it has; one without sees neither, and the capabilities
@@ -2290,6 +2317,7 @@ mod tests {
     fn the_dead_man_window_is_validated() {
         let with = |tools: Value, secs: Value| {
             let mut policy = serde_json::to_value(policy()).unwrap();
+            policy["price_collar_bps"] = 500.into();
             policy["tools"] = tools;
             policy["dead_man_secs"] = secs;
             serde_json::from_value::<PrincipalPolicy>(policy)
@@ -2380,6 +2408,7 @@ mod tests {
     fn guardrail_settings_are_validated() {
         let with = |field: &str, value: Value| {
             let mut policy = serde_json::to_value(policy()).unwrap();
+            policy["price_collar_bps"] = 500.into();
             policy[field] = value;
             serde_json::from_value::<PrincipalPolicy>(policy)
                 .unwrap()
@@ -2392,7 +2421,17 @@ mod tests {
         assert!(with("max_daily_notional", serde_json::json!("0")).is_err());
         assert!(with("max_daily_notional", serde_json::json!("5000")).is_ok());
         assert!(with("client_approval", serde_json::json!(true)).is_ok());
+        // A trader must set a collar; a principal that only reads need not.
+        let uncollared = with("price_collar_bps", Value::Null)
+            .unwrap_err()
+            .to_string();
+        assert!(uncollared.contains("price_collar_bps"), "{uncollared}");
+        let mut reader = serde_json::to_value(policy()).unwrap();
+        reader["tools"] = serde_json::json!(["get_account", "cancel_order"]);
+        let reader: PrincipalPolicy = serde_json::from_value(reader).unwrap();
+        assert!(reader.validate().is_ok(), "{:?}", reader.validate());
         let mut unapproved = serde_json::to_value(policy()).unwrap();
+        unapproved["price_collar_bps"] = 500.into();
         unapproved["require_approval"] = false.into();
         unapproved["client_approval"] = true.into();
         let unapproved: PrincipalPolicy = serde_json::from_value(unapproved).unwrap();

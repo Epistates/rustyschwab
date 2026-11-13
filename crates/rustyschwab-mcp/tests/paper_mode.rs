@@ -70,6 +70,7 @@ fn policy() -> PrincipalPolicy {
         "accounts": [ACCOUNT],
         "max_quantity": "10",
         "max_notional": "1000",
+        "price_collar_bps": 2000,
         "require_approval": false,
     }))
     .unwrap()
@@ -596,6 +597,19 @@ async fn guardrails_bound_symbols_prices_and_the_days_orders() {
             "{refused}"
         );
     }
+    // A limit-on-close sell is a limit too: a penny under a 10 bid is
+    // refused, so a sell cannot dodge the notional caps by its price.
+    let mut on_close = place("SELL", "0.01");
+    on_close["order"]["orderType"] = json!("LIMIT_ON_CLOSE");
+    let verdict = call(&server, "check_order", on_close).await;
+    assert_eq!(verdict["reasons"][0]["code"], "risk_denied", "{verdict}");
+    assert!(
+        verdict["reasons"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("bps through"),
+        "{verdict}"
+    );
 
     // A passive price and one inside the collar both go, and use the budget;
     // the refusals above did not.

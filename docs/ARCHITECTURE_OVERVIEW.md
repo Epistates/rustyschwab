@@ -362,7 +362,8 @@ future and stack frame stay small however many tools there are.
   unapproved or is cancelled leaves no audit record and no order.
 - `guardrails.rs` — the principal's limits beyond the per-order caps.
   `allowed_symbols`/`denied_symbols` are part of `review` (an option
-  matches by its underlying). `price_collar_bps` reads the venue's market
+  matches by its underlying). `price_collar_bps`, which a trading principal
+  must set, reads the venue's market
   (`TradingBackend::touch`) once the policy passes, an approval aside, and
   again after an approval hold, refusing a limit priced that far through
   the far touch. `max_daily_orders`/`max_daily_notional` are judged once

@@ -557,7 +557,7 @@ mod tests {
     fn policy(accounts: &[&str]) -> PrincipalPolicy {
         serde_json::from_value(json!({"name": "desk", "token_sha256": "a".repeat(64),
             "tools": ["place_order"], "accounts": accounts, "max_quantity": "10",
-            "max_notional": "1000", "dead_man_secs": 60}))
+            "max_notional": "1000", "price_collar_bps": 500, "dead_man_secs": 60}))
         .unwrap()
     }
 

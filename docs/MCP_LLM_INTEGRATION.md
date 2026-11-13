@@ -432,7 +432,9 @@ effort and never approves anything.
 
 A principal's policy may also hold it to `allowed_symbols` and
 `denied_symbols` (`not_permitted`), a `price_collar_bps` judged against the
-venue's current quote, and a daily budget (`max_daily_orders`,
+venue's current quote (required for a principal that can place or replace
+orders, since the notional caps count an order at its limit and a sell's
+limit is only a floor), and a daily budget (`max_daily_orders`,
 `max_daily_notional`, per New York trading day); the last two are
 `risk_denied`. `check_order` reports all of them, with the budget's use so
 far in `dailyBudget`, and `get_server_status` lists the limits.

@@ -63,6 +63,7 @@ fn grants() -> Value {
                 "accounts": ["A"],
                 "max_quantity": "2",
                 "max_notional": "100",
+                "price_collar_bps": 2000,
                 "require_approval": true,
             },
         }
@@ -118,6 +119,14 @@ async fn setup() -> Setup {
         )]),
     });
     let client = Arc::new(client.with_risk_provider(risk.clone()).unwrap());
+    // The market every trader's price collar judges an AAPL limit against.
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/AAPL/quotes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "AAPL": {"symbol": "AAPL", "quote": {"bidPrice": 9.9, "askPrice": 10.0}}
+        })))
+        .mount(&broker)
+        .await;
     let policy = dir.path().join("policy.json");
     std::fs::write(&policy, grants().to_string()).unwrap();
     let state = Arc::new(Authority::new(
@@ -537,13 +546,6 @@ async fn gateway_enforces_the_price_collar_and_the_daily_budget() {
     roles[2]["policy"]["price_collar_bps"] = json!(100);
     roles[2]["policy"]["max_daily_orders"] = json!(1);
     std::fs::write(&s.policy, roles.to_string()).unwrap();
-    Mock::given(method("GET"))
-        .and(path("/marketdata/v1/AAPL/quotes"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "AAPL": {"symbol": "AAPL", "quote": {"bidPrice": 9.9, "askPrice": 10.0}}
-        })))
-        .mount(&s.broker)
-        .await;
     Mock::given(method("POST"))
         .and(path("/trader/v1/accounts/A/orders"))
         .respond_with(ResponseTemplate::new(201).insert_header(

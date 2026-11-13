@@ -40,6 +40,7 @@ fn policies() -> Value {
         "accounts": [ACCOUNT],
         "max_quantity": "10",
         "max_notional": "1000",
+        "price_collar_bps": 2000,
         "require_approval": true,
         "max_delegation": {"mode": "autonomous"},
         "dead_man_secs": 600,

@@ -5,12 +5,18 @@
 //! - **Symbols.** `allowed_symbols` (empty: any) and `denied_symbols` name
 //!   equities, and options by their underlying or their own OSI symbol.
 //!   Every leg of every order in the strategy is judged; a denial wins.
-//! - **Price collar.** `price_collar_bps` refuses a limit order priced more
-//!   than that many basis points through the far side of the market: a buy
-//!   above the ask, or a sell below the bid, by more than the collar. A
-//!   passive price is never refused. The quote is read when the order is
-//!   judged; with no two-sided market the mark, then the last trade, stands
-//!   in, and with neither the order is refused.
+//! - **Price collar.** `price_collar_bps` refuses a limit order (`LIMIT` or
+//!   `LIMIT_ON_CLOSE`) priced more than that many basis points through the
+//!   far side of the market: a buy above the ask, or a sell below the bid,
+//!   by more than the collar. A passive price is never refused. The quote is
+//!   read when the order is judged; with no two-sided market the mark, then
+//!   the last trade, stands in, and with neither the order is refused. A
+//!   principal that can trade must set one: the notional caps and the daily
+//!   budget value an order at its limit, and a sell's limit is only a floor,
+//!   so it is the collar that keeps a sell's counted notional near what it
+//!   fills for. A stop-limit's limit is set against its stop, not today's
+//!   market, so the collar leaves it alone and the caps count it at the
+//!   higher of its stop and its limit.
 //! - **Daily budget.** `max_daily_orders` and `max_daily_notional` bound the
 //!   submissions (`place_order` and `replace_order`) a principal starts in
 //!   a New York trading day, by the wall clock, with each order's bounded
@@ -151,7 +157,10 @@ async fn collar(venue: &dyn TradingBackend, order: &OrderRequest, bps: u32) -> R
 /// prices against a market near this one.
 fn limit_orders(order: &OrderRequest) -> Vec<&OrderRequest> {
     let mut found = Vec::new();
-    if order.order_type == Some(OrderType::Limit) {
+    if matches!(
+        order.order_type,
+        Some(OrderType::Limit | OrderType::LimitOnClose)
+    ) {
         found.push(order);
     }
     for child in &order.child_order_strategies {
@@ -288,7 +297,7 @@ mod tests {
     fn policy(extra: Value) -> PrincipalPolicy {
         let mut base = json!({"name": "desk", "token_sha256": "a".repeat(64),
             "tools": ["place_order"], "accounts": ["A"], "max_quantity": "100",
-            "max_notional": "100000", "option_multipliers": {"AAPL  250117C00150000": "100"}});
+            "max_notional": "100000", "price_collar_bps": 500, "option_multipliers": {"AAPL  250117C00150000": "100"}});
         base.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());

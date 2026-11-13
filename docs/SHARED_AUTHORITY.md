@@ -19,7 +19,7 @@ Configure the existing Schwab OAuth environment variables on the authority host 
     "name":"desk","identity_subject":"worker-subject",
     "tools":["place_order","replace_order","cancel_order"],
     "accounts":["ACCOUNT_HASH"],"max_quantity":"2","max_notional":"1000",
-    "require_approval":true
+    "price_collar_bps":500,"require_approval":true
   }}
 ]
 ```
@@ -32,7 +32,7 @@ Configure the existing Schwab OAuth environment variables on the authority host 
 rustyschwab-authority --identity identity.json --policy authority-policy.json --risk risk.json
 ```
 
-A trader's policy may also carry `allowed_symbols`, `denied_symbols`, `price_collar_bps`, `max_daily_orders` and `max_daily_notional`; the gateway enforces them as the MCP server does. A collar refusal answers `422` (`risk_denied`) before any approval is spent, and a submission past the daily budget is journaled as rejected with its approval given back.
+A trader's policy must carry `price_collar_bps` and may also carry `allowed_symbols`, `denied_symbols`, `max_daily_orders` and `max_daily_notional`; the gateway enforces them as the MCP server does. A collar refusal answers `422` (`risk_denied`) before any approval is spent, and a submission past the daily budget is journaled as rejected with its approval given back.
 
 The risk file is the same shape as the local `SCHWAB_RISK_POLICY_FILE` ([operations](OPERATIONS.md#risk-boundary)); the optional `max_daily_loss` trips the authority's durable halt for every worker, and privileged backend workers report each reconciled baseline to it (`observe_baseline`) so the trip does not wait for the next order.
 

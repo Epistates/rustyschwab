@@ -118,6 +118,8 @@ def principal_policy(account_hash: str, price: Decimal) -> list[dict[str, Any]]:
             "accounts": [account_hash],
             "max_quantity": "1",
             "max_notional": str(cents_up(price + 1)),
+            # A trading principal must set one; the smoke order is passive.
+            "price_collar_bps": 500,
             # The principal's journal persists, so leave room to rerun.
             "max_daily_orders": 3,
         }

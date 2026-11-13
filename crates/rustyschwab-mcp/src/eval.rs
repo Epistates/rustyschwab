@@ -265,6 +265,7 @@ fn policy(scenario: Scenario) -> PrincipalPolicy {
         "accounts": [EVAL_ACCOUNT],
         "max_quantity": "10",
         "max_notional": "1000",
+        "price_collar_bps": 500,
         "require_approval": scenario == Scenario::DeniedApproval,
     }))
     .expect("eval principal policy")

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a trading principal must set a price collar
+
+- **Breaking (policy files):** a principal that holds `place_order` or
+  `replace_order`, on the MCP server or as an authority trader, must now set
+  `price_collar_bps`; a policy file without it is refused at startup and on
+  reload. `max_notional`, `max_daily_notional` and the approval threshold
+  value an order at its limit price, and a sell's limit only floors what it
+  fills for, so without a collar a sell of a whole position at a penny
+  counted as pennies against every cap. Migration: add
+  `"price_collar_bps": 500` (five percent through the market) or the band
+  you want to each trading principal; a symbol with no quote is then
+  refused, as a collar already did.
+- The collar also judges `LIMIT_ON_CLOSE` orders, and a stop-limit counts
+  against the notional caps at the higher of its stop and its limit, not at
+  its limit alone.
+
 ### Fixed
 
 - An `expires_in` of absurd size from the token endpoint panicked `chrono`
