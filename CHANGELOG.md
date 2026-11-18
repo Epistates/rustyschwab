@@ -185,6 +185,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.99.9, cargo-deny-action 2.1.2 (cargo-deny 0.21), crates-io-auth-action
   1.0.6. parking_lot stays at 0.12: 0.13 needs Rust 1.95 and the MSRV is 1.89,
   so Dependabot is told to skip it until the MSRV moves.
+- rusqlite 0.43 (bundled SQLite 3.54.1), which fixes use-after-free bugs in
+  APIs the SDK does not call and now refuses empty SQL, which it never sends.
 
 ## [0.3.0] - 2026-10-24
 
