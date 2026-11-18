@@ -187,6 +187,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so Dependabot is told to skip it until the MSRV moves.
 - rusqlite 0.43 (bundled SQLite 3.54.1), which fixes use-after-free bugs in
   APIs the SDK does not call and now refuses empty SQL, which it never sends.
+- jsonwebtoken 12 in `rustyschwab-mcp`. The OAuth identity check now rejects
+  tokens whose `sub`, `iss` or `aud` claims have the wrong JSON type, and
+  tokens that declare critical header extensions it does not understand.
 
 ## [0.3.0] - 2026-10-24
 
