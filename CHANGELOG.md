@@ -190,6 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - jsonwebtoken 12 in `rustyschwab-mcp`. The OAuth identity check now rejects
   tokens whose `sub`, `iss` or `aud` claims have the wrong JSON type, and
   tokens that declare critical header extensions it does not understand.
+- axum-server 0.9 behind the SDK's `callback-server` feature. The OAuth
+  callback server behaves as before.
 
 ## [0.3.0] - 2026-10-24
 
