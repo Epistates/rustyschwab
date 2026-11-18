@@ -192,6 +192,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tokens that declare critical header extensions it does not understand.
 - axum-server 0.9 behind the SDK's `callback-server` feature. The OAuth
   callback server behaves as before.
+- PyO3 0.30, pyo3-async-runtimes 0.30 and pythonize 0.30 in the Python
+  bindings, now that pythonize has a release for PyO3 0.30. The wheels still
+  cover CPython 3.10 and later.
 
 ## [0.3.0] - 2026-10-24
 
