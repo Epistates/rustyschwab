@@ -9,7 +9,15 @@ all-features = true
 # the build. Accepting one requires an entry here with its reason.
 unmaintained = "all"
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono's maintainer is winding it down in favor of jiff
+    # (chronotope/chrono#1768). These are notices, not vulnerabilities, and no
+    # release is affected by a known bug. chrono types are in the public API
+    # of every crate here, so replacing them is a breaking change of its own.
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained notice; moving to jiff is a breaking API change, tracked separately" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained notice; it goes with chrono" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime: unmaintained notice; only humantime-serde uses it, for durations in configuration files" },
+]
 
 [licenses]
 # Permissive licenses present in the dependency graph. Adding one is a

@@ -195,6 +195,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PyO3 0.30, pyo3-async-runtimes 0.30 and pythonize 0.30 in the Python
   bindings, now that pythonize has a release for PyO3 0.30. The wheels still
   cover CPython 3.10 and later.
+- RustSec now lists chrono, chrono-tz and humantime as unmaintained
+  (RUSTSEC-2026-0543, -0555 and -0542); their maintainer recommends jiff.
+  These are notices, not vulnerabilities. `deny.toml` accepts them, with the
+  reason, because chrono types are part of these crates' public API and
+  replacing them is a breaking change.
 
 ## [0.3.0] - 2026-10-24
 
