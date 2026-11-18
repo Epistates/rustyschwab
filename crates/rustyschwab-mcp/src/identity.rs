@@ -318,7 +318,7 @@ mod tests {
         let wrong_algorithm = jsonwebtoken::encode(
             &jsonwebtoken::Header::new(Algorithm::HS256),
             &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"not-a-signing-key"),
+            &jsonwebtoken::EncodingKey::from_secret(b"not-a-signing-key").unwrap(),
         )
         .unwrap();
         assert!(verifier.verify(&wrong_algorithm).await.is_err());
