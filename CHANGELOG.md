@@ -178,11 +178,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — dependencies
 
-- Every compatible update in both lockfiles (rusqlite 0.41.1, rustix 1.1.6,
-  openssl 0.10.82 and others), and the pinned GitHub Actions: setup-python
-  7.1.0, codeql-action 4.39.1, install-action 2.87.30, crates-io-auth-action
-  1.0.6. PyO3 and parking_lot stay behind for the reasons given under 0.3.0;
-  Dependabot is told to skip parking_lot 0.13 until the MSRV reaches 1.95.
+- Every compatible update in the three lockfiles, the workspace's,
+  `crates/schwab-py`'s and `fuzz/`'s (rustix 1.1.6, openssl 0.10.82, uuid
+  1.29.3, rustls-webpki 0.103.17 and others), and the pinned GitHub Actions:
+  setup-python 7.1.0, codeql-action 4.39.3, install-action 2.90.5, trufflehog
+  3.99.9, cargo-deny-action 2.1.2 (cargo-deny 0.21), crates-io-auth-action
+  1.0.6. parking_lot stays at 0.12: 0.13 needs Rust 1.95 and the MSRV is 1.89,
+  so Dependabot is told to skip it until the MSRV moves.
 
 ## [0.3.0] - 2026-10-24
 

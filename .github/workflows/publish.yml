@@ -36,7 +36,7 @@ jobs:
             passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" --commit "$sha" --status success --json databaseId --jq length)
             [ "$passed" -gt 0 ] || { echo "::error::$workflow has not passed on $sha"; exit 1; }
           done
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
       - name: Tag matches the crate version
