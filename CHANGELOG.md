@@ -284,6 +284,10 @@ and 4.0.0-beta.1) lists the rest.
   `2026-07-28` call's `requestState` with. turbomcp-codec,
   turbomcp-transport-stdio and turbomcp-transport-ws are gone: their code
   moved into the other TurboMCP crates.
+- In the lockfile errno, rustix, tempfile, winapi-util, quinn-udp and
+  rustls-platform-verifier link windows-sys 0.61.2 again, the newest they
+  accept. A resolution earlier in this cycle had left them on 0.52.0, which
+  only ring still requires.
 - The minimum versions the manifests declare are raised to ones the
   workspace resolves and builds with; the weekly minimal-versions job had
   never passed. `serde_json = "1.0"` allowed 1.0.0, which has no
