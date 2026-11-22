@@ -68,12 +68,4 @@ jobs:
           toolchain: nightly
       # The declared lower bounds must build, not only the locked versions.
       - run: cargo +nightly update -Z direct-minimal-versions
-      # Without the three crates that depend on turbomcp: a fresh resolution
-      # mixes 4.0.0-alpha.6 crates into the pinned 4.0.0-alpha.5, which does
-      # not compile (see the compatibility job in ci.yml). Drop the excludes
-      # when the turbomcp pin moves.
-      - run: >-
-          cargo +nightly check --workspace --all-features
-          --exclude rustyschwab-mcp
-          --exclude rustyschwab-console
-          --exclude rustyschwab-dash
+      - run: cargo +nightly check --workspace --all-features
