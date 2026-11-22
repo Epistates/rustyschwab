@@ -127,7 +127,7 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 windows-native-keyring-store = { version = "1", default-features = false }
 linux-keyutils-keyring-store = "1"
 # Memory-safe secret handling with automatic zeroization
-secrecy = { version = "0.10", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 zeroize = { version = "1.8.2", features = ["derive", "aarch64"] }
 # Safe POSIX calls for private files: open without following links, check
 # the open descriptor, and read the effective user.
