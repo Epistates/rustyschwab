@@ -304,6 +304,10 @@ pub fn open_private_file(_path: &Path) -> Result<std::fs::File> {
 /// A refusal that keeps the path out of the error string: it can reach an
 /// MCP tool response (and so a model), and the path discloses the home
 /// directory layout. The operator log gets the path.
+///
+/// Unix only: the Windows checks are in `security_windows`, with a refusal
+/// of their own.
+#[cfg(unix)]
 pub(crate) fn insecure(path: &Path, why: &str) -> Error {
     tracing::error!(?path, "secret file {why}");
     Error::Auth(AuthError::TokenFileInsecure(format!(
