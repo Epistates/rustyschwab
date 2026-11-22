@@ -201,6 +201,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason, because chrono types are part of these crates' public API and
   replacing them is a breaking change.
 
+### Fixed — CI
+
+- The `test (windows-latest)` job failed to build: a helper used only by the
+  Unix file checks was compiled, unused, on Windows, where warnings are
+  errors in CI.
+
 ### Removed
 
 - `docs/history/`, the archived enterprise audit, remediation report and
