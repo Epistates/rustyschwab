@@ -8,7 +8,7 @@ describes the code as it is; for how to run it see the [README](../README.md),
 ## Workspace
 
 Five published crates plus example packages, all on the workspace version
-(`0.3.0`, Rust 2024 edition, MSRV 1.89, `MIT OR Apache-2.0`). The Python
+(`0.3.0`, Rust 2024 edition, MSRV 1.95, `MIT OR Apache-2.0`). The Python
 bindings (`crates/schwab-py`) are outside the workspace, with their own
 lockfile:
 
@@ -452,7 +452,7 @@ combinations (no default features, `native-tls` alone with no rustls in its
 graph, `callback-server` alone), `cargo package` for the three crates,
 `cargo deny check advisories bans licenses sources` (`deny.toml`),
 `actionlint` (with shellcheck) on the workflows, an MSRV
-(1.89) build, `cargo-semver-checks`, and the stream soak harness
+(1.95) build, `cargo-semver-checks`, and the stream soak harness
 (`examples/enterprise_bench` + `tools/soak.py`). `qualification.yml` runs the
 full test suite on Linux, macOS and Windows plus longer soaks; `release.yml`
 checks the tag against the crate version and runs the tests, then builds the
