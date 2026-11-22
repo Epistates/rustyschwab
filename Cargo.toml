@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Nick Paterno"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/rustyschwab"
@@ -99,7 +99,7 @@ chrono-tz = "0.10"
 humantime-serde = "1.1"
 
 # Utilities
-parking_lot = "0.12.3"
+parking_lot = "0.13.0"
 uuid = { version = "1.26", features = ["v4", "serde"] }
 
 # Rate limiting

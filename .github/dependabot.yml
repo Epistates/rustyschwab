@@ -8,10 +8,6 @@ updates:
     groups:
       compatible-rust-updates:
         update-types: [minor, patch]
-    ignore:
-      # 0.13 needs Rust 1.95; the MSRV is 1.89. Drop this when the MSRV moves.
-      - dependency-name: parking_lot
-        versions: [">=0.13.0"]
   # The Python bindings are outside the workspace, with their own lockfile.
   - package-ecosystem: cargo
     directory: /crates/schwab-py
