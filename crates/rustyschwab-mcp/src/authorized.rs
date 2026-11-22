@@ -32,6 +32,32 @@ fn undeclared_argument(tool: &neutral::Tool, args: &Value) -> Option<String> {
         .cloned()
 }
 
+/// What a client's cancellation does to the call it cancels: the handler is
+/// dropped where it waits. A submission holding for its approval then places
+/// nothing, and one past its audit record runs on its own task to its
+/// outcome (see [`AuthorizedServer::dispatch`]). turbomcp's default lets a
+/// cancelled handler run on, which would place a held order its client had
+/// called off.
+pub(crate) const CANCELLATION: turbomcp::Cancellation = turbomcp::Cancellation::Abort;
+
+/// Serve `dispatcher` on `transport`, one connection (stdio), until the
+/// client disconnects. Calls in flight when it does have the drain window
+/// to finish, not turbomcp's two seconds: a client that sends an order and
+/// closes its end has not called the order off.
+pub(crate) async fn serve_pipe<S>(
+    dispatcher: VersionDispatcher<S>,
+    transport: impl turbomcp::Transport,
+) -> Result<(), turbomcp::ProtocolError>
+where
+    S: McpServerCore + Clone + Send + Sync + 'static,
+{
+    let drain = turbomcp::ServeConfig::new().drain_timeout;
+    let config = turbomcp::ServeConfig::new().with_eof_grace(drain);
+    turbomcp::Server::new(dispatcher)
+        .serve(turbomcp::Pipe::new(transport).with_config(config))
+        .await
+}
+
 /// How often a holding submission re-reads the approval store.
 const APPROVAL_POLL: Duration = Duration::from_secs(1);
 
@@ -139,7 +165,9 @@ impl AuthorizedServer {
     /// capabilities it is told agree with what it can use.
     pub fn dispatcher(self) -> VersionDispatcher<Self> {
         let guidance = self.offers_guidance();
-        let builder = ServerBuilder::new(self).with_tools();
+        let builder = ServerBuilder::new(self)
+            .with_cancellation(CANCELLATION)
+            .with_tools();
         if guidance {
             builder.with_resources().with_prompts().build()
         } else {
@@ -155,7 +183,16 @@ impl AuthorizedServer {
     }
     /// Serve this principal over stdio until the client disconnects.
     pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
-        turbomcp::serve_stdio(turbomcp::LegacySessionAdapter::new(self.dispatcher())).await
+        serve_pipe(self.dispatcher(), stdio()).await
+    }
+    /// Serve this principal on `transport` as [`run_stdio`](Self::run_stdio)
+    /// serves stdio: for tests, over an in-memory connection.
+    #[doc(hidden)]
+    pub async fn run_on(
+        self,
+        transport: impl turbomcp::Transport,
+    ) -> Result<(), turbomcp::ProtocolError> {
+        serve_pipe(self.dispatcher(), transport).await
     }
     /// After the client has gone, wait for the principal's dead-man switch
     /// to fire, or for another process to take over its watch; return at
@@ -229,7 +266,7 @@ impl WithTools for AuthorizedServer {
         &self,
         ctx: &ListToolsContext,
         name: String,
-    ) -> McpResult<Option<neutral::Tool>> {
+    ) -> McpResult<Option<Arc<neutral::Tool>>> {
         self.inner.lookup_tool(ctx, name).await
     }
     async fn list_tools(
@@ -1539,5 +1576,21 @@ mod tests {
             names.contains(&"get_account") && !names.contains(&"get_quotes"),
             "{names:?}"
         );
+
+        // A tool the server does not have is a protocol error: invalid
+        // params, as every revision lists an unknown tool.
+        let unknown = serde_json::json!({"name": "no_such_tool", "arguments": {}, "_meta": meta});
+        let request = turbomcp::JsonRpcRequest::new(2, "tools/call", Some(unknown));
+        let reply = dispatcher
+            .ready()
+            .await
+            .unwrap()
+            .call(request.into())
+            .await
+            .unwrap();
+        let Some(turbomcp::JsonRpcMessage::Response(reply)) = reply else {
+            panic!("expected a response");
+        };
+        assert_eq!(reply.error.map(|e| e.code), Some(-32602));
     }
 }

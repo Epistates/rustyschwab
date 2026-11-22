@@ -16,7 +16,7 @@ lockfile:
 |---|---|---|
 | `rustyschwab-types` | Wire types only. No I/O, no async. | `serde`, `serde_with`, `rust_decimal`, `chrono`; optional `schemars` |
 | `rustyschwab` | The SDK: OAuth, REST client, streaming client, durable execution state, paper engine, remote backends. | `tokio`, `reqwest` (rustls), `tokio-tungstenite`, `rusqlite` (bundled), `governor`, `tracing`, `metrics`, `chacha20poly1305`, `keyring-core` (one store per OS), `secrecy` |
-| `rustyschwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. Its policy, approval, delegation, dead-man and guardrail modules are domain code the console reuses. | `turbomcp` 4 (alpha), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
+| `rustyschwab-mcp` | MCP server over the SDK, plus the operator, authority, gateway and paper CLIs. Its policy, approval, delegation, dead-man and guardrail modules are domain code the console reuses. | `turbomcp` 4 (beta), `axum`, `jsonwebtoken`, `metrics-exporter-prometheus` |
 | `rustyschwab-console` | The operator console core, with no user interface: reads the servers' state into a serializable `Snapshot` and runs operator `Command`s (approve, delegate, halt, kill). | `rustyschwab`, `rustyschwab-mcp` |
 | `rustyschwab-dash` | The ratatui terminal dashboard over the console. Rendering and keys only. | `ratatui`, `rustyschwab-console` |
 

@@ -23,6 +23,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against the notional caps at the higher of its stop and its limit, not at
   its limit alone.
 
+### Changed — the MCP server runs on TurboMCP 4.0.0-beta.1
+
+`rustyschwab-mcp` moves from TurboMCP `4.0.0-alpha.5` to `4.0.0-beta.1`, the
+release that freezes TurboMCP's API for 4.0. The tools, their schemas and
+results, the policy, the approvals and the audit journal are unchanged. What
+a client can notice is in the transports; TurboMCP's CHANGELOG (4.0.0-alpha.6
+and 4.0.0-beta.1) lists the rest.
+
+- **Breaking (WebSocket clients):** WebSocket is now a route on TurboMCP's
+  HTTP endpoint.
+  - The upgrade is accepted at `/` only, the bare `ws://host:port` address.
+    It was accepted at any path.
+  - A missing or bad credential is answered `401` with a `WWW-Authenticate`
+    challenge before the upgrade. It was a `101` followed by close code
+    `1008`.
+  - A connection is closed with `1008` when its credential expires. Until
+    now only its next request was refused.
+  - At most 1,024 connections are held (`503` past that); there was no cap.
+    A connection still runs 32 calls at a time. Further calls now wait in
+    the server for a slot, where they used to wait unread in the socket.
+  - A client that disconnects abandons the calls it left in flight after
+    two seconds, not thirty. A write past its audit record still runs to
+    its outcome.
+  - With `SCHWAB_MCP_TRANSPORT=websocket` the listener also answers
+    Streamable HTTP at `/mcp`, behind the same credential check.
+- **Behavior change (Streamable HTTP):**
+  - A call still running after five seconds answers as `text/event-stream`,
+    kept open by keep-alive comments until its result arrives as the last
+    event. A submission holding for its approval is the usual case. Such a
+    call was answered as JSON when it finished, or cut off with `504` at two
+    minutes; now neither a proxy's idle timeout nor that deadline ends it.
+    A client must accept both media types, as the transport already required.
+  - On a `2025-06-18` or `2025-11-25` session, a dropped connection no
+    longer cancels the call it carried, as those revisions ask: a
+    submission holding for its approval keeps holding for its `wait_ms`
+    and is placed if the approval lands. `notifications/cancelled` still
+    drops it. On `2026-07-28` a disconnect cancels, as before.
+  - Response streams on a session are resumable with `Last-Event-ID`; their
+    events are kept in memory, 64 MiB at most. A principal may hold 1,024
+    sessions (`429` past that) and 64 open streams.
+  - Refusals carry a JSON-RPC error body, and a request with neither a
+    session nor the `2026-07-28` envelope is `400`. It was `200` with the
+    error in its body.
+- **Behavior change (every transport):** calling a tool the server does not
+  have is JSON-RPC `-32602`, as every revision lists an unknown tool. It was
+  `-32601`.
+- Kept as it was, against TurboMCP's new defaults:
+  - A call its client cancels is dropped where it waits
+    (`Cancellation::Abort`). TurboMCP now lets a cancelled handler run on by
+    default, which would place a held order after its client called it off.
+  - After a stdio client closes its end, calls in flight have thirty seconds
+    to finish (TurboMCP's default is now two).
+- The client-approval question is the same form. TurboMCP 4.0.0-beta.1
+  clients refuse a form elicitation without a valid `requestedSchema`
+  (`-32602`); the server's is checked against the form subset of every
+  revision it speaks. The server has no MCP client of its own, so the two
+  other client-side changes TurboMCP marks (`ClientBuilder::with_extension`
+  and exact issuer matching in its OAuth client) do not reach it. One note
+  for operators who issue JWTs: a TurboMCP 4.0.0-beta.1 client that
+  authorizes against this server requires the authorization server's own
+  `issuer` to equal the identity file's `issuer` exactly, trailing slash
+  included.
+- Rust API: `network::WEBSOCKET_PATH` is new. `Network::http_router`,
+  `Network::serve_websocket`, `AuthorizedServer::run_stdio` and
+  `eval::Recording::run_stdio` keep their signatures.
+
 ### Fixed
 
 - Performance ratios on a sparse equity curve were annualized as if each
@@ -204,25 +270,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stack on a URL with deeply nested `blob:` prefixes. The SDK calls it on the
   configured base URL and on the request URLs it builds. With it, every
   compatible update in the three lockfiles (keyring-core 1.1.0, serde_with
-  3.25.0, clap 4.6.9 and others) and install-action 2.90.6. The turbomcp
-  crates stay at 4.0.0-alpha.5.
+  3.25.0, clap 4.6.9 and others) and install-action 2.90.6.
+- TurboMCP 4.0.0-beta.1 in `rustyschwab-mcp`, from 4.0.0-alpha.5 (see
+  "the MCP server runs on TurboMCP 4.0.0-beta.1" above). Its crates require
+  each other exactly, so a build that resolves without the lockfile gets a
+  matched set. With it the lockfile takes jsonschema 0.61.2 (from 0.49.9),
+  fancy-regex 0.20.2 and fraction 0.17.0, and gains serde_json_canonicalizer
+  0.4.1, ryu-js and chacha20poly1305 0.10.1, which TurboMCP seals a
+  `2026-07-28` call's `requestState` with. turbomcp-codec,
+  turbomcp-transport-stdio and turbomcp-transport-ws are gone: their code
+  moved into the other TurboMCP crates.
 - The minimum versions the manifests declare are raised to ones the
   workspace resolves and builds with; the weekly minimal-versions job had
   never passed. `serde_json = "1.0"` allowed 1.0.0, which has no
   `float_roundtrip` feature; metrics 0.24.0 to 0.24.2 and anyhow 1.0.1 do
   not build with what depends on them or with a current compiler; the SDK
   needs `SecretString: Clone + From<&str>`, which secrecy has from 0.10.3;
-  and the other floors were below what turbomcp 4.0.0-alpha.5 and the rest
+  and the other floors were below what TurboMCP 4.0.0-beta.1 and the rest
   of the tree require. `url` is now at least 2.5.9, the release with the
-  fix above. Raised: serde 1.0.228, serde_json 1.0.149, reqwest 0.13.3,
-  axum 0.8.9, chrono 0.4.39, thiserror 2.0.20, anyhow 1.0.60, tracing
-  0.1.44, tracing-subscriber 0.3.22, metrics 0.24.3, schemars 1.2.1, tower
-  0.5.3, governor 0.10.4, rustix 1.1.4, futures-util 0.3.32, async-trait
-  0.1.89, parking_lot 0.12.3, rand 0.10.2, base64 0.23.1, zeroize 1.8.2,
-  secrecy 0.10.3 and windows-sys 0.61.2. All are at or below the versions
-  in `Cargo.lock`, so a build from the lockfile is unchanged. That job
-  leaves out the three crates that depend on turbomcp, for the reason given
-  under `compatibility` below.
+  fix above. Raised: serde 1.0.229, serde_json 1.0.154, tokio 1.54, reqwest
+  0.13.5, axum 0.8.9, chrono 0.4.39, thiserror 2.0.21, anyhow 1.0.60,
+  tracing 0.1.44, tracing-subscriber 0.3.22, metrics 0.24.3, schemars 1.2.3,
+  tower 0.5.3, governor 0.10.4, rustix 1.1.4, futures-util 0.3.34,
+  async-trait 0.1.92, parking_lot 0.12.3, rand 0.10.2, base64 0.23.1, uuid
+  1.26, zeroize 1.9, secrecy 0.10.3 and windows-sys 0.61.2. All are at or
+  below the versions in `Cargo.lock`, so a build from the lockfile is
+  unchanged.
 
 ### Fixed — CI
 

@@ -1123,6 +1123,320 @@ async fn a_submission_can_hold_for_an_approval_that_lands_out_of_band() {
     assert_eq!(records[0].request["intentDigest"], digest);
 }
 
+/// The client's end of an in-memory connection `server` serves as it
+/// serves stdio, after the `2025-11-25` handshake of a client declaring
+/// `capabilities`.
+async fn connect(
+    server: &AuthorizedServer,
+    capabilities: Value,
+) -> turbomcp::testing::MemoryTransport {
+    use turbomcp::Transport;
+    let (served, mut client) = turbomcp::testing::pair();
+    tokio::spawn(server.clone().run_on(served));
+    let hello = json!({
+        "protocolVersion": "2025-11-25",
+        "capabilities": capabilities,
+        "clientInfo": {"name": "desk-client", "version": "1"},
+    });
+    client
+        .send(turbomcp::JsonRpcRequest::new(0, "initialize", Some(hello)).into())
+        .await
+        .unwrap();
+    let Some(turbomcp::JsonRpcMessage::Response(welcome)) = client.recv().await.unwrap() else {
+        panic!("expected the handshake's answer");
+    };
+    assert!(welcome.error.is_none(), "{:?}", welcome.error);
+    client
+        .send(turbomcp::JsonRpcNotification::new("notifications/initialized", None).into())
+        .await
+        .unwrap();
+    client
+}
+
+/// A `tools/call` of `place_order` with `arguments`, under request id `id`.
+fn place_order_request(id: i64, arguments: &Value) -> turbomcp::JsonRpcMessage {
+    let params = json!({"name": "place_order", "arguments": arguments});
+    turbomcp::JsonRpcRequest::new(id, "tools/call", Some(params)).into()
+}
+
+/// A submission its client cancels while it holds for an approval is
+/// dropped where it waits: the approval that then lands inside the hold
+/// places nothing, and the cancelled call is never answered.
+#[tokio::test]
+async fn a_held_submission_the_client_cancels_places_nothing() {
+    use turbomcp::Transport;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut policy = policy();
+    policy.require_approval = true;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy);
+    let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
+    let digest = call(&server, "check_order", intent.clone()).await["intentDigest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut holding = intent;
+    holding["wait_ms"] = json!(10_000);
+
+    let mut client = connect(&server, json!({})).await;
+    client.send(place_order_request(7, &holding)).await.unwrap();
+    // Once the hold has begun the client calls it off, and only then does
+    // the operator approve.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let cancelled = json!({"requestId": 7, "reason": "the user changed their mind"});
+    client
+        .send(turbomcp::JsonRpcNotification::new("notifications/cancelled", Some(cancelled)).into())
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    server
+        .audit
+        .approve(
+            "paper-desk",
+            &digest,
+            "operator",
+            chrono::Utc::now().timestamp() + 60,
+        )
+        .await
+        .unwrap();
+
+    // A hold re-reads the approval store every second: one still running
+    // would have submitted well within this.
+    let answer = tokio::time::timeout(std::time::Duration::from_millis(2500), client.recv()).await;
+    assert!(
+        answer.is_err(),
+        "a cancelled call is not answered: {answer:?}"
+    );
+    assert!(server.audit.records().await.unwrap().is_empty());
+    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+}
+
+/// A client that sends a submission and closes its end has not called it
+/// off: the call keeps holding past the two seconds turbomcp gives calls
+/// in flight at end of input, and is placed when the approval lands.
+#[tokio::test]
+async fn a_held_submission_outlives_its_clients_end_of_input() {
+    use turbomcp::Transport;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut policy = policy();
+    policy.require_approval = true;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy);
+    let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
+    let digest = call(&server, "check_order", intent.clone()).await["intentDigest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut holding = intent;
+    holding["wait_ms"] = json!(20_000);
+
+    let mut client = connect(&server, json!({})).await;
+    client.send(place_order_request(7, &holding)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    client.close().await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+    server
+        .audit
+        .approve(
+            "paper-desk",
+            &digest,
+            "operator",
+            chrono::Utc::now().timestamp() + 60,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the held order was placed");
+}
+
+/// On a session revision the approval question is an inline
+/// `elicitation/create`. Its form is one every revision the server speaks
+/// lets a client render (turbomcp's own client refuses any other with
+/// `-32602`), and accepting it places the order.
+#[tokio::test]
+async fn the_approval_question_is_a_form_a_client_may_render() {
+    use turbomcp::Transport;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let mut desk = policy();
+    desk.require_approval = true;
+    desk.client_approval = true;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, desk);
+    let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "9")});
+
+    let mut client = connect(&server, json!({"elicitation": {}})).await;
+    client.send(place_order_request(7, &intent)).await.unwrap();
+    let Some(turbomcp::JsonRpcMessage::Request(question)) = client.recv().await.unwrap() else {
+        panic!("expected the approval question");
+    };
+    assert_eq!(question.method, "elicitation/create");
+    let asked = question.params.unwrap();
+    let message = asked["message"].as_str().unwrap();
+    assert!(message.contains("BUY 1 ABC LIMIT @ 9"), "{asked}");
+    let form = turbomcp::neutral::ElicitParams::new(message, asked["requestedSchema"].clone());
+    for revision in server.supported_versions() {
+        form.validate_for(revision)
+            .unwrap_or_else(|e| panic!("{revision:?} cannot render the form: {e}"));
+    }
+    assert_eq!(
+        asked["requestedSchema"]["properties"]["approve"]["type"], "boolean",
+        "{asked}"
+    );
+
+    let accept = json!({"action": "accept", "content": {"approve": true}});
+    client
+        .send(turbomcp::JsonRpcResponse::success(question.id, accept).into())
+        .await
+        .unwrap();
+    let Some(turbomcp::JsonRpcMessage::Response(placed)) = client.recv().await.unwrap() else {
+        panic!("expected the call's answer");
+    };
+    let placed = placed
+        .result
+        .unwrap_or_else(|| panic!("protocol error: {:?}", placed.error));
+    assert_eq!(read(&placed)["source"], "paper", "{placed}");
+    assert_eq!(broker.orders(ACCOUNT, 0, 10).await.unwrap().len(), 1);
+}
+
+/// Over Streamable HTTP a call still running after five seconds answers as
+/// an event stream, and the hold's outcome arrives as its last event
+/// instead of the request being cut off.
+#[tokio::test]
+async fn a_slow_http_call_answers_as_an_event_stream() {
+    use tower::ServiceExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let token = "t".repeat(32);
+    let mut desk = policy();
+    desk.require_approval = true;
+    desk.token_sha256 = rustyschwab_mcp::policy::digest(token.as_bytes());
+    desk.token_expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+    let server = AuthorizedServer::new(backend(broker, None), TRADING, desk);
+    let app = rustyschwab_mcp::network::router(vec![server]);
+
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+        "name": "place_order",
+        "arguments": {
+            "account_hash": ACCOUNT,
+            "order": order("BUY", "1", "9"),
+            "wait_ms": 6000,
+        },
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "desk-client", "version": "1"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        },
+    }});
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", "place_order")
+        .body(axum::body::Body::from(call.to_string()))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(5900),
+        "the stream opens before the hold ends"
+    );
+
+    let stream = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let stream = String::from_utf8(stream.to_vec()).unwrap();
+    let last = stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .next_back()
+        .unwrap_or_else(|| panic!("no event in {stream:?}"));
+    let answer: Value = serde_json::from_str(last.trim()).unwrap();
+    assert_eq!(
+        read(&answer["result"])["error"]["code"],
+        "approval_required",
+        "{answer}"
+    );
+    assert!(started.elapsed() >= std::time::Duration::from_millis(6000));
+}
+
+/// One WebSocket connection has at most 32 calls in flight: the rest wait
+/// their turn instead of all holding at once.
+#[tokio::test]
+async fn a_websocket_connection_runs_32_calls_at_a_time() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let (broker, _) = venue(dir.path()).await;
+    let token = "t".repeat(32);
+    let mut desk = policy();
+    desk.require_approval = true;
+    desk.token_sha256 = rustyschwab_mcp::policy::digest(token.as_bytes());
+    desk.token_expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+    let server = AuthorizedServer::new(backend(broker, None), TRADING, desk);
+    let network = rustyschwab_mcp::network::network(vec![server.clone()]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = turbomcp::CancellationToken::new();
+    let serving = tokio::spawn(async move { network.serve_websocket(listener, stop).await });
+
+    let mut upgrade = format!("ws://{address}{}", rustyschwab_mcp::network::WEBSOCKET_PATH)
+        .into_client_request()
+        .unwrap();
+    upgrade
+        .headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(upgrade).await.unwrap();
+
+    // Forty submissions, each of its own intent, each holding for an
+    // approval that never comes. An intent is noted as its hold begins.
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": {"name": "desk-client", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    for id in 0..40 {
+        let price = format!("9.{:02}", id + 1);
+        let arguments = json!({
+            "account_hash": ACCOUNT,
+            "order": order("BUY", "1", &price),
+            "wait_ms": 30_000,
+        });
+        let params = json!({"name": "place_order", "arguments": arguments, "_meta": meta});
+        let call = turbomcp::JsonRpcRequest::new(id, "tools/call", Some(params));
+        socket
+            .send(Message::text(serde_json::to_string(&call).unwrap()))
+            .await
+            .unwrap();
+    }
+    let holding = async || server.audit.intents(None, 0, 100).await.unwrap().len();
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while holding().await < 32 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("32 calls began");
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(holding().await, 32, "the other eight wait for a slot");
+
+    // Nothing was approved, so nothing was placed; the holds end with the
+    // test's runtime rather than being waited out.
+    assert!(server.audit.records().await.unwrap().is_empty());
+    serving.abort();
+}
+
 /// The dead-man window the tests arm in place of the policy's validated
 /// minimum, which is too long to wait out.
 const WINDOW: std::time::Duration = std::time::Duration::from_secs(1);

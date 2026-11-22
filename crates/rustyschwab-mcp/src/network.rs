@@ -21,9 +21,9 @@ use parking_lot::RwLock;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use turbomcp::http::HttpConfig;
+use turbomcp::http::{Http, HttpConfig, WebSocketConfig};
 use turbomcp::prelude::*;
-use turbomcp::{AuthDecision, HttpAuthenticator, ProtocolVersion, VersionDispatcher};
+use turbomcp::{AuthDecision, HttpAuthenticator, Identity, ProtocolVersion, VersionDispatcher};
 
 /// The principals a network transport serves, replaced as a whole when the
 /// policy reloads.
@@ -128,14 +128,13 @@ pub struct Credentials {
 
 impl Credentials {
     fn challenge(&self) -> AuthDecision {
-        AuthDecision::Challenge {
-            status: 401,
-            www_authenticate: self
-                .principals
+        AuthDecision::challenge(
+            401,
+            self.principals
                 .identity
                 .as_ref()
                 .map_or_else(|| "Bearer".into(), |id| id.challenge()),
-        }
+        )
     }
 }
 
@@ -152,10 +151,9 @@ impl HttpAuthenticator for Credentials {
                 return self.challenge();
             };
             match self.principals.authenticate(token).await {
-                Some((name, expires_at, generation)) => AuthDecision::Allow(json!({
-                    "sub": name,
-                    "claims": {"exp": expires_at, GENERATION_CLAIM: generation},
-                })),
+                Some((name, expires_at, generation)) => {
+                    AuthDecision::Allow(identity(name, expires_at, generation))
+                }
                 None => self.challenge(),
             }
         })
@@ -174,6 +172,15 @@ impl HttpAuthenticator for Credentials {
 /// Where the authenticator records the policy generation it checked a
 /// credential against, beside its expiry.
 const GENERATION_CLAIM: &str = "io.rustyschwab/policyGeneration";
+
+/// The identity of principal `name`, whose credential expires at
+/// `expires_at` (Unix seconds) and was checked against policy `generation`.
+fn identity(name: String, expires_at: i64, generation: u64) -> Identity {
+    let mut claims = serde_json::Map::new();
+    claims.insert("exp".into(), expires_at.into());
+    claims.insert(GENERATION_CLAIM.into(), generation.into());
+    Identity::bearer(name, claims)
+}
 
 /// Serves each request as the principal its credential names.
 #[derive(Clone)]
@@ -232,7 +239,7 @@ impl WithTools for PrincipalRouter {
         &self,
         ctx: &ListToolsContext,
         name: String,
-    ) -> McpResult<Option<neutral::Tool>> {
+    ) -> McpResult<Option<Arc<neutral::Tool>>> {
         self.select(&ctx.base)?.lookup_tool(ctx, name).await
     }
     async fn list_tools(
@@ -285,6 +292,13 @@ impl WithPrompts for PrincipalRouter {
     }
 }
 
+/// The path the WebSocket transport accepts upgrades on: the bare
+/// `ws://host:port` address.
+pub const WEBSOCKET_PATH: &str = "/";
+
+/// The calls one WebSocket connection may have in flight.
+const WEBSOCKET_MAX_IN_FLIGHT: usize = 32;
+
 /// What a network transport needs: the dispatcher over every principal and
 /// the authenticator that names them.
 #[derive(Debug, Clone)]
@@ -295,44 +309,53 @@ pub struct Network {
 
 impl Network {
     /// The Streamable HTTP endpoint at `/mcp`, with RFC 9728 metadata at
-    /// `/.well-known/oauth-protected-resource`. Requests are bounded at two
-    /// minutes; a write already handed to its own task still finishes.
+    /// `/.well-known/oauth-protected-resource`. A request has two minutes
+    /// to be admitted, authenticated and read, and to begin its response; a
+    /// call still running after five seconds answers as an event stream,
+    /// kept open until its result. A write already handed to its own task
+    /// finishes whatever becomes of the request.
     pub fn http_router(&self) -> Router {
-        turbomcp::http::router(
-            self.dispatcher.clone(),
+        Router::new().fallback_service(turbomcp::http::service(
+            turbomcp::Server::new(self.dispatcher.clone()),
             HttpConfig::new()
                 .with_authenticator(self.credentials.clone())
-                .request_timeout(std::time::Duration::from_secs(120)),
-        )
+                .with_request_timeout(std::time::Duration::from_secs(120)),
+        ))
     }
 
-    /// Serve MCP over WebSocket on `listener` until `shutdown` fires. The
-    /// credential is checked at the upgrade and its principal re-checked on
-    /// every request; browser origins are refused. Each connection is its
-    /// own session for clients on the session-based revisions.
+    /// Serve MCP over WebSocket at [`WEBSOCKET_PATH`] on `listener` until
+    /// `shutdown` fires. The credential is checked before the upgrade (a
+    /// bad one is answered `401`) and its principal re-checked on every
+    /// request; the connection is closed when the credential expires, and
+    /// browser origins are refused. Each connection is its own session for
+    /// clients on the session-based revisions.
+    ///
+    /// WebSocket is a route on turbomcp's HTTP endpoint, so the listener
+    /// also answers Streamable HTTP at `/mcp`, behind the same credential
+    /// check.
     pub async fn serve_websocket(
         &self,
         listener: tokio::net::TcpListener,
         shutdown: turbomcp::CancellationToken,
     ) -> anyhow::Result<()> {
-        let serve = turbomcp::ServeConfig {
-            shutdown,
-            // As many calls in flight per connection as a model needs, not
-            // as many as a client could pile up.
-            max_in_flight: 32,
-            ..Default::default()
-        };
-        let dispatcher = self.dispatcher.clone();
-        turbomcp::ws::serve_websocket_with(
-            listener,
-            move || turbomcp::LegacySessionAdapter::new(dispatcher.clone()),
-            turbomcp::ws::WsConfig::new()
-                .with_authenticator(self.credentials.clone())
-                .max_message_bytes(1024 * 1024)
-                .with_serve_config(serve),
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("WebSocket transport failed: {e}"))
+        turbomcp::Server::new(self.dispatcher.clone())
+            // A semaphore per connection (the layer is applied to each
+            // connection's service): as many calls in flight as a model
+            // needs, not as many as a client could pile up.
+            .layer(tower::limit::ConcurrencyLimitLayer::new(
+                WEBSOCKET_MAX_IN_FLIGHT,
+            ))
+            .serve(
+                Http::listener(listener).with_config(
+                    HttpConfig::new()
+                        .with_authenticator(self.credentials.clone())
+                        .with_max_body_bytes(1024 * 1024)
+                        .with_shutdown(shutdown)
+                        .with_websocket(WebSocketConfig::new(WEBSOCKET_PATH)),
+                ),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket transport failed: {e}"))
     }
 }
 
@@ -450,6 +473,7 @@ pub fn network_reloadable(
     };
     Network {
         dispatcher: ServerBuilder::new(router)
+            .with_cancellation(crate::authorized::CANCELLATION)
             .with_tools()
             .with_resources()
             .with_prompts()
@@ -580,6 +604,66 @@ mod tests {
         assert_eq!(tool_names(&app, &b).await, ["get_account"]);
     }
 
+    /// A `2025-11-25` session belongs to the principal that opened it:
+    /// another principal presenting its id is told there is no such
+    /// session, and is never served as the first.
+    #[tokio::test]
+    async fn a_session_cannot_cross_principals() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        let app = router(vec![
+            server(&dir, "A", &a, &["get_quote"]),
+            server(&dir, "B", &b, &["get_account"]),
+        ]);
+        let send = async |token: &str, session: Option<&str>, body: Value| {
+            let mut request = post(Some(token), body);
+            let headers = request.headers_mut();
+            headers.remove("mcp-method");
+            headers.insert("mcp-protocol-version", "2025-11-25".parse().unwrap());
+            if let Some(session) = session {
+                headers.insert("mcp-session-id", session.parse().unwrap());
+            }
+            app.clone().oneshot(request).await.unwrap()
+        };
+        let opened = send(
+            &a,
+            None,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "protocolVersion":"2025-11-25","capabilities":{},
+                "clientInfo":{"name":"audit","version":"1"}}}),
+        )
+        .await;
+        assert_eq!(opened.status(), StatusCode::OK);
+        let session = opened.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let ready = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        let accepted = send(&a, Some(&session), ready).await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+        let own = send(&a, Some(&session), list.clone()).await;
+        assert_eq!(own.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(own.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let listed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            listed["result"]["tools"][0]["name"], "get_quote",
+            "{listed}"
+        );
+
+        let borrowed = send(&b, Some(&session), list.clone()).await;
+        assert_eq!(borrowed.status(), StatusCode::NOT_FOUND);
+
+        // With neither a session nor the stateless envelope there is no
+        // revision to answer in: a bad request, not an error in a `200`.
+        let neither = send(&a, None, list).await;
+        assert_eq!(neither.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A credential checked under a replaced policy is refused, even for a
     /// principal the new policy keeps; one presented afresh is served.
     #[tokio::test]
@@ -595,11 +679,7 @@ mod tests {
             versions: ProtocolVersion::SUPPORTED,
         };
         let (name, expires_at, generation) = principals.authenticate(&token).await.unwrap();
-        let Value::Object(claims) = json!({"exp": expires_at, GENERATION_CLAIM: generation}) else {
-            unreachable!()
-        };
-        let base = RequestContext::default()
-            .with_identity(turbomcp::Identity::Bearer { sub: name, claims });
+        let base = RequestContext::default().with_identity(identity(name, expires_at, generation));
         assert!(router.select(&base).is_ok());
         replace(
             &principals.registry,
@@ -611,6 +691,69 @@ mod tests {
         );
         let app = network.http_router();
         assert_eq!(tool_names(&app, &token).await, ["get_quote"]);
+    }
+
+    /// The WebSocket transport checks the credential before the upgrade
+    /// and answers a bad one `401`, accepts the upgrade at its one path,
+    /// and serves the connection as the credential's principal.
+    #[tokio::test]
+    async fn the_websocket_upgrade_requires_a_valid_bearer_token() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Error, Message, client::IntoClientRequest};
+        let dir = tempfile::tempdir().unwrap();
+        let token = "a".repeat(32);
+        let network = network(vec![server(&dir, "A", &token, &["get_quote"])]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop = turbomcp::CancellationToken::new();
+        let stopped = stop.clone();
+        let serving = tokio::spawn(async move { network.serve_websocket(listener, stopped).await });
+
+        let upgrade = |path: &str, bearer: Option<&str>| {
+            let mut request = format!("ws://{address}{path}")
+                .into_client_request()
+                .unwrap();
+            if let Some(bearer) = bearer {
+                request
+                    .headers_mut()
+                    .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
+            }
+            tokio_tungstenite::connect_async(request)
+        };
+        for (path, bearer, status) in [
+            (WEBSOCKET_PATH, None, StatusCode::UNAUTHORIZED),
+            (
+                WEBSOCKET_PATH,
+                Some("b".repeat(32)),
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("/elsewhere", Some(token.clone()), StatusCode::NOT_FOUND),
+        ] {
+            match upgrade(path, bearer.as_deref()).await {
+                Err(Error::Http(refusal)) => assert_eq!(refusal.status(), status, "{path}"),
+                other => panic!("{path}: expected a refusal, got {other:?}"),
+            }
+        }
+
+        let (mut socket, _) = upgrade(WEBSOCKET_PATH, Some(&token)).await.unwrap();
+        socket
+            .send(Message::text(list_tools().to_string()))
+            .await
+            .unwrap();
+        let listed: Value = loop {
+            match socket.next().await.unwrap().unwrap() {
+                Message::Text(text) => break serde_json::from_str(&text).unwrap(),
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            listed["result"]["tools"][0]["name"], "get_quote",
+            "{listed}"
+        );
+
+        drop(socket);
+        stop.cancel();
+        serving.await.unwrap().unwrap();
     }
 
     #[tokio::test]

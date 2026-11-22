@@ -803,12 +803,13 @@ release.
 
 ## TurboMCP v4
 
-The server runs on TurboMCP `4.0.0-alpha.5`, a prerelease. One set of
-handlers answers the `2025-06-18` and `2025-11-25` session revisions and
-the stateless `2026-07-28` revision; a client picks by the version it
-sends. On the stateless revision there is no `initialize` or session: each
-request carries its protocol version and client capabilities in `_meta`,
-and HTTP clients send the `Mcp-Method` header.
+The server runs on TurboMCP `4.0.0-beta.1`, a prerelease whose API is
+frozen for 4.0. One set of handlers answers the `2025-06-18` and
+`2025-11-25` session revisions and the stateless `2026-07-28` revision; a
+client picks by the version it sends. On the stateless revision there is no
+`initialize` or session: each request carries its protocol version and
+client capabilities in `_meta`, and HTTP clients send the `Mcp-Method`
+header.
 
 - **Authorization is unchanged in substance.** `AuthorizedServer` wraps the
   macro-built `SchwabMcp` through v4's capability traits and filters what a
@@ -824,12 +825,29 @@ and HTTP clients send the `Mcp-Method` header.
   before the question is safe to repeat, and an approval the answer already
   recorded is honored.
 - **Tool schemas keep `$defs` and `$ref`** rather than inlining them.
-- **Byte-pipe transports** (stdio, WebSocket) wrap the dispatcher in
-  turbomcp's `LegacySessionAdapter`, which gives `2025-11-25` clients their
-  session per connection.
-- **Not carried over:** the WebSocket server has no per-process connection
-  cap (limit connections at the TLS proxy) and no per-call deadline (writes
-  run to their outcome on their own task regardless; Schwab reads have the
-  SDK's request timeouts).
+- **A cancelled call is dropped where it waits.** The server sets
+  turbomcp's `Cancellation::Abort`: a submission holding for its approval
+  that the client cancels places nothing, even if the approval then lands,
+  and one past its audit record runs to its outcome on its own task.
+- **Byte-pipe transports** (stdio, WebSocket) are served through turbomcp's
+  runtime, which gives `2025-11-25` clients their session per connection.
+  After a stdio client closes its end, calls in flight have thirty seconds
+  to finish.
+- **WebSocket is a route on turbomcp's HTTP endpoint.** The upgrade is
+  accepted at `/` (the bare `ws://host:port` address). The credential is
+  checked before the upgrade, so a bad one is answered `401` with its
+  `WWW-Authenticate` challenge, and the connection is closed with `1008`
+  when the credential expires. At most 1,024 connections are held, each
+  with 32 calls in flight. The same listener answers Streamable HTTP at
+  `/mcp`, behind the same credential check.
+- **A slow HTTP call answers as an event stream.** A call still running
+  after five seconds gets `text/event-stream`, kept open by keep-alive
+  comments until its result arrives as the last event; a client must accept
+  both media types, as the transport requires. On a `2025-06-18` or
+  `2025-11-25` session a dropped connection does not cancel the call
+  (`notifications/cancelled` does); on `2026-07-28` it does.
+- **No per-call deadline** on any transport: writes run to their outcome on
+  their own task regardless, and Schwab reads have the SDK's request
+  timeouts.
 
 Moving to a stable 4.x when it ships is a version bump plus this suite.
