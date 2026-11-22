@@ -64,6 +64,8 @@ subtle = "2.6"
 otel = ["rustyschwab/otel", "dep:metrics-util"]
 
 [dev-dependencies]
+# Paused-clock tests (`#[tokio::test(start_paused = true)]`).
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 tokio-tungstenite = { workspace = true }
 

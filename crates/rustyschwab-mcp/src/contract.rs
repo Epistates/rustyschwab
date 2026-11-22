@@ -82,6 +82,9 @@ pub enum FailureCode {
     RateLimited,
     /// The call timed out before anything was sent.
     Timeout,
+    /// The call was called off before anything was sent: its client
+    /// cancelled it, or its session ended.
+    Cancelled,
     /// A submission may have reached the broker; reconcile, never resubmit.
     ReconciliationRequired,
     /// The response exceeds the message budget; narrow the request.
@@ -135,11 +138,16 @@ impl FailureCode {
             Self::NotPermitted => Disposition::NotPermitted,
             Self::ApprovalRequired | Self::Halted | Self::Internal => Disposition::AskOperator,
             Self::DuplicateIntent | Self::ReconciliationRequired => Disposition::Reconcile,
-            Self::Unavailable | Self::RateLimited | Self::Timeout => Disposition::RetryLater,
+            Self::Unavailable | Self::RateLimited | Self::Timeout | Self::Cancelled => {
+                Disposition::RetryLater
+            }
         }
     }
     fn retryable(self) -> bool {
-        matches!(self, Self::Unavailable | Self::RateLimited | Self::Timeout)
+        matches!(
+            self,
+            Self::Unavailable | Self::RateLimited | Self::Timeout | Self::Cancelled
+        )
     }
     /// A submission refused with this code never reached the broker, and the
     /// same intent may succeed later, so it gives back the one-use approval

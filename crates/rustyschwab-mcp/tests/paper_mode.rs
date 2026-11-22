@@ -1155,104 +1155,343 @@ async fn connect(
 
 /// A `tools/call` of `place_order` with `arguments`, under request id `id`.
 fn place_order_request(id: i64, arguments: &Value) -> turbomcp::JsonRpcMessage {
-    let params = json!({"name": "place_order", "arguments": arguments});
+    let params =
+        json!({"name": "place_order", "arguments": arguments, "_meta": {"progressToken": id}});
     turbomcp::JsonRpcRequest::new(id, "tools/call", Some(params)).into()
 }
 
-/// A submission its client cancels while it holds for an approval is
-/// dropped where it waits: the approval that then lands inside the hold
-/// places nothing, and the cancelled call is never answered.
-#[tokio::test]
-async fn a_held_submission_the_client_cancels_places_nothing() {
-    use turbomcp::Transport;
-    let dir = tempfile::tempdir().unwrap();
-    let (broker, _) = venue(dir.path()).await;
-    let mut policy = policy();
-    policy.require_approval = true;
-    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy);
+/// A desk whose every order needs an operator's approval, over a fresh
+/// venue, with the intent the tests hold and its digest.
+async fn supervised_desk(dir: &Path) -> (AuthorizedServer, Arc<PaperBroker>, Value, String) {
+    let (broker, _) = venue(dir).await;
+    let mut desk = policy();
+    desk.require_approval = true;
+    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, desk);
     let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
     let digest = call(&server, "check_order", intent.clone()).await["intentDigest"]
         .as_str()
         .unwrap()
         .to_owned();
-    let mut holding = intent;
-    holding["wait_ms"] = json!(10_000);
+    (server, broker, intent, digest)
+}
+
+/// `intent`, holding for its approval for `wait_ms`.
+fn holding(intent: &Value, wait_ms: u64) -> Value {
+    let mut holding = intent.clone();
+    holding["wait_ms"] = json!(wait_ms);
+    holding
+}
+
+/// The operator approves `digest` for the desk, for a minute.
+async fn approve(server: &AuthorizedServer, digest: &str) {
+    server
+        .audit
+        .approve(
+            "paper-desk",
+            digest,
+            "operator",
+            chrono::Utc::now().timestamp() + 60,
+        )
+        .await
+        .unwrap();
+}
+
+/// The payload of the audit event a hold leaves when it ends without its
+/// order being placed, once it is written.
+async fn hold_ended(server: &AuthorizedServer) -> Value {
+    loop {
+        let events = server.audit.audit_page(0, 1000).await.unwrap();
+        let ended = events
+            .into_iter()
+            .find(|event| event.kind == rustyschwab_mcp::policy::HOLD_ENDED_EVENT);
+        if let Some(ended) = ended {
+            return ended.payload;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Once a hold of `digest` has ended, an approval places nothing, however
+/// long it is given: only a new call of the intent uses it.
+async fn a_late_approval_places_nothing(
+    server: &AuthorizedServer,
+    broker: &PaperBroker,
+    digest: &str,
+) {
+    approve(server, digest).await;
+    tokio::time::sleep(std::time::Duration::from_secs(50)).await;
+    assert!(server.audit.records().await.unwrap().is_empty());
+    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+}
+
+/// A held submission lasts no longer than the window its call asked for
+/// (the server's policy: at most 45 s). When the window ends the call is
+/// refused, saying so, and an approval that arrives afterwards places
+/// nothing until the client submits the intent again.
+#[tokio::test(start_paused = true)]
+async fn a_held_submission_expires_with_its_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, broker, intent, digest) = supervised_desk(dir.path()).await;
+
+    let started = tokio::time::Instant::now();
+    let expired = call(&server, "place_order", holding(&intent, 45_000)).await;
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(45));
+    assert_eq!(expired["error"]["code"], "approval_required", "{expired}");
+    assert_eq!(expired["error"]["intentDigest"], digest);
+    let message = expired["error"]["message"].as_str().unwrap();
+    assert!(message.contains("in the 45000 ms"), "{message}");
+    let ended = hold_ended(&server).await;
+    assert_eq!(ended["reason"], "window_elapsed", "{ended}");
+    assert_eq!(ended["intentDigest"], digest);
+    assert_eq!(ended["waitedMs"], 45_000);
+
+    a_late_approval_places_nothing(&server, &broker, &digest).await;
+
+    // The approval is the operator's and still stands: the next call of the
+    // same intent, which the client has to make, uses it.
+    let placed = call(&server, "place_order", intent).await;
+    assert_eq!(placed["source"], "paper", "{placed}");
+}
+
+/// A submission its client cancels while it holds for an approval is
+/// refused where it waits: the approval that then lands inside the window
+/// places nothing, and the cancelled call is never answered.
+#[tokio::test(start_paused = true)]
+async fn a_held_submission_the_client_cancels_places_nothing() {
+    use turbomcp::Transport;
+    let dir = tempfile::tempdir().unwrap();
+    let (server, broker, intent, digest) = supervised_desk(dir.path()).await;
 
     let mut client = connect(&server, json!({})).await;
-    client.send(place_order_request(7, &holding)).await.unwrap();
+    client
+        .send(place_order_request(7, &holding(&intent, 45_000)))
+        .await
+        .unwrap();
     // Once the hold has begun the client calls it off, and only then does
     // the operator approve.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     let cancelled = json!({"requestId": 7, "reason": "the user changed their mind"});
     client
         .send(turbomcp::JsonRpcNotification::new("notifications/cancelled", Some(cancelled)).into())
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    server
-        .audit
-        .approve(
-            "paper-desk",
-            &digest,
-            "operator",
-            chrono::Utc::now().timestamp() + 60,
-        )
-        .await
-        .unwrap();
+    let ended = hold_ended(&server).await;
+    assert_eq!(ended["reason"], "cancelled", "{ended}");
+    assert_eq!(ended["intentDigest"], digest);
 
-    // A hold re-reads the approval store every second: one still running
-    // would have submitted well within this.
-    let answer = tokio::time::timeout(std::time::Duration::from_millis(2500), client.recv()).await;
-    assert!(
-        answer.is_err(),
-        "a cancelled call is not answered: {answer:?}"
-    );
-    assert!(server.audit.records().await.unwrap().is_empty());
-    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+    a_late_approval_places_nothing(&server, &broker, &digest).await;
+    // Only the progress the hold reported while it waited was sent: a
+    // cancelled request gets no response.
+    while let Ok(frame) =
+        tokio::time::timeout(std::time::Duration::from_secs(1), client.recv()).await
+    {
+        let frame = frame.unwrap().expect("the connection is still open");
+        assert_eq!(frame.method(), Some("notifications/progress"), "{frame:?}");
+    }
 }
 
-/// A client that sends a submission and closes its end has not called it
-/// off: the call keeps holding past the two seconds turbomcp gives calls
-/// in flight at end of input, and is placed when the approval lands.
-#[tokio::test]
-async fn a_held_submission_outlives_its_clients_end_of_input() {
+/// A held submission ends with its session. On a session revision over
+/// Streamable HTTP the session ends when the client deletes it (or it
+/// expires); the held call is told through its cancellation and refuses,
+/// and an approval that arrives afterwards places nothing.
+#[tokio::test(start_paused = true)]
+async fn a_held_submission_ends_with_its_http_session() {
+    use tower::ServiceExt;
+    for revision in ["2025-11-25", "2025-06-18"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (broker, _) = venue(dir.path()).await;
+        let token = "t".repeat(32);
+        let mut desk = policy();
+        desk.require_approval = true;
+        desk.token_sha256 = rustyschwab_mcp::policy::digest(token.as_bytes());
+        desk.token_expires_at = Some(chrono::Utc::now().timestamp() + 3600);
+        let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, desk);
+        let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
+        let digest = rustyschwab_mcp::policy::intent_digest("place_order", &intent);
+        let app = rustyschwab_mcp::network::router(vec![server.clone()]);
+        let request = |method: &str, session: Option<&str>, body: Option<Value>| {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri("/mcp")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", revision);
+            if let Some(session) = session {
+                request = request.header("mcp-session-id", session);
+            }
+            let body = body.map_or_else(axum::body::Body::empty, |b| b.to_string().into());
+            app.clone().oneshot(request.body(body).unwrap())
+        };
+
+        let hello = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": revision, "capabilities": {},
+            "clientInfo": {"name": "desk-client", "version": "1"}}});
+        let opened = request("POST", None, Some(hello)).await.unwrap();
+        assert_eq!(opened.status(), axum::http::StatusCode::OK, "{revision}");
+        let session = opened.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let ready = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+        request("POST", Some(&session), Some(ready)).await.unwrap();
+
+        let held = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "place_order", "arguments": holding(&intent, 45_000)}});
+        let holding_call = tokio::spawn(request("POST", Some(&session), Some(held)));
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
+
+        let ended = request("DELETE", Some(&session), None).await.unwrap();
+        assert_eq!(
+            ended.status(),
+            axum::http::StatusCode::NO_CONTENT,
+            "{revision}"
+        );
+        let ended = hold_ended(&server).await;
+        assert_eq!(ended["reason"], "cancelled", "{revision}: {ended}");
+        assert_eq!(ended["intentDigest"], digest);
+
+        a_late_approval_places_nothing(&server, &broker, &digest).await;
+        holding_call.abort();
+    }
+}
+
+/// A held submission ends with its connection where the connection is the
+/// session (stdio, WebSocket): two seconds after the client's end closes,
+/// the held call is told through its cancellation and refuses.
+#[tokio::test(start_paused = true)]
+async fn a_held_submission_ends_with_its_connection() {
     use turbomcp::Transport;
     let dir = tempfile::tempdir().unwrap();
-    let (broker, _) = venue(dir.path()).await;
-    let mut policy = policy();
-    policy.require_approval = true;
-    let server = AuthorizedServer::new(backend(broker.clone(), None), TRADING, policy);
-    let intent = json!({"account_hash": ACCOUNT, "order": order("BUY", "1", "11")});
-    let digest = call(&server, "check_order", intent.clone()).await["intentDigest"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let mut holding = intent;
-    holding["wait_ms"] = json!(20_000);
+    let (server, broker, intent, digest) = supervised_desk(dir.path()).await;
 
     let mut client = connect(&server, json!({})).await;
-    client.send(place_order_request(7, &holding)).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    client.close().await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
-    assert!(broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty());
-    server
-        .audit
-        .approve(
-            "paper-desk",
-            &digest,
-            "operator",
-            chrono::Utc::now().timestamp() + 60,
-        )
+    client
+        .send(place_order_request(7, &holding(&intent, 45_000)))
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while broker.orders(ACCOUNT, 0, 10).await.unwrap().is_empty() {
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let closed = tokio::time::Instant::now();
+    client.close().await.unwrap();
+    let ended = hold_ended(&server).await;
+    assert_eq!(ended["reason"], "cancelled", "{ended}");
+    assert!(closed.elapsed() < std::time::Duration::from_secs(3));
+
+    a_late_approval_places_nothing(&server, &broker, &digest).await;
+}
+
+/// While it holds, a submission tells a client that asked for progress it
+/// is still waiting, once a second, and the approval then places it.
+#[tokio::test(start_paused = true)]
+async fn a_held_submission_reports_progress_until_it_is_approved() {
+    use turbomcp::Transport;
+    let dir = tempfile::tempdir().unwrap();
+    let (server, broker, intent, digest) = supervised_desk(dir.path()).await;
+
+    let mut client = connect(&server, json!({})).await;
+    client
+        .send(place_order_request(7, &holding(&intent, 45_000)))
+        .await
+        .unwrap();
+    let mut reported = Vec::new();
+    let placed = loop {
+        match client.recv().await.unwrap().expect("the call's answer") {
+            turbomcp::JsonRpcMessage::Notification(note) => {
+                assert_eq!(note.method, "notifications/progress");
+                let progress = note.params.unwrap();
+                assert_eq!(progress["progressToken"], 7, "{progress}");
+                assert_eq!(progress["total"], 45.0, "{progress}");
+                reported.push(progress["progress"].as_f64().unwrap());
+                if reported.len() == 3 {
+                    approve(&server, &digest).await;
+                }
+            }
+            turbomcp::JsonRpcMessage::Response(reply) => break reply.result.unwrap(),
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+    assert_eq!(&reported[..3], [1.0, 2.0, 3.0]);
+    assert_eq!(read(&placed)["source"], "paper", "{placed}");
+    assert_eq!(broker.orders(ACCOUNT, 0, 10).await.unwrap().len(), 1);
+}
+
+/// A call still running at the server's limit is answered instead of
+/// hanging. Before its audit record it has sent nothing: the answer is
+/// `timeout`, and nothing is placed afterwards.
+#[tokio::test(start_paused = true)]
+async fn a_call_past_the_servers_limit_is_answered_and_sends_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, broker, intent, digest) = supervised_desk(dir.path()).await;
+    assert_eq!(
+        server.call_timeout(),
+        std::time::Duration::from_secs(120),
+        "two minutes unless set"
+    );
+    // Shorter than the hold, as a call stuck before its audit record is.
+    let server = server.with_call_timeout(std::time::Duration::from_secs(10));
+
+    let started = tokio::time::Instant::now();
+    let late = call(&server, "place_order", holding(&intent, 45_000)).await;
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(10));
+    assert_eq!(late["error"]["code"], "timeout", "{late}");
+    assert_eq!(late["error"]["retryable"], true);
+
+    a_late_approval_places_nothing(&server, &broker, &digest).await;
+}
+
+/// Past its audit record a write is not cut off by the limit: the call is
+/// answered `reconciliation_required` with the attempt it started, and the
+/// write runs on to its outcome, which the journal records.
+#[tokio::test]
+async fn a_write_past_its_audit_record_outlives_the_calls_limit() {
+    use wiremock::matchers::method;
+    let schwab = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/trader/v1/accounts/A/orders/9"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(3)))
+        .expect(1)
+        .mount(&schwab)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let desk: PrincipalPolicy = serde_json::from_value(json!({
+        "name": "live-desk",
+        "token_sha256": "a".repeat(64),
+        "tools": ["cancel_order"],
+        "accounts": ["A"],
+    }))
+    .unwrap();
+    let switches = Switches {
+        trading: false,
+        cancel: true,
+    };
+    let client = mocked_client(&schwab.uri(), dir.path());
+    let server = AuthorizedServer::new(Backend::Live(client), switches, desk)
+        .with_call_timeout(std::time::Duration::from_secs(1));
+
+    let started = std::time::Instant::now();
+    let late = call(
+        &server,
+        "cancel_order",
+        json!({"account_hash": "A", "order_id": "9"}),
+    )
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_millis(2500));
+    assert_eq!(late["error"]["code"], "reconciliation_required", "{late}");
+    let records = server.audit.records().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(late["error"]["attemptId"], records[0].attempt_id.as_str());
+    assert!(records[0].outcome.is_none(), "the write is still under way");
+
+    // The cancel reaches Schwab and the record its outcome, with nobody
+    // waiting for either.
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while server.audit.records().await.unwrap()[0].outcome.is_none() {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the held order was placed");
+    .expect("the write reached its outcome");
 }
 
 /// On a session revision the approval question is an inline
@@ -1307,7 +1546,7 @@ async fn the_approval_question_is_a_form_a_client_may_render() {
 /// Over Streamable HTTP a call still running after five seconds answers as
 /// an event stream, and the hold's outcome arrives as its last event
 /// instead of the request being cut off.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_slow_http_call_answers_as_an_event_stream() {
     use tower::ServiceExt;
     let dir = tempfile::tempdir().unwrap();
@@ -1344,7 +1583,7 @@ async fn a_slow_http_call_answers_as_an_event_stream() {
         .header("mcp-name", "place_order")
         .body(axum::body::Body::from(call.to_string()))
         .unwrap();
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let response = app.oneshot(request).await.unwrap();
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");

@@ -341,7 +341,8 @@ impl Network {
         turbomcp::Server::new(self.dispatcher.clone())
             // A semaphore per connection (the layer is applied to each
             // connection's service): as many calls in flight as a model
-            // needs, not as many as a client could pile up.
+            // needs, not as many as a client could pile up. A call past the
+            // limit queues for a slot; it is not refused.
             .layer(tower::limit::ConcurrencyLimitLayer::new(
                 WEBSOCKET_MAX_IN_FLIGHT,
             ))
@@ -387,10 +388,10 @@ pub fn network_reloadable(
     policy_path: Option<std::path::PathBuf>,
 ) -> Network {
     // Reloaded principals share the first server's backend, switches,
-    // approval notifier, stream and dead-man registry: rebuilding a
-    // principal's server must not orphan the live stream or its lease on the
-    // login's streamer slot, nor run a second dead-man watcher beside the one
-    // it replaces.
+    // approval notifier, stream, dead-man registry and call limit:
+    // rebuilding a principal's server must not orphan the live stream or
+    // its lease on the login's streamer slot, nor run a second dead-man
+    // watcher beside the one it replaces.
     let shared = servers.first().map(|s| {
         (
             s.inner.backend().clone(),
@@ -398,6 +399,7 @@ pub fn network_reloadable(
             s.inner.stream_hub(),
             s.approval_notifier().cloned(),
             s.liveness().clone(),
+            s.call_timeout(),
         )
     });
     let (info, instructions, versions) = servers.first().map_or_else(
@@ -411,7 +413,8 @@ pub fn network_reloadable(
         |s| (s.server_info(), s.instructions(), s.supported_versions()),
     );
     let principals = Principals::new(servers, identity);
-    if let (Some(path), Some((backend, switches, hub, notifier, liveness))) = (policy_path, shared)
+    if let (Some(path), Some((backend, switches, hub, notifier, liveness, call_timeout))) =
+        (policy_path, shared)
     {
         let weak = Arc::downgrade(&principals.registry);
         let static_credentials = principals.identity.is_none();
@@ -457,6 +460,7 @@ pub fn network_reloadable(
                         )
                         .with_approval_notifier(notifier.clone())
                         .with_liveness(liveness.clone())
+                        .with_call_timeout(call_timeout)
                     })
                     .collect();
                 replace(&registry, servers);
@@ -473,7 +477,6 @@ pub fn network_reloadable(
     };
     Network {
         dispatcher: ServerBuilder::new(router)
-            .with_cancellation(crate::authorized::CANCELLATION)
             .with_tools()
             .with_resources()
             .with_prompts()
