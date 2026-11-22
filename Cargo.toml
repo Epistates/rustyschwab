@@ -28,7 +28,7 @@ categories = ["api-bindings", "finance"]
 
 [workspace.dependencies]
 # Random number generation (for jitter in backoff)
-rand = "0.10"
+rand = "0.10.2"
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
@@ -36,13 +36,14 @@ tokio = { version = "1.52", features = ["full"] }
 # features), never here: a backend listed at the workspace level is on for
 # every consumer and makes the other feature meaningless.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
-futures-util = "0.3"
-async-trait = "0.1"
+futures-util = "0.3.32"
+async-trait = "0.1.89"
 
 # HTTP and networking
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "charset", "http2", "system-proxy"] }
-url = "2.5"
-axum = "0.8"
+reqwest = { version = "0.13.3", default-features = false, features = ["json", "stream", "form", "query", "charset", "http2", "system-proxy"] }
+# 2.5.9 fixes RUSTSEC-2026-0592 (stack overflow in `Url::origin()`).
+url = "2.5.9"
+axum = "0.8.9"
 # TLS for the local OAuth callback server (Schwab requires an https
 # callback URL, so the capture server must terminate TLS itself).
 axum-server = { version = "0.9", default-features = false, features = ["tls-rustls-no-provider"] }
@@ -50,28 +51,28 @@ rcgen = "0.14"
 urlencoding = "2.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
 # `float_roundtrip`: Schwab's JSON floats must parse to the nearest f64 in
 # every build, not only where another dependency happens to enable it.
-serde_json = { version = "1.0", features = ["float_roundtrip"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 serde_with = "3.17"
 
 # Encoding
-base64 = "0.23"
+base64 = "0.23.1"
 
 # Error handling
-thiserror = "2.0"
-anyhow = "1.0"
+thiserror = "2.0.20"
+anyhow = "1.0.60"
 
 # Tracing (structured observability)
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 
 # Metrics facade + Prometheus exporter.
 # The SDK only depends on the `metrics` facade (no-op when no recorder is
 # installed); the MCP binary pulls in the Prometheus exporter and
 # spawns its own scrape listener when `SCHWAB_METRICS_BIND` is set.
-metrics = "0.24"
+metrics = "0.24.3"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 # Lets the Prometheus recorder and the OTLP bridge share the one global slot.
 metrics-util = { version = "0.20", default-features = false, features = ["layers"] }
@@ -95,17 +96,17 @@ tracing-opentelemetry = { version = "0.34", default-features = false }
 metrics-opentelemetry = "0.24033"
 
 # Time and date
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.39", features = ["serde"] }
 chrono-tz = "0.10"
 humantime-serde = "1.1"
 
 # Utilities
-parking_lot = "0.12"
+parking_lot = "0.12.3"
 uuid = { version = "1.23", features = ["v4", "serde"] }
 
 # Rate limiting
-governor = "0.10"
-tower = "0.5"
+governor = "0.10.4"
+tower = "0.5.3"
 
 # Security - Best-in-class 2026
 ring = "0.17"
@@ -127,10 +128,10 @@ windows-native-keyring-store = { version = "1", default-features = false }
 linux-keyutils-keyring-store = "1"
 # Memory-safe secret handling with automatic zeroization
 secrecy = { version = "0.10", features = ["serde"] }
-zeroize = { version = "1.8", features = ["derive", "aarch64"] }
+zeroize = { version = "1.8.2", features = ["derive", "aarch64"] }
 # Safe POSIX calls for private files: open without following links, check
 # the open descriptor, and read the effective user.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+rustix = { version = "1.1.4", default-features = false, features = ["std", "fs", "process"] }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -147,7 +148,7 @@ tempfile = "3.27"
 turbomcp = { version = "=4.0.0-alpha.5", default-features = false }
 
 # JSON-Schema for MCP tool parameter schemas (must match turbomcp's schemars version)
-schemars = { version = "1.0", features = ["chrono04"] }
+schemars = { version = "1.2.1", features = ["chrono04"] }
 
 # Shared lint policy; each crate opts in with `[lints] workspace = true`.
 [workspace.lints.rust]

@@ -206,6 +206,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compatible update in the three lockfiles (keyring-core 1.1.0, serde_with
   3.25.0, clap 4.6.9 and others) and install-action 2.90.6. The turbomcp
   crates stay at 4.0.0-alpha.5.
+- The minimum versions the manifests declare are raised to ones the
+  workspace resolves and builds with; the weekly minimal-versions job had
+  never passed. `serde_json = "1.0"` allowed 1.0.0, which has no
+  `float_roundtrip` feature; metrics 0.24.0 to 0.24.2 and anyhow 1.0.1 do
+  not build with what depends on them or with a current compiler; and the
+  other floors were below what turbomcp 4.0.0-alpha.5 and the rest of the
+  tree require. `url` is now at least 2.5.9, the release with the fix above.
+  Raised: serde 1.0.228, serde_json 1.0.149, reqwest 0.13.3, axum 0.8.9,
+  chrono 0.4.39, thiserror 2.0.20, anyhow 1.0.60, tracing 0.1.44,
+  tracing-subscriber 0.3.22, metrics 0.24.3, schemars 1.2.1, tower 0.5.3,
+  governor 0.10.4, rustix 1.1.4, futures-util 0.3.32, async-trait 0.1.89,
+  parking_lot 0.12.3, rand 0.10.2, base64 0.23.1, zeroize 1.8.2 and
+  windows-sys 0.61.2. All are at or below the versions in `Cargo.lock`, so
+  a build from the lockfile is unchanged. That job leaves out the three
+  crates that depend on turbomcp, for the reason given under
+  `compatibility` below.
 
 ### Fixed — CI
 
