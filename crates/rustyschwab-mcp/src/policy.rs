@@ -511,6 +511,37 @@ pub fn intent_digest(name: &str, args: &Value) -> String {
 /// answer: once audited, a dispatch runs to its outcome.
 pub const MAX_APPROVAL_WAIT_MS: u64 = 45_000;
 
+/// Env var bounding how long one MCP call may run, in whole seconds.
+pub const CALL_TIMEOUT_ENV: &str = "SCHWAB_MCP_CALL_TIMEOUT_SECS";
+
+/// How long a call may run when [`CALL_TIMEOUT_ENV`] is unset. The MCP
+/// specification leaves the number to the implementation and asks only
+/// that there be a maximum, whatever progress a call reports.
+pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The call limit from the environment: [`DEFAULT_CALL_TIMEOUT`] when
+/// [`CALL_TIMEOUT_ENV`] is unset. It must be longer than the longest
+/// approval hold, which would otherwise never see its approval.
+pub fn call_timeout() -> anyhow::Result<Duration> {
+    parse_call_timeout(std::env::var(CALL_TIMEOUT_ENV).ok().as_deref())
+}
+
+fn parse_call_timeout(raw: Option<&str>) -> anyhow::Result<Duration> {
+    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return Ok(DEFAULT_CALL_TIMEOUT);
+    };
+    let secs: u64 = raw
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{CALL_TIMEOUT_ENV}={raw:?} is not a number of seconds"))?;
+    let limit = Duration::from_secs(secs);
+    anyhow::ensure!(
+        limit > Duration::from_millis(MAX_APPROVAL_WAIT_MS),
+        "{CALL_TIMEOUT_ENV} must be more than {} seconds, the longest approval hold",
+        MAX_APPROVAL_WAIT_MS / 1000
+    );
+    Ok(limit)
+}
+
 /// Who the approval store records as granting an approval the client's
 /// user gave (see [`PrincipalPolicy::client_approval`]), before the
 /// principal's name. The authority gateway honors approvals by configured
@@ -559,7 +590,7 @@ pub fn tag_intent(mut args: Value, digest: &str) -> Value {
 }
 
 /// The MCP handler that holds a principal to its policy.
-pub use crate::authorized::AuthorizedServer;
+pub use crate::authorized::{AuthorizedServer, HOLD_ENDED_EVENT};
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -569,6 +600,21 @@ pub(crate) mod tests {
     }
     pub(crate) fn order(quantity: Value) -> Value {
         serde_json::json!({"orderStrategyType":"SINGLE","orderType":"LIMIT","session":"NORMAL","duration":"DAY","price":"50","orderLegCollection":[{"quantity":quantity,"instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})
+    }
+    /// The call limit is two minutes unless set, and never shorter than an
+    /// approval hold.
+    #[test]
+    fn the_call_limit_defaults_to_two_minutes_and_outlasts_a_hold() {
+        assert_eq!(parse_call_timeout(None).unwrap(), Duration::from_secs(120));
+        assert_eq!(parse_call_timeout(Some(" ")).unwrap(), DEFAULT_CALL_TIMEOUT);
+        assert_eq!(
+            parse_call_timeout(Some("300")).unwrap(),
+            Duration::from_secs(300)
+        );
+        for refused in ["45", "0", "-1", "two minutes"] {
+            assert!(parse_call_timeout(Some(refused)).is_err(), "{refused}");
+        }
+        assert!(parse_call_timeout(Some("46")).is_ok());
     }
     /// A limit-on-close order has a firm price, so it is bounded exposure.
     #[test]

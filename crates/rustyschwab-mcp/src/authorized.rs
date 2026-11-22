@@ -10,8 +10,8 @@ use crate::contract::{FailureCode, ToolFailure, ToolResult};
 use crate::dead_man::{Beacon, Liveness, Reaper};
 use crate::guidance;
 use crate::policy::{
-    CLIENT_APPROVAL_SECS, CLIENT_APPROVER_PREFIX, MAX_APPROVAL_WAIT_MS, PrincipalPolicy,
-    approval_wait, digest, intent_digest, tag_intent,
+    CLIENT_APPROVAL_SECS, CLIENT_APPROVER_PREFIX, DEFAULT_CALL_TIMEOUT, MAX_APPROVAL_WAIT_MS,
+    PrincipalPolicy, approval_wait, digest, intent_digest, tag_intent,
 };
 use crate::server::Switches;
 use rustyschwab::execution::OrderJournal;
@@ -32,18 +32,28 @@ fn undeclared_argument(tool: &neutral::Tool, args: &Value) -> Option<String> {
         .cloned()
 }
 
-/// What a client's cancellation does to the call it cancels: the handler is
-/// dropped where it waits. A submission holding for its approval then places
-/// nothing, and one past its audit record runs on its own task to its
-/// outcome (see [`AuthorizedServer::dispatch`]). turbomcp's default lets a
-/// cancelled handler run on, which would place a held order its client had
-/// called off.
-pub(crate) const CANCELLATION: turbomcp::Cancellation = turbomcp::Cancellation::Abort;
+/// Milliseconds since `started`.
+fn waited_ms(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// The refusal of a submission whose call was called off before its audit
+/// record: nothing was sent.
+fn called_off(digest: &str) -> ToolFailure {
+    ToolFailure::new(
+        FailureCode::Cancelled,
+        format!(
+            "This call was called off (its client cancelled it, or its session \
+             ended) before intent {digest} was submitted; nothing was submitted. An \
+             approval given later is not applied to this call; submit the order \
+             again to use it"
+        ),
+    )
+    .with_intent(digest)
+}
 
 /// Serve `dispatcher` on `transport`, one connection (stdio), until the
-/// client disconnects. Calls in flight when it does have the drain window
-/// to finish, not turbomcp's two seconds: a client that sends an order and
-/// closes its end has not called the order off.
+/// client disconnects.
 pub(crate) async fn serve_pipe<S>(
     dispatcher: VersionDispatcher<S>,
     transport: impl turbomcp::Transport,
@@ -51,15 +61,40 @@ pub(crate) async fn serve_pipe<S>(
 where
     S: McpServerCore + Clone + Send + Sync + 'static,
 {
-    let drain = turbomcp::ServeConfig::new().drain_timeout;
-    let config = turbomcp::ServeConfig::new().with_eof_grace(drain);
-    turbomcp::Server::new(dispatcher)
-        .serve(turbomcp::Pipe::new(transport).with_config(config))
-        .await
+    turbomcp::Server::new(dispatcher).serve(transport).await
 }
 
-/// How often a holding submission re-reads the approval store.
+/// How often a holding submission re-reads the approval store, and tells a
+/// client that asked for progress it is still waiting.
 const APPROVAL_POLL: Duration = Duration::from_secs(1);
+
+/// The audit event a submission leaves when it waited for an approval and
+/// was not placed: `{tool, intentDigest, reason, waitedMs}`, where `reason`
+/// is `window_elapsed` or `cancelled`. It is how an operator who approves
+/// afterwards learns why nothing happened.
+pub const HOLD_ENDED_EVENT: &str = "approval_hold_ended";
+
+/// Why a submission that waited for its approval was not placed. This is
+/// the server's policy: the MCP specification says how a call is cancelled
+/// and how long a sender may wait, not what a held order does about either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldEnd {
+    /// The approval window ended first.
+    WindowElapsed,
+    /// The call was called off: its client cancelled it, or the session or
+    /// connection it arrived on ended.
+    Cancelled,
+}
+
+impl HoldEnd {
+    /// The `reason` of the [`HOLD_ENDED_EVENT`].
+    fn reason(self) -> &'static str {
+        match self {
+            Self::WindowElapsed => "window_elapsed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
 
 type CallLimiter = governor::DefaultDirectRateLimiter;
 
@@ -74,6 +109,9 @@ pub struct AuthorizedServer {
     /// policy sets one (see [`crate::dead_man`]).
     dead_man: Option<Arc<Beacon>>,
     liveness: Liveness,
+    /// The longest one call may run; see
+    /// [`with_call_timeout`](Self::with_call_timeout).
+    call_timeout: Duration,
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
@@ -109,6 +147,7 @@ impl AuthorizedServer {
             notifier: None,
             dead_man: None,
             liveness: Liveness::default(),
+            call_timeout: DEFAULT_CALL_TIMEOUT,
         };
         let liveness = server.liveness.clone();
         server.armed(liveness, None)
@@ -160,14 +199,26 @@ impl AuthorizedServer {
         self.notifier = notifier;
         self
     }
+    /// Answer a call still running after `limit` instead of letting it hang
+    /// ([`DEFAULT_CALL_TIMEOUT`] unless set). Before its audit record a call
+    /// that runs out of time is `timeout` and has sent nothing; past it the
+    /// answer is `reconciliation_required` and the write runs on to its
+    /// outcome, which the journal records.
+    #[must_use]
+    pub fn with_call_timeout(mut self, limit: Duration) -> Self {
+        self.call_timeout = limit;
+        self
+    }
+    /// The limit [`with_call_timeout`](Self::with_call_timeout) set.
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
     /// The MCP dispatcher for this principal alone. Resources and prompts
     /// are registered only when the principal is offered them, so the
     /// capabilities it is told agree with what it can use.
     pub fn dispatcher(self) -> VersionDispatcher<Self> {
         let guidance = self.offers_guidance();
-        let builder = ServerBuilder::new(self)
-            .with_cancellation(CANCELLATION)
-            .with_tools();
+        let builder = ServerBuilder::new(self).with_tools();
         if guidance {
             builder.with_resources().with_prompts().build()
         } else {
@@ -290,7 +341,23 @@ impl WithTools for AuthorizedServer {
         let started = Instant::now();
         let name = params.name.clone();
         let arguments = Value::Object(params.arguments.clone());
-        let result = self.answer(ctx, params).await;
+        // One deadline for the whole call. Whatever it cuts off here had
+        // sent nothing: a write past its audit record is waited for inside
+        // `dispatch`, which answers for it by the same deadline.
+        let deadline = tokio::time::Instant::now() + self.call_timeout;
+        let result =
+            match tokio::time::timeout_at(deadline, self.answer(ctx, params, deadline)).await {
+                Ok(result) => result,
+                Err(_) => Ok(ToolFailure::new(
+                    FailureCode::Timeout,
+                    format!(
+                        "The call ran past the server's limit of {} s before anything was \
+                     sent; nothing was submitted",
+                        self.call_timeout.as_secs()
+                    ),
+                )
+                .into_result()),
+            };
         crate::activity::note(
             &self.audit,
             &self.principal.name,
@@ -308,6 +375,7 @@ impl AuthorizedServer {
         &self,
         ctx: &CallToolContext,
         params: neutral::CallToolParams,
+        deadline: tokio::time::Instant,
     ) -> McpResult<ToolResult> {
         let name = params.name.as_str();
         let args = Value::Object(params.arguments.clone());
@@ -341,7 +409,7 @@ impl AuthorizedServer {
             ))
             .into_result());
         }
-        match self.dispatch(name, args, ctx).await {
+        match self.dispatch(name, args, ctx, deadline).await {
             Ok(result) => result,
             Err(Refusal::Failure(failure)) => Ok(failure.into_result()),
             Err(Refusal::Protocol(error)) => Err(error),
@@ -430,6 +498,7 @@ impl AuthorizedServer {
         name: &str,
         args: Value,
         ctx: &CallToolContext,
+        deadline: tokio::time::Instant,
     ) -> Result<McpResult<ToolResult>, Refusal> {
         match name {
             "check_order" => return Ok(self.check_order(args).await?),
@@ -473,7 +542,7 @@ impl AuthorizedServer {
                 if !(submission && approvable) {
                     return Err(failure.into());
                 }
-                let started = Instant::now();
+                let started = tokio::time::Instant::now();
                 let effective = if self.principal.client_approval
                     && self.ask_client(name, &digest, &args, ctx).await?
                 {
@@ -482,20 +551,31 @@ impl AuthorizedServer {
                     let Some(wait) = wait else {
                         return Err(failure.into());
                     };
-                    self.await_approval(name, &digest, wait).await?.0
+                    self.await_approval(name, &digest, wait, ctx).await?
                 };
                 effective.authorize(name, &args)?;
                 // The market may have moved while the approver decided.
                 self.check_collar(&args).await?;
-                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+                Some(waited_ms(started))
             }
         };
+        let write = submission || name == "cancel_order";
+        // The last point a call can be called off. A cancellation is a
+        // token the handler is told about, not something that stops it, so
+        // it is read here: before the audit record nothing has been sent,
+        // and after it the write is the journal's to finish.
+        if write && ctx.base.cancellation.is_cancelled() {
+            if let Some(waited) = waited {
+                self.note_hold_ended(name, &digest, HoldEnd::Cancelled, waited)
+                    .await;
+            }
+            return Err(called_off(&digest).into());
+        }
         let args = if submission {
             tag_intent(args, &digest)
         } else {
             args
         };
-        let write = submission || name == "cancel_order";
         let audit_id = if write {
             let dedup = if approval_applies {
                 // The audit consumes this one-use approval, so refuse here
@@ -532,7 +612,7 @@ impl AuthorizedServer {
                 .audit
                 .begin_once(&audit_scope, name, request, dedup)
                 .await
-                .map_err(|e| ToolFailure::from(e).with_intent(digest))?;
+                .map_err(|e| ToolFailure::from(e).with_intent(digest.clone()))?;
             Some((id, consumes_approval))
         } else {
             None
@@ -569,14 +649,30 @@ impl AuthorizedServer {
         // From the audit record on, the dispatch runs on its own task: a
         // client that cancels, disconnects or times out abandons only the
         // answer, and the record still reaches its outcome rather than
-        // blocking every later submission of this principal.
+        // blocking every later submission of this principal. The call limit
+        // is the same: it ends the wait, not the write.
         let this = self.clone();
         let name = name.to_owned();
         let ctx = ctx.clone();
-        let audited = tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await })
-            .await
-            .map_err(|e| ToolFailure::internal("Dispatch task failed", e))??;
-        Ok(audited)
+        let attempt = audit_id.0.clone();
+        let audited = tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await });
+        match tokio::time::timeout_at(deadline, audited).await {
+            Ok(joined) => {
+                Ok(joined.map_err(|e| ToolFailure::internal("Dispatch task failed", e))??)
+            }
+            Err(_) => Err(ToolFailure::new(
+                FailureCode::ReconciliationRequired,
+                format!(
+                    "The call ran past the server's limit of {} s with its submission \
+                     under way. The submission runs on to its outcome; read it from \
+                     the order state or the trade journal, and never resubmit",
+                    self.call_timeout.as_secs()
+                ),
+            )
+            .with_intent(digest)
+            .with_attempt(attempt)
+            .into()),
+        }
     }
 
     /// Run tool `name` on the inner server, its argument-extraction failures
@@ -759,8 +855,9 @@ impl AuthorizedServer {
     /// by [`CLIENT_APPROVER_PREFIX`] and the principal's name, for
     /// [`CLIENT_APPROVAL_SECS`]. `Ok(false)`: the client cannot be asked
     /// (no client channel, no elicitation capability), so the operator path
-    /// applies. A decline, a dismissal, or no answer within
-    /// [`MAX_APPROVAL_WAIT_MS`] refuses the order.
+    /// applies. A decline, a dismissal, no answer within
+    /// [`MAX_APPROVAL_WAIT_MS`], or the call being called off while the
+    /// question is open refuses the order.
     ///
     /// On the stateless revision the question suspends the call
     /// ([`Refusal::Protocol`]) and the client calls again with the answer,
@@ -791,14 +888,22 @@ impl AuthorizedServer {
             }},
             "required": ["approve"],
         });
-        let asked = tokio::time::timeout(
-            Duration::from_millis(MAX_APPROVAL_WAIT_MS),
-            ctx.client.elicit(
-                &format!("client-approval:{digest}"),
-                neutral::ElicitParams::new(message, schema),
-            ),
-        )
-        .await;
+        let started = tokio::time::Instant::now();
+        let key = format!("client-approval:{digest}");
+        let question = ctx
+            .client
+            .elicit(&key, neutral::ElicitParams::new(message, schema));
+        let asked = tokio::select! {
+            biased;
+            () = ctx.base.cancellation.cancelled() => {
+                self.note_hold_ended(name, digest, HoldEnd::Cancelled, waited_ms(started))
+                    .await;
+                return Err(called_off(digest).into());
+            }
+            asked = tokio::time::timeout(Duration::from_millis(MAX_APPROVAL_WAIT_MS), question) => {
+                asked
+            }
+        };
         let unanswered = || {
             ToolFailure::new(
                 FailureCode::ApprovalRequired,
@@ -808,7 +913,11 @@ impl AuthorizedServer {
             .with_intent(digest)
         };
         let answer = match asked {
-            Err(_) | Ok(Err(McpError::Timeout(_))) => return Err(unanswered().into()),
+            Err(_) | Ok(Err(McpError::Timeout(_))) => {
+                self.note_hold_ended(name, digest, HoldEnd::WindowElapsed, waited_ms(started))
+                    .await;
+                return Err(unanswered().into());
+            }
             Ok(Err(McpError::InputRequired)) => {
                 return Err(Refusal::Protocol(McpError::InputRequired));
             }
@@ -846,8 +955,13 @@ impl AuthorizedServer {
         Ok(true)
     }
 
-    /// Hold, bounded, for the operator's approval of `digest`, then answer
-    /// with the policy as it stands and how long the hold took.
+    /// Hold for the operator's approval of `digest` and answer with the
+    /// policy that has it. The hold ends on whichever comes first: the
+    /// approval, the call being called off (its cancellation token, which
+    /// turbomcp fires when the client cancels the request, when its session
+    /// is closed or expires, and when its connection goes), or the end of
+    /// the window `wait`. The last two refuse the order, each saying which,
+    /// and leave a [`HOLD_ENDED_EVENT`] in the audit journal.
     ///
     /// The approval is still the operator's: this polls the same durable
     /// store [`effective_policy`](Self::effective_policy) reads, written by
@@ -856,21 +970,79 @@ impl AuthorizedServer {
     /// its own intent by waiting for it. The caller has judged that the
     /// approval is the only thing missing; a denial that appears while
     /// waiting is caught when the caller judges again.
+    ///
+    /// A client that asked for progress is told each second that the call
+    /// is still waiting, which lets it keep its own request timeout from
+    /// running out on a hold it asked for.
     async fn await_approval(
         &self,
         name: &str,
         digest: &str,
         wait: Duration,
-    ) -> Result<(PrincipalPolicy, u64), ToolFailure> {
-        let started = Instant::now();
-        loop {
-            let remaining = wait.saturating_sub(started.elapsed());
-            let effective = self.effective_policy(name, digest).await?;
-            if remaining.is_zero() || effective.approved_intents.contains(digest) {
-                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                return Ok((effective, ms));
+        ctx: &CallToolContext,
+    ) -> Result<PrincipalPolicy, ToolFailure> {
+        let started = tokio::time::Instant::now();
+        let approved = async {
+            loop {
+                let effective = self.effective_policy(name, digest).await?;
+                if effective.approved_intents.contains(digest) {
+                    return Ok::<_, ToolFailure>(effective);
+                }
+                tokio::time::sleep(APPROVAL_POLL).await;
+                ctx.progress
+                    .report(
+                        started.elapsed().as_secs_f64(),
+                        Some(wait.as_secs_f64()),
+                        Some("Waiting for an operator to approve this order"),
+                    )
+                    .await;
             }
-            tokio::time::sleep(remaining.min(APPROVAL_POLL)).await;
+        };
+        let end = tokio::select! {
+            biased;
+            () = ctx.base.cancellation.cancelled() => HoldEnd::Cancelled,
+            effective = approved => return effective,
+            () = tokio::time::sleep(wait) => HoldEnd::WindowElapsed,
+        };
+        if end == HoldEnd::WindowElapsed {
+            // An approval that landed in the window's last moment counts.
+            let effective = self.effective_policy(name, digest).await?;
+            if effective.approved_intents.contains(digest) {
+                return Ok(effective);
+            }
+        }
+        self.note_hold_ended(name, digest, end, waited_ms(started))
+            .await;
+        Err(match end {
+            HoldEnd::Cancelled => called_off(digest),
+            HoldEnd::WindowElapsed => ToolFailure::new(
+                FailureCode::ApprovalRequired,
+                format!(
+                    "No approval of intent {digest} arrived in the {} ms this call held \
+                     for it, so nothing was submitted. An approval given later is not \
+                     applied to this call; submit the order again to use it",
+                    wait.as_millis()
+                ),
+            )
+            .with_intent(digest),
+        })
+    }
+
+    /// Leave the [`HOLD_ENDED_EVENT`] for a submission that waited `waited`
+    /// ms for approval of `digest` and was not placed.
+    async fn note_hold_ended(&self, name: &str, digest: &str, end: HoldEnd, waited: u64) {
+        let payload = serde_json::json!({
+            "tool": name,
+            "intentDigest": digest,
+            "reason": end.reason(),
+            "waitedMs": waited,
+        });
+        if let Err(e) = self
+            .audit
+            .record_event(HOLD_ENDED_EVENT, &self.principal.name, payload)
+            .await
+        {
+            tracing::warn!(error = %e, tool = name, "a hold's end was not audited");
         }
     }
 
@@ -970,19 +1142,24 @@ mod tests {
 
         // An unapproved intent is still denied when the hold runs out, and
         // the hold is what was asked for, not what the operator takes.
-        let (unapproved, ms) = server
-            .await_approval("place_order", &digest, Duration::from_millis(0))
+        let started = Instant::now();
+        let unapproved = server
+            .await_approval("place_order", &digest, Duration::from_millis(0), &ctx)
             .await
-            .unwrap();
-        assert!(!unapproved.approved_intents.contains(&digest));
-        assert!(ms < 1_000, "{ms}");
+            .unwrap_err();
+        assert_eq!(unapproved.code, FailureCode::ApprovalRequired);
+        assert_eq!(unapproved.intent_digest.as_deref(), Some(digest.as_str()));
+        assert!(started.elapsed() < Duration::from_secs(1));
 
         // A denial only the caller can fix never holds, however long it asked.
         let mut oversized = args.clone();
         oversized["order"]["orderLegCollection"][0]["quantity"] = "3".into();
         oversized["wait_ms"] = MAX_APPROVAL_WAIT_MS.into();
         let started = Instant::now();
-        let Err(Refusal::Failure(denied)) = server.dispatch("place_order", oversized, &ctx).await
+        let deadline = tokio::time::Instant::now() + DEFAULT_CALL_TIMEOUT;
+        let Err(Refusal::Failure(denied)) = server
+            .dispatch("place_order", oversized, &ctx, deadline)
+            .await
         else {
             panic!("a risk denial is a failure the model reads");
         };
@@ -1007,8 +1184,8 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (approved, _) = server
-            .await_approval("place_order", &digest, Duration::from_secs(10))
+        let approved = server
+            .await_approval("place_order", &digest, Duration::from_secs(10), &ctx)
             .await
             .unwrap();
         assert!(approved.approved_intents.contains(&digest));

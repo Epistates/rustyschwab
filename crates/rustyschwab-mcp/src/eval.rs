@@ -459,7 +459,6 @@ impl Recording {
     /// Serve the recorded principal over stdio until the client disconnects.
     pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
         let dispatcher = ServerBuilder::new(self)
-            .with_cancellation(crate::authorized::CANCELLATION)
             .with_tools()
             .with_resources()
             .with_prompts()
