@@ -50,7 +50,7 @@ The public Rust API follows Cargo's 0.x convention: a minor version can break; p
 
 The Python package follows the same rule for its core modules.
 
-The minimum supported Rust version is 1.89.0, checked in CI. Raising it requires a release note. Python 3.10 or newer is supported. Linux, macOS and Windows are CI targets; a platform claim requires a successful native run.
+The minimum supported Rust version is 1.95.0, checked in CI. Raising it requires a release note. Python 3.10 or newer is supported. Linux, macOS and Windows are CI targets; a platform claim requires a successful native run.
 
 The 0.2 migration changes outbound order types, numeric precision, durable storage and network authorization. Follow [Operations](OPERATIONS.md): stop old writers, back up state and verify restoration before rollout. Rolling back to a JSON-only writer against migrated state is unsupported. Patch and schema upgrades must preserve pending intent, approval consumption, tag tombstones and audit ordering.
 

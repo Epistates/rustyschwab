@@ -14,7 +14,7 @@ problems privately rather than in a public issue.
 
 ## Development setup
 
-Rust 1.89 or newer (edition 2024; the MSRV). `rust-toolchain.toml` pins the
+Rust 1.95 or newer (edition 2024; the MSRV). `rust-toolchain.toml` pins the
 toolchain CI and releases build with, and rustup installs it on first use.
 SQLite is bundled. Fuzzing needs a nightly toolchain and `cargo-fuzz`.
 

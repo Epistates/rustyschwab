@@ -89,6 +89,16 @@ and 4.0.0-beta.1) lists the rest.
   `Network::serve_websocket`, `AuthorizedServer::run_stdio` and
   `eval::Recording::run_stdio` keep their signatures.
 
+### Changed — Rust 1.95 is the minimum
+
+- **Breaking (build):** the minimum supported Rust version is 1.95, from
+  1.89, for the five crates and for building the Python bindings from
+  source. parking_lot 0.13, which the SDK and the MCP server lock with,
+  requires it, and no dependency in the lockfile declares more. Migration:
+  build with Rust 1.95 or newer. The published wheels are unaffected, and
+  `rust-toolchain.toml` pins the toolchain this repository builds with (now
+  1.100.0). CI's minimum-version row builds and tests on 1.95.0.
+
 ### Fixed
 
 - Performance ratios on a sparse equity curve were annualized as if each
@@ -249,8 +259,12 @@ and 4.0.0-beta.1) lists the rest.
   1.29.3, rustls-webpki 0.103.17 and others), and the pinned GitHub Actions:
   setup-python 7.1.0, codeql-action 4.39.3, install-action 2.90.5, trufflehog
   3.99.9, cargo-deny-action 2.1.2 (cargo-deny 0.21), crates-io-auth-action
-  1.0.6. parking_lot stays at 0.12: 0.13 needs Rust 1.95 and the MSRV is 1.89,
-  so Dependabot is told to skip it until the MSRV moves.
+  1.0.6.
+- parking_lot 0.13 in the SDK and the MCP server, from 0.12. It needs Rust
+  1.95, so the minimum moves with it (see "Rust 1.95 is the minimum" above).
+  The crates use its `Mutex` and `RwLock` with plain `lock`, `read` and
+  `write`, which are unchanged. tokio and the other dependencies that lock
+  with parking_lot are still on 0.12, so both are in the tree.
 - The toolchain CI and releases build with (`rust-toolchain.toml`) is Rust
   1.100.0, from 1.98.1. Its Cargo warns about two manifest fields, which are
   removed: `homepage`, which repeated `repository` in every crate, and a
@@ -300,7 +314,7 @@ and 4.0.0-beta.1) lists the rest.
   0.13.5, axum 0.8.9, chrono 0.4.39, thiserror 2.0.21, anyhow 1.0.60,
   tracing 0.1.44, tracing-subscriber 0.3.22, metrics 0.24.3, schemars 1.2.3,
   tower 0.5.3, governor 0.10.4, rustix 1.1.4, futures-util 0.3.34,
-  async-trait 0.1.92, parking_lot 0.12.3, rand 0.10.2, base64 0.23.1, uuid
+  async-trait 0.1.92, parking_lot 0.13.0, rand 0.10.2, base64 0.23.1, uuid
   1.26, zeroize 1.9, secrecy 0.10.3 and windows-sys 0.61.2. All are at or
   below the versions in `Cargo.lock`, so a build from the lockfile is
   unchanged.
