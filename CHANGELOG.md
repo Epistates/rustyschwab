@@ -251,6 +251,10 @@ and 4.0.0-beta.1) lists the rest.
   3.99.9, cargo-deny-action 2.1.2 (cargo-deny 0.21), crates-io-auth-action
   1.0.6. parking_lot stays at 0.12: 0.13 needs Rust 1.95 and the MSRV is 1.89,
   so Dependabot is told to skip it until the MSRV moves.
+- The toolchain CI and releases build with (`rust-toolchain.toml`) is Rust
+  1.100.0, from 1.98.1. Its Cargo warns about two manifest fields, which are
+  removed: `homepage`, which repeated `repository` in every crate, and a
+  `readme` in `[workspace.package]` that no crate inherited.
 - rusqlite 0.43 (bundled SQLite 3.54.1), which fixes use-after-free bugs in
   APIs the SDK does not call and now refuses empty SQL, which it never sends.
 - jsonwebtoken 12 in `rustyschwab-mcp`. The OAuth identity check now rejects

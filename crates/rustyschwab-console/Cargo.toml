@@ -6,7 +6,6 @@ rust-version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-homepage = { workspace = true }
 readme = "README.md"
 description = "Unofficial operator console core for rustyschwab-mcp agents: a live snapshot of what they do and commands to approve, delegate, halt and kill, for any user interface"
 keywords = ["schwab", "trading", "mcp", "dashboard", "agents"]

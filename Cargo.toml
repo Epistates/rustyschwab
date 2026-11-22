@@ -20,9 +20,7 @@ rust-version = "1.89"
 authors = ["Nick Paterno"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/rustyschwab"
-homepage = "https://github.com/epistates/rustyschwab"
 documentation = "https://docs.rs/rustyschwab"
-readme = "README.md"
 keywords = ["schwab", "trading", "api", "finance", "market-data"]
 categories = ["api-bindings", "finance"]
 
