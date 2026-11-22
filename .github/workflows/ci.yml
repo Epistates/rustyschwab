@@ -27,9 +27,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
-        with:
-          tool: actionlint
+      # install-action has no manifest for actionlint and it is not a crate,
+      # so the cargo-binstall fallback cannot find it. The release archive
+      # is checked against the digest GitHub publishes for it; Dependabot
+      # does not see this pin, so raise the two values together by hand.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location --retry 3 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  ${archive}" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
       # Also runs shellcheck (preinstalled on the runner) on every `run:`.
       - run: actionlint
 
@@ -114,8 +128,11 @@ jobs:
       - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-hack
-      # Every feature on its own, not only the combinations above.
-      - run: cargo hack check -p rustyschwab -p rustyschwab-types --each-feature --no-dev-deps --locked
+      # Every feature on its own, not only the combinations above. No
+      # `--no-dev-deps`: it rewrites the manifests, which `--locked` then
+      # refuses, and with resolver 2 a library check never takes features
+      # from dev-dependencies anyway.
+      - run: cargo hack check -p rustyschwab -p rustyschwab-types --each-feature --locked
       # Choosing native-tls must actually drop rustls from the SDK.
       - name: native-tls build carries no rustls
         run: |
@@ -168,11 +185,13 @@ jobs:
         with:
           tool: cargo-fuzz
       # Short runs on every change; the scheduled workflow runs them long.
+      # The target is named because the prebuilt cargo-fuzz is a musl binary
+      # and builds for its own triple by default, which has no sanitizers.
       - name: Run each target briefly
         working-directory: fuzz
         run: |
           for target in $(cargo +nightly fuzz list); do
-            cargo +nightly fuzz run "$target" -- -max_total_time=30
+            cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$target" -- -max_total_time=30
           done
 
   package:
@@ -270,9 +289,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # cargo-semver-checks resolves dependencies without Cargo.lock. The
+      # three crates that depend on turbomcp do not build that way while it
+      # is pinned to 4.0.0-alpha.5: its transports ask for the other turbomcp
+      # crates with caret requirements, which now select 4.0.0-alpha.6, and
+      # the two do not compile together. Check them again (drop `exclude`)
+      # when the turbomcp pin moves.
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           baseline-rev: ${{ github.event.pull_request.base.sha }}
+          exclude: rustyschwab-mcp,rustyschwab-console,rustyschwab-dash
 
   soak:
     runs-on: ubuntu-latest
