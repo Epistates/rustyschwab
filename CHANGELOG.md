@@ -212,6 +212,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `test (windows-latest)` job failed to build: a helper used only by the
   Unix file checks was compiled, unused, on Windows, where warnings are
   errors in CI.
+- `workflow lint` and the two fuzz jobs never ran their tools. install-action
+  has no manifest for actionlint, so it is now downloaded from its release
+  and checked against the published digest; the prebuilt cargo-fuzz is a
+  musl binary that builds for musl unless told otherwise, so the fuzz jobs
+  name `x86_64-unknown-linux-gnu`.
+- `SDK feature combinations` passed `--no-dev-deps` with `--locked`: the
+  first rewrites the manifests and the second then refuses the lockfile.
+  `--no-dev-deps` is dropped, since with resolver 2 a library check does
+  not take features from dev-dependencies.
+- `compatibility` (cargo-semver-checks) skips `rustyschwab-mcp`,
+  `rustyschwab-console` and `rustyschwab-dash` for now. It resolves
+  dependencies without the lockfile, and turbomcp 4.0.0-alpha.5 does not
+  build that way since 4.0.0-alpha.6 of some of its crates was published.
 
 ### Removed
 
