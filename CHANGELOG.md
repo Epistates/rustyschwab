@@ -200,6 +200,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   These are notices, not vulnerabilities. `deny.toml` accepts them, with the
   reason, because chrono types are part of these crates' public API and
   replacing them is a breaking change.
+- url 2.5.9, which fixes RUSTSEC-2026-0592: `Url::origin()` overflowed the
+  stack on a URL with deeply nested `blob:` prefixes. The SDK calls it on the
+  configured base URL and on the request URLs it builds. With it, every
+  compatible update in the three lockfiles (keyring-core 1.1.0, serde_with
+  3.25.0, clap 4.6.9 and others) and install-action 2.90.6. The turbomcp
+  crates stay at 4.0.0-alpha.5.
 
 ### Fixed — CI
 
