@@ -6,7 +6,6 @@ rust-version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-homepage = { workspace = true }
 readme = "README.md"
 description = "Unofficial MCP server exposing the Charles Schwab Trader and Market Data APIs to LLM agents, behind per-principal policy and approvals"
 
