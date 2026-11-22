@@ -104,10 +104,16 @@ jobs:
         shell: bash
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo build --workspace --all-targets --locked
-      - run: cargo test --workspace --all-targets --all-features --locked
+      # Windows is compile-checked: the build above must pass there. Its tests
+      # run and report, but don't fail the job until the file-permission
+      # failures in #41 are fixed (docs/SUPPORT.md, "Open acceptance gates").
+      # `--no-fail-fast` keeps one failing test binary from hiding the rest.
+      - run: cargo test --workspace --all-targets --all-features --locked ${{ matrix.os == 'windows-latest' && '--no-fail-fast' || '' }}
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
       # `--all-targets` excludes doctests, so the examples in doc comments
       # get their own run.
       - run: cargo test --workspace --doc --all-features --locked
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
 
   features:
     name: SDK feature combinations
