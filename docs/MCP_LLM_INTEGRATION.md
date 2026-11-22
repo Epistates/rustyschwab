@@ -193,7 +193,7 @@ A failure is a tool result with `isError: true` whose text and
 | `approval_required` | `ask_operator` | false | Valid intent awaiting operator approval of `intentDigest`; `wait_ms` holds the submission for it ([pre-flight](#pre-flight)) |
 | `halted`, `internal` | `ask_operator` | false | Operator or daily-loss halt (`get_server_status` carries the reason), or a fault logged under the reference id in `message` |
 | `duplicate_intent`, `reconciliation_required` | `reconcile` | false | Read the order state first; never resubmit. `attemptId` names the uncertain submission |
-| `unavailable`, `rate_limited`, `timeout` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay. Includes submissions refused while the server drains |
+| `unavailable`, `rate_limited`, `timeout`, `cancelled` | `retry_later` | true | Nothing reached the broker; repeat the same call after a delay. Includes submissions refused while the server drains, a call that ran past the server's call limit before sending anything (`timeout`), and a submission called off before it was sent (`cancelled`) |
 
 An unauthenticated Schwab session is `unavailable` with `ask_operator`, since
 only the operator can re-run OAuth. Policy denials from the principal wrapper
@@ -388,11 +388,50 @@ clients default to) polls the durable approval store and submits
 the moment an operator grants that digest. It holds for nothing else, so a
 `risk_denied` or an argument the model must fix comes back at once, and
 the hold happens before anything is audited or dispatched: a call that ends
-unapproved, or a client that gives up, leaves no record and no order. The
-approval is still the operator's, granted through `rustyschwab-admin` or the
-authority against a verified operator subject; no tool the model holds
-approves anything, and waiting is not approving. A submission that waited
-records `approvalWaitedMs` in the audit journal.
+unapproved, or a client that gives up, leaves no submission record and no
+order. The approval is still the operator's, granted through
+`rustyschwab-admin` or the authority against a verified operator subject; no
+tool the model holds approves anything, and waiting is not approving. A
+submission that waited records `approvalWaitedMs` in the audit journal.
+
+#### What ends a held order
+
+A held order is bounded by this server, not by the connection it arrived
+on. The hold ends on whichever comes first:
+
+- **The approval.** The order is submitted at once.
+- **The end of its window.** The window is the call's `wait_ms`: none
+  unless the call asks, and never more than 45 s. The call is refused
+  `approval_required`, with the window in its message.
+- **The call being called off.** The client cancelled the request
+  (`notifications/cancelled`, or on `2026-07-28` Streamable HTTP by closing
+  the response stream), its session ended (the client deleted it, or it
+  expired), or the connection that is its session closed (stdio and
+  WebSocket, two seconds after the client's end closes). The call is
+  refused `cancelled`.
+
+Either refusal leaves an `approval_hold_ended` event in the principal's
+audit journal, `{tool, intentDigest, reason, waitedMs}` with `reason`
+`window_elapsed` or `cancelled`. An approval that arrives after a hold has
+ended places nothing. It stays valid until it expires, and the next
+`place_order` of the same intent, which the client has to send, uses it.
+The same holds for the client-approval question: no answer in 45 s, or the
+call called off while the question is open, refuses the order.
+
+The protocol defines the forms and this server uses them as they are: MCP
+cancellation calls a held order off, a client that sends a `progressToken`
+gets `notifications/progress` once a second while the order waits (so it
+can keep its own request timeout from running out), and the client-approval
+question is a form elicitation, sent the way each revision sends one. The
+protocol does not say how long an approval may take, that a held order ends
+with its session, or what a trading server does with a late approval.
+Those three are this server's policy.
+
+On a `2025-06-18` or `2025-11-25` Streamable HTTP session a dropped
+connection does not end a held order: those revisions say a disconnect is
+not a cancellation, and the client can come back and resume the response
+stream. The window, the session's end and an explicit cancellation are what
+bound it there.
 
 A principal whose operator set `client_approval` is asked differently: the
 server sends the client an MCP form elicitation describing the order in
@@ -825,29 +864,42 @@ header.
   before the question is safe to repeat, and an approval the answer already
   recorded is honored.
 - **Tool schemas keep `$defs` and `$ref`** rather than inlining them.
-- **A cancelled call is dropped where it waits.** The server sets
-  turbomcp's `Cancellation::Abort`: a submission holding for its approval
-  that the client cancels places nothing, even if the approval then lands,
-  and one past its audit record runs to its outcome on its own task.
+- **Cancellation is turbomcp's, read by the server.** turbomcp tells a
+  call it was called off through its cancellation token and lets it finish
+  its own way. A held order watches the token (see
+  [What ends a held order](#what-ends-a-held-order)), and every write reads
+  it once more just before its audit record: before the record nothing has
+  been sent and the call is refused `cancelled`; after it the write runs to
+  its outcome on its own task.
 - **Byte-pipe transports** (stdio, WebSocket) are served through turbomcp's
   runtime, which gives `2025-11-25` clients their session per connection.
-  After a stdio client closes its end, calls in flight have thirty seconds
-  to finish.
+  Two seconds after a client closes its end, the calls it left in flight
+  are told they were called off; a write past its audit record is still
+  waited for, for up to thirty seconds.
 - **WebSocket is a route on turbomcp's HTTP endpoint.** The upgrade is
   accepted at `/` (the bare `ws://host:port` address). The credential is
   checked before the upgrade, so a bad one is answered `401` with its
   `WWW-Authenticate` challenge, and the connection is closed with `1008`
   when the credential expires. At most 1,024 connections are held, each
-  with 32 calls in flight. The same listener answers Streamable HTTP at
-  `/mcp`, behind the same credential check.
+  with 32 calls in flight (a call past that waits for a slot). The same
+  listener answers Streamable HTTP at `/mcp`, behind the same credential
+  check.
 - **A slow HTTP call answers as an event stream.** A call still running
   after five seconds gets `text/event-stream`, kept open by keep-alive
   comments until its result arrives as the last event; a client must accept
   both media types, as the transport requires. On a `2025-06-18` or
   `2025-11-25` session a dropped connection does not cancel the call
   (`notifications/cancelled` does); on `2026-07-28` it does.
-- **No per-call deadline** on any transport: writes run to their outcome on
-  their own task regardless, and Schwab reads have the SDK's request
-  timeouts.
+- **Every call has a maximum duration**, on every transport: two minutes
+  unless `SCHWAB_MCP_CALL_TIMEOUT_SECS` sets another (more than 45, the
+  longest approval hold). MCP asks a request's sender to time its requests
+  out and to keep a maximum whatever progress arrives; this is the server's
+  own maximum for the calls it answers, and progress does not extend it. A
+  call that reaches it before its audit record has sent nothing and is
+  answered `timeout`. A write past its audit record is answered
+  `reconciliation_required` with its `attemptId` and runs on to its
+  outcome on its own task, where the journal records it: read the order
+  state or `get_trade_journal`, never resubmit. The read-only stdio server
+  that runs without a policy file answers a JSON-RPC timeout error instead.
 
 Moving to a stable 4.x when it ships is a version bump plus this suite.

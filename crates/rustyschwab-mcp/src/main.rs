@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(feature = "otel"))]
 use tracing_subscriber::EnvFilter;
+use turbomcp::prelude::stdio;
 
 /// Env var that opts a network transport into binding beyond loopback.
 const ALLOW_REMOTE_ENV: &str = "SCHWAB_MCP_ALLOW_REMOTE";
@@ -226,12 +227,19 @@ async fn main() -> anyhow::Result<()> {
         None
     };
     let transport = std::env::var("SCHWAB_MCP_TRANSPORT").unwrap_or_else(|_| "stdio".into());
+    let call_timeout = rustyschwab_mcp::policy::call_timeout()?;
     let policies: Vec<rustyschwab_mcp::policy::PrincipalPolicy> =
         match std::env::var("SCHWAB_MCP_POLICY_FILE") {
             Ok(path) => serde_json::from_slice(&rustyschwab_mcp::read_config(path)?)?,
             Err(_) if transport == "stdio" && switches == Switches::default() => {
-                let inner = SchwabMcp::new(backend, switches);
-                inner.run_stdio().await?;
+                // What the macro's `run_stdio` does, with the call limit:
+                // this server only reads, so turbomcp's own limit (a
+                // JSON-RPC timeout error) is all a call past it needs.
+                SchwabMcp::new(backend, switches)
+                    .into_server()
+                    .with_call_timeout(call_timeout)
+                    .serve(stdio())
+                    .await?;
                 return Ok(());
             }
             Err(_) => anyhow::bail!("Network access and trading require SCHWAB_MCP_POLICY_FILE"),
@@ -256,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
             )
             .with_approval_notifier(notifier.clone())
             .with_liveness(liveness.clone())
+            .with_call_timeout(call_timeout)
         })
         .collect();
     if transport == "stdio" {

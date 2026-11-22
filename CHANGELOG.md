@@ -26,55 +26,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed — the MCP server runs on TurboMCP 4.0.0-beta.1
 
 `rustyschwab-mcp` moves from TurboMCP `4.0.0-alpha.5` to `4.0.0-beta.1`, the
-release that freezes TurboMCP's API for 4.0. The tools, their schemas and
-results, the policy, the approvals and the audit journal are unchanged. What
-a client can notice is in the transports; TurboMCP's CHANGELOG (4.0.0-alpha.6
-and 4.0.0-beta.1) lists the rest.
+release that freezes TurboMCP's API for 4.0, and takes its behavior as it
+is. The tools, their schemas and results, the policy, the approvals and the
+audit journal are unchanged. Each change a client can notice has a line
+here or in the next section; TurboMCP's CHANGELOG (4.0.0-alpha.6 and
+4.0.0-beta.1) lists the rest.
 
-- **Breaking (WebSocket clients):** WebSocket is now a route on TurboMCP's
-  HTTP endpoint.
-  - The upgrade is accepted at `/` only, the bare `ws://host:port` address.
-    It was accepted at any path.
-  - A missing or bad credential is answered `401` with a `WWW-Authenticate`
-    challenge before the upgrade. It was a `101` followed by close code
-    `1008`.
-  - A connection is closed with `1008` when its credential expires. Until
-    now only its next request was refused.
-  - At most 1,024 connections are held (`503` past that); there was no cap.
-    A connection still runs 32 calls at a time. Further calls now wait in
-    the server for a slot, where they used to wait unread in the socket.
-  - A client that disconnects abandons the calls it left in flight after
-    two seconds, not thirty. A write past its audit record still runs to
-    its outcome.
-  - With `SCHWAB_MCP_TRANSPORT=websocket` the listener also answers
-    Streamable HTTP at `/mcp`, behind the same credential check.
-- **Behavior change (Streamable HTTP):**
-  - A call still running after five seconds answers as `text/event-stream`,
-    kept open by keep-alive comments until its result arrives as the last
-    event. A submission holding for its approval is the usual case. Such a
-    call was answered as JSON when it finished, or cut off with `504` at two
-    minutes; now neither a proxy's idle timeout nor that deadline ends it.
-    A client must accept both media types, as the transport already required.
-  - On a `2025-06-18` or `2025-11-25` session, a dropped connection no
-    longer cancels the call it carried, as those revisions ask: a
-    submission holding for its approval keeps holding for its `wait_ms`
-    and is placed if the approval lands. `notifications/cancelled` still
-    drops it. On `2026-07-28` a disconnect cancels, as before.
-  - Response streams on a session are resumable with `Last-Event-ID`; their
-    events are kept in memory, 64 MiB at most. A principal may hold 1,024
-    sessions (`429` past that) and 64 open streams.
-  - Refusals carry a JSON-RPC error body, and a request with neither a
-    session nor the `2026-07-28` envelope is `400`. It was `200` with the
-    error in its body.
+- **Breaking (WebSocket):** the upgrade is accepted at `/` only, the bare
+  `ws://host:port` address. It was accepted at any path.
+- **Breaking (WebSocket):** a missing or bad credential is answered `401`
+  with a `WWW-Authenticate` challenge before the upgrade. It was a `101`
+  followed by close code `1008`.
+- **Behavior change (WebSocket):** with `SCHWAB_MCP_TRANSPORT=websocket`
+  the listener also answers Streamable HTTP at `/mcp`, behind the same
+  credential check. WebSocket is now a route on TurboMCP's HTTP endpoint.
+- **Behavior change (WebSocket):** a connection is closed with `1008` when
+  its credential expires. Until now only its next request was refused.
+- **Behavior change (WebSocket):** at most 1,024 connections are held
+  (`503` past that); there was no cap. A connection still runs 32 calls at a
+  time. Further calls now wait in the server for a slot, where they used to
+  wait unread in the socket.
+- **Behavior change (Streamable HTTP):** a call still running after five
+  seconds answers as `text/event-stream`, kept open by keep-alive comments
+  until its result arrives as the last event. A submission holding for its
+  approval is the usual case. Such a call was answered as JSON when it
+  finished. A client must accept both media types, as the transport already
+  required.
+- **Behavior change (Streamable HTTP):** a request with neither a session
+  nor the `2026-07-28` envelope is `400`. It was `200` with the error in its
+  body. Other refusals now carry a JSON-RPC error body too.
+- **Behavior change (Streamable HTTP):** on a `2025-06-18` or `2025-11-25`
+  session, a dropped connection no longer cancels the call it carried, as
+  those revisions ask, and the client can resume the response stream with
+  `Last-Event-ID` (events are kept in memory, 64 MiB at most). On
+  `2026-07-28` a disconnect cancels, as before. A principal may hold 1,024
+  sessions (`429` past that) and 64 open streams.
+- **Behavior change (stdio, WebSocket):** two seconds after a client closes
+  its end, the calls it left in flight are told they were called off. They
+  had thirty seconds. A write past its audit record is still waited for, for
+  up to thirty seconds, and runs to its outcome either way.
 - **Behavior change (every transport):** calling a tool the server does not
   have is JSON-RPC `-32602`, as every revision lists an unknown tool. It was
   `-32601`.
-- Kept as it was, against TurboMCP's new defaults:
-  - A call its client cancels is dropped where it waits
-    (`Cancellation::Abort`). TurboMCP now lets a cancelled handler run on by
-    default, which would place a held order after its client called it off.
-  - After a stdio client closes its end, calls in flight have thirty seconds
-    to finish (TurboMCP's default is now two).
 - The client-approval question is the same form. TurboMCP 4.0.0-beta.1
   clients refuse a form elicitation without a valid `requestedSchema`
   (`-32602`); the server's is checked against the form subset of every
@@ -88,6 +81,51 @@ and 4.0.0-beta.1) lists the rest.
 - Rust API: `network::WEBSOCKET_PATH` is new. `Network::http_router`,
   `Network::serve_websocket`, `AuthorizedServer::run_stdio` and
   `eval::Recording::run_stdio` keep their signatures.
+
+### Changed — held orders and call time limits are the server's own policy
+
+MCP says how a call is cancelled, how progress is reported and that a
+request's sender should time its requests out. It does not say how long an
+approval may take, what a held order does when its session ends, or what a
+late approval does. The server now decides those itself, the same way on
+every transport and revision (`docs/MCP_LLM_INTEGRATION.md`, "What ends a
+held order").
+
+- **Behavior change:** a held order (`place_order` or `replace_order` with
+  `wait_ms`, or the client-approval question) ends when the call is called
+  off: the client cancels the request, its session is deleted or expires,
+  or the connection that is its session closes. The call is refused with
+  the new failure code `cancelled` (`retry_later`, nothing was sent). It
+  used to be dropped without a trace.
+- **Behavior change:** a held order that runs out its window (`wait_ms`, at
+  most 45 s, none unless asked for) is still refused `approval_required`,
+  and the message now gives the window and says a later approval is not
+  applied to that call.
+- **Behavior change:** either ending leaves an `approval_hold_ended` event
+  in the principal's audit journal, `{tool, intentDigest, reason,
+  waitedMs}` with `reason` `cancelled` or `window_elapsed`. An approval
+  that arrives after a hold has ended places nothing; the next call of the
+  same intent uses it, as before.
+- **Behavior change:** a write (`place_order`, `replace_order`,
+  `cancel_order`) whose call is cancelled before its audit record is
+  refused `cancelled` and sends nothing. Past the record it runs to its
+  outcome, as before.
+- **Added:** a held order sends `notifications/progress` once a second to a
+  client that sent a `progressToken`, so the client can keep its own request
+  timeout from running out on a hold it asked for.
+- **Behavior change:** every call has a maximum duration, two minutes
+  unless `SCHWAB_MCP_CALL_TIMEOUT_SECS` sets another (more than 45). A call
+  that reaches it before its audit record is answered `timeout` and has
+  sent nothing. A write past its audit record is answered
+  `reconciliation_required` with its `attemptId` and still runs to its
+  outcome. Over HTTP a call was cut off with `504` at two minutes; over
+  stdio and WebSocket nothing bounded it. The read-only stdio server that
+  runs without a policy file answers a JSON-RPC timeout error.
+- **Breaking (Rust API):** `contract::FailureCode` has a new variant,
+  `Cancelled`; add an arm where you match it. New:
+  `AuthorizedServer::with_call_timeout` and `call_timeout`,
+  `policy::CALL_TIMEOUT_ENV`, `DEFAULT_CALL_TIMEOUT`, `call_timeout` and
+  `HOLD_ENDED_EVENT`.
 
 ### Changed — Rust 1.95 is the minimum
 
