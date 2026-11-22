@@ -26,9 +26,9 @@
 - [Releasing](RELEASING.md) and the [live smoke](LIVE_SMOKE.md) that precedes a release.
 - [Changelog](../CHANGELOG.md)
 
-## History
+## Qualification evidence
 
-- [Enterprise audit](history/ENTERPRISE_AUDIT.md) (2026-09-09) → [remediation](history/ENTERPRISE_REMEDIATION.md) → [implementation status](history/ENTERPRISE_ROADMAP.md). The open acceptance gates are now tracked in [SUPPORT.md](SUPPORT.md#open-acceptance-gates).
+- The open acceptance gates are tracked in [SUPPORT.md](SUPPORT.md#open-acceptance-gates).
 - `docs/audit/` — probe sources and qualification evidence; git-ignored, produced locally by `tools/` and published as `qualification.yml` artifacts.
 
 ## Quick answers

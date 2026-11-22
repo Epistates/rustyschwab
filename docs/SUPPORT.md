@@ -65,7 +65,7 @@ Code being complete is not deployment acceptance. These remain open:
 - Sustained production-shaped load, recovery objectives and memory stability.
 - A hosted release run with artifact provenance verification.
 
-The history of how the 0.2 candidate got here is in [docs/history](history/).
+The history of how the 0.2 candidate got here is in the [changelog](../CHANGELOG.md).
 
 ## Reporting problems
 

@@ -201,6 +201,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reason, because chrono types are part of these crates' public API and
   replacing them is a breaking change.
 
+### Removed
+
+- `docs/history/`, the archived enterprise audit, remediation report and
+  roadmap. The open acceptance gates are in `docs/SUPPORT.md`.
+
 ## [0.3.0] - 2026-10-24
 
 Upgrading from 0.2.0: the commands are renamed (below);
@@ -1893,7 +1898,7 @@ the SDK validates before every request.
 - Expose stream loss/freshness and gate subscription restoration on acknowledgements.
 - Require network principal authorization, account/tool policy, risk caps and durable execution audit; keep cancellation separately controllable.
 - Add Windows atomic protected file storage, update dependencies and raise the minimum compiler to Rust 1.89.
-- See [migration and validation notes](docs/history/ENTERPRISE_REMEDIATION.md) for breaking API changes and deployment requirements.
+- See [docs/OPERATIONS.md](docs/OPERATIONS.md) for deployment requirements.
 
 ### Changed — error taxonomy (breaking)
 - `rustyschwab::Error`, `AuthError` and `StreamError` are now

@@ -12,7 +12,7 @@ Guidance for coding agents (and a short version of [CONTRIBUTING.md](CONTRIBUTIN
 | `crates/rustyschwab-console` | The operator console core: reads the servers' state into a serializable `Snapshot` and runs operator `Command`s (approve, delegate, halt, kill). No UI code. |
 | `crates/rustyschwab-dash` | The ratatui terminal frontend over the console (`rustyschwab-dash`). Rendering and keys only; anything that reads state or acts belongs in the console. |
 | `crates/schwab-py` | PyO3 bindings, published as `rustyschwab`. **Not a workspace member**: it has its own `Cargo.lock`, and workspace commands do not build it. Python sources are in `python/rustyschwab/`, tests in `tests/`. |
-| `docs/` | User and operator guides; `docs/INDEX.md` lists them. `docs/history/` is archived. `docs/audit/` is git-ignored local evidence. |
+| `docs/` | User and operator guides; `docs/INDEX.md` lists them. `docs/audit/` is git-ignored local evidence. |
 | `examples/`, `fuzz/`, `ops/`, `tools/` | Runnable programs, fuzz targets, paper configs and Prometheus assets, soak and SBOM scripts. |
 
 To find the module for a change, use the "Where to look" table in [docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md#where-to-look).
