@@ -6,7 +6,6 @@ rust-version = "1.89"
 authors = ["Nick Paterno"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/rustyschwab"
-homepage = "https://github.com/epistates/rustyschwab"
 readme = "README.md"
 description = "Python bindings (PyO3 + maturin) for the Schwab SDK, published to PyPI as rustyschwab"
 # Shipped as a wheel on PyPI by publish-python.yml, never to crates.io.

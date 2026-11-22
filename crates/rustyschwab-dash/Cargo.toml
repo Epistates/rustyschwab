@@ -6,7 +6,6 @@ rust-version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-homepage = { workspace = true }
 readme = "README.md"
 description = "Unofficial terminal dashboard for following and supervising agents that trade through rustyschwab-mcp"
 keywords = ["schwab", "trading", "tui", "dashboard", "mcp"]

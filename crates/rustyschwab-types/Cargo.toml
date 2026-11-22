@@ -6,7 +6,6 @@ rust-version = { workspace = true }
 authors = { workspace = true }
 license = { workspace = true }
 repository = { workspace = true }
-homepage = { workspace = true }
 documentation = "https://docs.rs/rustyschwab-types"
 readme = "README.md"
 description = "Unofficial wire types for the Charles Schwab Trader and Market Data APIs"
