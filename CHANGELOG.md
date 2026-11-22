@@ -312,9 +312,11 @@ and 4.0.0-beta.1) lists the rest.
   `--no-dev-deps` is dropped, since with resolver 2 a library check does
   not take features from dev-dependencies.
 - `compatibility` (cargo-semver-checks) skips `rustyschwab-mcp`,
-  `rustyschwab-console` and `rustyschwab-dash` for now. It resolves
-  dependencies without the lockfile, and turbomcp 4.0.0-alpha.5 does not
-  build that way since 4.0.0-alpha.6 of some of its crates was published.
+  `rustyschwab-console` and `rustyschwab-dash` until its baseline has
+  TurboMCP 4.0.0-beta.1. It resolves dependencies without the lockfile, for
+  the baseline too, and a base that pins 4.0.0-alpha.5 does not build that
+  way since later prereleases of some of its crates were published. The
+  weekly minimal-versions job checks the three crates again.
 
 ### Removed
 

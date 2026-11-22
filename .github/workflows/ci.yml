@@ -295,12 +295,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      # cargo-semver-checks resolves dependencies without Cargo.lock. The
-      # three crates that depend on turbomcp do not build that way while it
-      # is pinned to 4.0.0-alpha.5: its transports ask for the other turbomcp
-      # crates with caret requirements, which now select 4.0.0-alpha.6, and
-      # the two do not compile together. Check them again (drop `exclude`)
-      # when the turbomcp pin moves.
+      # cargo-semver-checks resolves dependencies without Cargo.lock, for the
+      # baseline as well. A base that still pins turbomcp 4.0.0-alpha.5 does
+      # not build that way: alpha.5 accepts later prereleases of its sibling
+      # crates, and the mix does not compile. So the three crates that depend
+      # on turbomcp cannot be compared in the pull request that moves the pin
+      # to 4.0.0-beta.1, whose crates require each other exactly. Drop
+      # `exclude` in the first pull request after that one merges.
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           baseline-rev: ${{ github.event.pull_request.base.sha }}
