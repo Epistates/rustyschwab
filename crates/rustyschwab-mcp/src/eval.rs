@@ -459,11 +459,12 @@ impl Recording {
     /// Serve the recorded principal over stdio until the client disconnects.
     pub async fn run_stdio(self) -> Result<(), turbomcp::ProtocolError> {
         let dispatcher = ServerBuilder::new(self)
+            .with_cancellation(crate::authorized::CANCELLATION)
             .with_tools()
             .with_resources()
             .with_prompts()
             .build();
-        turbomcp::serve_stdio(turbomcp::LegacySessionAdapter::new(dispatcher)).await
+        crate::authorized::serve_pipe(dispatcher, stdio()).await
     }
 }
 
@@ -490,7 +491,7 @@ impl WithTools for Recording {
         &self,
         ctx: &ListToolsContext,
         name: String,
-    ) -> McpResult<Option<neutral::Tool>> {
+    ) -> McpResult<Option<Arc<neutral::Tool>>> {
         self.inner.lookup_tool(ctx, name).await
     }
     async fn list_tools(
