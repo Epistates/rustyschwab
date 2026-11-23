@@ -168,16 +168,20 @@ one. Signatures are unchanged.
   place in line: it polls for the lock, waiting longer each time, so a
   writer that commits and asks again at once is nearly always first back,
   and on a slow disk (Windows in particular) one writer's run of commits
-  could keep another out past the five-second timeout. Writes now take
-  turns: in the order they asked within a process, and across processes
-  through `state.write.lock`, a lock file the SDK creates beside
-  `state.sqlite3` on the first write. A waiting writer is woken as soon as
-  the lock is released, and the operating system releases it if its holder
-  crashes. A write whose turn has not come within five seconds still fails
-  with `database is locked` and is not applied. A writer that does not use
-  the lock file (an earlier release, the `sqlite3` shell) is waited for as
-  before. Under contention the longest waits shrink and a write waits for
-  the writers queued ahead of it.
+  could keep another out past the five-second timeout. **Behavior change:**
+  writes now take turns. Within a process they go in the order they asked.
+  Across processes they go through `state.write.lock`, a lock file the SDK
+  creates beside `state.sqlite3` on the first write, and the operating
+  system wakes a waiting writer when the lock is released (it does not
+  promise first come, first served, so across processes the order is best
+  effort) and releases the lock if its holder crashes. A write whose turn
+  has not come within five seconds, or whose caller gave up first, fails
+  with `database is locked: another writer holds the state file`, and the
+  write is dropped, not run later when the lock frees. The wait for the lock
+  runs on a thread of the SDK's own, so dropping a Tokio runtime never waits
+  for it. A writer that does not use the lock file (an earlier release, the
+  `sqlite3` shell) is waited for as before. Under contention the longest
+  waits shrink and a write waits for the writers queued ahead of it.
 - `HistoryStore` failed at once with `database is locked`, without waiting,
   when it marked a span complete for a fetch that returned no candles
   while another process was writing to the same file: its transaction read
