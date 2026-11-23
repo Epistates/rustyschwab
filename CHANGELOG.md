@@ -127,7 +127,9 @@ held order").
   bounded it. The read-only stdio server that runs without a policy file
   answers a JSON-RPC timeout error.
 - **Breaking (Rust API):** `contract::FailureCode` has a new variant,
-  `Cancelled`; add an arm where you match it. New:
+  `Cancelled`, and is now `#[non_exhaustive]`. Migration: add a wildcard
+  arm where you match it; codes added later will then not break your
+  build. New:
   `AuthorizedServer::with_call_timeout` and `call_timeout`,
   `policy::CALL_TIMEOUT_ENV`, `DEFAULT_CALL_TIMEOUT`, `call_timeout` and
   `HOLD_ENDED_EVENT`.
