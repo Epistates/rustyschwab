@@ -150,28 +150,35 @@ impl Coordinator for StateDatabase {
                 params![key, now - 60000],
             )
             .map_err(sql)?;
-            let (count, oldest): (i64, Option<i64>) = tx
-                .query_row(
-                    "SELECT COUNT(*),MIN(at) FROM quota WHERE key=?1",
-                    [&key],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(sql)?;
-            let (short, shortest): (i64, Option<i64>) = tx
-                .query_row(
-                    "SELECT COUNT(*),MIN(at) FROM quota WHERE key=?1 AND at>?2",
-                    params![key, now - 1000],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(sql)?;
-            // A rolling second cap and rolling minute cap count actual attempts.
-            let wait = if count >= i64::from(rps) * 60 {
-                oldest.unwrap_or(now) + 60000 - now
-            } else if short >= i64::from(burst) {
-                shortest.unwrap_or(now) + 1000 - now
-            } else {
-                0
+            // A rolling second cap and a rolling minute cap count actual
+            // attempts. A request may go once each window holds fewer
+            // attempts than its cap, so the wait lasts until enough of the
+            // oldest have left the window. That is usually the oldest alone,
+            // but after the clock steps back a window can hold more than its
+            // cap, all counted from now.
+            let until_below = |window: i64, cap: i64| -> Result<i64> {
+                let since = now - window;
+                let held: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM quota WHERE key=?1 AND at>?2",
+                        params![key, since],
+                        |r| r.get(0),
+                    )
+                    .map_err(sql)?;
+                if held < cap {
+                    return Ok(0);
+                }
+                let leaves: i64 = tx
+                    .query_row(
+                        "SELECT at FROM quota WHERE key=?1 AND at>?2 ORDER BY at LIMIT 1 OFFSET ?3",
+                        params![key, since, held - cap],
+                        |r| r.get(0),
+                    )
+                    .map_err(sql)?;
+                Ok(leaves + window - now)
             };
+            let wait = until_below(60000, i64::from(rps) * 60)?
+                .max(until_below(1000, i64::from(burst))?);
             if wait == 0 {
                 tx.execute("INSERT INTO quota VALUES(?1,?2)", params![key, now])
                     .map_err(sql)?;
