@@ -676,7 +676,9 @@ impl SchwabClient {
         fence: Option<&crate::coordination::Lease>,
         call: impl Fn(String) -> futures_util::future::BoxFuture<'a, Result<T>> + 'a,
     ) -> Result<T> {
+        let diag_t0 = crate::storage::diag::now_us();
         self.ensure_live_state().await?;
+        let diag_live = crate::storage::diag::now_us();
         let start = std::time::Instant::now();
         let timeout = self.inner.config.timeout;
         let submission = op.class == OpClass::Submission;
@@ -718,6 +720,10 @@ impl SchwabClient {
                 .await
                 .map_err(Error::Auth)?;
             let deadline = tokio::time::Instant::now() + timeout;
+            crate::storage::diag::emit(serde_json::json!({
+                "ev": "req_start", "op": op.name, "deadline_ms": timeout.as_millis() as u64,
+                "t0": diag_t0, "t_live": diag_live, "t_deadline": crate::storage::diag::now_us(),
+            }));
             let operation = async {
                 let mut first_token = Some(first_token);
                 let mut refreshed = false;
@@ -732,11 +738,16 @@ impl SchwabClient {
                             .map_err(Error::Auth)?,
                     };
                     let attempt = || async {
+                        let diag_a = crate::storage::diag::now_us();
                         if let Some(budget) = &self.inner.rate_limiter {
                             budget
                                 .admit(self.inner.coordinator.as_ref(), priority)
                                 .await?;
                         }
+                        crate::storage::diag::emit(serde_json::json!({
+                            "ev": "req_admit", "op": op.name, "deadline_ms": timeout.as_millis() as u64,
+                            "t0": diag_a, "t1": crate::storage::diag::now_us(),
+                        }));
                         if submission {
                             self.submission_admission().await?;
                         }
@@ -767,7 +778,14 @@ impl SchwabClient {
                             self.inner.execution.arm(attempt).await?;
                         }
                         sent.store(true, std::sync::atomic::Ordering::Relaxed);
-                        call(token.clone()).await
+                        let diag_c = crate::storage::diag::now_us();
+                        let answer = call(token.clone()).await;
+                        crate::storage::diag::emit(serde_json::json!({
+                            "ev": "req_call", "op": op.name, "deadline_ms": timeout.as_millis() as u64,
+                            "t0": diag_c, "t1": crate::storage::diag::now_us(),
+                            "result": answer.as_ref().err().map(|e| format!("{e:?}")),
+                        }));
+                        answer
                     };
                     let result = if protective {
                         attempt().await
@@ -863,6 +881,11 @@ impl SchwabClient {
             "method" => method_label
         )
         .record(start.elapsed().as_secs_f64());
+        crate::storage::diag::emit(serde_json::json!({
+            "ev": "req_done", "op": op.name, "deadline_ms": timeout.as_millis() as u64,
+            "t0": diag_t0, "t1": crate::storage::diag::now_us(),
+            "result": result.as_ref().err().map(|e| format!("{e:?}")),
+        }));
         result
     }
 

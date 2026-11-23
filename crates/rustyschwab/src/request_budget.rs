@@ -104,10 +104,16 @@ impl RequestBudget {
     /// coordinator shares with every other process on this credential. Both
     /// count the attempt only once it is admitted.
     pub async fn admit(&self, coordinator: &dyn Coordinator, priority: Priority) -> Result<()> {
+        let diag_t0 = crate::storage::diag::now_us();
         self.acquire(priority).await;
+        let diag_t1 = crate::storage::diag::now_us();
         let (rps, burst) = self.configuration;
         loop {
             let wait = coordinator.quota(&self.key, rps, burst).await?;
+            crate::storage::diag::emit(serde_json::json!({
+                "ev": "admit", "t0": diag_t0, "t_acquired": diag_t1,
+                "t_quota": crate::storage::diag::now_us(), "wait_ms": wait.as_millis() as u64,
+            }));
             if wait.is_zero() {
                 return Ok(());
             }

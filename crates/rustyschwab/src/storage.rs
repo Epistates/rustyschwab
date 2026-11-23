@@ -133,16 +133,105 @@ const MIGRATIONS: &[Migration] = &[
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
+/// Temporary contention diagnostics, written as JSON lines to the file named
+/// by `RUSTYSCHWAB_DIAG`.
+#[doc(hidden)]
+pub mod diag {
+    use std::{
+        cell::Cell,
+        io::Write,
+        sync::{
+            OnceLock,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Instant,
+    };
+    static START: OnceLock<Instant> = OnceLock::new();
+    static OUT: OnceLock<Option<parking_lot::Mutex<std::fs::File>>> = OnceLock::new();
+    static IDS: AtomicU64 = AtomicU64::new(1);
+    thread_local! {
+        pub static POLLS: Cell<u32> = const { Cell::new(0) };
+        pub static SLEPT_US: Cell<u64> = const { Cell::new(0) };
+        pub static NOMINAL_MS: Cell<u64> = const { Cell::new(0) };
+        pub static GAVE_UP: Cell<bool> = const { Cell::new(false) };
+        pub static CTX: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+    pub fn next_id() -> u64 {
+        IDS.fetch_add(1, Ordering::Relaxed)
+    }
+    pub fn now_us() -> u64 {
+        START.get_or_init(Instant::now).elapsed().as_micros() as u64
+    }
+    fn out() -> &'static Option<parking_lot::Mutex<std::fs::File>> {
+        OUT.get_or_init(|| {
+            std::env::var_os("RUSTYSCHWAB_DIAG").map(|path| {
+                parking_lot::Mutex::new(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .expect("diagnostics file"),
+                )
+            })
+        })
+    }
+    pub fn emit(value: serde_json::Value) {
+        if let Some(file) = out() {
+            let _ = writeln!(file.lock(), "{value}");
+        }
+    }
+    pub fn reset_waits() {
+        POLLS.set(0);
+        SLEPT_US.set(0);
+        NOMINAL_MS.set(0);
+        GAVE_UP.set(false);
+    }
+    /// SQLite's own `sqliteDefaultBusyCallback` (the handler `busy_timeout`
+    /// installs), step for step, sleeping through the same VFS call, and
+    /// counting what it does.
+    pub fn default_busy(count: i32) -> bool {
+        const DELAYS: [i64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        const TOTALS: [i64; 12] = [0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228];
+        let timeout = super::BUSY_TIMEOUT.as_millis() as i64;
+        let count = i64::from(count);
+        let (mut delay, prior) = if count < 12 {
+            (DELAYS[count as usize], TOTALS[count as usize])
+        } else {
+            (100, 228 + 100 * (count - 11))
+        };
+        if prior + delay > timeout {
+            delay = timeout - prior;
+            if delay <= 0 {
+                GAVE_UP.set(true);
+                return false;
+            }
+        }
+        let started = Instant::now();
+        #[allow(unsafe_code)]
+        // SAFETY: sqlite3_sleep takes a millisecond count and has no other
+        // preconditions; it sleeps through the default VFS, as the default
+        // busy handler does.
+        unsafe {
+            rusqlite::ffi::sqlite3_sleep(delay as i32);
+        }
+        POLLS.set(POLLS.get() + 1);
+        SLEPT_US.set(SLEPT_US.get() + started.elapsed().as_micros() as u64);
+        NOMINAL_MS.set(NOMINAL_MS.get() + delay as u64);
+        true
+    }
+}
+
 #[derive(Clone)]
 pub struct StateDatabase {
     inner: Arc<Inner>,
 }
 struct Inner {
+    id: u64,
     path: PathBuf,
     legacy: Option<PathBuf>,
     initialized: tokio::sync::OnceCell<()>,
     slots: Arc<tokio::sync::Semaphore>,
-    idle: parking_lot::Mutex<Vec<Connection>>,
+    idle: parking_lot::Mutex<Vec<(u64, Connection)>>,
 }
 impl std::fmt::Debug for StateDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,6 +255,7 @@ impl StateDatabase {
         };
         Self {
             inner: Arc::new(Inner {
+                id: diag::next_id(),
                 path,
                 legacy,
                 initialized: tokio::sync::OnceCell::new(),
@@ -185,6 +275,7 @@ impl StateDatabase {
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let inner = self.inner.clone();
+        let t_call = diag::now_us();
         inner
             .initialized
             .get_or_try_init(|| async {
@@ -196,17 +287,27 @@ impl StateDatabase {
                 Ok::<_, Error>(())
             })
             .await?;
+        let t_init = diag::now_us();
         let permit = inner
             .slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
+        let t_permit = diag::now_us();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut connection = inner.checkout()?;
+            let t_start = diag::now_us();
+            let (conn_id, mut connection) = inner.checkout()?;
+            diag::CTX.set((inner.id, conn_id));
             let result = f(&mut connection);
-            inner.checkin(connection);
+            let t_end = diag::now_us();
+            diag::emit(serde_json::json!({
+                "ev": "run", "handle": inner.id, "conn": conn_id, "t_call": t_call,
+                "t_init": t_init, "t_permit": t_permit, "t_start": t_start, "t_end": t_end,
+                "ok": result.is_ok(),
+            }));
+            inner.checkin((conn_id, connection));
             result
         })
         .await
@@ -296,16 +397,20 @@ impl StateDatabase {
     }
 }
 impl Inner {
-    fn checkout(&self) -> Result<Connection> {
-        match self.idle.lock().pop() {
+    fn checkout(&self) -> Result<(u64, Connection)> {
+        let pooled = self.idle.lock().pop();
+        match pooled {
             Some(connection) => Ok(connection),
-            None => open_connection(&self.path),
+            None => {
+                let id = diag::next_id();
+                Ok((id, open_connection(&self.path, self.id, id)?))
+            }
         }
     }
     /// A connection left mid-transaction is closed (rolling it back) rather
     /// than handed to the next caller.
-    fn checkin(&self, connection: Connection) {
-        if connection.is_autocommit() {
+    fn checkin(&self, connection: (u64, Connection)) {
+        if connection.1.is_autocommit() {
             let mut idle = self.idle.lock();
             if idle.len() < POOL_SIZE {
                 idle.push(connection);
@@ -314,7 +419,8 @@ impl Inner {
     }
     /// Cross-process initialization is serialized by a lock file so two
     /// openers cannot race the schema migration.
-    fn initialize(&self) -> Result<Connection> {
+    fn initialize(&self) -> Result<(u64, Connection)> {
+        let t_start = diag::now_us();
         let parent = self
             .path
             .parent()
@@ -339,7 +445,9 @@ impl Inner {
             crate::security::secure_file_write(&self.path, &[])?;
         }
         crate::security::verify_file_permissions(&self.path)?;
-        let mut connection = open_connection(&self.path)?;
+        let t_locked = diag::now_us();
+        let id = diag::next_id();
+        let mut connection = open_connection(&self.path, self.id, id)?;
         connection
             .execute_batch("PRAGMA journal_mode=WAL")
             .map_err(sql)?;
@@ -354,14 +462,31 @@ impl Inner {
             import_legacy(&mut connection, legacy)?;
         }
         drop(lock);
-        Ok(connection)
+        diag::emit(serde_json::json!({
+            "ev": "init", "handle": self.id, "conn": id, "t_start": t_start,
+            "t_locked": t_locked, "t_end": diag::now_us(),
+        }));
+        Ok((id, connection))
     }
 }
-fn open_connection(path: &Path) -> Result<Connection> {
-    let connection = Connection::open(path).map_err(sql)?;
-    connection.busy_timeout(BUSY_TIMEOUT).map_err(sql)?;
+fn open_connection(path: &Path, handle: u64, id: u64) -> Result<Connection> {
+    let mut connection = Connection::open(path).map_err(sql)?;
+    connection.busy_handler(Some(diag::default_busy)).map_err(sql)?;
     connection
         .execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")
+        .map_err(sql)?;
+    // SQLite's default auto-checkpoint (`sqlite3WalDefaultHook`): a PASSIVE
+    // checkpoint once the WAL holds 1000 frames, timed.
+    connection
+        .wal_hook(Some(move |wal: &mut rusqlite::hooks::Wal, pages: i32| {
+            let t = diag::now_us();
+            let checkpoint = (pages >= 1000).then(|| wal.checkpoint().is_ok());
+            diag::emit(serde_json::json!({
+                "ev": "wal", "handle": handle, "conn": id, "t": t, "pages": pages,
+                "ckpt_ok": checkpoint, "ckpt_us": diag::now_us() - t,
+            }));
+            Ok(())
+        }))
         .map_err(sql)?;
     Ok(connection)
 }
@@ -600,9 +725,35 @@ pub(crate) fn audit(
         }
         return crate::audit_chain::append(conn, at, kind, subject, &payload);
     }
-    conn.execute_batch("BEGIN IMMEDIATE").map_err(sql)?;
-    let appended = crate::audit_chain::append(conn, at, kind, subject, &payload)
-        .and_then(|()| conn.execute_batch("COMMIT").map_err(sql));
+    diag::reset_waits();
+    let t0 = diag::now_us();
+    let begun = conn.execute_batch("BEGIN IMMEDIATE");
+    let t1 = diag::now_us();
+    let (handle, conn_id) = diag::CTX.get();
+    let report = |t2: u64, t3: u64, outcome: String| {
+        diag::emit(serde_json::json!({
+            "ev": "audit", "handle": handle, "conn": conn_id, "subject": subject,
+            "t0": t0, "t1": t1, "t2": t2, "t3": t3, "polls": diag::POLLS.get(),
+            "slept_us": diag::SLEPT_US.get(), "nominal_ms": diag::NOMINAL_MS.get(),
+            "gave_up": diag::GAVE_UP.get(), "outcome": outcome,
+        }));
+    };
+    if let Err(error) = begun {
+        report(t1, t1, format!("begin: {error}"));
+        return Err(sql(error));
+    }
+    let appended = crate::audit_chain::append(conn, at, kind, subject, &payload);
+    let t2 = diag::now_us();
+    let appended = appended.and_then(|()| conn.execute_batch("COMMIT").map_err(sql));
+    let t3 = diag::now_us();
+    report(
+        t2,
+        t3,
+        appended
+            .as_ref()
+            .err()
+            .map_or_else(|| "ok".to_owned(), ToString::to_string),
+    );
     if appended.is_err() && !conn.is_autocommit() {
         // Best effort: the error being returned is the one that matters, and
         // a connection left open is dropped by the pool.

@@ -1,0 +1,30 @@
+name: Contention diagnostics
+on:
+  push:
+    branches: [steward/store-contention-diag]
+permissions:
+  contents: read
+concurrency:
+  group: contention-diag
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: -D warnings
+  PYTHONUNBUFFERED: "1"
+jobs:
+  diag:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --workspace --all-features --locked --no-run --test audit_chain --test enterprise_regressions --test recovery_integration --test zz_diag
+      - run: python tools/diag_contention.py
+        shell: bash

@@ -487,12 +487,18 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                         recovery.0 = Some(tokio::spawn(async move {
                             loop {
                                 let started = std::time::Instant::now();
-                                let recovered = tokio::time::timeout(
+                                let diag_t0 = rustyschwab::storage::diag::now_us();
+                                let outcome = tokio::time::timeout(
                                     policy.deadline.max(std::time::Duration::from_millis(1)),
                                     recover(&cache, &client, &stream, status.generation),
                                 )
-                                .await
-                                .unwrap_or(false);
+                                .await;
+                                rustyschwab::storage::diag::emit(serde_json::json!({
+                                    "ev": "recovery_cycle", "t0": diag_t0,
+                                    "t1": rustyschwab::storage::diag::now_us(),
+                                    "outcome": match outcome { Ok(true) => "recovered", Ok(false) => "incomplete", Err(_) => "deadline" },
+                                }));
+                                let recovered = outcome.unwrap_or(false);
                                 metrics::histogram!(crate::metrics::STREAM_RECOVERY_SECONDS)
                                     .record(started.elapsed().as_secs_f64());
                                 metrics::gauge!(crate::metrics::STREAM_RECOVERY_READY)
@@ -509,6 +515,10 @@ pub fn spawn_recovering_cache_feeder_with_policy(
                     }
                 }
                 StreamMessage::Data(data) => {
+                    rustyschwab::storage::diag::emit(serde_json::json!({
+                        "ev": "stream_data", "t": rustyschwab::storage::diag::now_us(),
+                        "services": data.data.iter().map(|d| d.service.clone()).collect::<Vec<_>>(),
+                    }));
                     // Activity means orders or balances moved: have the
                     // recovery worker, if any, re-read the account now
                     // rather than at its next interval.
@@ -556,7 +566,13 @@ async fn recover(
             .map(String::as_str)
             .collect();
         for chunk in wanted.chunks(100) {
-            let Ok(quotes) = client.get_quotes(chunk).await else {
+            let diag_t0 = rustyschwab::storage::diag::now_us();
+            let quotes = client.get_quotes(chunk).await;
+            rustyschwab::storage::diag::emit(serde_json::json!({
+                "ev": "recovery_step", "step": "get_quotes", "t0": diag_t0,
+                "t1": rustyschwab::storage::diag::now_us(), "ok": quotes.is_ok(),
+            }));
+            let Ok(quotes) = quotes else {
                 recovered = false;
                 continue;
             };
@@ -575,7 +591,13 @@ async fn recover(
         }
     }
     if subscriptions.contains_key("ACCT_ACTIVITY") {
-        let reconciled = match client.get_account_numbers().await {
+        let diag_t0 = rustyschwab::storage::diag::now_us();
+        let numbers = client.get_account_numbers().await;
+        rustyschwab::storage::diag::emit(serde_json::json!({
+            "ev": "recovery_step", "step": "get_account_numbers", "t0": diag_t0,
+            "t1": rustyschwab::storage::diag::now_us(), "ok": numbers.is_ok(),
+        }));
+        let reconciled = match numbers {
             Ok(accounts) => {
                 let store = client.execution_store();
                 let mut all = true;
@@ -590,8 +612,14 @@ async fn recover(
                         .ok()
                         .flatten()
                         .map_or(0, |state| state.generation);
-                    let current = match client.reconcile_account(&account.hash_value, durable).await
-                    {
+                    let diag_t0 = rustyschwab::storage::diag::now_us();
+                    let reconciled = client.reconcile_account(&account.hash_value, durable).await;
+                    rustyschwab::storage::diag::emit(serde_json::json!({
+                        "ev": "recovery_step", "step": "reconcile_account", "t0": diag_t0,
+                        "t1": rustyschwab::storage::diag::now_us(),
+                        "ok": reconciled.as_ref().map(|r| r.reconciled).map_err(|e| format!("{e:?}")),
+                    }));
+                    let current = match reconciled {
                         Ok(report) if report.superseded => store
                             .account_state(&account.hash_value)
                             .await
