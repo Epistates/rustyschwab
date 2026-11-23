@@ -881,4 +881,126 @@ mod tests {
             assert!(!user.trusts(well_known(other).as_mut_ptr().cast()));
         }
     }
+
+    /// Reports the descriptors Windows assigns on this machine.
+    #[test]
+    fn report_the_descriptors_windows_assigns() {
+        use windows_sys::Win32::Security::{
+            TOKEN_ELEVATION, TOKEN_OWNER, TokenElevation, TokenOwner,
+        };
+        fn sddl(path: &Path) -> String {
+            let mut descriptor = ptr::null_mut();
+            let code = unsafe {
+                GetNamedSecurityInfoW(
+                    wide(path).as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            if code != 0 {
+                return format!("GetNamedSecurityInfoW failed: {code}");
+            }
+            let _descriptor = Local(descriptor);
+            let (mut text, mut len) = (ptr::null_mut(), 0);
+            if unsafe {
+                ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                    descriptor,
+                    SDDL_REVISION_1,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut text,
+                    &mut len,
+                )
+            } == 0
+            {
+                return format!("conversion failed: {}", std::io::Error::last_os_error());
+            }
+            let _text = Local(text.cast());
+            String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(text, len.saturating_sub(1) as usize)
+            })
+        }
+        let mut token = ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let _token = Handle(token);
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenElevation,
+                    (&raw mut elevation).cast(),
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut len,
+                )
+            },
+            0
+        );
+        let mut owner = vec![0u64; 16];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(token, TokenOwner, owner.as_mut_ptr().cast(), 128, &mut len)
+            },
+            0
+        );
+        let default_owner =
+            sid_text(unsafe { (*owner.as_ptr().cast::<TOKEN_OWNER>()).Owner }).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, b"x").unwrap();
+        let old_file = dir.path().join("old.json");
+        drop(
+            create_new_with(
+                &old_file,
+                &descriptor("D:P(A;;FA;;;OW)(A;;FA;;;SY)").unwrap(),
+            )
+            .unwrap(),
+        );
+        let old_dir = dir.path().join("old-state");
+        create_directory_with(&old_dir, "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)");
+        let new_file = dir.path().join("new.json");
+        let written = secure_file_write(&new_file, b"x");
+        let new_dir = dir.path().join("new-state");
+        let ensured = ensure_private_directory(&new_dir);
+        let held = dir.path().join("held.json");
+        std::fs::write(&held, b"x").unwrap();
+        let reader = File::open(&held).unwrap();
+        let source = dir.path().join("source.json");
+        std::fs::write(&source, b"y").unwrap();
+        let moved = unsafe {
+            MoveFileExW(
+                wide(&source).as_ptr(),
+                wide(&held).as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        let move_result = if moved == 0 {
+            std::io::Error::last_os_error().to_string()
+        } else {
+            "ok".into()
+        };
+        drop(reader);
+        panic!(
+            "\nuser {}\nelevated {}\ndefault owner {default_owner}\ntemp dir {}\nplain file {}\n\
+             old file {}\nold dir {}\nnew file {} ({written:?})\nnew dir {} ({ensured:?})\n\
+             MoveFileExW over an open file: {move_result}\n",
+            me(),
+            elevation.TokenIsElevated,
+            sddl(dir.path()),
+            sddl(&plain),
+            sddl(&old_file),
+            sddl(&old_dir),
+            sddl(&new_file),
+            sddl(&new_dir),
+        );
+    }
 }
