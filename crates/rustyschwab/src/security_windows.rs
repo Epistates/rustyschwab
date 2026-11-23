@@ -51,9 +51,11 @@
 //! volume keeps the file's own descriptor, so the replacement is private
 //! whatever the file it replaced allowed.
 //!
-//! Every check is made on an open handle, never on a path, and the handle
-//! is opened without following a reparse point, so the file checked is the
-//! file read.
+//! Every check is made on an open handle, never on a path, so the file
+//! checked is the file read. A reparse point as the last part of a path is
+//! refused rather than followed (`FILE_FLAG_OPEN_REPARSE_POINT`); one
+//! earlier in the path is followed, which is why a trusted file is opened
+//! inside the directory that was judged, as described below.
 //!
 //! # Trusted files
 //!
@@ -61,9 +63,31 @@
 //! risk file) is opened by `open_trusted_file`. It holds no secret, so
 //! others may read it, and it may be reached through a symbolic link. What
 //! it must not be is changeable by anyone else, because whoever can edit it
-//! can grant themselves trading, as on Unix. The path is resolved first.
-//! Then the file it resolves to and the directory that holds it are each
-//! opened without following a reparse point and judged:
+//! can grant themselves trading, as on Unix.
+//!
+//! The path is resolved first, following links as `std::fs::canonicalize`
+//! does. The directory holding the result is then opened, without following
+//! a reparse point and without `FILE_SHARE_DELETE`, and judged. The file is
+//! opened by its name relative to that directory's handle (`NtCreateFile`
+//! with the handle as `RootDirectory`, as `openat` does on Unix), with
+//! `FILE_OPEN_REPARSE_POINT`, and judged. The path is never resolved a
+//! second time, so no part of it can be swapped for a link between the
+//! check and the open: the file read is the file checked, and the directory
+//! judged is the directory it was opened in. The directory's handle stays
+//! open until the file is open, and since it does not share delete access,
+//! Windows refuses to rename or remove that directory meanwhile.
+//!
+//! As on Unix, only the directory that holds the file is judged, not its
+//! ancestors. An account that can delete children of an ancestor can rename
+//! the directory away, and a replacement it creates there is refused
+//! because it owns it.
+//!
+//! On a network share, SYSTEM and Administrators are the file server's
+//! groups and the server evaluates the access list, so the check says
+//! nothing about this machine's accounts. Keep authorization files on a
+//! local disk.
+//!
+//! Each of the file and the directory is judged as follows:
 //!
 //! - **Owner.** The same rule as for a private file.
 //! - **Access.** The same principals are trusted. An entry that allows
@@ -77,6 +101,11 @@
 //!   it to what is created there. A private directory must still refuse such
 //!   an entry, because the private files created in it would inherit it. A
 //!   trusted file already exists, with a DACL of its own.
+//! - **Entries this check cannot evaluate** (object, callback and
+//!   conditional entries) are refused even when they only grant reading:
+//!   whom they admit depends on the caller or on a condition.
+//! - **Kind.** The file must be an ordinary file that is not a reparse
+//!   point, and the directory an ordinary directory.
 //! - **Entries that deny access** never cause a refusal and never excuse an
 //!   entry that allows, as for a private file: whether a deny wins depends
 //!   on the order of the entries and on group membership, so the check
@@ -94,9 +123,16 @@ use std::{
     path::Path,
     ptr,
 };
+use windows_sys::Wdk::{
+    Foundation::OBJECT_ATTRIBUTES,
+    Storage::FileSystem::{
+        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    },
+};
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, GENERIC_ALL, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, LocalFree,
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     },
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, Authorization::*, DACL_SECURITY_INFORMATION, EqualSid,
@@ -108,6 +144,7 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::*,
     System::{
+        IO::IO_STATUS_BLOCK,
         SystemServices::{
             ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE, ACCESS_DENIED_CALLBACK_ACE_TYPE,
             ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_DENIED_OBJECT_ACE_TYPE,
@@ -345,6 +382,16 @@ enum Rule {
     Trusted { directory: bool },
 }
 
+impl Rule {
+    /// What the rule judges, for the operator log.
+    fn object(self) -> &'static str {
+        match self {
+            Rule::Private { directory: true } | Rule::Trusted { directory: true } => "directory",
+            Rule::Private { .. } | Rule::Trusted { .. } => "file",
+        }
+    }
+}
+
 /// Why `descriptor` does not make its file (or, with `directory`, its
 /// directory) private under the module policy, or `None` if it does.
 /// `path` is only for the operator log.
@@ -356,7 +403,9 @@ fn violation(
     judge(descriptor, Rule::Private { directory }, path)
 }
 
-/// Why `descriptor` does not satisfy `rule`, or `None` if it does.
+/// Why `descriptor` does not satisfy `rule`, or `None` if it does. `path` is
+/// the path of the object the descriptor belongs to, only for the operator
+/// log.
 fn judge(
     descriptor: PSECURITY_DESCRIPTOR,
     rule: Rule,
@@ -433,6 +482,7 @@ fn judge(
                 if let Some(why) = why {
                     tracing::error!(
                         ?path,
+                        object = rule.object(),
                         account = %sid_text(trustee).unwrap_or_default(),
                         rights = format_args!("{mask:#x}"),
                         "an access control entry allows another account"
@@ -529,14 +579,25 @@ fn open_regular(path: &Path, write: bool) -> Result<std::result::Result<File, &'
         .write(write)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
-    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Ok(Err("is a symbolic link or other reparse point"));
+    Ok(match not_regular(&file)? {
+        Some(why) => Err(why),
+        None => Ok(file),
+    })
+}
+
+/// Why `file`, opened without following a reparse point, is not an ordinary
+/// file, or `None` if it is.
+fn not_regular(file: &File) -> Result<Option<&'static str>> {
+    let metadata = file.metadata()?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Ok(Some("is a symbolic link or other reparse point"));
     }
     // SAFETY: the handle is open for the lifetime of `file`.
-    if unsafe { GetFileType(file.as_raw_handle() as HANDLE) } != FILE_TYPE_DISK {
-        return Ok(Err("is not a regular file"));
+    if metadata.is_dir() || unsafe { GetFileType(file.as_raw_handle() as HANDLE) } != FILE_TYPE_DISK
+    {
+        return Ok(Some("is not a regular file"));
     }
-    Ok(Ok(file))
+    Ok(None)
 }
 
 fn open_checked(path: &Path, write: bool) -> Result<File> {
@@ -550,29 +611,38 @@ fn open_checked(path: &Path, write: bool) -> Result<File> {
 
 /// An authorization file opened for reading, or an error that keeps `path`
 /// out of its text. See [`crate::security::read_trusted_file`] and the
-/// module documentation.
-///
-/// `path` is resolved as `std::fs::canonicalize` does, which follows
-/// symbolic links and junctions, and the directory holding the result is
-/// checked. The file itself is then opened without following a reparse
-/// point, and the handle that is returned is the one that was checked: a
-/// path swapped for a link after the resolution is refused, not followed.
+/// module documentation, which say what holds between the check and the
+/// read.
 pub(crate) fn open_trusted_file(path: &Path) -> Result<File> {
+    open_trusted_between(path, || {})
+}
+
+/// [`open_trusted_file`], running `between` once the directory has been
+/// judged and is held, and before the file is opened. It lets a test act in
+/// the window in which a path could be swapped.
+fn open_trusted_between(path: &Path, between: impl FnOnce()) -> Result<File> {
     let resolved = std::fs::canonicalize(path)?;
-    if let Some(parent) = resolved.parent() {
-        let why = match open_directory(parent)? {
-            None => Some("is in something other than an ordinary directory".to_string()),
-            Some(directory) => {
-                let security = security_of_handle(directory.as_raw_handle() as HANDLE)?;
-                judge(security.0, Rule::Trusted { directory: true }, path)?
-                    .map(|why| format!("is in a directory that {why}"))
-            }
-        };
-        if let Some(why) = why {
-            return Err(untrusted(path, &why));
-        }
+    let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+        return Err(untrusted(path, "is not a regular file"));
+    };
+    let Some(directory) = open_directory(parent)? else {
+        return Err(untrusted(
+            path,
+            "is in something other than an ordinary directory",
+        ));
+    };
+    let security = security_of_handle(directory.as_raw_handle() as HANDLE)?;
+    if let Some(why) = judge(security.0, Rule::Trusted { directory: true }, parent)? {
+        return Err(untrusted(path, &format!("is in a directory that {why}")));
     }
-    let file = open_regular(&resolved, false)?.map_err(|why| untrusted(path, why))?;
+    between();
+    // The file is named relative to the directory that was judged, which is
+    // held (and cannot be renamed or removed) until it is open.
+    let file = open_in(&directory, name)?;
+    drop(directory);
+    if let Some(why) = not_regular(&file)? {
+        return Err(untrusted(path, why));
+    }
     let security = security_of_handle(file.as_raw_handle() as HANDLE)?;
     match judge(security.0, Rule::Trusted { directory: false }, path)? {
         Some(why) => Err(untrusted(path, why)),
@@ -580,11 +650,83 @@ pub(crate) fn open_trusted_file(path: &Path) -> Result<File> {
     }
 }
 
-/// The directory at `path`, opened (for reading its security) without
-/// following a reparse point, or `None` if it is not a real directory.
+/// The file `name` in `directory`, opened for reading without following a
+/// reparse point, as `openat` does on Unix: `NtCreateFile` with the
+/// directory's handle as the root of the name, so the path to the directory
+/// is not resolved again. Opening is by the name alone, which must be a
+/// single path component.
+///
+/// The handle is the one `CreateFileW` would give for `GENERIC_READ` with
+/// the default sharing: synchronous, so the standard library can read from
+/// it without an `OVERLAPPED` structure. A directory is opened too, not
+/// refused here, so that [`not_regular`] can name it. `OBJ_CASE_INSENSITIVE`
+/// matches the case rules of `CreateFileW`.
+fn open_in(directory: &File, name: &std::ffi::OsStr) -> Result<File> {
+    let units: Vec<u16> = name.encode_wide().collect();
+    let bytes = u16::try_from(units.len() * 2)
+        .ok()
+        .filter(|_| !units.is_empty() && !units.contains(&u16::from(b'\\')))
+        .ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a file name is one path component",
+            ))
+        })?;
+    let object_name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_ptr().cast_mut(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle() as HANDLE,
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: ptr::null(),
+        SecurityQualityOfService: ptr::null(),
+    };
+    let mut handle = ptr::null_mut();
+    // SAFETY: a zeroed IO_STATUS_BLOCK is the documented initial state.
+    let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+    // SAFETY: `attributes` and the name it points to outlive the call, and
+    // the root is an open directory handle.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            FILE_GENERIC_READ,
+            &attributes,
+            &mut status_block,
+            ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: a plain conversion of an NTSTATUS.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(Error::Io(std::io::Error::from_raw_os_error(code as i32)));
+    }
+    // SAFETY: a successful NtCreateFile returns a uniquely owned file handle.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// The directory at `path`, opened without following a reparse point, or
+/// `None` if it is not a real directory.
+///
+/// Opened for `READ_CONTROL`, to read its security, and `FILE_LIST_DIRECTORY`
+/// (a read right, so that its sharing counts), and without
+/// `FILE_SHARE_DELETE`: while the handle is open Windows refuses to rename
+/// or remove the directory. Sharing is only enforced between opens that ask
+/// for data or delete access, so a handle with `READ_CONTROL` alone would
+/// not hold it.
 fn open_directory(path: &Path) -> Result<Option<File>> {
     let directory = std::fs::OpenOptions::new()
-        .access_mode(READ_CONTROL)
+        .access_mode(READ_CONTROL | FILE_LIST_DIRECTORY)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = directory.metadata()?;
@@ -646,6 +788,7 @@ mod tests {
     use crate::error::AuthError;
     use crate::security::{read_private_file, read_trusted_file, verify_file_permissions};
     use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
     use windows_sys::Win32::Security::{
         CONTAINER_INHERIT_ACE, CreateWellKnownSid, GetSecurityDescriptorControl, INHERITED_ACE,
         PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_MAX_SID_SIZE,
@@ -1274,7 +1417,10 @@ mod tests {
             judge(security.0, Rule::Trusted { directory: false }, &cmd).unwrap(),
             Some("is owned by another account")
         );
-        refusal(&cmd);
+        // `read_trusted_file(&cmd, ..)` is not asserted here: System32's own
+        // owner is another account too, so it would be refused for the
+        // directory whatever the file's owner is. The judgment above is of
+        // the file alone.
     }
 
     /// Nobody else may add, delete or replace files in the directory.
@@ -1459,10 +1605,16 @@ mod tests {
 
         // The file is opened without following a reparse point: handed a
         // link, as when the path is swapped after it was resolved, the open
-        // refuses it.
+        // refuses it, whether by path or by name inside its directory.
         assert_eq!(
             open_regular(&link, false).unwrap().unwrap_err(),
             "is a symbolic link or other reparse point"
+        );
+        let held = open_directory(dir.path()).unwrap().unwrap();
+        let by_name = open_in(&held, std::ffi::OsStr::new("current.json")).unwrap();
+        assert_eq!(
+            not_regular(&by_name).unwrap(),
+            Some("is a symbolic link or other reparse point")
         );
     }
 
@@ -1470,9 +1622,120 @@ mod tests {
     fn a_trusted_file_must_be_a_regular_file() {
         let dir = tempfile::tempdir().unwrap();
         let etc = trusted_directory(dir.path(), "etc");
-        assert!(read_trusted_file(&etc, 16).is_err());
-        assert!(read_trusted_file(&etc.join("missing.json"), 16).is_err());
+        let inner = etc.join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        assert_eq!(
+            refusal(&inner),
+            "A configuration file is not a regular file; see server logs for the path"
+        );
         let missing = read_trusted_file(&etc.join("missing.json"), 16).unwrap_err();
         assert!(matches!(missing, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound));
+        // A name relative to a directory is one path component.
+        let held = open_directory(&etc).unwrap().unwrap();
+        for name in ["", "a\\b"] {
+            assert!(
+                matches!(open_in(&held, std::ffi::OsStr::new(name)),
+                    Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput),
+                "{name:?}"
+            );
+        }
+        assert!(
+            matches!(open_in(&held, std::ffi::OsStr::new("missing.json")),
+                Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+
+    /// Entries of a kind this check cannot evaluate are refused whatever
+    /// they grant: an object entry applies to some property of an object,
+    /// and a callback or conditional entry depends on the caller. A file
+    /// system takes none of them on a real file, so these are judged as
+    /// descriptors. The same kinds that deny are ignored, as other deny
+    /// entries are.
+    #[test]
+    fn an_entry_that_cannot_be_evaluated_is_refused_even_when_it_only_reads() {
+        let me = me();
+        const OBJECT: &str = "bf967a86-0de6-11d0-a285-00aa006c33d6";
+        for entry in [
+            format!("(OA;;0x1;{OBJECT};;WD)"),
+            format!("(OA;;0x1;{OBJECT};;{me})"),
+            "(XA;;FR;;;WD;(Member_of {SID(BA)}))".to_string(),
+            "(XA;;0x1;;;BU;(Member_of {SID(BA)}))".to_string(),
+        ] {
+            for directory in [false, true] {
+                assert_eq!(
+                    trusted_verdict(&format!("O:{me}D:P(A;;FA;;;{me}){entry}"), directory),
+                    Some("has an access control entry that cannot be checked"),
+                    "{entry}"
+                );
+            }
+        }
+        for entry in [
+            format!("(OD;;0x2;{OBJECT};;BU)"),
+            "(XD;;FW;;;BU;(Member_of {SID(BA)}))".to_string(),
+        ] {
+            for directory in [false, true] {
+                assert_eq!(
+                    trusted_verdict(&format!("O:{me}D:P(A;;FA;;;{me}){entry}"), directory),
+                    None,
+                    "{entry}"
+                );
+            }
+        }
+    }
+
+    /// A hard link is another name for the same file, and the file's own
+    /// access list is what decides who may change it, so a name for an
+    /// acceptable file is accepted. It is opened in, and judged with, the
+    /// directory of the name it is read by: a link in a directory others
+    /// can write to is refused for that directory, however acceptable the
+    /// file is.
+    #[test]
+    fn a_hard_link_to_an_acceptable_file_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = trusted_directory(dir.path(), "etc");
+        let good = trusted_file(&etc, "policy.json", &closed("(A;;FR;;;WD)"));
+        let elsewhere = trusted_directory(dir.path(), "elsewhere");
+        let link = elsewhere.join("current.json");
+        std::fs::hard_link(&good, &link).unwrap();
+        accepted(&link);
+        accepted(&good);
+
+        let open = dir.path().join("open");
+        create_directory_with(
+            &open,
+            &format!("D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)(A;;0x2;;;BU)", me()),
+        );
+        let in_open = open.join("current.json");
+        std::fs::hard_link(&good, &in_open).unwrap();
+        assert_eq!(refusal(&in_open), DIRECTORY_REFUSED);
+        accepted(&good);
+    }
+
+    /// The directory that was judged cannot be renamed or removed until
+    /// the file is open, so a path to it cannot be pointed somewhere else
+    /// in between. `between` runs exactly in that window. Once the read is
+    /// over, the same rename is allowed, so the refusal is the hold.
+    #[test]
+    fn the_directory_cannot_be_renamed_while_the_file_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = trusted_directory(dir.path(), "etc");
+        let path = trusted_file(&etc, "policy.json", &closed("(A;;FR;;;WD)"));
+        let moved = dir.path().join("moved");
+        let mut rename = None;
+        let file = open_trusted_between(&path, || {
+            rename = Some(std::fs::rename(&etc, &moved));
+        })
+        .unwrap();
+        let error = rename.expect("between ran").unwrap_err();
+        assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_SHARING_VIOLATION as i32),
+            "{error}"
+        );
+        assert!(etc.exists() && !moved.exists());
+        // The file that was opened is the one that was judged.
+        assert_eq!(std::io::Read::bytes(file).count(), 2);
+        std::fs::rename(&etc, &moved).unwrap();
+        assert!(!etc.exists() && moved.join("policy.json").exists());
     }
 }

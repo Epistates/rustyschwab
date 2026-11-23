@@ -346,10 +346,19 @@ pub fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 ///   Opened non-blocking, so a planted FIFO cannot hang the read.
 /// - **Windows**: owned by this account, SYSTEM or the Administrators
 ///   group, with no entry in its access control list that allows anyone else
-///   to write, append, delete or change its attributes or security. Read
-///   access for others is fine. The directory must likewise let no one else
-///   add, delete or replace files. The file is opened without following a
-///   reparse point, and the handle that was checked is the one read.
+///   to write, append, change its extended attributes or attributes, delete
+///   it, or change its permissions, owner or audit list. The directory must
+///   likewise let no one else add files or subdirectories, delete files,
+///   delete it, or change its permissions, owner or audit list. Read access
+///   for others is fine. A missing access control list, and an entry of a
+///   kind that cannot be evaluated (object, callback or conditional), are
+///   refused. The file is opened by name inside the directory that was
+///   checked, whose handle is held until then and does not share delete
+///   access, and not through a reparse point, so the file read is the file
+///   checked and the directory judged is the one it was opened in. Only that
+///   directory is judged, not its ancestors, as on Unix. Keep these files on
+///   a local disk: on a network share the file server evaluates the access
+///   control list.
 ///
 /// Elsewhere it is read as is, within `limit`.
 pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
