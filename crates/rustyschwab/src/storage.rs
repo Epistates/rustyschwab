@@ -12,7 +12,7 @@
 //! has waited (its busy handler, up to 100 ms between attempts). SQLite
 //! promises no order among waiters, and a writer that commits and asks again
 //! at once is nearly always first back, so one busy writer can keep another
-//! out until its timeout. [`StateDatabase::write`] therefore makes writers
+//! out until its timeout. `StateDatabase::write` therefore makes writers
 //! take turns. Those on one handle queue in the order they asked, and the one
 //! at the head locks the file `state.write.lock`, beside `state.sqlite3`, for
 //! the length of its transaction. Other handles, in this process or another,
