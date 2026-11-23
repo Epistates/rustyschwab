@@ -151,10 +151,12 @@ held order").
   protected owner/SYSTEM DACL" or "State directory needs a protected
   inheritable owner/SYSTEM ACL", or with "Access is denied" when another
   handle had the token file open as it was replaced. Every refusal failed
-  closed, so nothing was exposed. The check compared the text of the
-  access control list with two fixed strings, so a list that Windows
-  reports differently from how it was written was refused even when it
-  granted exactly what the SDK set. It now reads the owner and each entry.
+  closed, so nothing was exposed. The check turned the access control list
+  into text and compared it with two fixed strings, but it took the size
+  of the buffer Windows returned for the length of the text, so the text
+  kept trailing NUL characters and never matched. Replacing the file used
+  a rename that Windows refuses while the old file is open. The check now
+  reads the owner and each entry instead of comparing text.
   A file or directory is private when this account, SYSTEM or the
   Administrators group owns it and every entry that allows access names
   one of them, the rule OpenSSH for Windows applies to private keys. A
