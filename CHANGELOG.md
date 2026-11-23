@@ -144,6 +144,12 @@ held order").
 
 ### Fixed
 
+- A new state file was created with one flush to disk per schema migration
+  (seven in all); it now takes one, so the first operation on a new file
+  is faster, and a process opening a file that another is still creating
+  no longer waits seconds for it on a slow disk. Opening a file that
+  needs several migrations applies them together, so a failure leaves it
+  at the version it had.
 - A write to the execution state (an audit event, a journal entry, a quota
   check) could fail with `Storage("database is locked")` while other tasks
   or processes wrote to the same file. SQLite gives a waiting writer no

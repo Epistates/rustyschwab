@@ -503,11 +503,6 @@ impl Inner {
             .execute_batch("PRAGMA journal_mode=WAL")
             .map_err(sql)?;
         validate_existing(&connection)?;
-        connection
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            )
-            .map_err(sql)?;
         migrate(&mut connection)?;
         if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
             import_legacy(&mut connection, legacy)?;
@@ -554,13 +549,7 @@ fn validate_existing(connection: &Connection) -> Result<()> {
             |r| r.get(0),
         )
         .map_err(sql)?;
-    let has_meta: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='meta')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(sql)?;
+    let has_meta = table_exists(connection, "meta")?;
     if tables > 0 && !has_meta {
         return Err(Error::Storage(
             "Existing state is missing metadata; restore a complete backup".into(),
@@ -598,20 +587,30 @@ fn schema_version(connection: &Connection) -> Result<Option<u32>> {
         })
         .transpose()
 }
-/// Each migration commits together with its history row and the version
-/// bump, so a crash leaves either the previous version or the next, never a
-/// half-applied schema.
+/// The pending migrations commit together, each with its history row, and
+/// with the version bump, so a crash leaves either the version before them
+/// or the newest, never a half-applied schema. A new file is created in one
+/// commit rather than one per migration: each commit is a flush to disk.
 fn migrate(connection: &mut Connection) -> Result<()> {
-    let applied = schema_version(connection)?.unwrap_or(0);
-    for migration in MIGRATIONS.iter().filter(|m| m.version > applied) {
-        let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(sql)?;
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, \
-             name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
-        )
+    let applied = if table_exists(connection, "meta")? {
+        schema_version(connection)?.unwrap_or(0)
+    } else {
+        0
+    };
+    let pending: Vec<&Migration> = MIGRATIONS.iter().filter(|m| m.version > applied).collect();
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let tx = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(sql)?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, \
+         name TEXT NOT NULL, applied_at INTEGER NOT NULL)",
+    )
+    .map_err(sql)?;
+    for migration in pending {
         tx.execute_batch(migration.sql).map_err(sql)?;
         if let Some(backfill) = migration.backfill {
             backfill(&tx)?;
@@ -626,9 +625,17 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )
         .map_err(sql)?;
         meta::put(&tx, "schema", &migration.version.to_string())?;
-        tx.commit().map_err(sql)?;
     }
-    Ok(())
+    tx.commit().map_err(sql)
+}
+fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [name],
+            |r| r.get(0),
+        )
+        .map_err(sql)
 }
 /// One-time import of the pre-SQLite JSON journal, recorded in `meta` so a
 /// retained legacy file is never replayed.
@@ -926,5 +933,34 @@ mod tests {
         assert!(!ran.load(Ordering::Relaxed));
         let late: bool = database.run(|c| meta::exists(c, "late")).await.unwrap();
         assert!(!late);
+    }
+
+    /// Commits in `database`'s write-ahead log: its frames that close a
+    /// transaction record the size of the database after it.
+    fn wal_commits(database: &StateDatabase) -> usize {
+        let wal = std::fs::read(database.path().with_extension("sqlite3-wal")).unwrap();
+        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
+        wal[32..]
+            .chunks_exact(24 + page_size)
+            .filter(|frame| frame[4..8] != [0; 4])
+            .count()
+    }
+
+    /// Every flush to disk costs a commit, and on a slow disk a new file's
+    /// six migrations took seconds: all of them are one commit.
+    #[tokio::test]
+    async fn a_new_state_file_is_created_in_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("fresh.json"));
+        database.run(|_| Ok(())).await.unwrap();
+        assert_eq!(wal_commits(&database), 1);
+        let versions: i64 = database
+            .run(|c| {
+                c.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+                    .map_err(sql)
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions, MIGRATIONS.len() as i64);
     }
 }
