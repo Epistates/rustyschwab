@@ -160,6 +160,12 @@ held order").
   the lock file (an earlier release, the `sqlite3` shell) is waited for as
   before. Under contention the longest waits shrink and a write waits for
   the writers queued ahead of it.
+- `HistoryStore` failed at once with `database is locked`, without waiting,
+  when it marked a span complete for a fetch that returned no candles
+  while another process was writing to the same file: its transaction read
+  before it wrote, and SQLite refuses to turn such a transaction into a
+  write while another connection holds the lock. History writes now take
+  the write lock when they begin and wait for it like any other write.
 - Performance ratios on a sparse equity curve were annualized as if each
   gap between points were one trading day: a weekly backtest's Sharpe was
   overstated by about the square root of five (roughly 2.2x), and the
