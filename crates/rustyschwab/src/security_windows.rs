@@ -242,6 +242,13 @@ fn security_of_handle(handle: HANDLE) -> Result<Local> {
     Ok(Local(descriptor))
 }
 
+/// The SID of the access-allowed entry at `ace`. It starts at the entry's
+/// `SidStart` field and runs past the end of the declared struct, so it is
+/// reached by offset from the entry's own pointer.
+fn allowed_ace_sid(ace: *mut std::ffi::c_void) -> PSID {
+    ace.wrapping_byte_add(std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+}
+
 /// Why `descriptor` does not make its file (or, with `directory`, its
 /// directory) private under the module policy, or `None` if it does.
 /// `path` is only for the operator log.
@@ -266,31 +273,34 @@ fn violation(
     {
         return Err(last_error());
     }
-    if present == 0 || dacl.is_null() {
-        return Ok(Some(
-            "has no access control list, so any account may use it",
-        ));
-    }
+    // SAFETY: a DACL present in a valid descriptor is null or a valid ACL.
+    let acl = match unsafe { dacl.as_ref() } {
+        Some(acl) if present != 0 => acl,
+        _ => {
+            return Ok(Some(
+                "has no access control list, so any account may use it",
+            ));
+        }
+    };
     let mut passed_on = false;
-    // SAFETY: a DACL present in a valid descriptor is a valid ACL.
-    for index in 0..unsafe { (*dacl).AceCount } {
+    for index in 0..acl.AceCount {
         let mut ace = ptr::null_mut();
         // SAFETY: `index` is below the ACL's entry count.
         if unsafe { GetAce(dacl, index.into(), &mut ace) } == 0 {
             return Err(last_error());
         }
-        // SAFETY: every entry starts with an ACE_HEADER.
-        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        // SAFETY: GetAce succeeded, so `ace` points at an entry inside the
+        // ACL, and every entry starts with an ACE_HEADER.
+        let Some(header) = (unsafe { ace.cast::<ACE_HEADER>().as_ref() }) else {
+            return Ok(Some("has an access control entry that cannot be checked"));
+        };
         match u32::from(header.AceType) {
             ACCESS_DENIED_ACE_TYPE
             | ACCESS_DENIED_OBJECT_ACE_TYPE
             | ACCESS_DENIED_CALLBACK_ACE_TYPE
             | ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE => {}
             ACCESS_ALLOWED_ACE_TYPE => {
-                // SAFETY: an entry of this type is an ACCESS_ALLOWED_ACE, whose
-                // SID starts at `SidStart`.
-                let trustee: PSID =
-                    unsafe { &raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart }.cast();
+                let trustee = allowed_ace_sid(ace);
                 // SAFETY: `trustee` is a valid SID inside `descriptor`.
                 let owner_alias = unsafe {
                     IsWellKnownSid(trustee, WinCreatorOwnerRightsSid) != 0
@@ -512,18 +522,17 @@ mod tests {
             unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
             0
         );
-        let allows = (0..unsafe { (*dacl).AceCount })
+        let acl = unsafe { dacl.as_ref() }.expect("a DACL");
+        let allows = (0..acl.AceCount)
             .map(|index| {
                 let mut ace = ptr::null_mut();
                 assert_ne!(unsafe { GetAce(dacl, index.into(), &mut ace) }, 0);
-                let ace = ace.cast::<ACCESS_ALLOWED_ACE>();
-                let header = unsafe { (*ace).Header };
-                assert_eq!(u32::from(header.AceType), ACCESS_ALLOWED_ACE_TYPE);
-                let trustee: PSID = unsafe { &raw mut (*ace).SidStart }.cast();
+                let entry = unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().as_ref() }.unwrap();
+                assert_eq!(u32::from(entry.Header.AceType), ACCESS_ALLOWED_ACE_TYPE);
                 (
-                    sid_text(trustee).unwrap(),
-                    u32::from(header.AceFlags),
-                    unsafe { (*ace).Mask },
+                    sid_text(allowed_ace_sid(ace)).unwrap(),
+                    u32::from(entry.Header.AceFlags),
+                    entry.Mask,
                 )
             })
             .collect();
