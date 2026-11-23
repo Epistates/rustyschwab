@@ -144,7 +144,7 @@ linux-keyutils-keyring-store = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { workspace = true }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_SystemServices", "Win32_System_Threading"] }
 
 # Used by serde(with) attributes in configuration types.
 [package.metadata.cargo-machete]

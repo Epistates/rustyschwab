@@ -15,7 +15,7 @@ For multiple hosts, the implemented `RemoteBackend` adapter and `rustyschwab-aut
 1. Stop all old-version writers before migration. Do not run JSON-only and SQLite clients concurrently.
 2. Back up token/key files and the old journal.
 3. `OrderJournal::new("tokens.orders.json")` opens `tokens.orders.store/state.sqlite3`. Existing protected JSON is imported once in a transaction, preserving pending intent and consumed approval keys. The source file is retained.
-4. Existing `state.sqlite3` paths open directly. The state directory must be private (Unix 0700; protected inheritable owner/SYSTEM ACL on Windows).
+4. Existing `state.sqlite3` paths open directly. The state directory must be private (Unix 0700; on Windows owned by, and open to, no one but this account, SYSTEM and Administrators, with entries the files created in it inherit). A directory the SDK creates already is.
 5. Inspect status and readiness before enabling submissions.
 
 SQLite writes run on a bounded blocking-worker pool. A submission runs on its own task once it is journaled, so a caller that cancels, disconnects or times out abandons only the answer: the intent still reaches its outcome. Each intent is *armed* in the journal immediately before its request leaves the host. A process that dies between journaling and arming leaves an unarmed intent, which provably reached no broker; reconciliation resolves it as rejected (audited `never_dispatched`, its tag and reservation freed) once it is ten minutes old, longer than any submission's own deadline. Arming only succeeds on an unresolved intent, so a dispatcher that wakes late cannot send what recovery resolved. An armed intent is never resolved without broker evidence.
@@ -219,7 +219,7 @@ Build `enterprise-bench` in release mode, then run `tools/benchmark.py` against 
 
 CI runs feature/platform/MSRV checks and short soak jobs. The release workflow creates binaries, a CycloneDX SBOM, checksums and GitHub build-provenance attestations; it uploads artifacts without publishing a release. Compatibility checking compares PRs with the base revision. Intentional breaking changes require an appropriate version bump and migration notes, not a bypass of the check. Verify provenance before deployment using the [GitHub attestation verification workflow](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
 
-Still required externally: native Windows execution, live broker contract/entitlement qualification, gateway/identity integration, backup restoration on the production filesystem, storage exhaustion exercises and a sustained production-shaped soak. This document does not mark those gates passed.
+Still required externally: live broker contract/entitlement qualification, gateway/identity integration, backup restoration on the production filesystem, storage exhaustion exercises and a sustained production-shaped soak. This document does not mark those gates passed.
 
 See [support and compatibility policy](SUPPORT.md). Local qualification evidence is written to `docs/audit/` (git-ignored; the same artifacts are uploaded by `qualification.yml`).
 

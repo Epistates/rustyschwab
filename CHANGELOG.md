@@ -156,6 +156,29 @@ one. Signatures are unchanged.
 
 ### Fixed
 
+- Windows: the SDK refused the private files and directories it had just
+  created, so the file and encrypted token stores, the OAuth callback
+  state, the refresh lock, the coordination lease and the durable state
+  directory did not work there. They failed with "Private file requires a
+  protected owner/SYSTEM DACL" or "State directory needs a protected
+  inheritable owner/SYSTEM ACL", or with "Access is denied" when another
+  handle had the token file open as it was replaced. Every refusal failed
+  closed, so nothing was exposed. The check turned the access control list
+  into text and compared it with two fixed strings, but it took the size
+  of the buffer Windows returned for the length of the text, so the text
+  kept trailing NUL characters and never matched. Replacing the file used
+  a rename that Windows refuses while the old file is open. The check now
+  reads the owner and each entry instead of comparing text.
+  A file or directory is private when this account, SYSTEM or the
+  Administrators group owns it and every entry that allows access names
+  one of them, the rule OpenSSH for Windows applies to private keys. A
+  directory must also pass that access on to the files created in it. New
+  files and directories are owned by this account and open to it and
+  SYSTEM only, and a replacement goes through while a reader has the old
+  file open. **Behavior change:** on Windows, a token or configuration
+  file saved in your own profile is now accepted, and files and state
+  directories written by earlier releases still open. A file that lets in
+  Everyone, Users or any other account is refused, as before.
 - **Behavior change:** a new state file was created with seven commits (the
   metadata table, then one per schema migration), each a flush to disk. It
   now takes one, so the first operation on a new file is faster, and a
