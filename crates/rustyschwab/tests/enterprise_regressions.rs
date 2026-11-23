@@ -405,6 +405,31 @@ async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
     );
 }
 
+/// The client's state is opened when it is built: the file exists before the
+/// first request, and a state location that cannot be used is the
+/// constructor's error rather than the first call's.
+#[test]
+fn a_client_opens_its_state_when_it_is_built() {
+    let config = |tokens_file: std::path::PathBuf| {
+        let mut config = SchwabConfig::default();
+        config.oauth.app_key = "k".repeat(32);
+        config.oauth.app_secret = "s".repeat(16);
+        config.oauth.token_store_kind = TokenStoreKind::File;
+        config.oauth.tokens_file = tokens_file;
+        config.oauth.auto_refresh = false;
+        config.streaming = None;
+        config
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = SchwabClient::new(config(dir.path().join("tokens.json"))).unwrap();
+    assert!(client.order_journal().path().exists());
+
+    // A regular file where the state's directory would be.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    SchwabClient::new(config(blocker.join("tokens.json"))).unwrap_err();
+}
+
 #[tokio::test]
 async fn concurrent_managers_share_refresh_and_persist_rotation() {
     use rustyschwab::auth::{AuthManager, OAuthConfig};

@@ -273,6 +273,20 @@ impl StateDatabase {
             .await
             .copied()
     }
+    /// Validate and migrate the file now, on the calling thread, so that an
+    /// error in the state location surfaces to whoever builds on it and the
+    /// first operation does not pay for creating the file.
+    pub(crate) fn open(&self) -> Result<()> {
+        if self.inner.initialized.initialized() {
+            return Ok(());
+        }
+        let connection = self.inner.initialize()?;
+        // Another caller may have opened it meanwhile: keep theirs.
+        if self.inner.initialized.set(()).is_ok() {
+            self.inner.idle.lock().push(connection);
+        }
+        Ok(())
+    }
     /// Run `f` on a pooled connection from a blocking thread. The first call
     /// validates and migrates the file; a failed initialization is retried by
     /// the next call rather than poisoning the handle.
