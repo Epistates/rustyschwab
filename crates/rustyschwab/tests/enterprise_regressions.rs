@@ -391,11 +391,14 @@ async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
     config.oauth.tokens_file = dir.path().join("tokens.json");
     config.oauth.auto_refresh = false;
     config.client.base_url = server.uri();
-    config.client.timeout = Duration::from_millis(80);
+    // The deadline also covers the durable quota reservation, so it leaves
+    // room for a slow disk. Had the client waited for the 60 s Retry-After,
+    // it would have reached this deadline and reported a timeout, after the
+    // outer 5 s bound had already failed the test.
+    config.client.timeout = Duration::from_secs(10);
     config.streaming = None;
     let client = SchwabClient::new(config).unwrap();
-    // Had it waited, the 80 ms deadline would have made it a timeout.
-    let error = tokio::time::timeout(Duration::from_secs(1), client.get_account_numbers())
+    let error = tokio::time::timeout(Duration::from_secs(5), client.get_account_numbers())
         .await
         .unwrap()
         .unwrap_err();
