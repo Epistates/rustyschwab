@@ -29,23 +29,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 release that freezes TurboMCP's API for 4.0, and takes its behavior as it
 is. The tools, their schemas and results, the policy, the approvals and the
 audit journal are unchanged. Each change a client can notice has a line
-here or in the next section; TurboMCP's CHANGELOG (4.0.0-alpha.6 and
-4.0.0-beta.1) lists the rest.
+here or in the next section. Lines marked "TurboMCP" describe behavior that
+is TurboMCP's own, as
+[its CHANGELOG](https://github.com/Epistates/turbomcp/blob/v4.0.0-beta.1/CHANGELOG.md)
+documents it under 4.0.0-alpha.6 and 4.0.0-beta.1.
 
 - **Breaking (WebSocket):** the upgrade is accepted at `/` only, the bare
-  `ws://host:port` address. It was accepted at any path.
+  `ws://host:port` address. It was accepted at any path. Migration: connect
+  to `ws://host:port/`.
 - **Breaking (WebSocket):** a missing or bad credential is answered `401`
   with a `WWW-Authenticate` challenge before the upgrade. It was a `101`
-  followed by close code `1008`.
+  followed by close code `1008`. Migration: handle the HTTP status of a
+  refused upgrade.
 - **Behavior change (WebSocket):** with `SCHWAB_MCP_TRANSPORT=websocket`
   the listener also answers Streamable HTTP at `/mcp`, behind the same
   credential check. WebSocket is now a route on TurboMCP's HTTP endpoint.
-- **Behavior change (WebSocket):** a connection is closed with `1008` when
-  its credential expires. Until now only its next request was refused.
-- **Behavior change (WebSocket):** at most 1,024 connections are held
-  (`503` past that); there was no cap. A connection still runs 32 calls at a
+- **Behavior change (WebSocket):** a connection still runs 32 calls at a
   time. Further calls now wait in the server for a slot, where they used to
   wait unread in the socket.
+- **Behavior change (WebSocket, TurboMCP):** a connection is closed with
+  `1008` when its credential expires. Until now only its next request was
+  refused.
+- **Behavior change (WebSocket, TurboMCP):** at most 1,024 connections are
+  held, and an upgrade past that is answered `503`. There was no cap.
 - **Behavior change (Streamable HTTP):** a call still running after five
   seconds answers as `text/event-stream`, kept open by keep-alive comments
   until its result arrives as the last event. A submission holding for its
@@ -54,30 +60,27 @@ here or in the next section; TurboMCP's CHANGELOG (4.0.0-alpha.6 and
   required.
 - **Behavior change (Streamable HTTP):** a request with neither a session
   nor the `2026-07-28` envelope is `400`. It was `200` with the error in its
-  body. Other refusals now carry a JSON-RPC error body too.
-- **Behavior change (Streamable HTTP):** on a `2025-06-18` or `2025-11-25`
-  session, a dropped connection no longer cancels the call it carried, as
-  those revisions ask, and the client can resume the response stream with
-  `Last-Event-ID` (events are kept in memory, 64 MiB at most). On
-  `2026-07-28` a disconnect cancels, as before. A principal may hold 1,024
-  sessions (`429` past that) and 64 open streams.
+  body.
+- **Behavior change (Streamable HTTP, TurboMCP):** on a `2025-06-18` or
+  `2025-11-25` session, a dropped connection no longer cancels the call it
+  carried, as those revisions ask, and the client can resume the response
+  stream with `Last-Event-ID`. On `2026-07-28` a disconnect cancels, as
+  before.
+- **Behavior change (Streamable HTTP, TurboMCP):** a principal may hold
+  1,024 sessions (`429` past that) and 64 open streams.
 - **Behavior change (stdio, WebSocket):** two seconds after a client closes
   its end, the calls it left in flight are told they were called off. They
-  had thirty seconds. A write past its audit record is still waited for, for
-  up to thirty seconds, and runs to its outcome either way.
+  had thirty seconds. A write past its audit record runs to its outcome
+  either way.
 - **Behavior change (every transport):** calling a tool the server does not
   have is JSON-RPC `-32602`, as every revision lists an unknown tool. It was
   `-32601`.
-- The client-approval question is the same form. TurboMCP 4.0.0-beta.1
-  clients refuse a form elicitation without a valid `requestedSchema`
-  (`-32602`); the server's is checked against the form subset of every
-  revision it speaks. The server has no MCP client of its own, so the two
-  other client-side changes TurboMCP marks (`ClientBuilder::with_extension`
-  and exact issuer matching in its OAuth client) do not reach it. One note
-  for operators who issue JWTs: a TurboMCP 4.0.0-beta.1 client that
-  authorizes against this server requires the authorization server's own
-  `issuer` to equal the identity file's `issuer` exactly, trailing slash
-  included.
+- The client-approval question is the same form, within the form subset of
+  every revision the server speaks; TurboMCP 4.0.0-beta.1 clients refuse a
+  form elicitation outside it. One note for operators who issue JWTs: a
+  TurboMCP 4.0.0-beta.1 client that authorizes against this server requires
+  the authorization server's own `issuer` to equal the identity file's
+  `issuer` exactly, trailing slash included.
 - Rust API: `network::WEBSOCKET_PATH` is new. `Network::http_router`,
   `Network::serve_websocket`, `AuthorizedServer::run_stdio` and
   `eval::Recording::run_stdio` keep their signatures.
@@ -118,9 +121,11 @@ held order").
   that reaches it before its audit record is answered `timeout` and has
   sent nothing. A write past its audit record is answered
   `reconciliation_required` with its `attemptId` and still runs to its
-  outcome. Over HTTP a call was cut off with `504` at two minutes; over
-  stdio and WebSocket nothing bounded it. The read-only stdio server that
-  runs without a policy file answers a JSON-RPC timeout error.
+  outcome. The limit never interrupts the audit record's commit, so a call
+  is told `timeout` only when no write was handed off. Over HTTP a call was
+  cut off with `504` at two minutes; over stdio and WebSocket nothing
+  bounded it. The read-only stdio server that runs without a policy file
+  answers a JSON-RPC timeout error.
 - **Breaking (Rust API):** `contract::FailureCode` has a new variant,
   `Cancelled`; add an arm where you match it. New:
   `AuthorizedServer::with_call_timeout` and `call_timeout`,
@@ -133,9 +138,7 @@ held order").
   1.89, for the five crates and for building the Python bindings from
   source. parking_lot 0.13, which the SDK and the MCP server lock with,
   requires it, and no dependency in the lockfile declares more. Migration:
-  build with Rust 1.95 or newer. The published wheels are unaffected, and
-  `rust-toolchain.toml` pins the toolchain this repository builds with (now
-  1.100.0). CI's minimum-version row builds and tests on 1.95.0.
+  build with Rust 1.95 or newer. The published wheels are unaffected.
 
 ### Fixed
 
@@ -278,35 +281,27 @@ held order").
 
 ### Changed — release gating
 
-- `publish.yml` and the PyPI job of `publish-python.yml` now refuse a tag
-  whose commit has not passed CI and `release.yml`, checked once the
-  environment approval is given. `publish.yml` packages all five crates
-  before it publishes any, and `publish-python.yml` runs the test suite and
-  `mypy` against the Linux wheel it publishes.
-- The live conformance jobs in `qualification.yml` run in a `live-schwab`
-  environment, so their Schwab credentials can be limited to `main` (move
-  the three secrets there; see `docs/RELEASING.md`).
-- `docs/RELEASING.md` is rewritten for releases after the first: the
-  repository settings a release depends on, every version to bump, and the
-  order of tagging, approval and publishing.
+- Crates and wheels are published only from a tag whose commit passed CI
+  and the release workflow. All five crates are packaged before any is
+  published, and the Linux wheel is tested and type-checked before it goes
+  to PyPI.
 
 ### Changed — dependencies
 
-- Every compatible update in the three lockfiles, the workspace's,
-  `crates/schwab-py`'s and `fuzz/`'s (rustix 1.1.6, openssl 0.10.82, uuid
-  1.29.3, rustls-webpki 0.103.17 and others), and the pinned GitHub Actions:
-  setup-python 7.1.0, codeql-action 4.39.3, install-action 2.90.5, trufflehog
-  3.99.9, cargo-deny-action 2.1.2 (cargo-deny 0.21), crates-io-auth-action
-  1.0.6.
+- TurboMCP 4.0.0-beta.1 in `rustyschwab-mcp`, from 4.0.0-alpha.5 (see
+  "the MCP server runs on TurboMCP 4.0.0-beta.1" above). Its crates require
+  each other exactly, so a build that resolves without the lockfile, such as
+  `cargo install` without `--locked`, gets a matched set. With it the
+  lockfile takes jsonschema 0.61.2 (from 0.49.9), fancy-regex 0.20.2 and
+  fraction 0.17.0, and gains serde_json_canonicalizer 0.4.1, ryu-js and
+  chacha20poly1305 0.10.1, which TurboMCP seals a `2026-07-28` call's
+  `requestState` with.
 - parking_lot 0.13 in the SDK and the MCP server, from 0.12. It needs Rust
   1.95, so the minimum moves with it (see "Rust 1.95 is the minimum" above).
   The crates use its `Mutex` and `RwLock` with plain `lock`, `read` and
-  `write`, which are unchanged. tokio and the other dependencies that lock
-  with parking_lot are still on 0.12, so both are in the tree.
-- The toolchain CI and releases build with (`rust-toolchain.toml`) is Rust
-  1.100.0, from 1.98.1. Its Cargo warns about two manifest fields, which are
-  removed: `homepage`, which repeated `repository` in every crate, and a
-  `readme` in `[workspace.package]` that no crate inherited.
+  `write`, which are unchanged.
+- Release binaries and wheels are built with Rust 1.100.0 (was 1.98.1). The
+  crates no longer set `homepage`, which repeated `repository`.
 - rusqlite 0.43 (bundled SQLite 3.54.1), which fixes use-after-free bugs in
   APIs the SDK does not call and now refuses empty SQL, which it never sends.
 - jsonwebtoken 12 in `rustyschwab-mcp`. The OAuth identity check now rejects
@@ -315,68 +310,32 @@ held order").
 - axum-server 0.9 behind the SDK's `callback-server` feature. The OAuth
   callback server behaves as before.
 - PyO3 0.30, pyo3-async-runtimes 0.30 and pythonize 0.30 in the Python
-  bindings, now that pythonize has a release for PyO3 0.30. The wheels still
-  cover CPython 3.10 and later.
-- RustSec now lists chrono, chrono-tz and humantime as unmaintained
-  (RUSTSEC-2026-0543, -0555 and -0542); their maintainer recommends jiff.
-  These are notices, not vulnerabilities. `deny.toml` accepts them, with the
-  reason, because chrono types are part of these crates' public API and
-  replacing them is a breaking change.
+  bindings. The wheels still cover CPython 3.10 and later.
 - url 2.5.9, which fixes RUSTSEC-2026-0592: `Url::origin()` overflowed the
   stack on a URL with deeply nested `blob:` prefixes. The SDK calls it on the
-  configured base URL and on the request URLs it builds. With it, every
-  compatible update in the three lockfiles (keyring-core 1.1.0, serde_with
-  3.25.0, clap 4.6.9 and others) and install-action 2.90.6.
-- TurboMCP 4.0.0-beta.1 in `rustyschwab-mcp`, from 4.0.0-alpha.5 (see
-  "the MCP server runs on TurboMCP 4.0.0-beta.1" above). Its crates require
-  each other exactly, so a build that resolves without the lockfile gets a
-  matched set. With it the lockfile takes jsonschema 0.61.2 (from 0.49.9),
-  fancy-regex 0.20.2 and fraction 0.17.0, and gains serde_json_canonicalizer
-  0.4.1, ryu-js and chacha20poly1305 0.10.1, which TurboMCP seals a
-  `2026-07-28` call's `requestState` with. turbomcp-codec,
-  turbomcp-transport-stdio and turbomcp-transport-ws are gone: their code
-  moved into the other TurboMCP crates.
-- In the lockfile errno, rustix, tempfile, winapi-util, quinn-udp and
-  rustls-platform-verifier link windows-sys 0.61.2 again, the newest they
-  accept. A resolution earlier in this cycle had left them on 0.52.0, which
-  only ring still requires.
-- The minimum versions the manifests declare are raised to ones the
-  workspace resolves and builds with; the weekly minimal-versions job had
-  never passed. `serde_json = "1.0"` allowed 1.0.0, which has no
+  configured base URL and on the request URLs it builds.
+- RustSec now lists chrono, chrono-tz and humantime as unmaintained
+  (RUSTSEC-2026-0543, -0555 and -0542); their maintainer recommends jiff.
+  These are notices, not vulnerabilities. The crates stay on chrono for now
+  because its types are part of their public API and replacing them is a
+  breaking change.
+- Every other compatible update in the lockfiles (rustix 1.1.6, openssl
+  0.10.82, uuid 1.29.3, rustls-webpki 0.103.17, keyring-core 1.1.0,
+  serde_with 3.25.0, clap 4.6.9 and others).
+- The minimum dependency versions the manifests declare are raised to ones
+  the crates build with. `serde_json = "1.0"` allowed 1.0.0, which has no
   `float_roundtrip` feature; metrics 0.24.0 to 0.24.2 and anyhow 1.0.1 do
   not build with what depends on them or with a current compiler; the SDK
   needs `SecretString: Clone + From<&str>`, which secrecy has from 0.10.3;
   and the other floors were below what TurboMCP 4.0.0-beta.1 and the rest
-  of the tree require. `url` is now at least 2.5.9, the release with the
-  fix above. Raised: serde 1.0.229, serde_json 1.0.154, tokio 1.54, reqwest
-  0.13.5, axum 0.8.9, chrono 0.4.39, thiserror 2.0.21, anyhow 1.0.60,
-  tracing 0.1.44, tracing-subscriber 0.3.22, metrics 0.24.3, schemars 1.2.3,
-  tower 0.5.3, governor 0.10.4, rustix 1.1.4, futures-util 0.3.34,
-  async-trait 0.1.92, parking_lot 0.13.0, rand 0.10.2, base64 0.23.1, uuid
-  1.26, zeroize 1.9, secrecy 0.10.3 and windows-sys 0.61.2. All are at or
-  below the versions in `Cargo.lock`, so a build from the lockfile is
-  unchanged.
-
-### Fixed — CI
-
-- The `test (windows-latest)` job failed to build: a helper used only by the
-  Unix file checks was compiled, unused, on Windows, where warnings are
-  errors in CI.
-- `workflow lint` and the two fuzz jobs never ran their tools. install-action
-  has no manifest for actionlint, so it is now downloaded from its release
-  and checked against the published digest; the prebuilt cargo-fuzz is a
-  musl binary that builds for musl unless told otherwise, so the fuzz jobs
-  name `x86_64-unknown-linux-gnu`.
-- `SDK feature combinations` passed `--no-dev-deps` with `--locked`: the
-  first rewrites the manifests and the second then refuses the lockfile.
-  `--no-dev-deps` is dropped, since with resolver 2 a library check does
-  not take features from dev-dependencies.
-- `compatibility` (cargo-semver-checks) skips `rustyschwab-mcp`,
-  `rustyschwab-console` and `rustyschwab-dash` until its baseline has
-  TurboMCP 4.0.0-beta.1. It resolves dependencies without the lockfile, for
-  the baseline too, and a base that pins 4.0.0-alpha.5 does not build that
-  way since later prereleases of some of its crates were published. The
-  weekly minimal-versions job checks the three crates again.
+  of the tree require. Now required: serde 1.0.229, serde_json 1.0.154,
+  tokio 1.54, reqwest 0.13.5, axum 0.8.9, chrono 0.4.39, thiserror 2.0.21,
+  anyhow 1.0.60, tracing 0.1.44, tracing-subscriber 0.3.22, metrics 0.24.3,
+  schemars 1.2.3, tower 0.5.3, governor 0.10.4, rustix 1.1.4, futures-util
+  0.3.34, async-trait 0.1.92, parking_lot 0.13.0, rand 0.10.2, base64
+  0.23.1, uuid 1.26, zeroize 1.9, secrecy 0.10.3, url 2.5.9 and windows-sys
+  0.61.2. All are at or below the versions in `Cargo.lock`, so a build from
+  the lockfile is unchanged.
 
 ### Removed
 
