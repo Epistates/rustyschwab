@@ -105,8 +105,10 @@ returns the URL and the caller passes the code to `exchange_code`. PKCE
 not use it.
 
 `security.rs` is the encryption, key derivation and file-permission code
-used by the stores; `security_windows.rs` applies an owner/SYSTEM DACL on
-Windows.
+used by the stores. `security_windows.rs` is its Windows half: it creates
+files and directories owned by this account and open to it and SYSTEM
+only, and accepts an existing one when its owner and every entry that
+allows access is this account, SYSTEM or Administrators.
 
 ### REST client
 

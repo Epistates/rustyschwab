@@ -144,6 +144,27 @@ held order").
 
 ### Fixed
 
+- Windows: the SDK refused the private files and directories it had just
+  created, so the file and encrypted token stores, the OAuth callback
+  state, the refresh lock, the coordination lease and the durable state
+  directory did not work there. They failed with "Private file requires a
+  protected owner/SYSTEM DACL" or "State directory needs a protected
+  inheritable owner/SYSTEM ACL", or with "Access is denied" when another
+  handle had the token file open as it was replaced. Every refusal failed
+  closed, so nothing was exposed. The check compared the text of the
+  access control list with two fixed strings, so a list that Windows
+  reports differently from how it was written was refused even when it
+  granted exactly what the SDK set. It now reads the owner and each entry.
+  A file or directory is private when this account, SYSTEM or the
+  Administrators group owns it and every entry that allows access names
+  one of them, the rule OpenSSH for Windows applies to private keys. A
+  directory must also pass that access on to the files created in it. New
+  files and directories are owned by this account and open to it and
+  SYSTEM only, and a replacement goes through while a reader has the old
+  file open. **Behavior change:** on Windows, a token or configuration
+  file saved in your own profile is now accepted, and files and state
+  directories written by earlier releases still open. A file that lets in
+  Everyone, Users or any other account is refused, as before.
 - Performance ratios on a sparse equity curve were annualized as if each
   gap between points were one trading day: a weekly backtest's Sharpe was
   overstated by about the square root of five (roughly 2.2x), and the

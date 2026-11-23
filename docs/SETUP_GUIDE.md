@@ -119,7 +119,7 @@ By default, the SDK saves tokens to `schwab_tokens.json` (override with `SCHWAB_
 | Encrypted file | `encrypted` | Linux, Windows | A token file that leaves the machine on its own (a backup, a copied directory). ChaCha20-Poly1305 with a random key in `schwab_tokens.key` beside it. It does not protect against a local account that can read both files; use the keychain for that. |
 | File | `file` | — | Nothing beyond owner-only permissions. Development only. |
 
-Token files are written owner-only (0600 on Unix, an owner-only ACL on Windows) and checked before every read. In memory, tokens are `SecretString`s that are zeroized on drop and redacted from `Debug` output and logs. Pages are not locked, so disable core dumps and use encrypted swap on hosts that hold credentials.
+Token files are written owner-only (0600 on Unix; on Windows an ACL that admits only this account and SYSTEM) and checked before every read. On Windows an existing file passes when it is owned by, and open to, no one but this account, SYSTEM and Administrators, which is what a file saved in your own profile gets. In memory, tokens are `SecretString`s that are zeroized on drop and redacted from `Debug` output and logs. Pages are not locked, so disable core dumps and use encrypted swap on hosts that hold credentials.
 
 The access token lasts about 30 minutes and is refreshed in the background (`SCHWAB_REFRESH_BUFFER` seconds before expiry). The refresh token lasts 7 days; after that, run the authorization flow again. `OAuthConfig::on_token_notification` warns before the refresh token expires (`TokenNotification::RefreshTokenExpiring`).
 
