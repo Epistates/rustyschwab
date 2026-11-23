@@ -24,8 +24,9 @@
 //! five seconds, or whose caller gave up first, fails with `database is
 //! locked` and never runs.
 //!
-//! The wait for the lock runs on a thread of its own per handle, outside
-//! Tokio's blocking pool (see `lock_thread`).
+//! A writer first tries for the lock where a blocking task runs. If another
+//! handle or process holds it, the wait goes to a thread of its own per
+//! handle, outside Tokio's blocking pool (see `lock_thread`).
 //!
 //! The lock file orders only writers that use it. One that does not (an
 //! earlier release of the SDK, the `sqlite3` shell) is waited for through
@@ -175,8 +176,10 @@ struct Inner {
     /// The turn to write. Writers on this handle queue on it in the order
     /// they asked (Tokio's mutex is fair).
     turn: Arc<tokio::sync::Mutex<()>>,
-    /// Asks the handle's lock thread for the write lock file, once one has
-    /// been started.
+    /// The write lock file, opened on first use.
+    lock_file: Arc<LockFile>,
+    /// Asks the handle's lock thread to wait for the write lock file, once
+    /// one has been started.
     locker: parking_lot::Mutex<Option<mpsc::Sender<LockRequest>>>,
 }
 
@@ -184,27 +187,66 @@ fn locked() -> Error {
     Error::Storage("database is locked: another writer holds the state file".into())
 }
 
-/// A writer's request for the write lock file, answered on `reply`. A request
+/// The write lock file beside a database, opened on first use. It is shared
+/// by the handle's writers, one at a time: whoever holds this handle's turn.
+struct LockFile {
+    path: PathBuf,
+    file: parking_lot::Mutex<Option<Arc<std::fs::File>>>,
+}
+impl LockFile {
+    fn open(&self) -> Result<Arc<std::fs::File>> {
+        let mut file = self.file.lock();
+        if let Some(file) = file.as_ref() {
+            return Ok(file.clone());
+        }
+        let opened = Arc::new(crate::auth::token_store::open_lock_file(&self.path)?);
+        *file = Some(opened.clone());
+        Ok(opened)
+    }
+}
+
+/// The write lock file, locked, and this handle's turn with it. Dropping it,
+/// on any thread and however (a panic included), unlocks the file and then
+/// passes the turn to the next writer on the handle.
+struct HeldLock {
+    file: Arc<std::fs::File>,
+    owner: Arc<LockFile>,
+    _turn: tokio::sync::OwnedMutexGuard<()>,
+}
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        // A file that cannot be unlocked is closed, which unlocks it, and
+        // opened again for the next writer.
+        if self.file.unlock().is_err() {
+            *self.owner.file.lock() = None;
+        }
+    }
+}
+
+/// What a first, non-blocking try for the write lock file came to.
+enum Attempt {
+    Held(HeldLock),
+    /// Another handle or process holds it.
+    Busy {
+        file: Arc<std::fs::File>,
+        owner: Arc<LockFile>,
+        turn: tokio::sync::OwnedMutexGuard<()>,
+    },
+}
+
+/// A writer's wait for the write lock file, answered on `reply`. A request
 /// whose `reply` has been dropped is abandoned: its caller timed out or went
 /// away, and the lock thread skips it, or unlocks at once if it was already
 /// waiting for the lock.
 struct LockRequest {
-    path: PathBuf,
-    /// This handle's turn. The lock thread keeps it until it has unlocked, so
-    /// the next writer on the handle asks only afterwards, as late as another
-    /// handle's writer waiting in the operating system needs to be woken.
+    file: Arc<std::fs::File>,
+    owner: Arc<LockFile>,
     turn: tokio::sync::OwnedMutexGuard<()>,
     reply: tokio::sync::oneshot::Sender<Result<HeldLock>>,
 }
 
-/// The write lock file, locked. Dropping it, wherever and however (a
-/// panic included), has the lock thread unlock the file.
-struct HeldLock {
-    _release: mpsc::Sender<()>,
-}
-
-/// Serve a handle's [`LockRequest`]s, one at a time and in the order they
-/// were made, for as long as the handle lives.
+/// Wait for the write lock file on behalf of the handle's writers, one request
+/// at a time and in the order they were made, for as long as the handle lives.
 ///
 /// This is a thread of its own, not a task on Tokio's blocking pool, on
 /// purpose. A thread blocked in `flock` or `LockFileEx` cannot be cancelled
@@ -217,39 +259,27 @@ struct HeldLock {
 /// the order that makes writers take turns. Do not move this into
 /// `spawn_blocking`.
 fn lock_thread(requests: mpsc::Receiver<LockRequest>) {
-    let mut file: Option<std::fs::File> = None;
     for request in requests {
-        // Dropped last, after the unlock below.
-        let LockRequest { path, turn, reply } = request;
+        let LockRequest {
+            file,
+            owner,
+            turn,
+            reply,
+        } = request;
         if reply.is_closed() {
             continue;
         }
-        let acquired = match file.take() {
-            Some(file) => Ok(file),
-            None => crate::auth::token_store::open_lock_file(&path).map_err(Error::from),
-        }
-        .and_then(|file| match file.lock() {
-            Ok(()) => Ok(file),
+        let answer = match file.lock() {
+            Ok(()) => Ok(HeldLock {
+                file,
+                owner,
+                _turn: turn,
+            }),
             Err(error) => Err(Error::Io(error)),
-        });
-        match acquired {
-            Ok(held) => {
-                let (release, released) = mpsc::channel::<()>();
-                // Should nobody be waiting for the answer any more, the send
-                // fails and drops the lock with it, which ends the wait below.
-                let _ = reply.send(Ok(HeldLock { _release: release }));
-                let _ = released.recv();
-                // A file that cannot be unlocked is closed, which unlocks it,
-                // and opened again for the next request.
-                if held.unlock().is_ok() {
-                    file = Some(held);
-                }
-            }
-            Err(error) => {
-                let _ = reply.send(Err(error));
-            }
-        }
-        drop(turn);
+        };
+        // Should nobody be waiting for the answer any more, the send fails
+        // and drops the lock, which unlocks the file.
+        let _ = reply.send(answer);
     }
 }
 impl std::fmt::Debug for StateDatabase {
@@ -272,6 +302,7 @@ impl StateDatabase {
                 Some(path),
             )
         };
+        let path_for_lock = path.with_extension("write.lock");
         Self {
             inner: Arc::new(Inner {
                 path,
@@ -280,6 +311,10 @@ impl StateDatabase {
                 slots: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
                 idle: parking_lot::Mutex::new(Vec::with_capacity(POOL_SIZE)),
                 turn: Arc::new(tokio::sync::Mutex::new(())),
+                lock_file: Arc::new(LockFile {
+                    path: path_for_lock,
+                    file: parking_lot::Mutex::new(None),
+                }),
                 locker: parking_lot::Mutex::new(None),
             }),
         }
@@ -473,12 +508,29 @@ impl Inner {
         let turn = tokio::time::timeout_at(expiry, self.turn.clone().lock_owned())
             .await
             .map_err(|_| locked())?;
-        let (reply, granted) = tokio::sync::oneshot::channel();
-        let request = LockRequest {
-            path: self.path.with_extension("write.lock"),
-            turn,
-            reply,
+        // The lock is free more often than not, and a try for it is quick:
+        // make it where a blocking task would run, so that a paused clock
+        // (`tokio::time::pause`) waits for it as it does for any other.
+        let owner = self.lock_file.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            let file = owner.open()?;
+            match file.try_lock() {
+                Ok(()) => Ok(Attempt::Held(HeldLock {
+                    file,
+                    owner,
+                    _turn: turn,
+                })),
+                Err(std::fs::TryLockError::WouldBlock) => Ok(Attempt::Busy { file, owner, turn }),
+                Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+            }
+        })
+        .await
+        .map_err(|_| Error::Storage("State worker failed".into()))??;
+        let (file, owner, turn) = match attempt {
+            Attempt::Held(held) => return Ok(held),
+            Attempt::Busy { file, owner, turn } => (file, owner, turn),
         };
+        let (reply, granted) = tokio::sync::oneshot::channel();
         let stopped = || Error::Storage("State lock thread stopped".into());
         {
             let mut locker = self.locker.lock();
@@ -494,6 +546,12 @@ impl Inner {
                     .map_err(|error| Error::Storage(format!("State lock thread: {error}")))?;
                 *locker = Some(requests);
             }
+            let request = LockRequest {
+                file,
+                owner,
+                turn,
+                reply,
+            };
             if locker.as_ref().is_some_and(|l| l.send(request).is_err()) {
                 // The thread is gone: start another for the next write.
                 *locker = None;
@@ -1071,6 +1129,25 @@ mod tests {
             .recv_timeout(Duration::from_secs(3))
             .expect("dropping the runtime waited for the writer");
         runner.join().unwrap();
+    }
+
+    /// A write that finds the lock free is not cut short by a paused clock:
+    /// tests that pause Tokio's time (`start_paused`) run the SDK's writes
+    /// as they do any other blocking work, and the five seconds a write may
+    /// wait for its turn do not pass while it runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_completes_under_a_paused_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("paused.json"));
+        for n in 0..5 {
+            database
+                .write(move |c| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    insert(c, &format!("paused{n}"))
+                })
+                .await
+                .unwrap();
+        }
     }
 
     /// Commits in `database`'s write-ahead log: its frames that close a
