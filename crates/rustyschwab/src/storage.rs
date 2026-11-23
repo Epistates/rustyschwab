@@ -4,17 +4,44 @@
 //! then serves operations from a small pool of open connections. Clones share
 //! the pool; a second handle on the same path is a separate opener, so
 //! cross-process safety comes from SQLite's WAL locking, not from this type.
+//!
+//! # Writers take turns
+//!
+//! SQLite lets one connection write at a time, and a connection that finds
+//! the write lock taken can only poll for it, sleeping longer the longer it
+//! has waited (its busy handler, up to 100 ms between attempts). SQLite
+//! promises no order among waiters, and a writer that commits and asks again
+//! at once is nearly always first back, so one busy writer can keep another
+//! out until its timeout. [`StateDatabase::write`] therefore makes writers
+//! take turns. Those on one handle queue in the order they asked, and the one
+//! at the head locks the file `state.write.lock`, beside `state.sqlite3`, for
+//! the length of its transaction. Other handles, in this process or another,
+//! wait for that lock in the operating system (`flock`, or `LockFileEx` on
+//! Windows), which wakes a waiter when it is released instead of leaving it to
+//! poll. The operating system releases the lock when its holder exits or
+//! crashes. A write whose turn has not come within five seconds fails with
+//! `database is locked`, as one that could not get SQLite's lock always has.
+//!
+//! The lock file orders only writers that use it. One that does not (an
+//! earlier release of the SDK, the `sqlite3` shell) is waited for through
+//! SQLite's busy timeout, as before.
 use crate::error::{Error, Result};
 use rusqlite::{Connection, backup::Progress};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 
-/// Connections kept open per database. Writers serialize on SQLite's lock, so
-/// a small pool bounds blocking threads without starving readers or backups.
+/// Connections kept open per database. Writers take turns (see the module
+/// documentation), so a small pool bounds blocking threads without starving
+/// readers or backups.
 const POOL_SIZE: usize = 4;
+/// How long a write waits for its turn, and a connection for a lock held
+/// outside the turn order, before failing with `database is locked`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -143,6 +170,57 @@ struct Inner {
     initialized: tokio::sync::OnceCell<()>,
     slots: Arc<tokio::sync::Semaphore>,
     idle: parking_lot::Mutex<Vec<Connection>>,
+    /// The turn to write. Writers on this handle queue on it in the order
+    /// they asked (Tokio's mutex is fair); it keeps the write lock file once
+    /// that is open.
+    turn: Arc<tokio::sync::Mutex<Option<std::fs::File>>>,
+}
+
+/// Where a write stands between its caller and the blocking thread waiting
+/// for its turn: whichever moves it on first decides.
+const WRITE_WAITING: u8 = 0;
+const WRITE_STARTED: u8 = 1;
+const WRITE_ABANDONED: u8 = 2;
+
+fn locked() -> Error {
+    Error::Storage("database is locked".into())
+}
+
+/// This handle's turn to write, with the write lock file locked. Dropping it
+/// unlocks the file and passes the turn to the next writer in the queue.
+struct WriteTurn {
+    turn: tokio::sync::OwnedMutexGuard<Option<std::fs::File>>,
+}
+impl WriteTurn {
+    /// Lock the write lock file beside `database`, opening it on first use.
+    /// While another handle or process holds it, this thread waits in the
+    /// operating system's queue for the lock.
+    fn take(
+        mut turn: tokio::sync::OwnedMutexGuard<Option<std::fs::File>>,
+        database: &Path,
+    ) -> Result<Self> {
+        let file = match turn.take() {
+            Some(file) => file,
+            None => {
+                crate::auth::token_store::open_lock_file(&database.with_extension("write.lock"))?
+            }
+        };
+        file.lock()?;
+        *turn = Some(file);
+        Ok(Self { turn })
+    }
+}
+impl Drop for WriteTurn {
+    fn drop(&mut self) {
+        // Closing the file releases the lock as well, should unlocking fail.
+        if self
+            .turn
+            .as_ref()
+            .is_some_and(|file| file.unlock().is_err())
+        {
+            *self.turn = None;
+        }
+    }
 }
 impl std::fmt::Debug for StateDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -171,6 +249,7 @@ impl StateDatabase {
                 initialized: tokio::sync::OnceCell::new(),
                 slots: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
                 idle: parking_lot::Mutex::new(Vec::with_capacity(POOL_SIZE)),
+                turn: Arc::new(tokio::sync::Mutex::new(None)),
             }),
         }
     }
@@ -219,14 +298,78 @@ impl StateDatabase {
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))?
     }
-    /// [`run`](Self::run) for an operation that writes. Every write the SDK
-    /// makes goes through here, so what a write needs of its connection is
-    /// decided in one place.
+    /// [`run`](Self::run) for an operation that writes: `f` runs once it is
+    /// this handle's turn to write and no other handle or process is writing
+    /// in turn (see the module documentation). If the turn has not come
+    /// within five seconds this fails with `database is locked` and `f`
+    /// never runs; once `f` has started it runs to the end.
     pub(crate) async fn write<T: Send + 'static>(
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.run(f).await
+        self.write_within(BUSY_TIMEOUT, f).await
+    }
+    /// [`write`](Self::write), waiting at most `wait` for the turn.
+    async fn write_within<T: Send + 'static>(
+        &self,
+        wait: Duration,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.initialized().await?;
+        let expiry = tokio::time::Instant::now() + wait;
+        let turn = tokio::time::timeout_at(expiry, self.inner.turn.clone().lock_owned())
+            .await
+            .map_err(|_| locked())?;
+        let permit = tokio::time::timeout_at(expiry, self.inner.slots.clone().acquire_owned())
+            .await
+            .map_err(|_| locked())?
+            .map_err(|_| Error::Storage("State worker pool closed".into()))?;
+        let state = Arc::new(AtomicU8::new(WRITE_WAITING));
+        let (started, has_started) = tokio::sync::oneshot::channel::<()>();
+        let inner = self.inner.clone();
+        let worker_state = state.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let turn = WriteTurn::take(turn, &inner.path)?;
+            if worker_state
+                .compare_exchange(
+                    WRITE_WAITING,
+                    WRITE_STARTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                // The caller stopped waiting; the turn passes on unused.
+                return Err(locked());
+            }
+            let _ = started.send(());
+            let mut connection = inner.checkout()?;
+            let result = f(&mut connection);
+            drop(turn);
+            inner.checkin(connection);
+            result
+        });
+        tokio::select! {
+            // Started, or failed before it could.
+            _ = has_started => {}
+            () = tokio::time::sleep_until(expiry) => {
+                if state
+                    .compare_exchange(
+                        WRITE_WAITING,
+                        WRITE_ABANDONED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return Err(locked());
+                }
+            }
+        }
+        worker
+            .await
+            .map_err(|_| Error::Storage("State worker failed".into()))?
     }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
@@ -646,5 +789,142 @@ fn reserve_backup_file(path: &Path) -> Result<std::fs::File> {
         let file = options.open(path)?;
         crate::security::verify_file_permissions(path)?;
         Ok(file)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    fn insert(c: &Connection, key: &str) -> Result<()> {
+        c.execute(
+            "INSERT INTO meta VALUES(?1,'') ON CONFLICT(key) DO NOTHING",
+            [key],
+        )
+        .map(drop)
+        .map_err(sql)
+    }
+
+    /// Hold SQLite's write lock for `hold`, then commit an insert of `key`.
+    fn hold_and_insert(c: &mut Connection, key: &str, hold: Duration) -> Result<()> {
+        let tx = c
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        std::thread::sleep(hold);
+        insert(&tx, key)?;
+        tx.commit().map_err(sql)
+    }
+
+    /// Two handles on one file, as two processes would have: one writes
+    /// back to back, and the other asks for a single write. It is served
+    /// within a turn or two. Polling for SQLite's lock, the busy writer was
+    /// almost always first back, so the other waited through many of its
+    /// commits and could give up after five seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_writer_on_another_handle_gets_a_turn_beside_a_steady_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let busy = StateDatabase::new(dir.path().join("steady.json"));
+        let other = StateDatabase::new(busy.path().to_owned());
+        busy.run(|_| Ok(())).await.unwrap();
+        other.run(|_| Ok(())).await.unwrap();
+        let committed = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let steady = {
+            let (busy, committed, done) = (busy.clone(), committed.clone(), done.clone());
+            tokio::spawn(async move {
+                // Longer than the timeout in all, should the other write
+                // have to wait for this to stop.
+                for n in 0..300 {
+                    if done.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let committed = committed.clone();
+                    busy.write(move |c| {
+                        hold_and_insert(c, &format!("steady{n}"), Duration::from_millis(25))?;
+                        committed.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = committed.load(Ordering::Relaxed);
+        other.write(|c| insert(c, "other")).await.unwrap();
+        let during = committed.load(Ordering::Relaxed) - before;
+        done.store(true, Ordering::Relaxed);
+        steady.await.unwrap();
+        assert!(during <= 3, "{during} writes went ahead of a waiting one");
+    }
+
+    /// Writers on one handle are served in the order they asked: none gets
+    /// a second turn while another is waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writers_on_one_handle_take_turns_in_the_order_they_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("turns.json"));
+        database.run(|_| Ok(())).await.unwrap();
+        let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let tasks: Vec<_> = (0..4)
+            .map(|task| {
+                let (database, order) = (database.clone(), order.clone());
+                tokio::spawn(async move {
+                    for n in 0..5 {
+                        let order = order.clone();
+                        database
+                            .write(move |c| {
+                                order.lock().push(task);
+                                hold_and_insert(
+                                    c,
+                                    &format!("t{task}n{n}"),
+                                    Duration::from_millis(25),
+                                )
+                            })
+                            .await
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let order = order.lock();
+        assert_eq!(order.len(), 20);
+        assert!(order.windows(2).all(|w| w[0] != w[1]), "{order:?}");
+    }
+
+    /// A write whose turn does not come fails as `database is locked` and
+    /// never runs; the turn it was waiting for passes to the next writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_gets_no_turn_fails_as_locked_and_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("held.json"));
+        database.run(|_| Ok(())).await.unwrap();
+        // Another process in the middle of a write.
+        let held =
+            crate::auth::token_store::open_lock_file(&database.path().with_extension("write.lock"))
+                .unwrap();
+        held.lock().unwrap();
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let refused = database
+            .write_within(Duration::from_millis(200), move |c| {
+                flag.store(true, Ordering::Relaxed);
+                insert(c, "late")
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&refused, Error::Storage(m) if m == "database is locked"),
+            "{refused:?}"
+        );
+        held.unlock().unwrap();
+        database.write(|c| insert(c, "next")).await.unwrap();
+        assert!(!ran.load(Ordering::Relaxed));
+        let late: bool = database.run(|c| meta::exists(c, "late")).await.unwrap();
+        assert!(!late);
     }
 }

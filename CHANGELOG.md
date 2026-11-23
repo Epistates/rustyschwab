@@ -144,6 +144,22 @@ held order").
 
 ### Fixed
 
+- A write to the execution state (an audit event, a journal entry, a quota
+  check) could fail with `Storage("database is locked")` while other tasks
+  or processes wrote to the same file. SQLite gives a waiting writer no
+  place in line: it polls for the lock, waiting longer each time, so a
+  writer that commits and asks again at once is nearly always first back,
+  and on a slow disk (Windows in particular) one writer's run of commits
+  could keep another out past the five-second timeout. Writes now take
+  turns: in the order they asked within a process, and across processes
+  through `state.write.lock`, a lock file the SDK creates beside
+  `state.sqlite3` on the first write. A waiting writer is woken as soon as
+  the lock is released, and the operating system releases it if its holder
+  crashes. A write whose turn has not come within five seconds still fails
+  with `database is locked` and is not applied. A writer that does not use
+  the lock file (an earlier release, the `sqlite3` shell) is waited for as
+  before. Under contention the longest waits shrink and a write waits for
+  the writers queued ahead of it.
 - Performance ratios on a sparse equity curve were annualized as if each
   gap between points were one trading day: a weekly backtest's Sharpe was
   overstated by about the square root of five (roughly 2.2x), and the
