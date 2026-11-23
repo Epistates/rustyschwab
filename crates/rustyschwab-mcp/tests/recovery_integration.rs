@@ -59,10 +59,38 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
         .await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (request_delta, mut delta_requested) = tokio::sync::mpsc::unbounded_channel::<()>();
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-        while let Some(Ok(frame)) = ws.next().await {
+        loop {
+            let frame = tokio::select! {
+                frame = ws.next() => match frame {
+                    Some(Ok(frame)) => frame,
+                    _ => break,
+                },
+                // The data frame for a subscription is sent when the test
+                // asks for it, so how long it takes the test to get from
+                // that frame to the REST baseline is the test's to control.
+                Some(()) = delta_requested.recv() => {
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let frame = json!({"data":[{
+                        "service":"LEVELONE_EQUITIES","timestamp":now,"command":"SUBS",
+                        "content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY",
+                            "1":150.25,"2":150.5}]
+                    }]});
+                    if ws
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            frame.to_string().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
             let Ok(text) = frame.into_text() else {
                 continue;
             };
@@ -72,17 +100,10 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
             for r in request["requests"].as_array().unwrap() {
                 let ack = json!({"response":[{"service":r["service"],"command":r["command"],"requestid":r["requestid"],"SchwabClientCorrelId":"correl","timestamp":1,"content":{"code":0,"msg":"synthetic"}}]});
                 let mut frames = vec![ack];
-                // Every subscription is answered with one numbered data frame,
-                // as the broker sends them.
+                // The account subscription is answered with one numbered data
+                // frame, as the broker sends them.
                 let now = chrono::Utc::now().timestamp_millis();
                 match (r["service"].as_str(), r["command"].as_str()) {
-                    (Some("LEVELONE_EQUITIES"), Some("SUBS" | "ADD")) => {
-                        frames.push(json!({"data":[{
-                            "service":"LEVELONE_EQUITIES","timestamp":now,"command":"SUBS",
-                            "content":[{"key":"AAPL","delayed":false,"assetMainType":"EQUITY",
-                                "1":150.25,"2":150.5}]
-                        }]}))
-                    }
                     (Some("ACCT_ACTIVITY"), Some("SUBS" | "ADD")) => {
                         // Field 3 is JSON serialized into a string.
                         let message =
@@ -144,7 +165,16 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
     );
     tokio::time::sleep(Duration::from_millis(160)).await;
     assert!(!client.submissions_suspended());
-    // The delta is cached but cannot be fresh until the REST baseline lands.
+    // The stream's first delta arrives while recovery cannot reach the REST
+    // baseline. It is cached but cannot be fresh until the baseline lands.
+    request_delta.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while cache.snapshot("LEVELONE_EQUITIES", None).get("AAPL").is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
     assert_eq!(snapshot["AAPL"]["fresh"], false);
     assert_eq!(
@@ -165,22 +195,7 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
     .await
     .unwrap();
     assert!(!client.submissions_suspended());
-    // A delta stays fresh for two seconds after it arrives, and recovery on
-    // a slow machine can take longer than that after the first one. Judge
-    // freshness by a delta that arrives once the baseline has landed, as a
-    // live subscription keeps sending: asked again, the server sends one.
-    let first = cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["receivedAt"].clone();
-    stream
-        .subscribe_level_one_equities(&["AAPL"])
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["receivedAt"] == first {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    // The delta that arrived before the baseline is fresh once it lands.
     let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
     assert_eq!(snapshot["AAPL"]["fresh"], true);
     // Snapshots carry field names, not numbers; the stream delta wins over
