@@ -103,18 +103,17 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
                 // The account subscription is answered with one numbered data
                 // frame, as the broker sends them.
                 let now = chrono::Utc::now().timestamp_millis();
-                match (r["service"].as_str(), r["command"].as_str()) {
-                    (Some("ACCT_ACTIVITY"), Some("SUBS" | "ADD")) => {
-                        // Field 3 is JSON serialized into a string.
-                        let message =
-                            json!({"SchwabOrderID":"1","BaseEvent":{"AccountNumber":"123456789"}});
-                        frames.push(json!({"data":[{
-                            "service":"ACCT_ACTIVITY","timestamp":now,"command":"SUBS",
-                            "content":[{"seq":1,"key":"Account Activity","1":"123456789",
-                                "2":"OrderCreated","3":message.to_string()}]
-                        }]}));
-                    }
-                    _ => {}
+                if let (Some("ACCT_ACTIVITY"), Some("SUBS" | "ADD")) =
+                    (r["service"].as_str(), r["command"].as_str())
+                {
+                    // Field 3 is JSON serialized into a string.
+                    let message =
+                        json!({"SchwabOrderID":"1","BaseEvent":{"AccountNumber":"123456789"}});
+                    frames.push(json!({"data":[{
+                        "service":"ACCT_ACTIVITY","timestamp":now,"command":"SUBS",
+                        "content":[{"seq":1,"key":"Account Activity","1":"123456789",
+                            "2":"OrderCreated","3":message.to_string()}]
+                    }]}));
                 }
                 for frame in frames {
                     if ws
@@ -169,7 +168,10 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
     // baseline. It is cached but cannot be fresh until the baseline lands.
     request_delta.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while cache.snapshot("LEVELONE_EQUITIES", None).get("AAPL").is_none() {
+        while !cache
+            .snapshot("LEVELONE_EQUITIES", None)
+            .contains_key("AAPL")
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
