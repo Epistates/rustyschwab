@@ -341,7 +341,7 @@ impl PortfolioRisk {
         let account = account.to_owned();
         let id = attempt_id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 use rusqlite::OptionalExtension;
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -682,7 +682,7 @@ impl RiskProvider for PortfolioRisk {
         };
         let account = account.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 use rusqlite::OptionalExtension;
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -757,7 +757,7 @@ impl RiskProvider for PortfolioRisk {
     async fn release(&self, attempt_id: &str) -> Result<()> {
         let id = attempt_id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 c.execute(
                     "UPDATE reservations SET state='released' WHERE id=?1 AND state='held'",
                     [&id],

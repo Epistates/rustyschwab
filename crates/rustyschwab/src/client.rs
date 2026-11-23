@@ -370,7 +370,7 @@ impl SchwabClient {
                 self.inner
                     .journal
                     .database()
-                    .run(|c| {
+                    .write(|c| {
                         use crate::storage::{meta, sql};
                         let tx = c
                             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

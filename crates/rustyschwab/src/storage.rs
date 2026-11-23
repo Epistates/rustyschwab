@@ -177,15 +177,11 @@ impl StateDatabase {
     pub fn path(&self) -> &Path {
         &self.inner.path
     }
-    /// Run `f` on a pooled connection from a blocking thread. The first call
-    /// validates and migrates the file; a failed initialization is retried by
-    /// the next call rather than poisoning the handle.
-    pub async fn run<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
-    ) -> Result<T> {
-        let inner = self.inner.clone();
-        inner
+    /// Validate and migrate the file on the first call; a failed
+    /// initialization is retried by the next call rather than poisoning the
+    /// handle.
+    async fn initialized(&self) -> Result<()> {
+        self.inner
             .initialized
             .get_or_try_init(|| async {
                 let inner = self.inner.clone();
@@ -195,7 +191,18 @@ impl StateDatabase {
                 self.inner.idle.lock().push(connection);
                 Ok::<_, Error>(())
             })
-            .await?;
+            .await
+            .copied()
+    }
+    /// Run `f` on a pooled connection from a blocking thread. The first call
+    /// validates and migrates the file; a failed initialization is retried by
+    /// the next call rather than poisoning the handle.
+    pub async fn run<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.initialized().await?;
+        let inner = self.inner.clone();
         let permit = inner
             .slots
             .clone()
@@ -211,6 +218,15 @@ impl StateDatabase {
         })
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))?
+    }
+    /// [`run`](Self::run) for an operation that writes. Every write the SDK
+    /// makes goes through here, so what a write needs of its connection is
+    /// decided in one place.
+    pub(crate) async fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        self.run(f).await
     }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
@@ -277,7 +293,7 @@ impl StateDatabase {
         // no account baseline in it may be trusted until reconciliation
         // reads the broker again (and learns the order tags it now holds).
         target
-            .run(|c| {
+            .write(|c| {
                 integrity_check(c)?;
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

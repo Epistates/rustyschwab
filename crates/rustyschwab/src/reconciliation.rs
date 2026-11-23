@@ -109,7 +109,7 @@ pub struct ReconciliationReport {
 impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
         let account = account.to_owned();
-        self.run(move |c| {
+        self.write(move |c| {
             c.execute(INVALIDATE_ACCOUNT, params![account, generation as i64])
                 .map_err(sql)?;
             Ok(())
@@ -182,7 +182,7 @@ impl StateDatabase {
         orders: Vec<Value>,
     ) -> Result<ReconciliationReport> {
         let account = account.to_owned();
-        self.run(move |c| {
+        self.write(move |c| {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
