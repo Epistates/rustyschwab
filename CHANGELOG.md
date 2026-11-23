@@ -408,6 +408,24 @@ one. Signatures are unchanged.
   0.61.2. All are at or below the versions in `Cargo.lock`, so a build from
   the lockfile is unchanged.
 
+### Security
+
+- **On Windows, the SDK read the MCP policy, grants, identity and risk files
+  without checking who else could change them.** A machine where another
+  local account could write to one of those files, or to the directory that
+  holds it, was affected: whoever can edit these files decides who may
+  trade. **Behavior change:** such a file is now refused, with "A
+  configuration file can be changed by another account" or "A configuration
+  file is in a directory that can be changed by another account" and the
+  path in the server log. The file it resolves to, when it is a symbolic
+  link, and that file's directory must each be owned by your account,
+  SYSTEM or the Administrators group, and no other account may hold a right
+  to write to, append to, delete, or change the attributes, permissions or
+  owner of the file, or to add, delete or replace files in the directory.
+  Files anyone may read are still accepted, and so are files in your own
+  profile. To fix a refusal, remove the other accounts' write access to the
+  file and to its directory. Unix already applied this rule.
+
 ### Removed
 
 - `docs/history/`, the archived enterprise audit, remediation report and

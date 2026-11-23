@@ -337,13 +337,25 @@ pub fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 /// grants, identity or risk file), at most `limit` bytes.
 ///
 /// Unlike a secret it may be world-readable, and it may be a symlink (a
-/// Kubernetes ConfigMap mounts files through two of them), but on Unix the
-/// file it resolves to, and that file's directory, must be owned by this
-/// account or root and writable by no one else: a file another local user
-/// can edit could grant that user trading. Non-blocking, so a planted FIFO
-/// cannot hang the read. Elsewhere it is read as is, within `limit`.
+/// Kubernetes ConfigMap mounts files through two of them), but the file it
+/// resolves to, and that file's directory, must be owned by this account
+/// and be changeable by no one else: a file another local user can edit
+/// could grant that user trading.
+///
+/// - **Unix**: owned by this account or root, and writable by no one else.
+///   Opened non-blocking, so a planted FIFO cannot hang the read.
+/// - **Windows**: owned by this account, SYSTEM or the Administrators
+///   group, with no entry in its access control list that allows anyone else
+///   to write, append, delete or change its attributes or security. Read
+///   access for others is fine. The directory must likewise let no one else
+///   add, delete or replace files. The file is opened without following a
+///   reparse point, and the handle that was checked is the one read.
+///
+/// Elsewhere it is read as is, within `limit`.
 pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
+    #[cfg(windows)]
+    let file = crate::security_windows::open_trusted_file(path)?;
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags};
@@ -378,7 +390,7 @@ pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         }
         file
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let file = std::fs::File::open(path)?;
     let mut contents = Vec::new();
     file.take(limit + 1).read_to_end(&mut contents)?;
@@ -390,8 +402,8 @@ pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-#[cfg(unix)]
-fn untrusted(path: &Path, why: &str) -> Error {
+#[cfg(any(unix, windows))]
+pub(crate) fn untrusted(path: &Path, why: &str) -> Error {
     tracing::error!(?path, "configuration file {why}");
     Error::Config(format!(
         "A configuration file {why}; see server logs for the path"

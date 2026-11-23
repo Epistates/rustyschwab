@@ -40,8 +40,9 @@ pub use server::SchwabMcp;
 pub const CONFIG_FILE_LIMIT: u64 = 1024 * 1024;
 
 /// Read an authorization file through [`rustyschwab::security::read_trusted_file`]:
-/// on Unix it must be owned by this account or root and writable by no one
-/// else, since whoever can edit it decides who may trade.
+/// it must be owned by this account (or root; SYSTEM or the Administrators
+/// group on Windows) and changeable by no one else, since whoever can edit it
+/// decides who may trade.
 pub fn read_config(path: impl AsRef<std::path::Path>) -> anyhow::Result<Vec<u8>> {
     let path = path.as_ref();
     rustyschwab::security::read_trusted_file(path, CONFIG_FILE_LIMIT)
