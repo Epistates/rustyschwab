@@ -170,7 +170,9 @@ pub fn generate_random_key() -> Result<Zeroizing<[u8; KEY_SIZE]>> {
 /// # Security
 ///
 /// - **Unix**: Sets permissions to 0600 (owner read/write only)
-/// - **Windows**: Protected owner/SYSTEM DACL and atomic replacement
+/// - **Windows**: Created owned by this account, with a DACL that is
+///   protected from inheritance and grants access to this account and
+///   SYSTEM only
 /// - Atomic write via temp file + rename
 /// - Verifies permissions after write
 ///
@@ -256,8 +258,10 @@ pub fn secure_file_write(_path: &Path, _data: &[u8]) -> Result<()> {
 /// - **Unix**: opened with `O_NOFOLLOW` (a symlink is refused) and
 ///   `O_NONBLOCK` (a planted FIFO cannot hang the open), then required to
 ///   be a regular file owned by this user (or root) with mode exactly 0600.
-/// - **Windows**: an owner-only protected DACL, opened without following a
-///   reparse point, and refused if the handle is one.
+/// - **Windows**: opened without following a reparse point (one is
+///   refused), then required to be an ordinary file whose owner, and every
+///   principal its DACL allows, is this account, SYSTEM or the
+///   Administrators group.
 ///
 /// A missing file is [`Error::Io`] with [`std::io::ErrorKind::NotFound`].
 #[cfg(unix)]
@@ -304,10 +308,7 @@ pub fn open_private_file(_path: &Path) -> Result<std::fs::File> {
 /// A refusal that keeps the path out of the error string: it can reach an
 /// MCP tool response (and so a model), and the path discloses the home
 /// directory layout. The operator log gets the path.
-///
-/// Unix only: the Windows checks are in `security_windows`, with a refusal
-/// of their own.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn insecure(path: &Path, why: &str) -> Error {
     tracing::error!(?path, "secret file {why}");
     Error::Auth(AuthError::TokenFileInsecure(format!(
@@ -401,6 +402,9 @@ fn untrusted(path: &Path, why: &str) -> Error {
 ///
 /// A directory created here is 0700; an existing one must already be a
 /// real directory (not a symlink), owned by this user and closed to others.
+/// On Windows a directory created here is owned by this account and open
+/// to it and SYSTEM only, and an existing one must be owned by, and open to,
+/// no one but this account, SYSTEM and the Administrators group.
 #[cfg(unix)]
 pub fn ensure_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
