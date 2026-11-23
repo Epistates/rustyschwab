@@ -17,7 +17,7 @@ use crate::server::Switches;
 use rustyschwab::execution::OrderJournal;
 use serde_json::Value;
 use std::{
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use turbomcp::prelude::*;
@@ -74,6 +74,53 @@ const APPROVAL_POLL: Duration = Duration::from_secs(1);
 /// afterwards learns why nothing happened.
 pub const HOLD_ENDED_EVENT: &str = "approval_hold_ended";
 
+/// How far a call has got when everything before its audit record is done.
+enum Staged {
+    /// It needed no audit record: this is its answer.
+    Answered(McpResult<ToolResult>),
+    /// It is a write, authorized and ready to be recorded.
+    Write(Write),
+}
+
+/// A write on the point of its audit record: what [`AuthorizedServer::write`]
+/// commits and hands to a task of its own.
+struct Write {
+    name: String,
+    /// As dispatched: a submission carries its tag.
+    args: Value,
+    digest: String,
+    /// The journal scope the record serializes on.
+    scope: String,
+    /// The audit record's request.
+    request: Value,
+    /// The one-use approval the record consumes, if approval applied.
+    dedup: Option<String>,
+}
+
+/// The write a call has handed to a task of its own. A call holds one from
+/// the moment the write is spawned, and what the call is told when it runs
+/// out of time is read from whether it does.
+#[derive(Debug)]
+struct Handoff {
+    /// The audit record the write settles.
+    attempt: String,
+    intent: String,
+}
+
+/// Pauses a test holds open in the write path, on tokio's paused clock, to
+/// put a call's deadline where it wants it. Not in a build.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Stalls {
+    /// After the audit record's commit returns, before the write is handed
+    /// off: the call is still inside the commit as far as its limit goes.
+    committed: Duration,
+    /// In the write, before it runs the tool.
+    write: Duration,
+    /// After the write has finished, before the call answers.
+    answered: Duration,
+}
+
 /// Why a submission that waited for its approval was not placed. This is
 /// the server's policy: the MCP specification says how a call is cancelled
 /// and how long a sender may wait, not what a held order does about either.
@@ -112,6 +159,8 @@ pub struct AuthorizedServer {
     /// The longest one call may run; see
     /// [`with_call_timeout`](Self::with_call_timeout).
     call_timeout: Duration,
+    #[cfg(test)]
+    stalls: Stalls,
 }
 impl AuthorizedServer {
     /// Bind a principal to its own approval and dispatch journal, kept beside
@@ -148,6 +197,8 @@ impl AuthorizedServer {
             dead_man: None,
             liveness: Liveness::default(),
             call_timeout: DEFAULT_CALL_TIMEOUT,
+            #[cfg(test)]
+            stalls: Stalls::default(),
         };
         let liveness = server.liveness.clone();
         server.armed(liveness, None)
@@ -201,9 +252,10 @@ impl AuthorizedServer {
     }
     /// Answer a call still running after `limit` instead of letting it hang
     /// ([`DEFAULT_CALL_TIMEOUT`] unless set). Before its audit record a call
-    /// that runs out of time is `timeout` and has sent nothing; past it the
-    /// answer is `reconciliation_required` and the write runs on to its
-    /// outcome, which the journal records.
+    /// that runs out of time is `timeout` and has sent nothing; once its
+    /// write is handed off the answer is `reconciliation_required` and the
+    /// write runs on to its outcome, which the journal records. The limit
+    /// does not interrupt the record's commit between the two.
     #[must_use]
     pub fn with_call_timeout(mut self, limit: Duration) -> Self {
         self.call_timeout = limit;
@@ -341,23 +393,7 @@ impl WithTools for AuthorizedServer {
         let started = Instant::now();
         let name = params.name.clone();
         let arguments = Value::Object(params.arguments.clone());
-        // One deadline for the whole call. Whatever it cuts off here had
-        // sent nothing: a write past its audit record is waited for inside
-        // `dispatch`, which answers for it by the same deadline.
-        let deadline = tokio::time::Instant::now() + self.call_timeout;
-        let result =
-            match tokio::time::timeout_at(deadline, self.answer(ctx, params, deadline)).await {
-                Ok(result) => result,
-                Err(_) => Ok(ToolFailure::new(
-                    FailureCode::Timeout,
-                    format!(
-                        "The call ran past the server's limit of {} s before anything was \
-                     sent; nothing was submitted",
-                        self.call_timeout.as_secs()
-                    ),
-                )
-                .into_result()),
-            };
+        let result = self.answer(ctx, params).await;
         crate::activity::note(
             &self.audit,
             &self.principal.name,
@@ -370,18 +406,75 @@ impl WithTools for AuthorizedServer {
     }
 }
 impl AuthorizedServer {
-    /// [`call_tool`](WithTools::call_tool) without the activity note.
+    /// [`call_tool`](WithTools::call_tool) without the activity note, held
+    /// to the call's limit.
+    ///
+    /// The limit bounds the two waits a call has: everything before its
+    /// audit record ([`stage`](Self::stage)), and the wait for a write
+    /// handed to its own task ([`write`](Self::write)). It is not applied
+    /// around the record's commit, which is never abandoned halfway. What a
+    /// call out of time is told comes from `handoff`, which
+    /// [`hand_off`](Self::hand_off) sets as it spawns the write: never from
+    /// which wait happened to be cut.
     async fn answer(
         &self,
         ctx: &CallToolContext,
         params: neutral::CallToolParams,
-        deadline: tokio::time::Instant,
     ) -> McpResult<ToolResult> {
-        let name = params.name.as_str();
-        let args = Value::Object(params.arguments.clone());
         // Any call, even a denied or unknown one, shows the principal is
         // alive; the guard also keeps it so for as long as the call runs.
         let _alive = self.dead_man.as_ref().map(Beacon::call);
+        let deadline = tokio::time::Instant::now() + self.call_timeout;
+        let handoff = OnceLock::new();
+        let write = match tokio::time::timeout_at(deadline, self.stage(ctx, &params)).await {
+            Err(_) => return Ok(self.out_of_time(&handoff).into_result()),
+            Ok(staged) => match staged? {
+                Staged::Answered(result) => return result,
+                Staged::Write(write) => write,
+            },
+        };
+        match self.write(write, ctx, deadline, &handoff).await {
+            Ok(result) => result,
+            Err(failure) => Ok(failure.into_result()),
+        }
+    }
+
+    /// What a call that reached its limit is told, read from what it has
+    /// handed off. Only a call that handed nothing off sent nothing; one
+    /// that did is told to reconcile the attempt, which runs on.
+    fn out_of_time(&self, handoff: &OnceLock<Handoff>) -> ToolFailure {
+        let limit = self.call_timeout.as_secs();
+        match handoff.get() {
+            None => ToolFailure::new(
+                FailureCode::Timeout,
+                format!(
+                    "The call ran past the server's limit of {limit} s before anything \
+                     was sent; nothing was submitted"
+                ),
+            ),
+            Some(handed) => ToolFailure::new(
+                FailureCode::ReconciliationRequired,
+                format!(
+                    "The call ran past the server's limit of {limit} s with its \
+                     submission under way. The submission runs on to its outcome; read \
+                     it from the order state or the trade journal, and never resubmit"
+                ),
+            )
+            .with_intent(handed.intent.clone())
+            .with_attempt(handed.attempt.clone()),
+        }
+    }
+
+    /// Everything a call does before its audit record: the answer itself
+    /// for a call that needs none, or the write ready to be recorded.
+    async fn stage(
+        &self,
+        ctx: &CallToolContext,
+        params: &neutral::CallToolParams,
+    ) -> McpResult<Staged> {
+        let name = params.name.as_str();
+        let args = Value::Object(params.arguments.clone());
+        let answered = |failure: ToolFailure| Ok(Staged::Answered(Ok(failure.into_result())));
         // The dispatcher answers a tool that does not exist before this runs;
         // a direct caller gets a protocol error. One that exists but is not
         // granted is a `not_permitted` result the model can read.
@@ -392,11 +485,10 @@ impl AuthorizedServer {
         if let Some(calls) = &self.calls
             && calls.check().is_err()
         {
-            return Ok(ToolFailure::new(
+            return answered(ToolFailure::new(
                 FailureCode::RateLimited,
                 "This principal's tool-call rate limit is reached; call again shortly",
-            )
-            .into_result());
+            ));
         }
         // A write's arguments are digested and journaled as sent: one its
         // schema does not declare would change the digest (and defeat the
@@ -404,16 +496,87 @@ impl AuthorizedServer {
         if matches!(name, "place_order" | "replace_order" | "cancel_order")
             && let Some(unknown) = undeclared_argument(&tool, &args)
         {
-            return Ok(ToolFailure::invalid_arguments(format!(
+            return answered(ToolFailure::invalid_arguments(format!(
                 "{name} takes no argument `{unknown}`"
-            ))
-            .into_result());
+            )));
         }
-        match self.dispatch(name, args, ctx, deadline).await {
-            Ok(result) => result,
-            Err(Refusal::Failure(failure)) => Ok(failure.into_result()),
+        match self.dispatch(name, args, ctx).await {
+            Ok(staged) => Ok(staged),
+            Err(Refusal::Failure(failure)) => answered(failure),
             Err(Refusal::Protocol(error)) => Err(error),
         }
+    }
+
+    /// Commit `write`'s audit record, hand the write to a task of its own
+    /// and wait for it until the call's `deadline`.
+    ///
+    /// From the audit record on, a client that cancels, disconnects or
+    /// times out abandons only the answer: the record still reaches its
+    /// outcome rather than blocking every later submission of this
+    /// principal. The call's limit is the same. It ends the wait, never the
+    /// write, and it does not interrupt the commit: a call whose deadline
+    /// passes while its record is being written still hands the write off,
+    /// and is told to reconcile it as soon as the commit returns.
+    async fn write(
+        &self,
+        write: Write,
+        ctx: &CallToolContext,
+        deadline: tokio::time::Instant,
+        handoff: &OnceLock<Handoff>,
+    ) -> Result<McpResult<ToolResult>, ToolFailure> {
+        let Write {
+            name,
+            args,
+            digest,
+            scope,
+            request,
+            dedup,
+        } = write;
+        // The refusal says which: a consumed approval or reused tag is a
+        // duplicate, an unresolved earlier submission needs
+        // reconciliation, and a lapsed approval needs a new one.
+        let consumes_approval = dedup.is_some();
+        let attempt = self
+            .audit
+            .begin_once(&scope, &name, request, dedup)
+            .await
+            .map_err(|e| ToolFailure::from(e).with_intent(digest.clone()))?;
+        #[cfg(test)]
+        tokio::time::sleep(self.stalls.committed).await;
+        let record = Handoff {
+            attempt,
+            intent: digest,
+        };
+        let audited = self.hand_off(handoff, record, consumes_approval, name, args, ctx.clone());
+        let finished = async {
+            let joined = audited.await;
+            #[cfg(test)]
+            tokio::time::sleep(self.stalls.answered).await;
+            joined
+        };
+        match tokio::time::timeout_at(deadline, finished).await {
+            Ok(joined) => joined.map_err(|e| ToolFailure::internal("Dispatch task failed", e))?,
+            Err(_) => Err(self.out_of_time(handoff)),
+        }
+    }
+
+    /// Spawn the write whose audit record is `record` and note in `handoff`
+    /// that the call has handed it off. Not `async`, so nothing can come
+    /// between the two: a write is under way exactly when `handoff` is set.
+    fn hand_off(
+        &self,
+        handoff: &OnceLock<Handoff>,
+        record: Handoff,
+        consumes_approval: bool,
+        name: String,
+        args: Value,
+        ctx: CallToolContext,
+    ) -> tokio::task::JoinHandle<Result<McpResult<ToolResult>, ToolFailure>> {
+        let audit_id = (record.attempt.clone(), consumes_approval);
+        let handed = handoff.set(record);
+        debug_assert!(handed.is_ok(), "a call hands off one write");
+        let this = self.clone();
+        tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await })
     }
 }
 impl WithResources for AuthorizedServer {
@@ -486,9 +649,10 @@ impl AuthorizedServer {
             self.inner.backend().mode(),
         )
     }
-    /// Authorize, audit and dispatch one call. A `ToolFailure` here is a
-    /// denial or an audit fault the model must see; the inner result is
-    /// whatever the tool itself produced.
+    /// Authorize one call and answer it, or, for a write, leave it staged
+    /// for its audit record ([`write`](Self::write)). A `ToolFailure` here is
+    /// a denial the model must see; the inner result is whatever the tool
+    /// itself produced.
     ///
     /// The intent digest, and therefore approval, binds the arguments as the
     /// model sent them; the tag defaulted from it is added only to the
@@ -498,13 +662,16 @@ impl AuthorizedServer {
         name: &str,
         args: Value,
         ctx: &CallToolContext,
-        deadline: tokio::time::Instant,
-    ) -> Result<McpResult<ToolResult>, Refusal> {
+    ) -> Result<Staged, Refusal> {
         match name {
-            "check_order" => return Ok(self.check_order(args).await?),
-            "get_server_status" => return Ok(self.get_server_status(args).await?),
-            "get_trade_journal" => return Ok(self.get_trade_journal(args).await?),
-            "get_performance" => return Ok(self.get_performance(args).await?),
+            "check_order" => return Ok(Staged::Answered(self.check_order(args).await?)),
+            "get_server_status" => {
+                return Ok(Staged::Answered(self.get_server_status(args).await?));
+            }
+            "get_trade_journal" => {
+                return Ok(Staged::Answered(self.get_trade_journal(args).await?));
+            }
+            "get_performance" => return Ok(Staged::Answered(self.get_performance(args).await?)),
             _ => {}
         }
         let submission = matches!(name, "place_order" | "replace_order");
@@ -576,48 +743,7 @@ impl AuthorizedServer {
         } else {
             args
         };
-        let audit_id = if write {
-            let dedup = if approval_applies {
-                // The audit consumes this one-use approval, so refuse here
-                // what the tool would refuse before sending; a refusal
-                // after it would leave the operator to approve a new intent.
-                self.inner.switches().require(name)?;
-                self.inner.backend().submission_admission().await?;
-                Some(digest.clone())
-            } else {
-                None
-            };
-            // Cancellation must remain available while a submission audit is pending.
-            let audit_scope = if name == "cancel_order" {
-                format!("{}:cancel:{}", self.principal.name, uuid::Uuid::new_v4())
-            } else {
-                self.principal.name.clone()
-            };
-            let mut request = serde_json::json!({
-                "principal": self.principal.name,
-                "intentDigest": digest,
-                // Not the transport's JSON-RPC id, which the dispatcher
-                // keeps: a fresh id for correlating this record in logs.
-                "requestId": uuid::Uuid::new_v4().to_string(),
-                "arguments": args,
-            });
-            if let Some(ms) = waited {
-                request["approvalWaitedMs"] = ms.into();
-            }
-            // The refusal says which: a consumed approval or reused tag is a
-            // duplicate, an unresolved earlier submission needs
-            // reconciliation, and a lapsed approval needs a new one.
-            let consumes_approval = dedup.is_some();
-            let id = self
-                .audit
-                .begin_once(&audit_scope, name, request, dedup)
-                .await
-                .map_err(|e| ToolFailure::from(e).with_intent(digest.clone()))?;
-            Some((id, consumes_approval))
-        } else {
-            None
-        };
-        let Some(audit_id) = audit_id else {
+        if !write {
             let stream_control = matches!(
                 name,
                 "stream_connect"
@@ -644,35 +770,43 @@ impl AuthorizedServer {
                     tracing::warn!(error = %e, tool = name, "stream control was not audited");
                 }
             }
-            return Ok(result);
-        };
-        // From the audit record on, the dispatch runs on its own task: a
-        // client that cancels, disconnects or times out abandons only the
-        // answer, and the record still reaches its outcome rather than
-        // blocking every later submission of this principal. The call limit
-        // is the same: it ends the wait, not the write.
-        let this = self.clone();
-        let name = name.to_owned();
-        let ctx = ctx.clone();
-        let attempt = audit_id.0.clone();
-        let audited = tokio::spawn(async move { this.audited(&name, args, &ctx, audit_id).await });
-        match tokio::time::timeout_at(deadline, audited).await {
-            Ok(joined) => {
-                Ok(joined.map_err(|e| ToolFailure::internal("Dispatch task failed", e))??)
-            }
-            Err(_) => Err(ToolFailure::new(
-                FailureCode::ReconciliationRequired,
-                format!(
-                    "The call ran past the server's limit of {} s with its submission \
-                     under way. The submission runs on to its outcome; read it from \
-                     the order state or the trade journal, and never resubmit",
-                    self.call_timeout.as_secs()
-                ),
-            )
-            .with_intent(digest)
-            .with_attempt(attempt)
-            .into()),
+            return Ok(Staged::Answered(result));
         }
+        let dedup = if approval_applies {
+            // The audit consumes this one-use approval, so refuse here
+            // what the tool would refuse before sending; a refusal
+            // after it would leave the operator to approve a new intent.
+            self.inner.switches().require(name)?;
+            self.inner.backend().submission_admission().await?;
+            Some(digest.clone())
+        } else {
+            None
+        };
+        // Cancellation must remain available while a submission audit is pending.
+        let scope = if name == "cancel_order" {
+            format!("{}:cancel:{}", self.principal.name, uuid::Uuid::new_v4())
+        } else {
+            self.principal.name.clone()
+        };
+        let mut request = serde_json::json!({
+            "principal": self.principal.name,
+            "intentDigest": digest,
+            // Not the transport's JSON-RPC id, which the dispatcher
+            // keeps: a fresh id for correlating this record in logs.
+            "requestId": uuid::Uuid::new_v4().to_string(),
+            "arguments": args,
+        });
+        if let Some(ms) = waited {
+            request["approvalWaitedMs"] = ms.into();
+        }
+        Ok(Staged::Write(Write {
+            name: name.to_owned(),
+            args,
+            digest,
+            scope,
+            request,
+            dedup,
+        }))
     }
 
     /// Run tool `name` on the inner server, its argument-extraction failures
@@ -702,6 +836,8 @@ impl AuthorizedServer {
         ctx: &CallToolContext,
         (id, consumed_approval): (String, bool),
     ) -> Result<McpResult<ToolResult>, ToolFailure> {
+        #[cfg(test)]
+        tokio::time::sleep(self.stalls.write).await;
         // Judged with the audit record open: this principal has no other
         // submission in flight, so none can take the same budget.
         let budget =
@@ -1156,10 +1292,7 @@ mod tests {
         oversized["order"]["orderLegCollection"][0]["quantity"] = "3".into();
         oversized["wait_ms"] = MAX_APPROVAL_WAIT_MS.into();
         let started = Instant::now();
-        let deadline = tokio::time::Instant::now() + DEFAULT_CALL_TIMEOUT;
-        let Err(Refusal::Failure(denied)) = server
-            .dispatch("place_order", oversized, &ctx, deadline)
-            .await
+        let Err(Refusal::Failure(denied)) = server.dispatch("place_order", oversized, &ctx).await
         else {
             panic!("a risk denial is a failure the model reads");
         };
@@ -1189,6 +1322,119 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.approved_intents.contains(&digest));
+    }
+    /// A desk whose `cancel_order` reaches its audit record and is then
+    /// refused by the server's cancel switch, without a network: a write
+    /// that runs to an outcome. Its calls are limited to ten seconds.
+    fn writing_desk(stalls: Stalls) -> (tempfile::TempDir, AuthorizedServer) {
+        let switches = Switches {
+            trading: false,
+            cancel: false,
+        };
+        let (dir, mut server) = authorized_as(switches, policy());
+        server.call_timeout = Duration::from_secs(10);
+        server.stalls = stalls;
+        (dir, server)
+    }
+    /// What the model reads from a `cancel_order` on `server`, and how long
+    /// the call took.
+    async fn cancel(server: &AuthorizedServer) -> (Value, Duration) {
+        let started = tokio::time::Instant::now();
+        let args = serde_json::json!({"account_hash": "A", "order_id": "9"});
+        let result = crate::testing::call_tool(server, "cancel_order", args)
+            .await
+            .unwrap();
+        (crate::testing::reading(&result), started.elapsed())
+    }
+    /// A call that runs out of time with its write handed off is told to
+    /// reconcile that attempt, whichever wait the limit cut: the write
+    /// itself, or anything the call still does after it. The write runs to
+    /// its outcome.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_out_of_time_after_its_write_is_handed_off_is_told_to_reconcile() {
+        // The write is still running at the limit.
+        let (_dir, server) = writing_desk(Stalls {
+            write: Duration::from_secs(30),
+            ..Stalls::default()
+        });
+        let (late, took) = cancel(&server).await;
+        assert_eq!(took, Duration::from_secs(10));
+        assert_eq!(late["error"]["code"], "reconciliation_required", "{late}");
+        let records = server.audit.records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(late["error"]["attemptId"], records[0].attempt_id.as_str());
+        assert_eq!(
+            late["error"]["intentDigest"],
+            records[0].request["intentDigest"]
+        );
+        assert!(records[0].outcome.is_none(), "the write is under way");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let records = server.audit.records().await.unwrap();
+        assert!(records[0].outcome.is_some(), "the write ran to its outcome");
+
+        // The write has finished and the call is held up afterwards: the
+        // answer is still about the attempt, never "nothing was sent".
+        let (_dir, server) = writing_desk(Stalls {
+            answered: Duration::from_secs(30),
+            ..Stalls::default()
+        });
+        let (late, took) = cancel(&server).await;
+        assert_eq!(took, Duration::from_secs(10));
+        assert_eq!(late["error"]["code"], "reconciliation_required", "{late}");
+        let records = server.audit.records().await.unwrap();
+        assert_eq!(late["error"]["attemptId"], records[0].attempt_id.as_str());
+        assert!(records[0].outcome.is_some());
+    }
+    /// The limit does not interrupt an audit record's commit. A call whose
+    /// deadline passes inside it still hands the write off, and is then told
+    /// to reconcile the attempt the journal holds: never that nothing was
+    /// sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_out_of_time_inside_its_audit_commit_still_hands_the_write_off() {
+        let (_dir, server) = writing_desk(Stalls {
+            committed: Duration::from_secs(30),
+            ..Stalls::default()
+        });
+        let (late, took) = cancel(&server).await;
+        assert_eq!(
+            took,
+            Duration::from_secs(30),
+            "answered as the commit returns"
+        );
+        assert_eq!(late["error"]["code"], "reconciliation_required", "{late}");
+        let records = server.audit.records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(late["error"]["attemptId"], records[0].attempt_id.as_str());
+        // The journal agrees: the attempt exists, and its write finishes.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let records = server.audit.records().await.unwrap();
+        assert!(records[0].outcome.is_some(), "the write ran to its outcome");
+    }
+    /// A call that runs out of time before its audit record has handed
+    /// nothing off, and nothing is recorded or sent for it afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_out_of_time_before_its_audit_record_has_sent_nothing() {
+        let (_dir, mut server) = authorized_as(
+            Switches {
+                trading: true,
+                cancel: true,
+            },
+            policy(),
+        );
+        server.call_timeout = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let args = serde_json::json!({
+            "account_hash": "A", "order": order("2".into()), "wait_ms": MAX_APPROVAL_WAIT_MS,
+        });
+        let result = crate::testing::call_tool(&server, "place_order", args)
+            .await
+            .unwrap();
+        let late = crate::testing::reading(&result);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+        assert_eq!(late["error"]["code"], "timeout", "{late}");
+        assert!(late["error"].get("attemptId").is_none(), "{late}");
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(server.audit.records().await.unwrap().is_empty());
     }
     /// `check_order` is judged under the principal, durable approvals
     /// included, reports every reason at once, and audits nothing.

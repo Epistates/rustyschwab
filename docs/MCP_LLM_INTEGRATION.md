@@ -899,7 +899,11 @@ header.
   answered `timeout`. A write past its audit record is answered
   `reconciliation_required` with its `attemptId` and runs on to its
   outcome on its own task, where the journal records it: read the order
-  state or `get_trade_journal`, never resubmit. The read-only stdio server
-  that runs without a policy file answers a JSON-RPC timeout error instead.
+  state or `get_trade_journal`, never resubmit. Which of the two a call is
+  told is read from whether it has handed a write off, and the limit never
+  interrupts the audit record's commit: a call whose time runs out while
+  its record is being written hands the write off and is answered
+  `reconciliation_required` as soon as the commit returns. The read-only
+  stdio server that runs without a policy file answers a JSON-RPC timeout
+  error instead.
 
-Moving to a stable 4.x when it ships is a version bump plus this suite.
