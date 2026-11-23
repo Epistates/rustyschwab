@@ -58,9 +58,12 @@ pub enum Source {
     Local,
 }
 
-/// Closed failure vocabulary. Add a variant rather than overloading one.
+/// Closed failure vocabulary: every failure carries exactly one of these
+/// codes. It grows by adding a variant, never by overloading one, so match
+/// it with a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FailureCode {
     /// The arguments are malformed or violate a static rule; change them.
     InvalidArguments,
