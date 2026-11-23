@@ -391,11 +391,14 @@ async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
     config.oauth.tokens_file = dir.path().join("tokens.json");
     config.oauth.auto_refresh = false;
     config.client.base_url = server.uri();
-    config.client.timeout = Duration::from_millis(80);
+    // The deadline also covers the durable quota reservation, so it leaves
+    // room for a slow disk. Had the client waited for the 60 s Retry-After,
+    // it would have reached this deadline and reported a timeout, after the
+    // outer 5 s bound had already failed the test.
+    config.client.timeout = Duration::from_secs(10);
     config.streaming = None;
     let client = SchwabClient::new(config).unwrap();
-    // Had it waited, the 80 ms deadline would have made it a timeout.
-    let error = tokio::time::timeout(Duration::from_secs(1), client.get_account_numbers())
+    let error = tokio::time::timeout(Duration::from_secs(5), client.get_account_numbers())
         .await
         .unwrap()
         .unwrap_err();
@@ -403,6 +406,33 @@ async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
         matches!(error, Error::RateLimit { retry_after: 60 }),
         "{error:?}"
     );
+}
+
+/// The client's state is opened when it is built: the file exists before the
+/// first request, and a state location that cannot be used is the
+/// constructor's error rather than the first call's.
+#[test]
+fn a_client_opens_its_state_when_it_is_built() {
+    let config = |tokens_file: std::path::PathBuf| {
+        let mut config = SchwabConfig::default();
+        config.oauth.app_key = "k".repeat(32);
+        config.oauth.app_secret = "s".repeat(16);
+        config.oauth.token_store_kind = TokenStoreKind::File;
+        config.oauth.tokens_file = tokens_file;
+        config.oauth.auto_refresh = false;
+        config.streaming = None;
+        config
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = SchwabClient::new(config(dir.path().join("tokens.json"))).unwrap();
+    assert!(client.order_journal().path().exists());
+
+    // A regular file where the state's directory would be.
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, b"").unwrap();
+    let error = SchwabClient::new(config(blocker.join("tokens.json"))).unwrap_err();
+    // The state directory cannot be created under a file.
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
 }
 
 #[tokio::test]

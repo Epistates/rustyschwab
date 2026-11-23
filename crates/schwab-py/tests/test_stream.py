@@ -173,12 +173,18 @@ async def test_reads_cancelled_by_timeouts_lose_no_message(
         await next_of_type(stream, "state")
         await stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
         frames = 300
+        # A read times out only when nothing is queued, and on a fast machine
+        # the consumer may never find the queue empty. After every ten frames
+        # the producer waits for a read to time out, so reads are cancelled
+        # all through the stream.
+        cancelled = asyncio.Event()
 
         async def produce() -> None:
             for number in range(frames):
                 await streamer.push(level_one(**{"1": number}))
                 if number % 10 == 0:
-                    await asyncio.sleep(0.001)
+                    cancelled.clear()
+                    await asyncio.wait_for(cancelled.wait(), timeout=20)
 
         producer = asyncio.create_task(produce())
         seen: list[int] = []
@@ -189,6 +195,7 @@ async def test_reads_cancelled_by_timeouts_lose_no_message(
                 message = await asyncio.wait_for(anext(stream), timeout=0.001)
             except asyncio.TimeoutError:
                 timeouts += 1
+                cancelled.set()
                 continue
             if message["type"] == "data":
                 seen.extend(int(c["bidPrice"]) for c in message["data"][0]["content"])

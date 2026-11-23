@@ -62,33 +62,41 @@ const EXPECTED_TOOLS: &[&str] = &[
 ];
 
 /// `SchwabMcp::new` doesn't touch the network, so a non-functional client
-/// is enough to exercise the tool registry and server metadata.
-fn server() -> SchwabMcp {
+/// is enough to exercise the tool registry and server metadata. The client
+/// keeps its state in a directory of its own, which must outlive the server.
+fn server() -> (SchwabMcp, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
     let dummy = rustyschwab::SchwabClient::new(rustyschwab::SchwabConfig {
         oauth: rustyschwab::OAuthConfig {
             app_key: "x".repeat(32),
             app_secret: "y".repeat(16),
+            tokens_file: dir.path().join("tokens.json"),
             ..rustyschwab::OAuthConfig::default()
         },
         client: rustyschwab::ClientConfig::default(),
         streaming: None,
     })
     .expect("dummy client");
-    SchwabMcp::new(Backend::Live(Arc::new(dummy)), Switches::default())
+    (
+        SchwabMcp::new(Backend::Live(Arc::new(dummy)), Switches::default()),
+        dir,
+    )
 }
 
 /// The `#[turbomcp::server]` macro only takes string literals, so the
 /// version it advertises is a copy of the crate version.
 #[test]
 fn server_info_matches_crate_metadata() {
-    let info = server().server_info();
+    let (server, _dir) = server();
+    let info = server.server_info();
     assert_eq!(info.name, env!("CARGO_PKG_NAME"));
     assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]
 async fn every_expected_tool_is_registered() {
-    let tools = tools(&server()).await;
+    let (server, _dir) = server();
+    let tools = tools(&server).await;
     for tool in &tools {
         let annotations = tool
             .annotations
@@ -160,7 +168,7 @@ fn every_tool_has_one_catalog_row() {
 /// discriminator so clients can compose specs from the schema alone.
 #[tokio::test]
 async fn build_order_expands_specs_into_order_requests() {
-    let server = server();
+    let (server, _dir) = server();
     let schema = tools(&server)
         .await
         .into_iter()
@@ -229,7 +237,8 @@ async fn build_order_expands_specs_into_order_requests() {
 /// and the schema says so.
 #[tokio::test]
 async fn windowed_reads_advertise_flexible_optional_bounds() {
-    let tools = tools(&server()).await;
+    let (server, _dir) = server();
+    let tools = tools(&server).await;
     let schema = |name: &str| {
         tools
             .iter()
@@ -289,7 +298,7 @@ fn resolve<'a>(
 /// halt, with no limits or approval to speak of. Nothing reaches Schwab.
 #[tokio::test]
 async fn check_order_reports_a_local_verdict_without_a_principal() {
-    let server = server();
+    let (server, _dir) = server();
     let order = serde_json::json!({
         "orderStrategyType": "SINGLE", "orderType": "LIMIT", "session": "NORMAL",
         "duration": "DAY", "price": "50",
@@ -366,7 +375,7 @@ async fn check_order_reports_a_local_verdict_without_a_principal() {
 /// provenance; local computations and control acknowledgements are bare.
 #[tokio::test]
 async fn responses_carry_provenance_envelopes() {
-    let server = server();
+    let (server, _dir) = server();
     let text = |result: rustyschwab_mcp::contract::ToolResult| -> serde_json::Value {
         assert!(!result.is_error);
         serde_json::from_str(first_text(&result).unwrap()).unwrap()
@@ -397,7 +406,7 @@ async fn responses_carry_provenance_envelopes() {
 /// warning, and nothing is wrapped in a provenance envelope.
 #[tokio::test]
 async fn server_status_is_complete_without_a_session() {
-    let server = server();
+    let (server, _dir) = server();
     let result = call_tool(&server, "get_server_status", serde_json::json!({}))
         .await
         .unwrap();
@@ -435,7 +444,7 @@ async fn server_status_is_complete_without_a_session() {
 /// resource and the propose-a-trade workflow as one prompt.
 #[tokio::test]
 async fn guidance_is_one_resource_and_one_prompt() {
-    let server = server();
+    let (server, _dir) = server();
 
     let resources = resources(&server).await;
     assert_eq!(resources.len(), 1, "{resources:?}");

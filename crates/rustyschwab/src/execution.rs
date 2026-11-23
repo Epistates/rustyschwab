@@ -269,7 +269,7 @@ impl OrderJournal {
         let account = account.to_owned();
         let operation = operation.to_owned();
         self.database
-            .run(move |conn| {
+            .write(move |conn| {
                 use rusqlite::{OptionalExtension, params};
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -376,7 +376,7 @@ impl OrderJournal {
         }
         let id = id.to_owned();
         self.database
-            .run(move |conn| {
+            .write(move |conn| {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -453,7 +453,7 @@ impl OrderJournal {
         let kind = kind.to_owned();
         let subject = subject.to_owned();
         self.database
-            .run(move |c| audit(c, &kind, &subject, &payload))
+            .write(move |c| audit(c, &kind, &subject, &payload))
             .await
     }
     /// One submission by attempt ID.
@@ -471,7 +471,7 @@ impl OrderJournal {
     pub async fn arm(&self, id: &str) -> Result<()> {
         let id = id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -492,7 +492,7 @@ impl OrderJournal {
     /// events are kept. Returns the number of orders removed.
     pub async fn prune_history(&self, before: i64) -> Result<usize> {
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -542,7 +542,7 @@ impl OrderJournal {
         let kind = kind.to_owned();
         let payload = serde_json::to_string(&payload)?;
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 c.execute(
                     "INSERT INTO activity(at,subject,kind,payload) VALUES(?1,?2,?3,?4)",
                     rusqlite::params![
@@ -618,7 +618,7 @@ impl OrderJournal {
         let key = setting_key(key);
         let operator = operator.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -682,7 +682,7 @@ impl OrderJournal {
     /// consumed approval tombstones and all audit events remain intact.
     pub async fn prune_resolved(&self, before: i64, exported_through: i64) -> Result<usize> {
         self.database
-            .run(move |conn| {
+            .write(move |conn| {
                 let tx = conn
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -818,7 +818,7 @@ impl OrderJournal {
         let digest = digest.to_owned();
         let operator = operator.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -870,7 +870,7 @@ impl OrderJournal {
             serde_json::to_string(arguments)?,
         );
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 c.query_row(
                     UPSERT_INTENT,
                     rusqlite::params![
@@ -996,7 +996,7 @@ impl OrderJournal {
     pub async fn refund_approval(&self, id: &str) -> Result<()> {
         let id = id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 use rusqlite::OptionalExtension;
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1057,7 +1057,7 @@ impl OrderJournal {
         }
         let (id, operator, evidence) = (id.to_owned(), operator.to_owned(), evidence.to_owned());
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 use rusqlite::OptionalExtension;
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -1099,7 +1099,7 @@ impl OrderJournal {
         let digest = digest.to_owned();
         let operator = operator.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -1238,7 +1238,7 @@ impl ExecutionStore for OrderJournal {
         let account = account.to_owned();
         let id = order_id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 c.execute(
                     "INSERT OR IGNORE INTO orders VALUES(?1,?2,0,?3)",
                     rusqlite::params![
@@ -1260,7 +1260,7 @@ impl ExecutionStore for OrderJournal {
         }
         let account = account.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -1287,7 +1287,7 @@ impl ExecutionStore for OrderJournal {
         }
         let operator = operator.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -1349,7 +1349,7 @@ impl ExecutionStore for OrderJournal {
         let account = account.to_owned();
         let order_id = order_id.to_owned();
         self.database
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -1427,7 +1427,7 @@ impl ExecutionStore for OrderJournal {
     }
     async fn healthcheck(&self) -> Result<()> {
         self.database
-            .run(|c| {
+            .write(|c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
