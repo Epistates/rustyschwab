@@ -144,9 +144,9 @@ held order").
 
 ### Changed — the client opens its state when it is built
 
-`SchwabClient::new` (and the builder's `build`) now opens the client's state
-database, creating it the first time, instead of leaving that to the first
-request. A state location that cannot be used (a directory that is not
+**Behavior change:** `SchwabClient::new` (and the builder's `build`) now
+opens the client's state database, creating it the first time, instead of
+leaving that to the first request. A state location that cannot be used (a directory that is not
 private, a file in the way, a disk that refuses the write) is reported by
 the constructor, not by the first call. No request's deadline pays for
 creating the file any more. The constructor does a little file I/O, so
@@ -156,12 +156,13 @@ one. Signatures are unchanged.
 
 ### Fixed
 
-- A new state file was created with one flush to disk per schema migration
-  (seven in all); it now takes one, so the first operation on a new file
-  is faster, and a process opening a file that another is still creating
-  no longer waits seconds for it on a slow disk. Opening a file that
-  needs several migrations applies them together, so a failure leaves it
-  at the version it had.
+- **Behavior change:** a new state file was created with seven commits (the
+  metadata table, then one per schema migration), each a flush to disk. It
+  now takes one, so the first operation on a new file is faster, and a
+  process opening a file that another is still creating no longer waits
+  seconds for it on a slow disk. Opening a file that needs several
+  migrations applies them together, so a failure leaves it at the version it
+  had.
 - A write to the execution state (an audit event, a journal entry, a quota
   check) could fail with `Storage("database is locked")` while other tasks
   or processes wrote to the same file. SQLite gives a waiting writer no
@@ -182,12 +183,13 @@ one. Signatures are unchanged.
   for it. A writer that does not use the lock file (an earlier release, the
   `sqlite3` shell) is waited for as before. Under contention the longest
   waits shrink and a write waits for the writers queued ahead of it.
-- `HistoryStore` failed at once with `database is locked`, without waiting,
-  when it marked a span complete for a fetch that returned no candles
-  while another process was writing to the same file: its transaction read
-  before it wrote, and SQLite refuses to turn such a transaction into a
-  write while another connection holds the lock. History writes now take
-  the write lock when they begin and wait for it like any other write.
+- **Behavior change:** `HistoryStore` failed at once with `database is
+  locked`, without waiting, when it marked a span complete for a fetch that
+  returned no candles while another process was writing to the same file:
+  its transaction read before it wrote, and SQLite refuses to turn such a
+  transaction into a write while another connection holds SQLite's write
+  lock. History writes now take SQLite's write lock when they begin and wait
+  for it like any other write.
 - Performance ratios on a sparse equity curve were annualized as if each
   gap between points were one trading day: a weekly backtest's Sharpe was
   overstated by about the square root of five (roughly 2.2x), and the
