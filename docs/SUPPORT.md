@@ -59,7 +59,6 @@ The 0.2 migration changes outbound order types, numeric precision, durable stora
 Code being complete is not deployment acceptance. These remain open:
 
 - Live broker conformance for orders, including tag preservation and cancel, replace and fill races.
-- Native Windows execution of the full suite and ACL behavior (currently compile-checked).
 - Deployment identity, external risk and exposure, and cross-host coordinator or gateway integration.
 - Backup restoration and disk exhaustion on the production filesystem.
 - Sustained production-shaped load, recovery objectives and memory stability.
