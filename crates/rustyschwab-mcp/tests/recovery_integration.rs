@@ -165,6 +165,22 @@ async fn stream_recovery_seeds_baselines_and_never_gates_trading() {
     .await
     .unwrap();
     assert!(!client.submissions_suspended());
+    // A delta stays fresh for two seconds after it arrives, and recovery on
+    // a slow machine can take longer than that after the first one. Judge
+    // freshness by a delta that arrives once the baseline has landed, as a
+    // live subscription keeps sending: asked again, the server sends one.
+    let first = cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["receivedAt"].clone();
+    stream
+        .subscribe_level_one_equities(&["AAPL"])
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while cache.snapshot("LEVELONE_EQUITIES", None)["AAPL"]["receivedAt"] == first {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let snapshot = cache.snapshot("LEVELONE_EQUITIES", None);
     assert_eq!(snapshot["AAPL"]["fresh"], true);
     // Snapshots carry field names, not numbers; the stream delta wins over
