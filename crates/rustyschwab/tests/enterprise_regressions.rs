@@ -430,7 +430,9 @@ fn a_client_opens_its_state_when_it_is_built() {
     // A regular file where the state's directory would be.
     let blocker = dir.path().join("blocker");
     std::fs::write(&blocker, b"").unwrap();
-    SchwabClient::new(config(blocker.join("tokens.json"))).unwrap_err();
+    let error = SchwabClient::new(config(blocker.join("tokens.json"))).unwrap_err();
+    // The state directory cannot be created under a file.
+    assert!(matches!(error, Error::Io(_)), "{error:?}");
 }
 
 #[tokio::test]
