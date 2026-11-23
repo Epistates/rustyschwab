@@ -754,6 +754,28 @@ mod tests {
             "{listed}"
         );
 
+        // The same listener answers Streamable HTTP, behind the same check.
+        let http = reqwest::Client::new();
+        let call = |bearer: Option<&str>| {
+            let mut request = http
+                .post(format!("http://{address}/mcp"))
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "tools/list")
+                .json(&list_tools());
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            request.send()
+        };
+        let refused = call(None).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        let listed: Value = call(Some(&token)).await.unwrap().json().await.unwrap();
+        assert_eq!(
+            listed["result"]["tools"][0]["name"], "get_quote",
+            "{listed}"
+        );
+
         drop(socket);
         stop.cancel();
         serving.await.unwrap().unwrap();
