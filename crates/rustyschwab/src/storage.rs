@@ -407,16 +407,25 @@ impl StateDatabase {
             .map_err(|_| locked())?
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
         let inner = self.inner.clone();
+        let (outcome, finished) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut connection = inner.checkout()?;
-            let result = f(&mut connection);
-            drop(held);
-            inner.checkin(connection);
-            result
-        })
-        .await
-        .map_err(|_| Error::Storage("State worker failed".into()))?
+            // The caller may have stopped waiting since the lock was granted;
+            // a write it no longer waits for is dropped, and `held` with it.
+            if outcome.is_closed() {
+                return;
+            }
+            let result = inner.checkout().and_then(|mut connection| {
+                let result = f(&mut connection);
+                drop(held);
+                inner.checkin(connection);
+                result
+            });
+            let _ = outcome.send(result);
+        });
+        finished
+            .await
+            .map_err(|_| Error::Storage("State worker failed".into()))?
     }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {

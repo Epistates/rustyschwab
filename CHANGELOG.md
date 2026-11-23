@@ -146,9 +146,9 @@ held order").
 
 **Behavior change:** `SchwabClient::new` (and the builder's `build`) now
 opens the client's state database, creating it the first time, instead of
-leaving that to the first request. A state location that cannot be used (a directory that is not
-private, a file in the way, a disk that refuses the write) is reported by
-the constructor, not by the first call. No request's deadline pays for
+leaving that to the first request. A state location that cannot be used (a
+directory that is not private, a file in the way, a disk that refuses the
+write) is reported by the constructor, not by the first call. No request's deadline pays for
 creating the file any more. The constructor does a little file I/O, so
 build the client where blocking for a moment is acceptable; creating a new
 state file takes tens of milliseconds on most disks and longer on a slow
