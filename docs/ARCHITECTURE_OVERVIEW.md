@@ -165,7 +165,7 @@ at `<tokens_file>.orders.json` is imported once). Tables: `submissions`,
 `audit`, `consumed_approvals`, `used_order_tags`, `accounts`, `orders`,
 `executions`, `leases`, `quota`, `quota_config`, `approvals`,
 `reservations`, `intents`, `audit_anchor`, `meta`, `schema_migrations`.
-Migrations, online backup and restore live in `storage.rs`. `audit` rows
+Migrations, online backup and restore live in `storage.rs`, as does the turn order its writers keep (`state.write.lock`). `audit` rows
 form a SHA-256 hash chain (`audit_chain.rs`, checked by
 `OrderJournal::verify_audit` and `rustyschwab-admin verify-audit`).
 

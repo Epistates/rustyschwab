@@ -597,7 +597,7 @@ impl PaperBroker {
         let saved = config.clone();
         journal
             .database()
-            .run(move |c| initialize(c, &saved))
+            .write(move |c| initialize(c, &saved))
             .await?;
         Ok(Self {
             journal,
@@ -689,7 +689,7 @@ impl PaperBroker {
         let (response, lost) = self
             .journal
             .database()
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -981,7 +981,7 @@ impl PaperBroker {
         let config = self.config.clone();
         self.journal
             .database()
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -1161,7 +1161,7 @@ impl PaperBroker {
         let config = self.config.clone();
         self.journal
             .database()
-            .run(move |c| {
+            .write(move |c| {
                 apply_event(
                     c,
                     &config,
@@ -1228,7 +1228,7 @@ impl PaperBroker {
         let config = self.config.clone();
         self.journal
             .database()
-            .run(move |c| apply_event(c, &config, event, source))
+            .write(move |c| apply_event(c, &config, event, source))
             .await
     }
     /// Apply consecutive sequenced events in one transaction: all of them, or
@@ -1244,7 +1244,7 @@ impl PaperBroker {
         let config = self.config.clone();
         self.journal
             .database()
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -2084,7 +2084,7 @@ impl PaperBroker {
         self.journal.database().backup(destination.clone()).await?;
         self.journal
             .database()
-            .run(move |connection| {
+            .write(move |connection| {
                 use std::io::Read;
                 let archive = rusqlite::Connection::open_with_flags(
                     &destination,

@@ -188,6 +188,10 @@ impl std::fmt::Debug for SchwabClient {
 }
 
 impl SchwabClient {
+    /// Build a client. This opens the client's state database next to the
+    /// token file, creating it the first time, so it does file I/O (blocking
+    /// for a moment, longer on a slow disk) and reports an unusable state
+    /// location as an error.
     pub fn new(config: SchwabConfig) -> Result<Self> {
         config.validate()?;
 
@@ -217,6 +221,11 @@ impl SchwabClient {
 
         let retry_policy = RetryPolicy::new(&config.client.retry);
         let circuit_breaker = Arc::new(CircuitBreaker::new(config.client.circuit_breaker.clone()));
+
+        // The state file is opened (and created, the first time) here, so a
+        // problem with its location is reported by the constructor and no
+        // request's deadline pays for creating it.
+        journal.database().open()?;
 
         Ok(Self {
             inner: Arc::new(ClientInner {
@@ -370,7 +379,7 @@ impl SchwabClient {
                 self.inner
                     .journal
                     .database()
-                    .run(|c| {
+                    .write(|c| {
                         use crate::storage::{meta, sql};
                         let tx = c
                             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)

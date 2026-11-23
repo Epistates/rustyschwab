@@ -84,7 +84,7 @@ impl Coordinator for StateDatabase {
             return Err(Error::Config("Quota must be positive".into()));
         }
         let key = key.to_owned();
-        self.run(move |c| {
+        self.write(move |c| {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
@@ -184,7 +184,7 @@ impl Coordinator for StateDatabase {
     async fn acquire(&self, resource: &str, owner: &str, ttl: Duration) -> Result<Lease> {
         let resource = resource.to_owned();
         let owner = owner.to_owned();
-        self.run(move |c| {
+        self.write(move |c| {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
@@ -236,7 +236,7 @@ impl Coordinator for StateDatabase {
     }
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<Lease> {
         let mut lease = lease.clone();
-        self.run(move |c| {
+        self.write(move |c| {
             let now = chrono::Utc::now().timestamp_millis();
             let expires_at = expiry(now, ttl)?;
             let renewed = c
@@ -262,7 +262,7 @@ impl Coordinator for StateDatabase {
     }
     async fn release(&self, lease: &Lease) -> Result<()> {
         let lease = lease.clone();
-        self.run(move |c| {
+        self.write(move |c| {
             c.execute(
                 RELEASE_LEASE,
                 params![lease.resource, lease.owner, lease.epoch as i64],

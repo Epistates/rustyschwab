@@ -625,14 +625,19 @@ async fn model_configuration_and_state_modes_cannot_be_swapped() {
     live.oauth.app_secret = "s".repeat(16);
     live.oauth.capture_callback = false;
     live.oauth.auto_refresh = false;
-    // The live journal derivation resolves to the paper database.
+    // The live journal derivation resolves to the paper database. A client
+    // opens its state when it is built, so the paper state is put there first.
     live.oauth.tokens_file = dir.path().join("tokens.json");
-    let client = rustyschwab::SchwabClient::new(live).unwrap();
+    let journal = rustyschwab::execution::OrderJournal::new(
+        live.oauth.tokens_file.with_extension("orders.json"),
+    );
     b.order_journal()
         .database()
-        .backup(client.order_journal().path().to_owned())
+        .backup(journal.path().to_owned())
         .await
         .unwrap();
+    let client = rustyschwab::SchwabClient::new(live).unwrap();
+    assert_eq!(client.order_journal().path(), journal.path());
     assert!(matches!(
         client.get_account("paper-test", true).await,
         Err(Error::Config(_))

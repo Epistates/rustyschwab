@@ -50,7 +50,7 @@ impl OrderJournal {
         let endpoint = endpoint.to_owned();
         let (stream, cursor) = self
             .database()
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;
@@ -98,7 +98,7 @@ impl OrderJournal {
             digest: batch.batch_sha256,
         };
         self.database()
-            .run(move |c| {
+            .write(move |c| {
                 let tx = c
                     .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                     .map_err(sql)?;

@@ -346,7 +346,7 @@ impl HistoryStore {
             )));
         }
         self.run(move |c| {
-            let tx = c.transaction().map_err(sql)?;
+            let tx = write_transaction(c)?;
             {
                 let mut insert = tx
                     .prepare_cached(
@@ -414,6 +414,16 @@ impl HistoryStore {
         })
         .await
     }
+}
+
+/// A transaction that holds the write lock from its start. A deferred one
+/// that reads before it writes (the spans, when a fetch returned no candles)
+/// would have to upgrade its read to a write, and SQLite refuses that at
+/// once, without calling the busy handler, while another connection writes
+/// ([`lang_transaction`](https://www.sqlite.org/lang_transaction.html)).
+fn write_transaction(c: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(sql)
 }
 
 fn initialize(path: &Path) -> Result<Connection> {
@@ -526,7 +536,7 @@ fn write_candles(
     candles: &[Candle],
     complete: Option<(i64, i64)>,
 ) -> Result<()> {
-    let tx = c.transaction().map_err(sql)?;
+    let tx = write_transaction(c)?;
     {
         let mut insert = tx
             .prepare_cached(
@@ -672,6 +682,27 @@ mod tests {
         assert!(BarSize::new(FrequencyType::Daily, 5).is_err());
         assert_eq!(BarSize::MINUTE.duration_ms(), Some(MINUTE));
         assert_eq!(BarSize::WEEKLY.duration_ms(), None);
+    }
+
+    /// Marking a span complete when its fetch returned no candles reads the
+    /// spans before it writes. With another process writing, that used to
+    /// fail at once with `database is locked`; it now waits its turn.
+    #[tokio::test]
+    async fn an_empty_complete_span_waits_for_another_writer() {
+        let (_dir, store) = store().await;
+        let request = HistoryRequest::new("ABC", BarSize::MINUTE, OPEN, OPEN + 59 * MINUTE);
+        let other = Connection::open(store.path()).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            other.execute_batch("COMMIT").unwrap();
+        });
+        store
+            .put_candles(&request, Vec::new(), Some((OPEN, OPEN + 59 * MINUTE)))
+            .await
+            .unwrap();
+        writer.join().unwrap();
+        assert!(store.missing(&request).await.unwrap().is_empty());
     }
 
     #[tokio::test]
