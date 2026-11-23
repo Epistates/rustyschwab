@@ -582,6 +582,33 @@ async fn a_clock_step_back_delays_requests_by_a_window_at_most() {
     assert_eq!(db.quota("credential", 2, 2).await.unwrap(), Duration::ZERO);
 }
 
+/// When a window holds more attempts than its cap, the wait lasts until
+/// enough of them have left it, not only the oldest: after the clock steps
+/// back, an attempt half a second old and two counted from now hold a burst
+/// of two for a whole second.
+#[tokio::test]
+async fn the_wait_lasts_until_the_window_is_below_its_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let db = journal.database();
+    assert_eq!(db.quota("credential", 2, 2).await.unwrap(), Duration::ZERO);
+    let now = chrono::Utc::now().timestamp_millis();
+    let connection = rusqlite::Connection::open(journal.path()).unwrap();
+    connection
+        .execute_batch(&format!(
+            "DELETE FROM quota;
+             INSERT INTO quota VALUES('credential',{earlier}),('credential',{ahead}),('credential',{ahead});",
+            earlier = now - 500,
+            ahead = now + 600_000,
+        ))
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        db.quota("credential", 2, 2).await.unwrap(),
+        Duration::from_secs(1)
+    );
+}
+
 /// A restored backup trusts none of its account baselines.
 #[tokio::test]
 async fn a_restore_invalidates_every_baseline() {
