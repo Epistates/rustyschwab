@@ -190,6 +190,11 @@ one. Signatures are unchanged.
   transaction into a write while another connection holds SQLite's write
   lock. History writes now take SQLite's write lock when they begin and wait
   for it like any other write.
+- The request quota's wait could be too short after the system clock
+  stepped back. Attempts dated after now are counted from now, so a window
+  can then hold more attempts than its cap, and the wait ran only until the
+  oldest left it: a caller that waited it out was told to wait again. The
+  wait now lasts until the window holds fewer attempts than its cap.
 - Performance ratios on a sparse equity curve were annualized as if each
   gap between points were one trading day: a weekly backtest's Sharpe was
   overstated by about the square root of five (roughly 2.2x), and the
