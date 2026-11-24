@@ -369,7 +369,7 @@ async def test_a_timeout_between_attempts_carries_the_last_failed_attempt_as_its
         await client.quotes(["AAPL"])
     assert str(caught.value) == "Timeout occurred after 2 seconds"
     cause = caught.value.__cause__
-    assert isinstance(cause, errors.HttpError)
+    assert isinstance(cause, errors.BrokerError)
     assert cause.status == 503
     assert cause.__cause__ is None
 
