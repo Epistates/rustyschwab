@@ -397,8 +397,20 @@ impl StateDatabase {
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         self.initialized().await?;
+        let shared = self.inner.path.to_string_lossy().contains("shared.store");
+        let began = std::time::Instant::now();
         let expiry = tokio::time::Instant::now() + wait;
-        let held = self.inner.lock_for_write(expiry).await?;
+        let held = self.inner.lock_for_write(expiry).await;
+        let waited = began.elapsed().as_millis();
+        let held = match held {
+            Ok(held) => held,
+            Err(error) => {
+                if shared {
+                    diag_write("LOCK_FAIL", self.inner.as_ref(), waited, 0, 0, Some(&error));
+                }
+                return Err(error);
+            }
+        };
         // A connection is taken only once the lock is held, so a wait for
         // the lock holds no slot. Readers never wait for the lock, so this
         // wait cannot deadlock.
@@ -416,16 +428,24 @@ impl StateDatabase {
                 return;
             }
             let result = inner.checkout().and_then(|mut connection| {
+                let t = std::time::Instant::now();
                 let result = f(&mut connection);
+                let ran = t.elapsed().as_millis();
+                let t = std::time::Instant::now();
                 drop(held);
+                let unlock = t.elapsed().as_millis();
                 inner.checkin(connection);
-                result
+                Ok((result, ran, unlock))
             });
             let _ = outcome.send(result);
         });
-        finished
+        let (result, ran, unlock) = finished
             .await
-            .map_err(|_| Error::Storage("State worker failed".into()))?
+            .map_err(|_| Error::Storage("State worker failed".into()))??;
+        if shared {
+            diag_write("write", self.inner.as_ref(), waited, ran, unlock, result.as_ref().err());
+        }
+        result
     }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
@@ -611,10 +631,9 @@ impl Inner {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    diag.step("LOCK_TIMEOUT");
                     diag.attempts = attempts;
                     diag.steps.push_str(&format!(
-                        " now@{} holder=[{}] elapsed={}ms",
+                        " now@{} threads=[{:?}] elapsed={}ms",
                         std::time::Instant::now()
                             .duration_since(Diag::epoch())
                             .as_millis(),
@@ -686,8 +705,9 @@ impl Diag {
             epoch
         })
     }
-    fn current() -> &'static parking_lot::Mutex<String> {
-        static CURRENT: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
+    fn current() -> &'static parking_lot::Mutex<Vec<(String, String)>> {
+        static CURRENT: parking_lot::Mutex<Vec<(String, String)>> =
+            parking_lot::Mutex::new(Vec::new());
         &CURRENT
     }
     fn new(inner: &Inner) -> Self {
@@ -715,7 +735,12 @@ impl Diag {
         ));
         self.last = now;
         if self.tag.starts_with("SHARED") {
-            *Self::current().lock() = format!("{} last step {name} done@{at}", self.tag);
+            let status = format!("{name} done@{at}");
+            let mut current = Self::current().lock();
+            match current.iter_mut().find(|(tag, _)| *tag == self.tag) {
+                Some(entry) => entry.1 = status,
+                None => current.push((self.tag.clone(), status)),
+            }
         }
     }
     fn print(&self) {
@@ -1286,5 +1311,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions, MIGRATIONS.len() as i64);
+    }
+}
+
+static W_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static W_RAN_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static W_RAN_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static W_WAIT_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static W_WAIT_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn diag_write(what: &str, inner: &Inner, waited: u128, ran: u128, unlock: u128, error: Option<&Error>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = std::time::Instant::now().duration_since(Diag::epoch()).as_millis();
+    W_N.fetch_add(1, Relaxed);
+    W_RAN_SUM.fetch_add(ran as u64, Relaxed);
+    W_RAN_MAX.fetch_max(ran as u64, Relaxed);
+    W_WAIT_SUM.fetch_add(waited as u64, Relaxed);
+    W_WAIT_MAX.fetch_max(waited as u64, Relaxed);
+    if error.is_some() || waited > 1000 || ran > 500 || unlock > 100 {
+        eprintln!(
+            "DIAG {what} h={:p} at={at} waited={waited}ms ran={ran}ms unlock={unlock}ms err={:?} | n={} wait_sum={} wait_max={} ran_sum={} ran_max={}",
+            inner,
+            error.map(|e| e.to_string()),
+            W_N.load(Relaxed),
+            W_WAIT_SUM.load(Relaxed),
+            W_WAIT_MAX.load(Relaxed),
+            W_RAN_SUM.load(Relaxed),
+            W_RAN_MAX.load(Relaxed)
+        );
     }
 }
