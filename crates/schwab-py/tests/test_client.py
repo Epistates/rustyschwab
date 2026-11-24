@@ -339,7 +339,11 @@ async def test_missing_tokens_require_reauthorization(
 async def test_an_unreachable_server_raises_a_retryable_network_error(
     server: MockSchwab, make_client: Make
 ) -> None:
-    client = make_client(client={"base_url": "http://127.0.0.1:1"})
+    # Windows refuses a connection to a closed port only after about two
+    # seconds, retrying it first, so three attempts outlast these tests' usual
+    # five-second deadline and end as a Timeout. The SDK's default deadline
+    # leaves room for every attempt on each platform.
+    client = make_client(client={"base_url": "http://127.0.0.1:1", "timeout": 30})
     with pytest.raises(errors.NetworkError) as caught:
         await client.quotes(["AAPL"])
     assert caught.value.retryable is True

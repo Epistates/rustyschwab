@@ -50,7 +50,7 @@ The public Rust API follows Cargo's 0.x convention: a minor version can break; p
 
 The Python package follows the same rule for its core modules.
 
-The minimum supported Rust version is 1.95.0, checked in CI. Raising it requires a release note. Python 3.10 or newer is supported. A platform claim requires a successful native run. CI runs the Rust test suite natively on Linux, macOS and Windows, including the Windows file-permission checks, and the Python test suite on Linux and macOS. Release wheels are built for Linux (x86_64 and aarch64), macOS (arm64 and x86_64) and Windows (x86_64), and each one except the Intel macOS wheel is installed and smoke-tested on its own platform before it is published.
+The minimum supported Rust version is 1.95.0, checked in CI. Raising it requires a release note. Python 3.10 or newer is supported. A platform claim requires a successful native run. CI runs the Rust and Python test suites natively on Linux, macOS and Windows, including the Windows file-permission checks. Release wheels are built for Linux (x86_64 and aarch64), macOS (arm64 and x86_64) and Windows (x86_64), and each one except the Intel macOS wheel is installed and smoke-tested on its own platform before it is published.
 
 The 0.2 migration changes outbound order types, numeric precision, durable storage and network authorization. Follow [Operations](OPERATIONS.md): stop old writers, back up state and verify restoration before rollout. Rolling back to a JSON-only writer against migrated state is unsupported. Patch and schema upgrades must preserve pending intent, approval consumption, tag tombstones and audit ordering.
 
@@ -63,7 +63,7 @@ Code being complete is not deployment acceptance. These remain open:
 - Backup restoration and disk exhaustion on the production filesystem.
 - Sustained production-shaped load, recovery objectives and memory stability.
 - A hosted release run with artifact provenance verification.
-- The Python test suite on Windows, and the Intel macOS wheel run on Intel hardware.
+- The Intel macOS wheel run on Intel hardware.
 
 The history of how the 0.2 candidate got here is in the [changelog](../CHANGELOG.md).
 
