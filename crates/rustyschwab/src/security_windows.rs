@@ -528,6 +528,28 @@ pub(crate) fn secure_create_new(path: &Path) -> Result<File> {
     create_new_with(path, &private_descriptor(false)?)
 }
 
+/// See [`crate::security::rename_noclobber`].
+pub(crate) fn rename_noclobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    let moved = unsafe {
+        MoveFileExW(
+            wide(from).as_ptr(),
+            wide(to).as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Windows has no call that flushes a directory: `rename_noclobber` writes
+/// through, and the caller flushes the file once more under its new name.
+pub(crate) fn sync_directory(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub fn secure_file_write(path: &Path, data: &[u8]) -> Result<()> {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));

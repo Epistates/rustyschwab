@@ -35,10 +35,22 @@
 //!
 //! # Opening
 //!
-//! The first use of a handle validates and migrates the file under a second
-//! lock file, `state.init.lock`, so that two openers, in this process or
-//! another, cannot race the schema migration. An opener that finds the lock
-//! taken waits for it like a writer waits for its turn: in the operating
+//! A new file is built whole in a private temporary file beside it
+//! (`state.sqlite3.<random>.tmp`): created as private as the state file will
+//! be, filled with the schema in one transaction without a journal or a
+//! flush, switched to WAL mode, closed, flushed once, and moved into place
+//! with a rename that fails if the name is taken. A crash at any point leaves
+//! no state file or a complete one, never a partial one, and two openers that
+//! create it at the same moment need no lock: the one whose move fails
+//! discards its copy and opens the other's. A crash while building leaves its
+//! temporary file behind; the next opener removes those that are more than an
+//! hour old.
+//!
+//! An existing file that is behind (it needs a migration, or the import of a
+//! legacy journal) is prepared under a second lock file, `state.init.lock`, so
+//! that two openers, in this process or another, cannot race the migration. A
+//! file that is already current is opened without it. An opener that finds the
+//! lock taken waits for it like a writer waits for its turn: in the operating
 //! system, on the handle's lock thread, until its caller's deadline. A write
 //! has one deadline for the whole call, so opening and the turn to write share
 //! the five seconds; an operation that has no deadline of its own (`run`)
@@ -70,6 +82,10 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// operation started with [`StateDatabase::run`]. Past it they fail with
 /// [`Error::StateBusy`]. A write is bound by its own deadline instead.
 const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How old a temporary file left by a crash while building a new state file
+/// must be before an opener removes it. A build takes a second or two, even on
+/// a slow disk, so nothing that old has an owner.
+const STALE_BUILD_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Tables created by the baseline migration. Every schema version has them,
 /// and a restore refuses a backup missing any of them.
@@ -185,6 +201,28 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
+
+/// A state file opened without the init lock.
+enum Opened {
+    /// Current: nothing to migrate and nothing to import.
+    Ready(Connection),
+    /// Behind, or not what it should be: prepare it under the init lock, which
+    /// also decides whether it is refused.
+    Behind(Connection),
+}
+
+/// A point at which a test process, run as a child, stops as a crash would:
+/// the process aborts, with no destructor run and nothing flushed. Named by
+/// `RUSTYSCHWAB_TEST_CRASH_AT`. Does nothing outside the unit tests.
+#[cfg(test)]
+pub(crate) fn failpoint(name: &str) {
+    if std::env::var("RUSTYSCHWAB_TEST_CRASH_AT").is_ok_and(|at| at == name) {
+        std::process::abort();
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn failpoint(_: &str) {}
 
 #[derive(Clone)]
 pub struct StateDatabase {
@@ -397,11 +435,23 @@ impl StateDatabase {
         if self.inner.initialized.initialized() {
             return Ok(());
         }
-        let held = self.inner.lock_init(expiry).await?;
+        // A file that is current is opened without the init lock. The work of
+        // creating or preparing one runs on a blocking task to its end, even
+        // if this future is dropped meanwhile.
         let inner = self.inner.clone();
-        let connection = tokio::task::spawn_blocking(move || inner.initialize(held))
+        let connection = match tokio::task::spawn_blocking(move || inner.open_unlocked())
             .await
-            .map_err(|_| Error::Storage("State worker failed".into()))??;
+            .map_err(|_| Error::Storage("State worker failed".into()))??
+        {
+            Opened::Ready(connection) => connection,
+            Opened::Behind(connection) => {
+                let held = self.inner.lock_init(expiry).await?;
+                let inner = self.inner.clone();
+                tokio::task::spawn_blocking(move || inner.prepare(connection, held))
+                    .await
+                    .map_err(|_| Error::Storage("State worker failed".into()))??
+            }
+        };
         // The sync constructor may have opened it meanwhile: keep theirs.
         if self.inner.initialized.set(()).is_ok() {
             self.inner.idle.lock().push(connection);
@@ -422,8 +472,13 @@ impl StateDatabase {
         if self.inner.initialized.initialized() {
             return Ok(());
         }
-        let held = self.inner.lock_init_blocking(wait)?;
-        let connection = self.inner.initialize(held)?;
+        let connection = match self.inner.open_unlocked()? {
+            Opened::Ready(connection) => connection,
+            Opened::Behind(connection) => {
+                let held = self.inner.lock_init_blocking(wait)?;
+                self.inner.prepare(connection, held)?
+            }
+        };
         // Another caller may have opened it meanwhile: keep theirs.
         if self.inner.initialized.set(()).is_ok() {
             self.inner.idle.lock().push(connection);
@@ -716,14 +771,88 @@ impl Inner {
             }
         }
     }
-    /// Prepare the file under the init lock, which is released when this
-    /// returns, so that two openers cannot race the schema migration.
-    fn initialize(&self, held: HeldLock) -> Result<Connection> {
+    /// Open the state file, building it first if it does not exist, and say
+    /// whether it is current. Takes no lock: a new file is moved into place
+    /// whole or not at all (see the module documentation).
+    fn open_unlocked(&self) -> Result<Opened> {
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| Error::Config("State path requires a directory".into()))?;
+        crate::security::ensure_private_directory(parent)?;
         if !self.path.exists() {
-            crate::security::secure_file_write(&self.path, &[])?;
+            self.create_new_file(parent)?;
         }
         crate::security::verify_file_permissions(&self.path)?;
-        let mut connection = open_connection(&self.path)?;
+        let connection = open_connection(&self.path)?;
+        remove_stale_builds(&self.path, STALE_BUILD_AGE);
+        Ok(if self.is_current(&connection) {
+            Opened::Ready(connection)
+        } else {
+            Opened::Behind(connection)
+        })
+    }
+    /// Whether `connection`'s file is complete, in WAL mode and at the newest
+    /// schema, with nothing left to import. Anything else, including a file
+    /// that cannot be read, is for the locked path to judge: another opener
+    /// of an older release may be part way through creating it.
+    fn is_current(&self, connection: &Connection) -> bool {
+        let current = || -> Result<bool> {
+            if !table_exists(connection, "meta")?
+                || schema_version(connection)? != Some(SCHEMA_VERSION)
+                || !baseline_tables_present(connection)?
+            {
+                return Ok(false);
+            }
+            let mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .map_err(sql)?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                return Ok(false);
+            }
+            let imported = meta::exists(connection, "legacy_imported")?;
+            Ok(imported || !self.legacy.as_deref().is_some_and(Path::exists))
+        };
+        current().unwrap_or(false)
+    }
+    /// Build a new state file and move it into place, unless another opener
+    /// moves theirs first, in which case theirs stands and this one's copy is
+    /// discarded.
+    fn create_new_file(&self, parent: &Path) -> Result<()> {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        let temp = self.path.with_file_name(name);
+        let created = (|| {
+            // As private as the state file, from the moment it exists.
+            let file = reserve_backup_file(&temp)?;
+            failpoint("reserved");
+            build_database(&temp, self.legacy.as_deref())?;
+            failpoint("built");
+            // The one flush: everything in the file is on disk before it has
+            // the state file's name.
+            file.sync_all()?;
+            failpoint("flushed");
+            match crate::security::rename_noclobber(&temp, &self.path) {
+                Ok(()) => {}
+                // Lost the race: the winner's file is complete.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+            failpoint("moved");
+            // The new name is on disk before any write to the file is.
+            crate::security::sync_directory(parent)?;
+            #[cfg(windows)]
+            file.sync_all()?;
+            failpoint("published");
+            Ok(())
+        })();
+        discard_build(&temp);
+        created
+    }
+    /// Prepare an existing file that is behind, under the init lock, which is
+    /// released when this returns, so that two openers cannot race the
+    /// migration.
+    fn prepare(&self, mut connection: Connection, held: HeldLock) -> Result<Connection> {
         connection
             .execute_batch("PRAGMA journal_mode=WAL")
             .map_err(sql)?;
@@ -734,6 +863,103 @@ impl Inner {
         }
         drop(held);
         Ok(connection)
+    }
+}
+/// The file a database's SQLite sidecar of `suffix` (`-wal`, `-shm`,
+/// `-journal`) is named after `path`.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+/// Build the complete database at `path`, an empty file made for it, and leave
+/// it closed, in WAL mode and with no file beside it.
+///
+/// Nothing here has to survive a crash: the file is not the state file until
+/// it is moved, and a crash leaves it a stray to remove. So the schema goes in
+/// with no rollback journal on disk and no flush, and one flush by the caller
+/// makes it durable. The file is switched to WAL mode last, which SQLite
+/// records in the file's header, so that the first connection to open the
+/// state file finds it ready and does not change its mode, and a closed
+/// database has no write-ahead log or shared-memory file.
+fn build_database(path: &Path, legacy: Option<&Path>) -> Result<()> {
+    let mut connection = Connection::open(path).map_err(sql)?;
+    connection
+        .execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY")
+        .map_err(sql)?;
+    migrate(&mut connection)?;
+    if let Some(legacy) = legacy.filter(|p| p.exists()) {
+        import_legacy(&mut connection, legacy)?;
+    }
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(sql)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::Storage(
+            "A new state file would not switch to WAL mode".into(),
+        ));
+    }
+    // The last connection to close checkpoints the log, which has nothing in
+    // it, and deletes it and the shared-memory file.
+    connection.close().map_err(|(_, error)| sql(error))?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let beside = sidecar(path, suffix);
+        let Ok(metadata) = std::fs::metadata(&beside) else {
+            continue;
+        };
+        // Moving the database without a log that holds anything would lose
+        // that, and a journal that exists is a hot one: neither is ours to
+        // delete. An empty log and the shared-memory index hold nothing.
+        if metadata.len() != 0 && suffix != "-shm" {
+            return Err(Error::Storage(format!(
+                "A new state file was left with a {suffix} file"
+            )));
+        }
+        std::fs::remove_file(&beside)?;
+    }
+    Ok(())
+}
+/// Remove a build that was not moved into place, and whatever SQLite left
+/// beside it. Best effort: a stray is removed later (see
+/// [`remove_stale_builds`]).
+fn discard_build(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(sidecar(path, suffix));
+    }
+}
+/// Remove the temporary files that a crash while building the state file at
+/// `path` left beside it, and their SQLite files, once they are `older_than`.
+/// A build that is still running is younger than that. Best effort.
+fn remove_stale_builds(path: &Path, older_than: Duration) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|f| f.strip_prefix(name))
+            .and_then(|f| f.strip_prefix('.'))
+        else {
+            continue;
+        };
+        let build = ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
+            rest.strip_suffix(suffix)
+                .and_then(|r| r.strip_suffix(".tmp"))
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if build && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 fn open_connection(path: &Path) -> Result<Connection> {
@@ -1266,6 +1492,22 @@ mod tests {
         }
     }
 
+    /// A handle on a state file that an earlier release left one migration
+    /// behind, so that opening it must take the init lock.
+    fn one_release_behind(dir: &Path, name: &str) -> StateDatabase {
+        let first = StateDatabase::new(dir.join(name));
+        first.open().unwrap();
+        Connection::open(first.path())
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE activity;
+                 DELETE FROM schema_migrations WHERE version=6;
+                 UPDATE meta SET value='5' WHERE key='schema'",
+            )
+            .unwrap();
+        StateDatabase::new(first.path().to_owned())
+    }
+
     /// Another opener in the middle of preparing the file: the init lock,
     /// locked from a handle of its own.
     fn hold_init_lock(database: &StateDatabase) -> std::fs::File {
@@ -1288,7 +1530,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_write_gives_up_on_a_busy_opener_at_its_own_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("deadline.json"));
+        let database = one_release_behind(dir.path(), "deadline.json");
         let held = hold_init_lock(&database);
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
@@ -1318,7 +1560,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_write_waits_for_a_busy_opener_within_its_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("patient.json"));
+        let database = one_release_behind(dir.path(), "patient.json");
         let released = release_after(hold_init_lock(&database), Duration::from_millis(300));
         let started = std::time::Instant::now();
         database
@@ -1335,7 +1577,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn openers_on_one_handle_each_follow_their_own_deadline() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("queue.json"));
+        let database = one_release_behind(dir.path(), "queue.json");
         let held = hold_init_lock(&database);
         let patient = {
             let database = database.clone();
@@ -1370,7 +1612,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_constructor_waits_for_another_opener_within_its_bound() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("constructor.json"));
+        let database = one_release_behind(dir.path(), "constructor.json");
         let held = hold_init_lock(&database);
         let started = std::time::Instant::now();
         let refused = database
@@ -1394,7 +1636,7 @@ mod tests {
     async fn open_and_run_give_up_on_a_busy_opener_after_five_seconds() {
         assert_eq!(INIT_LOCK_TIMEOUT, Duration::from_secs(5));
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("bound.json"));
+        let database = one_release_behind(dir.path(), "bound.json");
         let held = hold_init_lock(&database);
         let constructor = {
             let database = database.clone();
@@ -1422,7 +1664,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_opener_whose_caller_went_away_leaves_no_lock_held() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("abandoned.json"));
+        let database = one_release_behind(dir.path(), "abandoned.json");
         let held = hold_init_lock(&database);
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
@@ -1474,32 +1716,264 @@ mod tests {
         }
     }
 
-    /// Commits in `database`'s write-ahead log: its frames that close a
-    /// transaction record the size of the database after it.
-    fn wal_commits(database: &StateDatabase) -> usize {
-        let wal = std::fs::read(database.path().with_extension("sqlite3-wal")).unwrap();
-        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
-        wal[32..]
-            .chunks_exact(24 + page_size)
-            .filter(|frame| frame[4..8] != [0; 4])
-            .count()
+    /// `path` is a complete state file, closed: in WAL mode by its header,
+    /// intact, at the newest schema, with every baseline table.
+    fn assert_complete(path: &Path) {
+        let header = std::fs::read(path).unwrap();
+        assert_eq!(header[18..20], [2, 2], "not in WAL mode: {path:?}");
+        let connection = Connection::open(path).unwrap();
+        integrity_check(&connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), Some(SCHEMA_VERSION));
+        assert!(baseline_tables_present(&connection).unwrap());
+        let applied: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, MIGRATIONS.len() as i64);
     }
 
-    /// Every flush to disk costs a commit, and on a slow disk a new file's
-    /// six migrations took seconds: all of them are one commit.
+    /// Files in `dir` that a build leaves, or SQLite leaves beside the state
+    /// file or a build.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp") || n.ends_with("-journal"))
+            .collect()
+    }
+
+    /// Every flush to disk costs, and on a slow disk a new file's migrations
+    /// took seconds: the file is built whole, in one transaction, in a private
+    /// file, and moved into place with one flush. It is closed, with no log
+    /// beside it, and its first opener finds it ready and writes nothing.
     #[tokio::test]
-    async fn a_new_state_file_is_created_in_one_commit() {
+    async fn a_new_state_file_is_built_whole_and_opens_without_a_write() {
         let dir = tempfile::tempdir().unwrap();
         let database = StateDatabase::new(dir.path().join("fresh.json"));
+        let state = database.path().to_owned();
+        let parent = state.parent().unwrap();
+        crate::security::ensure_private_directory(parent).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        assert_complete(&state);
+        crate::security::verify_file_permissions(&state).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["state.sqlite3"]);
+        // Opening it needs no init lock and changes nothing in the file.
+        let held = hold_init_lock(&database);
+        let before = std::fs::read(&state).unwrap();
         database.run(|_| Ok(())).await.unwrap();
-        assert_eq!(wal_commits(&database), 1);
-        let versions: i64 = database
-            .run(|c| {
-                c.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
-                    .map_err(sql)
-            })
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        let log = std::fs::metadata(state.with_extension("sqlite3-wal"));
+        assert!(
+            log.is_ok_and(|log| log.len() == 0) || !state.with_extension("sqlite3-wal").exists()
+        );
+        held.unlock().unwrap();
+    }
+
+    /// A new file is created whole, or not at all: the opener that loses the
+    /// race leaves the winner's file as it was and removes its own.
+    #[test]
+    fn an_opener_that_loses_the_race_to_create_leaves_the_winners_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("race.json"));
+        let state = database.path().to_owned();
+        let parent = state.parent().unwrap();
+        crate::security::ensure_private_directory(parent).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        let before = std::fs::read(&state).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert!(leftovers(parent).is_empty(), "{:?}", leftovers(parent));
+    }
+
+    /// Openers that create one file at the same moment, in separate handles
+    /// as separate processes would have, all end with the one complete file.
+    #[test]
+    fn openers_racing_to_create_a_state_file_share_one_complete_file() {
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state").join("state.sqlite3");
+            let start = Arc::new(std::sync::Barrier::new(8));
+            let openers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (state, start) = (state.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let database = StateDatabase::new(state);
+                        start.wait();
+                        database.open().map(|()| database)
+                    })
+                })
+                .collect();
+            let databases: Vec<_> = openers
+                .into_iter()
+                .map(|o| {
+                    o.join()
+                        .unwrap()
+                        .unwrap_or_else(|e| panic!("round {round}: {e}"))
+                })
+                .collect();
+            drop(databases);
+            assert_complete(&state);
+            let parent = state.parent().unwrap();
+            assert!(leftovers(parent).is_empty(), "{:?}", leftovers(parent));
+        }
+    }
+
+    /// A new file is not prepared under the init lock, and neither is a
+    /// current one: another opener holding it does not keep them waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_file_that_is_behind_waits_for_the_init_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = StateDatabase::new(dir.path().join("new.json"));
+        let held = hold_init_lock(&new);
+        new.write_within(Duration::from_millis(500), |c| insert(c, "a"))
             .await
             .unwrap();
-        assert_eq!(versions, MIGRATIONS.len() as i64);
+        held.unlock().unwrap();
+        let current = StateDatabase::new(new.path().to_owned());
+        let held = hold_init_lock(&current);
+        current
+            .write_within(Duration::from_millis(500), |c| insert(c, "b"))
+            .await
+            .unwrap();
+        held.unlock().unwrap();
+        let behind = one_release_behind(dir.path(), "behind.json");
+        let held = hold_init_lock(&behind);
+        let refused = behind
+            .write_within(Duration::from_millis(300), |c| insert(c, "c"))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, Error::StateBusy(_)), "{refused:?}");
+        held.unlock().unwrap();
+    }
+
+    /// The temporary files a crashed build leaves are removed once they are
+    /// old enough to have no owner, together with SQLite's files beside them,
+    /// and nothing else is.
+    #[test]
+    fn stale_builds_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.sqlite3");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let build = format!("state.sqlite3.{id}.tmp");
+        let ours = [
+            build.clone(),
+            format!("{build}-wal"),
+            format!("{build}-shm"),
+            format!("{build}-journal"),
+        ];
+        let theirs = [
+            "state.sqlite3".to_owned(),
+            "state.sqlite3-wal".to_owned(),
+            "state.sqlite3-shm".to_owned(),
+            "state.write.lock".to_owned(),
+            "state.init.lock".to_owned(),
+            "state.sqlite3.backup".to_owned(),
+            format!("other.sqlite3.{id}.tmp"),
+            "state.sqlite3.notahexid.tmp".to_owned(),
+        ];
+        for name in ours.iter().chain(&theirs) {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // Too young to be anybody's stray: a build may be running.
+        remove_stale_builds(&state, STALE_BUILD_AGE);
+        assert!(ours.iter().all(|n| dir.path().join(n).exists()));
+        remove_stale_builds(&state, Duration::ZERO);
+        assert!(ours.iter().all(|n| !dir.path().join(n).exists()));
+        assert!(theirs.iter().all(|n| dir.path().join(n).exists()));
+    }
+
+    /// A child process for the crash tests: it opens a new state file in the
+    /// directory it is given, and the parent stops it. It does nothing when
+    /// run as one of the unit tests.
+    #[test]
+    fn crash_test_child() {
+        if let Some(dir) = std::env::var_os("RUSTYSCHWAB_TEST_CRASH_DIR") {
+            StateDatabase::new(PathBuf::from(dir).join("state.sqlite3"))
+                .open()
+                .unwrap();
+        }
+    }
+
+    fn child(dir: &Path) -> std::process::Command {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "storage::tests::crash_test_child",
+                "--test-threads=1",
+            ])
+            .env("RUSTYSCHWAB_TEST_CRASH_DIR", dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        child
+    }
+
+    /// What a state location holds after a crash: no state file, or a
+    /// complete one, and a later opener gets a working file either way.
+    fn assert_recovers(dir: &Path) {
+        let state = dir.join("state.sqlite3");
+        if state.exists() {
+            assert_complete(&state);
+        }
+        let database = StateDatabase::new(state.clone());
+        database.open().unwrap();
+        assert_complete(&state);
+        remove_stale_builds(&state, Duration::ZERO);
+        assert!(leftovers(dir).is_empty(), "{:?}", leftovers(dir));
+    }
+
+    /// A process that dies while it builds the state file leaves no state
+    /// file: only the temporary one, which the next opener removes once it is
+    /// old. One that dies after the move leaves the complete file.
+    #[test]
+    fn a_crash_before_the_move_leaves_no_state_file() {
+        for point in ["reserved", "built", "flushed"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let status = child(&dir)
+                .env("RUSTYSCHWAB_TEST_CRASH_AT", point)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{point}: the child did not crash");
+            assert!(!dir.join("state.sqlite3").exists(), "{point}");
+            assert_eq!(leftovers(&dir).len(), 1, "{point}");
+            assert_recovers(&dir);
+        }
+    }
+
+    #[test]
+    fn a_crash_after_the_move_leaves_the_complete_file() {
+        for point in ["moved", "published"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let status = child(&dir)
+                .env("RUSTYSCHWAB_TEST_CRASH_AT", point)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{point}: the child did not crash");
+            assert!(leftovers(&dir).is_empty(), "{point}");
+            assert_complete(&dir.join("state.sqlite3"));
+            assert_recovers(&dir);
+        }
+    }
+
+    /// Killed at any instant, not only the ones named: the same holds.
+    #[test]
+    fn a_process_killed_at_any_instant_leaves_no_file_or_a_complete_one() {
+        for delay in (0..160).step_by(5) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let mut child = child(&dir).spawn().unwrap();
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_recovers(&dir);
+        }
     }
 }

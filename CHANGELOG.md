@@ -177,6 +177,21 @@ held order").
   Python caller sees as `StateBusy` (a `StorageError`) from the
   constructor. An operation with no deadline of its own, the first call on
   a journal, waits at most five seconds too.
+- **Behavior change:** a new state file is built whole in a private
+  temporary file beside it (`state.sqlite3.<id>.tmp`, as private as the
+  state file), flushed once, and moved into place with a rename that fails
+  if the name is taken, instead of being created empty and then filled in
+  through several flushes. A crash at any point leaves no state file or a
+  complete one; before, it could leave an empty or part-built one, which
+  the next opener finished. Openers that create the same new file at the
+  same moment no longer wait for each other: each builds its own and the
+  one whose move fails discards it and opens the other's. The init lock
+  (`state.init.lock`) is now taken only to prepare a file that is behind, one
+  that needs a migration or a legacy import; a current file is opened
+  without it. A crash while building leaves its temporary file behind,
+  which holds no state and is removed by the next opener once it is an
+  hour old. The new file is in WAL mode from the start, so its first
+  opener no longer converts it.
 - Python: the new `StateBusy` exception is a subclass of `StorageError`, so
   an existing `except StorageError` still catches it.
 - **Behavior change:** a paper venue mutation whose write turn does not come
