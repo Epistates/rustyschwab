@@ -162,21 +162,18 @@ held order").
   relays its message. A failure SQLite itself reports (`database is
   locked` from a connection's busy timeout) is still `Storage`.
 - **Behavior change:** the wait for another opener to finish preparing a
-  state file follows the caller's deadline, as a write's wait for its turn
-  does. It used to poll for five seconds on a thread of Tokio's blocking
-  pool, however short the caller's own deadline was, and dropping the future
-  left that thread polling. Now the wait is in the operating system, on the
-  thread the SDK already keeps for write locks, and a write's one deadline
-  (five seconds, or the caller's `wait`) covers opening the file and its
-  turn together: a first write could wait five seconds to open and five more
-  for its turn. When the wait runs out the call fails with `StateBusy`
-  ("the initialization lock was not granted in time") instead of `Storage`,
-  and a dropped future gives the lock back as soon as it is granted. No wait
-  gets longer. `SchwabClient::new` cannot take a deadline: it still waits at
-  most five seconds for another opener, then fails with `StateBusy`, which a
-  Python caller sees as `StateBusy` (a `StorageError`) from the
-  constructor. An operation with no deadline of its own, the first call on
-  a journal, waits at most five seconds too.
+  state file now ends when the caller drops the future (for example, with
+  `tokio::time::timeout` around the call). It used to poll for five seconds
+  on a thread of Tokio's blocking pool whatever the caller did, and the
+  thread kept polling after the future was dropped. The wait is now in the
+  operating system, on the thread the SDK already keeps for write locks, and
+  a dropped future gives the lock back as soon as it is granted. The five
+  seconds are still the longest it waits, counted from when it starts, and
+  running out fails with `StateBusy` instead of `Storage`. A write's wait for
+  its turn, five seconds, starts once the file is open. `SchwabClient::new`
+  has no future to drop: it still waits at most five seconds for another
+  opener, then fails with `StateBusy`, which a Python caller sees from the
+  constructor as `StateBusy` (a `StorageError`).
 - **Behavior change:** a new state file is built whole in a private
   temporary file beside it (`state.sqlite3.<id>.tmp`, as private as the
   state file), flushed once, and moved into place with a rename that fails

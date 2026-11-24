@@ -51,19 +51,21 @@
 //! that two openers, in this process or another, cannot race the migration. A
 //! file that is already current is opened without it. An opener that finds the
 //! lock taken waits for it like a writer waits for its turn: in the operating
-//! system, on the handle's lock thread, until its caller's deadline. A write
-//! has one deadline for the whole call, so opening and the turn to write share
-//! the five seconds; an operation that has no deadline of its own (`run`)
-//! waits at most five seconds for the lock. When the wait runs out the call
-//! fails with [`Error::StateBusy`] and nothing has been written. Dropping the
-//! future abandons the wait, and the lock thread gives the lock back as soon
-//! as it is granted. The constructor (`StateDatabase::open`, which
-//! `SchwabClient::new` calls) cannot take a future's deadline: it polls for the
-//! lock on the calling thread for at most five seconds.
+//! system, on the handle's lock thread, for at most five seconds from when the
+//! wait starts, and the wait ends sooner if its caller drops the future (a
+//! caller's deadline, `tokio::time::timeout` around the call, does that). The
+//! lock thread gives the lock back as soon as it is granted to a request that
+//! was dropped. When the five seconds run out the call fails with
+//! [`Error::StateBusy`] and nothing has been written. The wait for the turn to
+//! write starts only once opening is done, with its own five seconds. The
+//! constructor (`StateDatabase::open`, which `SchwabClient::new` calls) has no
+//! future to drop: it polls for the lock on the calling thread for at most
+//! five seconds.
 //!
-//! The deadline is for waits that may not end, such as a lock another process
-//! holds. An opener that finds another on its own handle already building the
-//! file waits for that work to finish, as it would for any work under way.
+//! These waits are for locks that may not be released, such as one another
+//! process holds. An opener that finds another on its own handle already
+//! building the file waits for that work to finish, as it would for any work
+//! under way.
 use crate::error::{Error, Result};
 use rusqlite::{Connection, backup::Progress};
 use std::{
@@ -80,11 +82,11 @@ const POOL_SIZE: usize = 4;
 /// [`Error::StateBusy`], and how long a connection waits for a lock held
 /// outside the turn order before SQLite fails it with `database is locked`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-/// The longest an opener waits for another to finish preparing the file,
-/// when its caller has no deadline of its own: the synchronous constructor
-/// ([`StateDatabase::open`], which `SchwabClient::new` calls) and an
-/// operation started with [`StateDatabase::run`]. Past it they fail with
-/// [`Error::StateBusy`]. A write is bound by its own deadline instead.
+/// The longest an opener waits for the init lock, counted from when it starts
+/// waiting: for the synchronous constructor (`StateDatabase::open`, which
+/// `SchwabClient::new` calls, and which has no future to drop) and for the
+/// async path (`run`, `write`), where the caller can end the wait sooner by
+/// dropping the future. Past it they fail with [`Error::StateBusy`].
 const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How old a temporary file left by a crash while building a new state file
 /// must be before an opener removes it. A build takes a second or two, even on
@@ -426,10 +428,11 @@ impl StateDatabase {
     }
     /// Validate and migrate the file on the first call; a failed
     /// initialization is retried by the next call rather than poisoning the
-    /// handle. Waiting for another opener ends at `expiry`, with
-    /// [`Error::StateBusy`]; the work of preparing the file, once this call
-    /// holds the lock, runs to its end.
-    async fn initialized_by(&self, expiry: tokio::time::Instant) -> Result<()> {
+    /// handle. Waiting for the init lock ends after [`INIT_LOCK_TIMEOUT`],
+    /// with [`Error::StateBusy`], or sooner if the future is dropped; the
+    /// work of preparing the file, once this call holds the lock, runs to its
+    /// end.
+    async fn initialized(&self) -> Result<()> {
         if self.inner.initialized.initialized() {
             return Ok(());
         }
@@ -453,7 +456,7 @@ impl StateDatabase {
         let connection = match opened {
             Opened::Ready(connection) => connection,
             Opened::Behind(connection) => {
-                let held = self.inner.lock_init(expiry).await?;
+                let held = self.inner.lock_init().await?;
                 // Another opener on this handle may have prepared it while
                 // this one waited for the lock.
                 if self.inner.initialized.initialized() {
@@ -505,8 +508,7 @@ impl StateDatabase {
         &self,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        self.initialized_by(tokio::time::Instant::now() + INIT_LOCK_TIMEOUT)
-            .await?;
+        self.initialized().await?;
         let inner = self.inner.clone();
         let permit = inner
             .slots
@@ -527,9 +529,8 @@ impl StateDatabase {
     /// [`run`](Self::run) for an operation that writes: `f` runs once it is
     /// this handle's turn to write and no other handle or process is writing
     /// in turn (see the module documentation). If the turn has not come
-    /// within five seconds, counting any wait to open the file (see the module
-    /// documentation), this fails with [`Error::StateBusy`] and `f`
-    /// never runs, and neither does it if the caller stops waiting first (the
+    /// within five seconds, counted from when the file is open, this fails
+    /// with [`Error::StateBusy`] and `f` never runs, and neither does it if the caller stops waiting first (the
     /// future is dropped); once `f` has started it runs to the end.
     pub(crate) async fn write<T: Send + 'static>(
         &self,
@@ -537,16 +538,15 @@ impl StateDatabase {
     ) -> Result<T> {
         self.write_within(BUSY_TIMEOUT, f).await
     }
-    /// [`write`](Self::write), waiting at most `wait` in all for another
-    /// opener to finish with the file (on the handle's first use) and for the
-    /// turn.
+    /// [`write`](Self::write), waiting at most `wait` for the turn once the
+    /// file is open.
     async fn write_within<T: Send + 'static>(
         &self,
         wait: Duration,
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.initialized().await?;
         let expiry = tokio::time::Instant::now() + wait;
-        self.initialized_by(expiry).await?;
         let held = self.inner.lock_for_write(expiry).await?;
         // A connection is taken only once the lock is held, so a wait for
         // the lock holds no slot. Readers never wait for the lock, so this
@@ -747,9 +747,9 @@ impl Inner {
         )?)
     }
     /// Take the init lock, trying where a blocking task runs. If another
-    /// opener holds it, wait on the handle's lock thread until `expiry`.
-    /// Dropping the future abandons the request.
-    async fn lock_init(&self, expiry: tokio::time::Instant) -> Result<HeldLock> {
+    /// opener holds it, wait on the handle's lock thread for at most
+    /// [`INIT_LOCK_TIMEOUT`]. Dropping the future abandons the request.
+    async fn lock_init(&self) -> Result<HeldLock> {
         let path = self.path.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             try_lock_file(Arc::new(Self::open_init_lock(&path)?), None, None)
@@ -758,7 +758,10 @@ impl Inner {
         .map_err(|_| Error::Storage("State worker failed".into()))??;
         match attempt {
             Attempt::Held(held) => Ok(held),
-            Attempt::Busy(waiting) => self.wait_for_lock(waiting, expiry, init_busy).await,
+            Attempt::Busy(waiting) => {
+                let expiry = tokio::time::Instant::now() + INIT_LOCK_TIMEOUT;
+                self.wait_for_lock(waiting, expiry, init_busy).await
+            }
         }
     }
     /// Take the init lock on the calling thread, polling for it for at most
@@ -1537,78 +1540,119 @@ mod tests {
         })
     }
 
-    /// A write's deadline covers opening the file as well as its turn: when
-    /// another opener keeps the file past it, the write fails as busy at the
-    /// deadline, not at the opener's own five seconds, and never runs.
+    /// Once the init lock is free again, nothing holds it: the request of a
+    /// caller that went away was granted the lock, found nobody waiting and
+    /// gave it back, so another can take it, and the handle's lock thread is
+    /// free for the next request.
+    async fn assert_lock_given_back(database: &StateDatabase) {
+        let probe = Inner::open_init_lock(database.path()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match probe.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("the lock was never given back: {error:?}"),
+            }
+        }
+        probe.unlock().unwrap();
+        database.write(|c| insert(c, "next")).await.unwrap();
+    }
+
+    /// An async caller sets its own deadline by dropping the future (here,
+    /// `tokio::time::timeout`): while another opener keeps the file, the call
+    /// ends at that deadline and not at the five seconds of the wait itself,
+    /// the write never runs, and no lock or waiting thread is left behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_write_gives_up_on_a_busy_opener_at_its_own_deadline() {
+    async fn a_caller_deadline_ends_the_wait_for_a_busy_opener() {
         let dir = tempfile::tempdir().unwrap();
         let database = one_release_behind(dir.path(), "deadline.json");
         let held = hold_init_lock(&database);
         let ran = Arc::new(AtomicBool::new(false));
         let flag = ran.clone();
         let started = std::time::Instant::now();
-        let refused = database
-            .write_within(Duration::from_millis(300), move |c| {
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            database.write(move |c| {
                 flag.store(true, Ordering::Relaxed);
                 insert(c, "early")
-            })
-            .await
-            .unwrap_err();
-        let waited = started.elapsed();
-        assert!(
-            matches!(&refused, Error::StateBusy(m) if m.contains("initialization")),
-            "{refused:?}"
-        );
-        assert!(waited >= Duration::from_millis(290), "{waited:?}");
-        assert!(waited < Duration::from_secs(3), "{waited:?}");
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(waited.is_err(), "the lock was held: {waited:?}");
+        assert!(elapsed >= Duration::from_millis(290), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         held.unlock().unwrap();
-        // The file was never prepared for it, and the next call does.
-        database.write(|c| insert(c, "next")).await.unwrap();
+        assert_lock_given_back(&database).await;
         assert!(!ran.load(Ordering::Relaxed));
         assert!(!database.run(|c| meta::exists(c, "early")).await.unwrap());
     }
 
-    /// A deadline that outlasts the other opener is served once it lets go.
+    /// A write waits for a busy opener and goes ahead once it lets go.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_write_waits_for_a_busy_opener_within_its_deadline() {
+    async fn a_write_waits_for_a_busy_opener_that_lets_go() {
         let dir = tempfile::tempdir().unwrap();
         let database = one_release_behind(dir.path(), "patient.json");
         let released = release_after(hold_init_lock(&database), Duration::from_millis(300));
         let started = std::time::Instant::now();
-        database
-            .write_within(Duration::from_secs(20), |c| insert(c, "patient"))
-            .await
-            .unwrap();
+        // A caller's deadline that outlasts the other opener.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            database.write(|c| insert(c, "patient")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(started.elapsed() >= Duration::from_millis(290));
         released.join().unwrap();
         assert!(database.run(|c| meta::exists(c, "patient")).await.unwrap());
     }
 
+    /// The turn to write has its own wait, counted from when the file is
+    /// open: a write that had to wait for another opener still gets all of
+    /// it. Here opening takes 1 s of a 2 s wait and the turn comes at 2.5 s,
+    /// which is after the wait would have run out had it started with the
+    /// call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_opening_does_not_shorten_the_wait_for_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "slow.json");
+        let opener = release_after(hold_init_lock(&database), Duration::from_secs(1));
+        let writer = release_after(hold_write_lock(&database), Duration::from_millis(2500));
+        let started = std::time::Instant::now();
+        database
+            .write_within(Duration::from_secs(2), |c| insert(c, "slow"))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(2400));
+        opener.join().unwrap();
+        writer.join().unwrap();
+        assert!(database.run(|c| meta::exists(c, "slow")).await.unwrap());
+    }
+
     /// Openers on one handle that wait for the init lock each follow their own
-    /// deadline: the one that is not first waits no longer than its own.
+    /// caller: one that stops waiting does not hold up the one in front.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn openers_on_one_handle_each_follow_their_own_deadline() {
+    async fn openers_on_one_handle_each_end_their_wait_with_their_caller() {
         let dir = tempfile::tempdir().unwrap();
         let database = one_release_behind(dir.path(), "queue.json");
         let held = hold_init_lock(&database);
         let patient = {
             let database = database.clone();
-            tokio::spawn(async move {
-                database
-                    .write_within(Duration::from_secs(20), |c| insert(c, "patient"))
-                    .await
-            })
+            tokio::spawn(async move { database.write(|c| insert(c, "patient")).await })
         };
         // The patient opener is waiting for the lock by now; the impatient
         // one is behind it.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let started = std::time::Instant::now();
-        let refused = database
-            .write_within(Duration::from_millis(300), |c| insert(c, "impatient"))
-            .await
-            .unwrap_err();
-        assert!(matches!(refused, Error::StateBusy(_)), "{refused:?}");
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            database.write(|c| insert(c, "impatient")),
+        )
+        .await;
+        assert!(waited.is_err(), "{waited:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
         held.unlock().unwrap();
         patient.await.unwrap().unwrap();
@@ -1684,7 +1728,7 @@ mod tests {
         // Dropped by its own timeout.
         let waited = tokio::time::timeout(
             Duration::from_millis(200),
-            database.write_within(Duration::from_secs(60), move |c| {
+            database.write(move |c| {
                 flag.store(true, Ordering::Relaxed);
                 insert(c, "timed-out")
             }),
@@ -1696,7 +1740,7 @@ mod tests {
         let handle = database.clone();
         let task = tokio::spawn(async move {
             handle
-                .write_within(Duration::from_secs(60), move |c| {
+                .write(move |c| {
                     flag.store(true, Ordering::Relaxed);
                     insert(c, "aborted")
                 })
@@ -1706,22 +1750,7 @@ mod tests {
         task.abort();
         let _ = task.await;
         held.unlock().unwrap();
-        // The lock thread is granted the lock, finds nobody waiting for it,
-        // and gives it back: someone else can take it at once.
-        let probe = Inner::open_init_lock(database.path()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            match probe.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("the lock was never given back: {error:?}"),
-            }
-        }
-        probe.unlock().unwrap();
-        // And the thread is free for the next request.
-        database.write(|c| insert(c, "next")).await.unwrap();
+        assert_lock_given_back(&database).await;
         assert!(!ran.load(Ordering::Relaxed));
         for key in ["timed-out", "aborted"] {
             let present = database.run(move |c| meta::exists(c, key)).await.unwrap();
@@ -1857,11 +1886,10 @@ mod tests {
         held.unlock().unwrap();
         let behind = one_release_behind(dir.path(), "behind.json");
         let held = hold_init_lock(&behind);
-        let refused = behind
-            .write_within(Duration::from_millis(300), |c| insert(c, "c"))
-            .await
-            .unwrap_err();
-        assert!(matches!(refused, Error::StateBusy(_)), "{refused:?}");
+        let waited =
+            tokio::time::timeout(Duration::from_millis(300), behind.write(|c| insert(c, "c")))
+                .await;
+        assert!(waited.is_err(), "{waited:?}");
         held.unlock().unwrap();
     }
 
