@@ -183,11 +183,11 @@ fn exception(
     cause: Option<&Error>,
 ) -> PyResult<PyErr> {
     let details = pythonize(py, &details)?;
-    let exception = py
+    let built = py
         .import("rustyschwab.errors")?
         .getattr("from_native")?
         .call1((kind, message, details))?;
-    let error = PyErr::from_value(exception);
+    let error = PyErr::from_value(built);
     if let Some(cause) = cause {
         let described = describe_error(cause);
         error.set_cause(py, Some(exception(py, described, cause_of_error(cause))?));
@@ -233,11 +233,9 @@ mod tests {
 
     #[test]
     fn a_timeout_names_its_cause_even_inside_a_submission() {
-        let timeout = || Error::Timeout {
-            duration: 5,
-            source: Some(Box::new(Error::ConnectionClosed)),
-        };
-        let cause = cause_of(&Failure::Sdk(timeout())).expect("the timeout has a cause");
+        let timeout = || Error::timeout_with_cause(5, Error::ConnectionClosed);
+        let failure = Failure::Sdk(timeout());
+        let cause = cause_of(&failure).expect("the timeout has a cause");
         assert_eq!(describe_error(cause).0, "connection_closed");
         let submission = Failure::Submission {
             tag: "rs-1".into(),

@@ -268,8 +268,9 @@ pub enum Error {
     /// When the call's deadline fell between attempts of a retried call, the
     /// error of the last attempt that finished is the cause, available from
     /// [`source`](std::error::Error::source). A deadline that fell during the
-    /// first attempt has no cause. Build one with [`Error::timeout`]; the
-    /// variant is `#[non_exhaustive]`, so match it with `..`.
+    /// first attempt has no cause. Build one with [`Error::timeout`] or
+    /// [`Error::timeout_with_cause`]; the variant is `#[non_exhaustive]`, so
+    /// match it with `..`.
     ///
     /// **Recovery**: Retry with longer timeout or check server status
     #[error("Timeout occurred after {duration} seconds")]
@@ -430,6 +431,15 @@ impl Error {
         Self::Timeout {
             duration,
             source: None,
+        }
+    }
+
+    /// A [`Error::Timeout`] after `duration` seconds whose cause is `cause`,
+    /// the error of the last attempt that finished.
+    pub fn timeout_with_cause(duration: u64, cause: Error) -> Self {
+        Self::Timeout {
+            duration,
+            source: Some(Box::new(cause)),
         }
     }
 

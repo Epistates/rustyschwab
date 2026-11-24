@@ -22,7 +22,8 @@ attempt has no cause.
   `std::error::Error::source()`. The variant is now `#[non_exhaustive]`, so
   fields added later will not break a match again. Migration: match it as
   `Error::Timeout { duration, .. }`, and build one with the new
-  `Error::timeout(duration)` where you wrote `Error::Timeout { duration }`.
+  `Error::timeout(duration)` where you wrote `Error::Timeout { duration }`
+  (`Error::timeout_with_cause(duration, cause)` sets a cause).
 - **Python:** the raised `Timeout` has the converted cause exception as its
   `__cause__`, with its own class and message, for example `NetworkError`
   or `HttpError`.
