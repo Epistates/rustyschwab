@@ -10,6 +10,8 @@ Clients sharing a broker credential must use the same durable state location and
 
 For multiple hosts, the implemented `RemoteBackend` adapter and `rustyschwab-authority` service share execution storage, quotas, leases and risk reservations. The authority also supplies a broker gateway with verified operator actions and dispatch-time fencing. See [shared authority deployment](SHARED_AUTHORITY.md). The bundled authority is a single writer on local SQLite; it does not provide active-active storage or automatic failover. Schwab does not enforce the SDK's lease tokens or retract already-transmitted requests.
 
+Keep the files that decide authorization (the MCP policy, grants, identity and risk files) on a **local disk** too, in a directory only you control. On Unix the file and its directory must be owned by this account or root and writable by no one else. On Windows they must be owned by this account, SYSTEM or the Administrators group, and no other account may hold a right to change the file or to add, delete or replace files in its directory. On a network share, SYSTEM and Administrators are the file server's groups and the server evaluates the access list, so the check says nothing about the accounts on this machine.
+
 ## Upgrade and storage
 
 1. Stop all old-version writers before migration. Do not run JSON-only and SQLite clients concurrently.

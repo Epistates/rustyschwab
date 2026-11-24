@@ -337,13 +337,34 @@ pub fn read_private_file(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
 /// grants, identity or risk file), at most `limit` bytes.
 ///
 /// Unlike a secret it may be world-readable, and it may be a symlink (a
-/// Kubernetes ConfigMap mounts files through two of them), but on Unix the
-/// file it resolves to, and that file's directory, must be owned by this
-/// account or root and writable by no one else: a file another local user
-/// can edit could grant that user trading. Non-blocking, so a planted FIFO
-/// cannot hang the read. Elsewhere it is read as is, within `limit`.
+/// Kubernetes ConfigMap mounts files through two of them), but the file it
+/// resolves to, and that file's directory, must be owned by this account
+/// and be changeable by no one else: a file another local user can edit
+/// could grant that user trading.
+///
+/// - **Unix**: owned by this account or root, and writable by no one else.
+///   Opened non-blocking, so a planted FIFO cannot hang the read.
+/// - **Windows**: owned by this account, SYSTEM or the Administrators
+///   group, with no entry in its access control list that allows anyone else
+///   to write, append, change its extended attributes or attributes, delete
+///   it, or change its permissions, owner or audit list. The directory must
+///   likewise let no one else add files or subdirectories, delete files,
+///   delete it, or change its permissions, owner or audit list. Read access
+///   for others is fine. A missing access control list, and an entry of a
+///   kind that cannot be evaluated (object, callback or conditional), are
+///   refused. The file is opened by name inside the directory that was
+///   checked, whose handle is held until then and does not share delete
+///   access, and not through a reparse point, so the file read is the file
+///   checked and the directory judged is the one it was opened in. Only that
+///   directory is judged, not its ancestors, as on Unix. Keep these files on
+///   a local disk: on a network share the file server evaluates the access
+///   control list.
+///
+/// Elsewhere it is read as is, within `limit`.
 pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
+    #[cfg(windows)]
+    let file = crate::security_windows::open_trusted_file(path)?;
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags};
@@ -378,7 +399,7 @@ pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
         }
         file
     };
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let file = std::fs::File::open(path)?;
     let mut contents = Vec::new();
     file.take(limit + 1).read_to_end(&mut contents)?;
@@ -390,8 +411,8 @@ pub fn read_trusted_file(path: &Path, limit: u64) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
-#[cfg(unix)]
-fn untrusted(path: &Path, why: &str) -> Error {
+#[cfg(any(unix, windows))]
+pub(crate) fn untrusted(path: &Path, why: &str) -> Error {
     tracing::error!(?path, "configuration file {why}");
     Error::Config(format!(
         "A configuration file {why}; see server logs for the path"
