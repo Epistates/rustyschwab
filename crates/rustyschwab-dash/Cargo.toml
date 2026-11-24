@@ -19,7 +19,7 @@ name = "rustyschwab-dash"
 path = "src/main.rs"
 
 [dependencies]
-rustyschwab-console = { path = "../rustyschwab-console", version = "0.3.0" }
+rustyschwab-console = { path = "../rustyschwab-console", version = "0.4.0" }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
