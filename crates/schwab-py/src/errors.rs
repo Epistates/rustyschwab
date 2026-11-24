@@ -99,59 +99,63 @@ fn describe(failure: &Failure) -> (&'static str, String, Map<String, Value>) {
                 details,
             )
         }
-        Failure::Sdk(error) => {
-            details.insert("retryable".into(), json!(error.is_retryable()));
-            match error {
-                Error::RateLimit { retry_after } => {
-                    details.insert("retry_after".into(), json!(retry_after));
-                }
-                Error::Timeout { duration } => {
-                    details.insert("duration".into(), json!(duration));
-                }
-                Error::Http { status, message } | Error::Remote { status, message } => {
-                    details.insert("status".into(), json!(status.as_u16()));
-                    details.insert("body".into(), json!(message));
-                }
-                Error::Broker {
-                    status,
-                    details: errors,
-                    request_id,
-                } => {
-                    details.insert("status".into(), json!(status.as_u16()));
-                    details.insert("request_id".into(), json!(request_id));
-                    details.insert(
-                        "errors".into(),
-                        serde_json::to_value(errors).unwrap_or(Value::Null),
-                    );
-                }
-                Error::Api { code, .. } => {
-                    details.insert("code".into(), json!(code));
-                }
-                Error::Auth(auth) => {
-                    details.insert(
-                        "reauthorization_required".into(),
-                        json!(auth.requires_reauthorization()),
-                    );
-                }
-                Error::ReconciliationRequired { attempt_id } => {
-                    details.insert("attempt_id".into(), json!(attempt_id));
-                }
-                Error::SubmissionUnknown { attempt_id, source } => {
-                    details.insert("attempt_id".into(), json!(attempt_id));
-                    details.insert("cause".into(), json!(source.to_string()));
-                }
-                Error::BaselineStale { account, reason } => {
-                    details.insert("account".into(), json!(account));
-                    details.insert("reason".into(), json!(reason));
-                }
-                Error::Validation(invalid) => {
-                    details.insert("field".into(), json!(invalid.field()));
-                }
-                _ => {}
-            }
-            (error.kind().as_str(), error.to_string(), details)
-        }
+        Failure::Sdk(error) => describe_error(error),
     }
+}
+
+/// The classification, message and attributes of an SDK error.
+fn describe_error(error: &Error) -> (&'static str, String, Map<String, Value>) {
+    let mut details = Map::new();
+    details.insert("retryable".into(), json!(error.is_retryable()));
+    match error {
+        Error::RateLimit { retry_after } => {
+            details.insert("retry_after".into(), json!(retry_after));
+        }
+        Error::Timeout { duration, .. } => {
+            details.insert("duration".into(), json!(duration));
+        }
+        Error::Http { status, message } | Error::Remote { status, message } => {
+            details.insert("status".into(), json!(status.as_u16()));
+            details.insert("body".into(), json!(message));
+        }
+        Error::Broker {
+            status,
+            details: errors,
+            request_id,
+        } => {
+            details.insert("status".into(), json!(status.as_u16()));
+            details.insert("request_id".into(), json!(request_id));
+            details.insert(
+                "errors".into(),
+                serde_json::to_value(errors).unwrap_or(Value::Null),
+            );
+        }
+        Error::Api { code, .. } => {
+            details.insert("code".into(), json!(code));
+        }
+        Error::Auth(auth) => {
+            details.insert(
+                "reauthorization_required".into(),
+                json!(auth.requires_reauthorization()),
+            );
+        }
+        Error::ReconciliationRequired { attempt_id } => {
+            details.insert("attempt_id".into(), json!(attempt_id));
+        }
+        Error::SubmissionUnknown { attempt_id, source } => {
+            details.insert("attempt_id".into(), json!(attempt_id));
+            details.insert("cause".into(), json!(source.to_string()));
+        }
+        Error::BaselineStale { account, reason } => {
+            details.insert("account".into(), json!(account));
+            details.insert("reason".into(), json!(reason));
+        }
+        Error::Validation(invalid) => {
+            details.insert("field".into(), json!(invalid.field()));
+        }
+        _ => {}
+    }
+    (error.kind().as_str(), error.to_string(), details)
 }
 
 /// The Python exception for `failure`, built by `rustyschwab.errors`.
