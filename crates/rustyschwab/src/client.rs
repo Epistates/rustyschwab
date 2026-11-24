@@ -61,6 +61,20 @@ fn submission_task_failed(
     }
 }
 
+/// A state write that follows work the operation has already done (the intent
+/// journaled, the order possibly sent) failed because the state file stayed
+/// busy. [`Error::StateBusy`] says that nothing was written and the same call
+/// can be made again, which is true of the write but not of the operation, so
+/// it is reported as it was before that kind existed: a storage failure the
+/// caller reconciles, never a "busy, retry" answer for an order that may be
+/// at the broker.
+fn after_work(error: Error) -> Error {
+    match error {
+        Error::StateBusy(message) => Error::Storage(message),
+        other => other,
+    }
+}
+
 /// How the request pipeline treats an operation: whether a failure may be
 /// sent again, which share of the request budget it draws on, and whether an
 /// open circuit breaker refuses it.
@@ -598,7 +612,8 @@ impl SchwabClient {
             self.inner
                 .execution
                 .finish(&attempt_id, crate::execution::SubmissionOutcome::Rejected)
-                .await?;
+                .await
+                .map_err(after_work)?;
             return Err(error);
         }
         let method_label = method_label(method);
@@ -635,9 +650,10 @@ impl SchwabClient {
                 self.inner
                     .execution
                     .finish(&attempt_id, crate::execution::SubmissionOutcome::Rejected)
-                    .await?;
+                    .await
+                    .map_err(after_work)?;
                 if let Some(risk) = &self.inner.risk {
-                    risk.release(&attempt_id).await?;
+                    risk.release(&attempt_id).await.map_err(after_work)?;
                 }
                 return Err(error);
             }
@@ -655,7 +671,7 @@ impl SchwabClient {
             .await
             .map_err(|e| Error::SubmissionUnknown {
                 attempt_id: attempt_id.clone(),
-                source: Box::new(e),
+                source: Box::new(after_work(e)),
             })?;
         Ok(OrderSubmitResponse { order_id, location })
     }

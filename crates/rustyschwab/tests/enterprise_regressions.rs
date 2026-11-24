@@ -573,6 +573,94 @@ fn journal_initialization_is_serialized_across_processes() {
     assert_eq!(records.len(), 1);
 }
 
+/// The state file's write lock, held by a test that stands in for another
+/// process that is writing: taken the moment a request reaches the mock
+/// broker, so that the journal's write after the send finds the file busy.
+struct HoldsStateOnRequest {
+    lock_path: std::path::PathBuf,
+    held: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    response: ResponseTemplate,
+}
+impl wiremock::Respond for HoldsStateOnRequest {
+    fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.lock_path)
+            .unwrap();
+        file.lock().unwrap();
+        *self.held.lock().unwrap() = Some(file);
+        self.response.clone()
+    }
+}
+
+/// Submit an order whose broker answer is `response`, with the state file
+/// busy from the moment the order is sent until the journal gives up on it.
+async fn submit_with_the_state_busy_after_the_send(
+    response: ResponseTemplate,
+) -> Result<rustyschwab::types::trading::OrderSubmitResponse, Error> {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+    Mock::given(method("POST"))
+        .and(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(HoldsStateOnRequest {
+            lock_path: client
+                .order_journal()
+                .database()
+                .path()
+                .with_extension("write.lock"),
+            held: held.clone(),
+            response,
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = client.place_order("hash", &limit_order()).await;
+    // The request did go out, and the lock was held for the whole write wait.
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let file = held.lock().unwrap().take().expect("the order was sent");
+    file.unlock().unwrap();
+    result
+}
+
+/// The journal records an accepted order after it is sent. When the state
+/// file is busy for that write, the order may well be at the broker: the
+/// caller must get the unknown outcome to reconcile, as it did when the
+/// failure was `Storage`, never `StateBusy` ("nothing happened, retry").
+#[tokio::test]
+async fn a_busy_state_file_after_an_order_is_sent_is_an_unknown_submission() {
+    let error =
+        submit_with_the_state_busy_after_the_send(ResponseTemplate::new(201).insert_header(
+            "Location",
+            "https://api.schwabapi.com/trader/v1/accounts/hash/orders/4242",
+        ))
+        .await
+        .unwrap_err();
+    let Error::SubmissionUnknown { source, .. } = &error else {
+        panic!("expected an unknown submission, got {error:?}");
+    };
+    assert!(
+        matches!(**source, Error::Storage(_)),
+        "the cause must not read as a busy retry: {source:?}"
+    );
+    assert_ne!(error.kind(), rustyschwab::ErrorKind::StateBusy);
+}
+
+/// A definite rejection is recorded after the send as well. The write that
+/// cannot be made is reported as the storage failure it always was.
+#[tokio::test]
+async fn a_busy_state_file_after_a_rejection_is_a_storage_failure_not_a_busy_one() {
+    let error = submit_with_the_state_busy_after_the_send(
+        ResponseTemplate::new(400).set_body_json(serde_json::json!({"message": "Rejected"})),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, Error::Storage(_)), "{error:?}");
+}
+
 #[tokio::test]
 async fn recovery_and_process_drain_close_submission_admission_before_wire() {
     let server = MockServer::start().await;
