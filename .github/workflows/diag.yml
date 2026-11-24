@@ -27,10 +27,14 @@ jobs:
       - name: Loop
         shell: bash
         run: |
-          fail=0
-          for i in $(seq 1 ${LOOPS:-30}); do
-            if cargo test -p rustyschwab --test audit_chain --locked -- --nocapture > out.txt 2>&1; then r=ok; else r=FAILED; fail=$((fail+1)); fi
-            echo "RUN $i $r"
-            grep -E "DIAG|panicked|^test concurrent" out.txt || true
-          done
-          echo "SUMMARY shard=${{ matrix.shard }} failures=$fail"
+          one() {
+            fail=0
+            for i in $(seq 1 ${LOOPS:-25}); do
+              if cargo test -p rustyschwab --test audit_chain --locked -- --nocapture > out$1.txt 2>&1; then r=ok; else r=FAILED; fail=$((fail+1)); fi
+              echo "RUN $1.$i $r"
+              grep -E "DIAG|panicked|^test concurrent" out$1.txt || true
+            done
+            echo "SUMMARY shard=${{ matrix.shard }} lane=$1 failures=$fail"
+          }
+          one a & one b & one c &
+          wait

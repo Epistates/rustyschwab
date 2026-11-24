@@ -613,6 +613,14 @@ impl Inner {
                 Err(std::fs::TryLockError::WouldBlock) => {
                     diag.step("LOCK_TIMEOUT");
                     diag.attempts = attempts;
+                    diag.steps.push_str(&format!(
+                        " now@{} holder=[{}] elapsed={}ms",
+                        std::time::Instant::now()
+                            .duration_since(Diag::epoch())
+                            .as_millis(),
+                        Diag::current().lock(),
+                        started.elapsed().as_millis()
+                    ));
                     diag.print();
                     return Err(Error::Storage("State initialization lock timed out".into()));
                 }
@@ -658,7 +666,29 @@ struct Diag {
 impl Diag {
     fn epoch() -> std::time::Instant {
         static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        *EPOCH.get_or_init(std::time::Instant::now)
+        *EPOCH.get_or_init(|| {
+            let epoch = std::time::Instant::now();
+            std::thread::spawn(move || {
+                let mut last = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(Duration::from_millis(20));
+                    let now = std::time::Instant::now();
+                    let gap = now.duration_since(last).as_millis();
+                    if gap > 500 {
+                        eprintln!(
+                            "DIAG STALL gap={gap}ms ended@{}",
+                            now.duration_since(epoch).as_millis()
+                        );
+                    }
+                    last = now;
+                }
+            });
+            epoch
+        })
+    }
+    fn current() -> &'static parking_lot::Mutex<String> {
+        static CURRENT: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
+        &CURRENT
     }
     fn new(inner: &Inner) -> Self {
         let _ = Self::epoch();
@@ -684,6 +714,9 @@ impl Diag {
             now.duration_since(self.last).as_millis()
         ));
         self.last = now;
+        if self.tag.starts_with("SHARED") {
+            *Self::current().lock() = format!("{} last step {name} done@{at}", self.tag);
+        }
     }
     fn print(&self) {
         let total = self.last.duration_since(self.t0).as_millis();
