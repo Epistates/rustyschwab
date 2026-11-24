@@ -1276,6 +1276,65 @@ async fn a_closed_calendar_day_closes_the_session_instead_of_faulting_the_feed()
     // The feed stops at the closed calendar rather than asking for quotes.
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
+/// A feed that cannot record because the venue's state file is busy stops
+/// with an error that says so, so whoever restarts it knows nothing is
+/// damaged, and the disconnect is still recorded once the file is free.
+#[tokio::test]
+async fn a_feed_stopped_by_a_busy_state_file_says_so() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let (client, _tokens_dir, _) = common::mock_client(&server, false);
+    let today = feed::trading_date(chrono::Utc::now()).to_string();
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/markets/equity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "equity": {"equity": {
+                "date": today, "marketType": "EQUITY", "product": "EQ", "isOpen": false,
+            }}
+        })))
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config();
+    config.clock = PaperClockMode::Wall;
+    let b = PaperBroker::open(dir.path().join("state/paper.sqlite3"), config)
+        .await
+        .unwrap();
+    let feed = feed::SchwabPaperFeed::new(
+        std::sync::Arc::new(client),
+        b.clone(),
+        vec!["ABC".into()],
+        d("100"),
+    )
+    .unwrap();
+    // Another writer holds the file for longer than a write waits for its
+    // turn, then lets go in time for the disconnect to be recorded.
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(
+            b.order_journal()
+                .database()
+                .path()
+                .with_extension("write.lock"),
+        )
+        .unwrap();
+    lock.lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5500));
+        lock.unlock().unwrap();
+    });
+    let error = feed.tick().await.unwrap_err();
+    release.join().unwrap();
+    let rustyschwab::Error::StateBusy(message) = &error else {
+        panic!("expected a busy state file, got {error:?}");
+    };
+    assert!(message.contains("paper feed stopped"), "{message}");
+    assert!(message.contains("state file was busy"), "{message}");
+}
 #[test]
 fn feed_requires_realtime_identity_side_timestamps_and_explicit_size_units() {
     let mut item:rustyschwab::types::market_data::QuoteItem=serde_json::from_value(json!({"symbol":"ABC","assetMainType":"EQUITY","realtime":true,"quote":{"bidPrice":10.25,"askPrice":10.26,"bidSize":2,"askSize":3,"bidTime":100,"askTime":101}})).unwrap();

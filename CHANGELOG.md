@@ -196,7 +196,8 @@ held order").
   an existing `except StorageError` still catches it.
 - **Behavior change:** a paper venue mutation whose write turn does not come
   in time fails as `StateBusy`. It failed as `SubmissionUnknown`, which
-  assumed the commit might have happened; here the write never ran.
+  assumed the commit might have happened; here the write never ran. A paper
+  feed that stops because its state file was busy says so in its error.
 - **Behavior change (MCP server):** the tool failure for a busy state file
   is `Unavailable` and carries the message, where it was an internal error,
   and the approval it used is kept.
