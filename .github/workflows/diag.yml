@@ -13,7 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -32,7 +32,7 @@ jobs:
             for i in $(seq 1 ${LOOPS:-25}); do
               if cargo test -p rustyschwab --test audit_chain --locked -- --nocapture > out$1.txt 2>&1; then r=ok; else r=FAILED; fail=$((fail+1)); fi
               echo "RUN $1.$i $r"
-              grep -E "DIAG|panicked|^test concurrent" out$1.txt || true
+              grep -E -A1 "DIAG|panicked|^test concurrent" out$1.txt || true
             done
             echo "SUMMARY shard=${{ matrix.shard }} lane=$1 failures=$fail"
           }
