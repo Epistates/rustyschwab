@@ -235,15 +235,18 @@ impl Drop for HeldLock {
     }
 }
 
+/// A lock file that another handle or process holds, and the turn that goes
+/// with it: what a writer waits with.
+struct Waiting {
+    file: Arc<std::fs::File>,
+    owner: Arc<LockFile>,
+    turn: tokio::sync::OwnedMutexGuard<()>,
+}
+
 /// What a first, non-blocking try for the write lock file came to.
 enum Attempt {
     Held(HeldLock),
-    /// Another handle or process holds it.
-    Busy {
-        file: Arc<std::fs::File>,
-        owner: Arc<LockFile>,
-        turn: tokio::sync::OwnedMutexGuard<()>,
-    },
+    Busy(Waiting),
 }
 
 /// A writer's wait for the write lock file, answered on `reply`. A request
@@ -251,9 +254,7 @@ enum Attempt {
 /// away, and the lock thread skips it, or unlocks at once if it was already
 /// waiting for the lock.
 struct LockRequest {
-    file: Arc<std::fs::File>,
-    owner: Arc<LockFile>,
-    turn: tokio::sync::OwnedMutexGuard<()>,
+    waiting: Waiting,
     reply: tokio::sync::oneshot::Sender<Result<HeldLock>>,
 }
 
@@ -273,9 +274,7 @@ struct LockRequest {
 fn lock_thread(requests: mpsc::Receiver<LockRequest>) {
     for request in requests {
         let LockRequest {
-            file,
-            owner,
-            turn,
+            waiting: Waiting { file, owner, turn },
             reply,
         } = request;
         if reply.is_closed() {
@@ -541,16 +540,28 @@ impl Inner {
                     owner,
                     _turn: turn,
                 })),
-                Err(std::fs::TryLockError::WouldBlock) => Ok(Attempt::Busy { file, owner, turn }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    Ok(Attempt::Busy(Waiting { file, owner, turn }))
+                }
                 Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
             }
         })
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))??;
-        let (file, owner, turn) = match attempt {
-            Attempt::Held(held) => return Ok(held),
-            Attempt::Busy { file, owner, turn } => (file, owner, turn),
-        };
+        match attempt {
+            Attempt::Held(held) => Ok(held),
+            Attempt::Busy(waiting) => self.wait_for_lock(waiting, expiry, write_turn_busy).await,
+        }
+    }
+    /// Wait on the handle's lock thread for a lock that is held elsewhere,
+    /// until `expiry`, when the caller fails with `busy`. Dropping the
+    /// future abandons the request.
+    async fn wait_for_lock(
+        &self,
+        waiting: Waiting,
+        expiry: tokio::time::Instant,
+        busy: fn() -> Error,
+    ) -> Result<HeldLock> {
         let (reply, granted) = tokio::sync::oneshot::channel();
         let stopped = || Error::Storage("State lock thread stopped".into());
         {
@@ -567,12 +578,7 @@ impl Inner {
                     .map_err(|error| Error::Storage(format!("State lock thread: {error}")))?;
                 *locker = Some(requests);
             }
-            let request = LockRequest {
-                file,
-                owner,
-                turn,
-                reply,
-            };
+            let request = LockRequest { waiting, reply };
             if locker.as_ref().is_some_and(|l| l.send(request).is_err()) {
                 // The thread is gone: start another for the next write.
                 *locker = None;
@@ -581,7 +587,7 @@ impl Inner {
         }
         tokio::time::timeout_at(expiry, granted)
             .await
-            .map_err(|_| write_turn_busy())?
+            .map_err(|_| busy())?
             .map_err(|_| stopped())?
     }
     fn checkout(&self) -> Result<Connection> {
