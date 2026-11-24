@@ -139,6 +139,17 @@ impl std::fmt::Debug for SchwabPaperFeed {
             .finish_non_exhaustive()
     }
 }
+/// The error that stops the feed. When the venue's state file was busy the
+/// message says so, for whoever restarts the feed: nothing is wrong with the
+/// state, and the feed started again will carry on.
+fn stopped(error: Error) -> Error {
+    match error {
+        Error::StateBusy(message) => Error::StateBusy(format!(
+            "the paper feed stopped because the state file was busy: {message}"
+        )),
+        other => other,
+    }
+}
 impl SchwabPaperFeed {
     pub fn new(
         market_data: Arc<SchwabClient>,
@@ -172,8 +183,10 @@ impl SchwabPaperFeed {
         match self.poll().await {
             Ok(()) => Ok(()),
             Err(error) => {
-                self.publish(PaperEventKind::Disconnect).await?;
-                Err(error)
+                self.publish(PaperEventKind::Disconnect)
+                    .await
+                    .map_err(stopped)?;
+                Err(stopped(error))
             }
         }
     }
@@ -250,7 +263,9 @@ impl SchwabPaperFeed {
             match self.publish(event).await {
                 Ok(_) => {}
                 // The venue's own state failing is the feed failing.
-                Err(error @ (Error::Storage(_) | Error::Io(_))) => return Err(error),
+                Err(error @ (Error::Storage(_) | Error::StateBusy(_) | Error::Io(_))) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(%symbol, %error, "paper feed: the venue refused a quote; skipped");
                 }

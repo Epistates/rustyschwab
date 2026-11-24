@@ -142,6 +142,63 @@ held order").
   requires it, and no dependency in the lockfile declares more. Migration:
   build with Rust 1.95 or newer. The published wheels are unaffected.
 
+### Changed — a busy state file is its own error
+
+- **Breaking (Rust):** a write that does not get its turn within five
+  seconds, and an opener that waits out another's initialization of a state
+  file, now fail with the new `Error::StateBusy` (`ErrorKind::StateBusy`,
+  `"state_busy"`), where they failed with `Error::Storage`. `Storage` says
+  that durable state failed and should be checked; here nothing was written
+  and the state is not damaged. The message says which wait ran out (`the
+  write turn did not come in time` or `the initialization lock was not
+  granted in time`). Migration: a caller that matched `ErrorKind::Storage`
+  or `Error::Storage(_)` for a lock timeout matches `StateBusy` for it.
+  A failure SQLite itself reports (`database is locked` from a connection's
+  busy timeout) is still `Storage`.
+- `is_retryable()` is false for `StateBusy`, as for `LeaseBusy`: nothing was
+  written and the caller may retry, but the SDK does not retry for it, so it
+  adds nothing to the contention that caused the wait, and a busy state file
+  does not count against the circuit breaker. A state write that follows
+  work an order has already done (the intent journaled, the order sent) and
+  finds the file busy is reported as before (`SubmissionUnknown` or
+  `Storage`), since there the order may be at the broker. The remote
+  authority answers `503` with `Retry-After: 1` and relays the message.
+- **Behavior change:** the wait for another opener to finish preparing a
+  state file now ends when the caller drops the future (for example, with
+  `tokio::time::timeout` around the call). It used to poll for five seconds
+  on a blocking-pool thread whatever the caller did, and the thread kept
+  polling after the future was dropped. The wait is now in the operating
+  system and a dropped future gives the lock back as soon as it is granted.
+  Five seconds is still the longest it waits, counted from when it starts,
+  and running out fails with `StateBusy`. A write's five seconds for its
+  turn start once the file is open. `SchwabClient::new` has no future to
+  drop: it waits at most five seconds for another opener, then fails with
+  `StateBusy` (in Python, a `StorageError` subclass).
+- **Behavior change:** a new state file is built whole in a private
+  temporary file beside it (`state.sqlite3.<id>.tmp`, as private as the
+  state file), flushed once, and moved into place with a rename that fails
+  if the name is taken, instead of being created empty and then filled in
+  through several flushes. A crash at any point leaves no state file or a
+  complete one; before, it could leave an empty or part-built one, which
+  the next opener finished. Openers that create the same new file at the
+  same moment no longer wait for each other: each builds its own and the
+  one whose move fails discards it and opens the other's. The init lock
+  (`state.init.lock`) is now taken only to prepare a file that is behind, one
+  that needs a migration or a legacy import; a current file is opened
+  without it. A crash while building leaves its temporary file behind,
+  which holds no state and is removed by the next opener once it is an
+  hour old. The new file is in WAL mode from the start, so its first
+  opener no longer converts it.
+- Python: the new `StateBusy` exception is a subclass of `StorageError`, so
+  an existing `except StorageError` still catches it.
+- **Behavior change:** a paper venue mutation whose write turn does not come
+  in time fails as `StateBusy`. It failed as `SubmissionUnknown`, which
+  assumed the commit might have happened; here the write never ran. A paper
+  feed that stops because its state file was busy says so in its error.
+- **Behavior change (MCP server):** the tool failure for a busy state file
+  is `Unavailable` and carries the message, where it was an internal error,
+  and the approval it used is kept.
+
 ### Changed — the client opens its state when it is built
 
 **Behavior change:** `SchwabClient::new` (and the builder's `build`) now
@@ -200,8 +257,8 @@ one. Signatures are unchanged.
   promise first come, first served, so across processes the order is best
   effort) and releases the lock if its holder crashes. A write whose turn
   has not come within five seconds, or whose caller gave up first, fails
-  with `database is locked: another writer holds the state file`, and the
-  write is dropped, not run later when the lock frees. The wait for the lock
+  with `Error::StateBusy` (see "a busy state file is its own error"), and
+  the write is dropped, not run later when the lock frees. The wait for the lock
   runs on a thread of the SDK's own, so dropping a Tokio runtime never waits
   for it. A writer that does not use the lock file (an earlier release, the
   `sqlite3` shell) is waited for as before. Under contention the longest

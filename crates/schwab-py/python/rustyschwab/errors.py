@@ -44,6 +44,7 @@ __all__ = [
     "RiskDenied",
     "SchwabError",
     "SerializationError",
+    "StateBusy",
     "StorageError",
     "StreamError",
     "SubmissionUnknown",
@@ -192,6 +193,21 @@ class StorageError(SchwabError):
     """Durable state (the order journal, the paper ledger) failed."""
 
     kind = "storage"
+
+
+class StateBusy(StorageError):
+    """The state file stayed busy for the whole wait; nothing was written.
+
+    A write's turn did not come in time, or another opener was still preparing
+    the state file. The call gave up before it changed anything, so the same
+    call can be made again. The state is not damaged. It is a
+    :class:`StorageError`, so a handler for that still catches it; catch
+    ``StateBusy`` first to tell the two apart. ``retryable`` is false, as for
+    :class:`LeaseBusy`, although you may retry: the SDK does not retry for
+    you, so it adds nothing to the contention that caused the wait.
+    """
+
+    kind = "state_busy"
 
 
 class UnknownError(SchwabError):
@@ -348,6 +364,7 @@ _BY_KIND: dict[str, type[SchwabError]] = {
         RemoteError,
         RiskDenied,
         SerializationError,
+        StateBusy,
         StorageError,
         StreamError,
         SubmissionUnknown,

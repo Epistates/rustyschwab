@@ -34,6 +34,8 @@
 //! - [`Error::OwnershipLost`] - Another writer holds the execution lease
 //! - [`Error::LeaseBusy`] - Another operation held the lease for the whole
 //!   wait; nothing was sent, so the same intent can be submitted again
+//! - [`Error::StateBusy`] - The state file stayed busy for the whole wait;
+//!   nothing was written, so the same call can be made again
 //!
 //! # Portability
 //!
@@ -91,6 +93,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// Durable state (SQLite journal, ledger, reservation) failed or is
     /// inconsistent. Not a caller error; check the database and its backups.
+    /// A call that only waited too long for the state file is
+    /// [`Error::StateBusy`], not this.
     #[error("Durable state failure: {0}")]
     Storage(String),
     #[error("Ownership lease lost; reconcile in-flight operations")]
@@ -99,6 +103,21 @@ pub enum Error {
     /// The resource is not named: lease names embed the app key.
     #[error("Another operation holds the lease; nothing was sent")]
     LeaseBusy,
+    /// The state file stayed busy for the whole wait: a write's turn did not
+    /// come, or another opener was still preparing the file. The call gave up
+    /// before it wrote anything, so nothing changed and the same call can be
+    /// made again. The message says which wait ran out. Unlike
+    /// [`Error::Storage`], the state is not damaged; no check of the database
+    /// or its backups is needed.
+    ///
+    /// [`is_retryable`](Error::is_retryable) is false all the same: the
+    /// caller may retry, but the SDK does not retry for it, so it adds
+    /// nothing to the contention that caused the wait. A write that follows
+    /// work the operation has already done (an order journaled or sent) is
+    /// not reported this way, because there "nothing was written" does not
+    /// mean nothing happened.
+    #[error("State busy: {0}")]
+    StateBusy(String),
     #[error("Circuit breaker is open")]
     CircuitOpen,
     #[error("Reconciliation is required for pending submission {attempt_id}")]
@@ -401,6 +420,7 @@ impl Error {
             Self::Storage(_) => ErrorKind::Storage,
             Self::OwnershipLost => ErrorKind::OwnershipLost,
             Self::LeaseBusy => ErrorKind::LeaseBusy,
+            Self::StateBusy(_) => ErrorKind::StateBusy,
             Self::CircuitOpen => ErrorKind::CircuitOpen,
             Self::ReconciliationRequired { .. } => ErrorKind::ReconciliationRequired,
             Self::Halted(_) => ErrorKind::Halted,
@@ -566,10 +586,13 @@ pub enum ErrorKind {
     Subscription,
     Stream,
     Io,
+    // A new kind takes the next discriminant after `Unknown`'s, so that no
+    // existing kind's value changes; `Unknown` stays last for `serde(other)`.
+    StateBusy = 30,
     /// Also any kind a newer peer sends that this release does not know, so
     /// an envelope from a newer authority still decodes.
     #[serde(other)]
-    Unknown,
+    Unknown = 29,
 }
 
 impl ErrorKind {
@@ -579,6 +602,7 @@ impl ErrorKind {
             Self::Storage => "storage",
             Self::OwnershipLost => "ownership_lost",
             Self::LeaseBusy => "lease_busy",
+            Self::StateBusy => "state_busy",
             Self::CircuitOpen => "circuit_open",
             Self::ReconciliationRequired => "reconciliation_required",
             Self::Halted => "halted",
@@ -662,6 +686,7 @@ impl From<&Error> for ErrorEnvelope {
         };
         match error {
             Error::Storage(message)
+            | Error::StateBusy(message)
             | Error::Halted(message)
             | Error::Suspended(message)
             | Error::RiskDenied(message)
@@ -729,6 +754,7 @@ impl From<ErrorEnvelope> for Error {
             ErrorKind::Storage => Error::Storage(envelope.message),
             ErrorKind::OwnershipLost => Error::OwnershipLost,
             ErrorKind::LeaseBusy => Error::LeaseBusy,
+            ErrorKind::StateBusy => Error::StateBusy(envelope.message),
             ErrorKind::CircuitOpen => Error::CircuitOpen,
             ErrorKind::ReconciliationRequired => match envelope.attempt_id.clone() {
                 Some(attempt_id) => Error::ReconciliationRequired { attempt_id },
@@ -836,6 +862,12 @@ mod tests {
         assert!(!Error::Duplicate("tag".into()).is_retryable());
         assert!(!Error::ApprovalInvalid("expired".into()).is_retryable());
 
+        // Busy outcomes leave the next call to the caller, as `LeaseBusy`
+        // does: the request pipeline must neither replay them nor count them
+        // against the broker's circuit breaker.
+        assert!(!Error::LeaseBusy.is_retryable());
+        assert!(!Error::StateBusy("write turn".into()).is_retryable());
+
         // Authority failures follow the HTTP 5xx rule but never expose an
         // upstream status
         let unavailable = Error::Remote {
@@ -936,6 +968,10 @@ mod tests {
         assert!(matches!(round_trip(Error::CircuitOpen), Error::CircuitOpen));
         assert!(matches!(round_trip(Error::LeaseBusy), Error::LeaseBusy));
         assert!(matches!(
+            round_trip(Error::StateBusy("write turn".into())),
+            Error::StateBusy(m) if m == "write turn"
+        ));
+        assert!(matches!(
             round_trip(Error::Broker {
                 status: reqwest::StatusCode::BAD_REQUEST,
                 details: vec![ApiError::new(None, "secret", None)],
@@ -1003,6 +1039,8 @@ mod tests {
         );
         assert_eq!(ErrorKind::RiskDenied.to_string(), "risk_denied");
         assert_eq!(Error::Halted(String::new()).kind(), ErrorKind::Halted);
+        assert_eq!(Error::StateBusy(String::new()).kind(), ErrorKind::StateBusy);
+        assert_eq!(ErrorKind::StateBusy.to_string(), "state_busy");
     }
 
     #[test]

@@ -251,6 +251,59 @@ pub fn secure_file_write(_path: &Path, _data: &[u8]) -> Result<()> {
     ))
 }
 
+/// Move the finished file at `from` to `to`, failing with
+/// [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) if `to` exists. When
+/// several processes move a file of their own to the same name, exactly one
+/// succeeds and the others change nothing: the way to create a file whole, or
+/// not at all.
+///
+/// - **Unix**: `renameat2` with `RENAME_NOREPLACE` on Linux and `renamex_np`
+///   with `RENAME_EXCL` on Apple platforms, which leave neither name moved when
+///   `to` exists. A filesystem that does not support the flag gets a hard
+///   link, which fails the same way, then the old name removed. The caller
+///   must [`sync_directory`] to make the move durable.
+/// - **Windows**: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, with
+///   `MOVEFILE_WRITE_THROUGH` so that the rename is on disk when it returns.
+///   (`tempfile`'s `persist_noclobber`, which does the same move, does not ask
+///   for write-through.) Windows has no way to flush a directory.
+#[cfg(unix)]
+pub(crate) fn rename_noclobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    use rustix::io::Errno;
+
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Ok(()) => return Ok(()),
+        // Not supported by this kernel or this filesystem.
+        Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::hard_link(from, to)?;
+    // The file has both names; the old one is only a leftover if this fails.
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) use crate::security_windows::{rename_noclobber, sync_directory};
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn rename_noclobber(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Flush the directory `dir`, so that the names created or moved in it are on
+/// disk. Without it a crash after [`rename_noclobber`] can lose the new name,
+/// and with it every write made to the file since.
+#[cfg(unix)]
+pub(crate) fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn sync_directory(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Open an existing private file for reading, checking the open descriptor
 /// rather than the path, so the file read is the file checked: a path
 /// swapped for a symlink between a check and a read cannot slip through.

@@ -7,7 +7,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header::RETRY_AFTER},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -345,6 +345,7 @@ fn status_for(envelope: &ErrorEnvelope) -> StatusCode {
         | ErrorKind::Remote
         | ErrorKind::CircuitOpen
         | ErrorKind::LeaseBusy
+        | ErrorKind::StateBusy
         | ErrorKind::Suspended => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -367,6 +368,7 @@ fn envelope(error: &rustyschwab::Error) -> ErrorEnvelope {
             | ErrorKind::SubmissionUnknown
             | ErrorKind::OwnershipLost
             | ErrorKind::LeaseBusy
+            | ErrorKind::StateBusy
             | ErrorKind::CircuitOpen
             | ErrorKind::RateLimit
             | ErrorKind::Timeout
@@ -378,6 +380,12 @@ fn envelope(error: &rustyschwab::Error) -> ErrorEnvelope {
     }
     envelope
 }
+/// Seconds a caller is told to wait before it asks again when the authority's
+/// state file stayed busy. The authority has already waited five seconds for
+/// the turn, and what held it is another writer's transactions, which take
+/// milliseconds: one second lets the queue move without every caller asking
+/// again at once.
+const STATE_BUSY_RETRY_AFTER: &str = "1";
 fn response(result: Result<Value, Denial>) -> Response {
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
@@ -386,7 +394,16 @@ fn response(result: Result<Value, Denial>) -> Response {
         }
         Err(Denial::Error(error)) => {
             let envelope = envelope(&error);
-            (status_for(&envelope), Json(envelope)).into_response()
+            let status = status_for(&envelope);
+            if envelope.kind == ErrorKind::StateBusy {
+                return (
+                    status,
+                    [(RETRY_AFTER, STATE_BUSY_RETRY_AFTER)],
+                    Json(envelope),
+                )
+                    .into_response();
+            }
+            (status, Json(envelope)).into_response()
         }
     }
 }
@@ -969,4 +986,25 @@ async fn paper_account(
         }
         .await,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A busy state file is a temporary condition: `503` with the standard
+    /// `Retry-After` hint and the typed envelope. Other failures that share
+    /// the status carry no hint.
+    #[test]
+    fn a_busy_state_file_answers_503_with_retry_after() {
+        let busy = response(Err(rustyschwab::Error::StateBusy(
+            "the write turn did not come in time".into(),
+        )
+        .into()));
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.headers()[RETRY_AFTER], "1");
+        let other = response(Err(rustyschwab::Error::Storage("disk".into()).into()));
+        assert_eq!(other.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(other.headers().get(RETRY_AFTER).is_none());
+    }
 }

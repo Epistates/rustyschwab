@@ -21,8 +21,9 @@
 //! poll. The wait is best effort in order: `flock` does not promise to serve
 //! waiters first come, first served. The operating system releases the lock
 //! when its holder exits or crashes. A write whose turn has not come within
-//! five seconds, or whose caller gave up first, fails with `database is
-//! locked` and never runs.
+//! five seconds, or whose caller gave up first, fails with
+//! [`Error::StateBusy`] and never runs: nothing was written, and the same
+//! call can be made again.
 //!
 //! A writer first tries for the lock where a blocking task runs. If another
 //! handle or process holds it, the wait goes to a thread of its own per
@@ -31,6 +32,40 @@
 //! The lock file orders only writers that use it. One that does not (an
 //! earlier release of the SDK, the `sqlite3` shell) is waited for through
 //! SQLite's busy timeout, as before.
+//!
+//! # Opening
+//!
+//! A new file is built whole in a private temporary file beside it
+//! (`state.sqlite3.<random>.tmp`): created as private as the state file will
+//! be, filled with the schema in one transaction without a journal or a
+//! flush, switched to WAL mode, closed, flushed once, and moved into place
+//! with a rename that fails if the name is taken. A crash at any point leaves
+//! no state file or a complete one, never a partial one, and two openers that
+//! create it at the same moment need no lock: the one whose move fails
+//! discards its copy and opens the other's. A crash while building leaves its
+//! temporary file behind; the next opener removes those that are more than an
+//! hour old.
+//!
+//! An existing file that is behind (it needs a migration, or the import of a
+//! legacy journal) is prepared under a second lock file, `state.init.lock`, so
+//! that two openers, in this process or another, cannot race the migration. A
+//! file that is already current is opened without it. An opener that finds the
+//! lock taken waits for it like a writer waits for its turn: in the operating
+//! system, on the handle's lock thread, for at most five seconds from when the
+//! wait starts, and the wait ends sooner if its caller drops the future (a
+//! caller's deadline, `tokio::time::timeout` around the call, does that). The
+//! lock thread gives the lock back as soon as it is granted to a request that
+//! was dropped. When the five seconds run out the call fails with
+//! [`Error::StateBusy`] and nothing has been written. The wait for the turn to
+//! write starts only once opening is done, with its own five seconds. The
+//! constructor (`StateDatabase::open`, which `SchwabClient::new` calls) has no
+//! future to drop: it polls for the lock on the calling thread for at most
+//! five seconds.
+//!
+//! These waits are for locks that may not be released, such as one another
+//! process holds. An opener that finds another on its own handle already
+//! building the file waits for that work to finish, as it would for any work
+//! under way.
 use crate::error::{Error, Result};
 use rusqlite::{Connection, backup::Progress};
 use std::{
@@ -43,10 +78,20 @@ use std::{
 /// documentation), so a small pool bounds blocking threads without starving
 /// readers or backups.
 const POOL_SIZE: usize = 4;
-/// How long a write waits for its turn, and a connection for a lock held
-/// outside the turn order, before failing with `database is locked`.
+/// How long a write waits for its turn before failing with
+/// [`Error::StateBusy`], and how long a connection waits for a lock held
+/// outside the turn order before SQLite fails it with `database is locked`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The longest an opener waits for the init lock, counted from when it starts
+/// waiting: for the synchronous constructor (`StateDatabase::open`, which
+/// `SchwabClient::new` calls, and which has no future to drop) and for the
+/// async path (`run`, `write`), where the caller can end the wait sooner by
+/// dropping the future. Past it they fail with [`Error::StateBusy`].
 const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How old a temporary file left by a crash while building a new state file
+/// must be before an opener removes it. A build takes a second or two, even on
+/// a slow disk, so nothing that old has an owner.
+const STALE_BUILD_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Tables created by the baseline migration. Every schema version has them,
 /// and a restore refuses a backup missing any of them.
@@ -163,6 +208,28 @@ const MIGRATIONS: &[Migration] = &[
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
+/// A state file opened without the init lock.
+enum Opened {
+    /// Current: nothing to migrate and nothing to import.
+    Ready(Connection),
+    /// Behind, or not what it should be: prepare it under the init lock, which
+    /// also decides whether it is refused.
+    Behind(Connection),
+}
+
+/// A point at which a test process, run as a child, stops as a crash would:
+/// the process aborts, with no destructor run and nothing flushed. Named by
+/// `RUSTYSCHWAB_TEST_CRASH_AT`. Does nothing outside the unit tests.
+#[cfg(test)]
+pub(crate) fn failpoint(name: &str) {
+    if std::env::var("RUSTYSCHWAB_TEST_CRASH_AT").is_ok_and(|at| at == name) {
+        std::process::abort();
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn failpoint(_: &str) {}
+
 #[derive(Clone)]
 pub struct StateDatabase {
     inner: Arc<Inner>,
@@ -171,6 +238,10 @@ struct Inner {
     path: PathBuf,
     legacy: Option<PathBuf>,
     initialized: tokio::sync::OnceCell<()>,
+    /// Openers on this handle take turns at creating or opening the file, so
+    /// that the ones behind the first find it ready instead of each building
+    /// one.
+    opening: tokio::sync::Mutex<()>,
     slots: Arc<tokio::sync::Semaphore>,
     idle: parking_lot::Mutex<Vec<Connection>>,
     /// The turn to write. Writers on this handle queue on it in the order
@@ -183,8 +254,18 @@ struct Inner {
     locker: parking_lot::Mutex<Option<mpsc::Sender<LockRequest>>>,
 }
 
-fn locked() -> Error {
-    Error::Storage("database is locked: another writer holds the state file".into())
+/// A write whose turn did not come in time: it never ran.
+fn write_turn_busy() -> Error {
+    Error::StateBusy(
+        "the write turn did not come in time: another writer holds the state file".into(),
+    )
+}
+/// An opener that gave up waiting for another to finish preparing the file.
+fn init_busy() -> Error {
+    Error::StateBusy(
+        "the initialization lock was not granted in time: another opener is still preparing the state file"
+            .into(),
+    )
 }
 
 /// The write lock file beside a database, opened on first use. It is shared
@@ -205,47 +286,71 @@ impl LockFile {
     }
 }
 
-/// The write lock file, locked, and this handle's turn with it. Dropping it,
-/// on any thread and however (a panic included), unlocks the file and then
-/// passes the turn to the next writer on the handle.
+/// A lock file, locked, and the turn that goes with it. Dropping it, on any
+/// thread and however (a panic included), unlocks the file and then passes the
+/// turn on.
+///
+/// The write lock file is shared by the handle's writers, who hold it in
+/// turn: `owner` is its slot, and `turn` the handle's turn to write. An
+/// opener's init lock file is opened for the one use and has neither.
 struct HeldLock {
     file: Arc<std::fs::File>,
-    owner: Arc<LockFile>,
-    _turn: tokio::sync::OwnedMutexGuard<()>,
+    owner: Option<Arc<LockFile>>,
+    _turn: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 impl Drop for HeldLock {
     fn drop(&mut self) {
         // A file that cannot be unlocked is closed, which unlocks it, and
         // opened again for the next writer.
-        if self.file.unlock().is_err() {
-            *self.owner.file.lock() = None;
+        if self.file.unlock().is_err()
+            && let Some(owner) = &self.owner
+        {
+            *owner.file.lock() = None;
         }
     }
 }
 
-/// What a first, non-blocking try for the write lock file came to.
-enum Attempt {
-    Held(HeldLock),
-    /// Another handle or process holds it.
-    Busy {
-        file: Arc<std::fs::File>,
-        owner: Arc<LockFile>,
-        turn: tokio::sync::OwnedMutexGuard<()>,
-    },
+/// A lock file that another handle or process holds, and the turn that goes
+/// with it: what a writer or an opener waits with.
+struct Waiting {
+    file: Arc<std::fs::File>,
+    owner: Option<Arc<LockFile>>,
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-/// A writer's wait for the write lock file, answered on `reply`. A request
+/// What a first, non-blocking try for a lock file came to.
+enum Attempt {
+    Held(HeldLock),
+    Busy(Waiting),
+}
+
+/// Try once to lock `file`, without waiting.
+fn try_lock_file(
+    file: Arc<std::fs::File>,
+    owner: Option<Arc<LockFile>>,
+    turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<Attempt> {
+    match file.try_lock() {
+        Ok(()) => Ok(Attempt::Held(HeldLock {
+            file,
+            owner,
+            _turn: turn,
+        })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(Attempt::Busy(Waiting { file, owner, turn })),
+        Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+    }
+}
+
+/// A wait for a lock file, answered on `reply`. A request
 /// whose `reply` has been dropped is abandoned: its caller timed out or went
 /// away, and the lock thread skips it, or unlocks at once if it was already
 /// waiting for the lock.
 struct LockRequest {
-    file: Arc<std::fs::File>,
-    owner: Arc<LockFile>,
-    turn: tokio::sync::OwnedMutexGuard<()>,
+    waiting: Waiting,
     reply: tokio::sync::oneshot::Sender<Result<HeldLock>>,
 }
 
-/// Wait for the write lock file on behalf of the handle's writers, one request
+/// Wait for a lock file on behalf of the handle's writers and its opener, one request
 /// at a time and in the order they were made, for as long as the handle lives.
 ///
 /// This is a thread of its own, not a task on Tokio's blocking pool, on
@@ -261,9 +366,7 @@ struct LockRequest {
 fn lock_thread(requests: mpsc::Receiver<LockRequest>) {
     for request in requests {
         let LockRequest {
-            file,
-            owner,
-            turn,
+            waiting: Waiting { file, owner, turn },
             reply,
         } = request;
         if reply.is_closed() {
@@ -308,6 +411,7 @@ impl StateDatabase {
                 path,
                 legacy,
                 initialized: tokio::sync::OnceCell::new(),
+                opening: tokio::sync::Mutex::new(()),
                 slots: Arc::new(tokio::sync::Semaphore::new(POOL_SIZE)),
                 idle: parking_lot::Mutex::new(Vec::with_capacity(POOL_SIZE)),
                 turn: Arc::new(tokio::sync::Mutex::new(())),
@@ -324,29 +428,73 @@ impl StateDatabase {
     }
     /// Validate and migrate the file on the first call; a failed
     /// initialization is retried by the next call rather than poisoning the
-    /// handle.
+    /// handle. Waiting for the init lock ends after [`INIT_LOCK_TIMEOUT`],
+    /// with [`Error::StateBusy`], or sooner if the future is dropped; the
+    /// work of preparing the file, once this call holds the lock, runs to its
+    /// end.
     async fn initialized(&self) -> Result<()> {
-        self.inner
-            .initialized
-            .get_or_try_init(|| async {
-                let inner = self.inner.clone();
-                let connection = tokio::task::spawn_blocking(move || inner.initialize())
-                    .await
-                    .map_err(|_| Error::Storage("State worker failed".into()))??;
-                self.inner.idle.lock().push(connection);
-                Ok::<_, Error>(())
-            })
-            .await
-            .copied()
-    }
-    /// Validate and migrate the file now, on the calling thread, so that an
-    /// error in the state location surfaces to whoever builds on it and the
-    /// first operation does not pay for creating the file.
-    pub(crate) fn open(&self) -> Result<()> {
         if self.inner.initialized.initialized() {
             return Ok(());
         }
-        let connection = self.inner.initialize()?;
+        // A file that is current is opened without the init lock. The work of
+        // creating a file runs on a blocking task to its end, even if this
+        // future is dropped meanwhile. Openers on this handle take turns at
+        // it, and one behind another waits for that work as it waits for any
+        // other that is running: the deadline is for waits that may not end,
+        // such as a lock another process holds, and does not cut short work
+        // that is under way.
+        let opened = {
+            let _working = self.inner.opening.lock().await;
+            if self.inner.initialized.initialized() {
+                return Ok(());
+            }
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || inner.open_unlocked())
+                .await
+                .map_err(|_| Error::Storage("State worker failed".into()))??
+        };
+        let connection = match opened {
+            Opened::Ready(connection) => connection,
+            Opened::Behind(connection) => {
+                let held = self.inner.lock_init().await?;
+                // Another opener on this handle may have prepared it while
+                // this one waited for the lock.
+                if self.inner.initialized.initialized() {
+                    return Ok(());
+                }
+                let inner = self.inner.clone();
+                tokio::task::spawn_blocking(move || inner.prepare(connection, held))
+                    .await
+                    .map_err(|_| Error::Storage("State worker failed".into()))??
+            }
+        };
+        // The sync constructor may have opened it meanwhile: keep theirs.
+        if self.inner.initialized.set(()).is_ok() {
+            self.inner.idle.lock().push(connection);
+        }
+        Ok(())
+    }
+    /// Validate and migrate the file now, on the calling thread, so that an
+    /// error in the state location surfaces to whoever builds on it and the
+    /// first operation does not pay for creating the file. It has no
+    /// deadline to follow, so it waits for another opener at most
+    /// [`INIT_LOCK_TIMEOUT`] (five seconds) and then fails with
+    /// [`Error::StateBusy`].
+    pub(crate) fn open(&self) -> Result<()> {
+        self.open_within(INIT_LOCK_TIMEOUT)
+    }
+    /// [`open`](Self::open), waiting at most `wait` for another opener.
+    fn open_within(&self, wait: Duration) -> Result<()> {
+        if self.inner.initialized.initialized() {
+            return Ok(());
+        }
+        let connection = match self.inner.open_unlocked()? {
+            Opened::Ready(connection) => connection,
+            Opened::Behind(connection) => {
+                let held = self.inner.lock_init_blocking(wait)?;
+                self.inner.prepare(connection, held)?
+            }
+        };
         // Another caller may have opened it meanwhile: keep theirs.
         if self.inner.initialized.set(()).is_ok() {
             self.inner.idle.lock().push(connection);
@@ -381,8 +529,8 @@ impl StateDatabase {
     /// [`run`](Self::run) for an operation that writes: `f` runs once it is
     /// this handle's turn to write and no other handle or process is writing
     /// in turn (see the module documentation). If the turn has not come
-    /// within five seconds this fails with `database is locked` and `f`
-    /// never runs, and neither does it if the caller stops waiting first (the
+    /// within five seconds, counted from when the file is open, this fails
+    /// with [`Error::StateBusy`] and `f` never runs, and neither does it if the caller stops waiting first (the
     /// future is dropped); once `f` has started it runs to the end.
     pub(crate) async fn write<T: Send + 'static>(
         &self,
@@ -390,7 +538,8 @@ impl StateDatabase {
     ) -> Result<T> {
         self.write_within(BUSY_TIMEOUT, f).await
     }
-    /// [`write`](Self::write), waiting at most `wait` for the turn.
+    /// [`write`](Self::write), waiting at most `wait` for the turn once the
+    /// file is open.
     async fn write_within<T: Send + 'static>(
         &self,
         wait: Duration,
@@ -404,7 +553,7 @@ impl StateDatabase {
         // wait cannot deadlock.
         let permit = tokio::time::timeout_at(expiry, self.inner.slots.clone().acquire_owned())
             .await
-            .map_err(|_| locked())?
+            .map_err(|_| write_turn_busy())?
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
         let inner = self.inner.clone();
         let (outcome, finished) = tokio::sync::oneshot::channel();
@@ -516,29 +665,31 @@ impl Inner {
     async fn lock_for_write(&self, expiry: tokio::time::Instant) -> Result<HeldLock> {
         let turn = tokio::time::timeout_at(expiry, self.turn.clone().lock_owned())
             .await
-            .map_err(|_| locked())?;
+            .map_err(|_| write_turn_busy())?;
         // The lock is free more often than not, and a try for it is quick:
         // make it where a blocking task would run, so that a paused clock
         // (`tokio::time::pause`) waits for it as it does for any other.
         let owner = self.lock_file.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             let file = owner.open()?;
-            match file.try_lock() {
-                Ok(()) => Ok(Attempt::Held(HeldLock {
-                    file,
-                    owner,
-                    _turn: turn,
-                })),
-                Err(std::fs::TryLockError::WouldBlock) => Ok(Attempt::Busy { file, owner, turn }),
-                Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
-            }
+            try_lock_file(file, Some(owner), Some(turn))
         })
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))??;
-        let (file, owner, turn) = match attempt {
-            Attempt::Held(held) => return Ok(held),
-            Attempt::Busy { file, owner, turn } => (file, owner, turn),
-        };
+        match attempt {
+            Attempt::Held(held) => Ok(held),
+            Attempt::Busy(waiting) => self.wait_for_lock(waiting, expiry, write_turn_busy).await,
+        }
+    }
+    /// Wait on the handle's lock thread for a lock that is held elsewhere,
+    /// until `expiry`, when the caller fails with `busy`. Dropping the
+    /// future abandons the request.
+    async fn wait_for_lock(
+        &self,
+        waiting: Waiting,
+        expiry: tokio::time::Instant,
+        busy: fn() -> Error,
+    ) -> Result<HeldLock> {
         let (reply, granted) = tokio::sync::oneshot::channel();
         let stopped = || Error::Storage("State lock thread stopped".into());
         {
@@ -555,12 +706,7 @@ impl Inner {
                     .map_err(|error| Error::Storage(format!("State lock thread: {error}")))?;
                 *locker = Some(requests);
             }
-            let request = LockRequest {
-                file,
-                owner,
-                turn,
-                reply,
-            };
+            let request = LockRequest { waiting, reply };
             if locker.as_ref().is_some_and(|l| l.send(request).is_err()) {
                 // The thread is gone: start another for the next write.
                 *locker = None;
@@ -569,7 +715,7 @@ impl Inner {
         }
         tokio::time::timeout_at(expiry, granted)
             .await
-            .map_err(|_| locked())?
+            .map_err(|_| busy())?
             .map_err(|_| stopped())?
     }
     fn checkout(&self) -> Result<Connection> {
@@ -588,34 +734,141 @@ impl Inner {
             }
         }
     }
-    /// Cross-process initialization is serialized by a lock file so two
-    /// openers cannot race the schema migration.
-    fn initialize(&self) -> Result<Connection> {
+    /// The init lock file, opened for this one use: a file shared by the
+    /// handle's openers would be locked by whichever asked first, and then
+    /// by the others too. Creates the state directory if need be.
+    fn open_init_lock(path: &Path) -> Result<std::fs::File> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| Error::Config("State path requires a directory".into()))?;
+        crate::security::ensure_private_directory(parent)?;
+        Ok(crate::auth::token_store::open_lock_file(
+            &path.with_extension("init.lock"),
+        )?)
+    }
+    /// Take the init lock, trying where a blocking task runs. If another
+    /// opener holds it, wait on the handle's lock thread for at most
+    /// [`INIT_LOCK_TIMEOUT`]. Dropping the future abandons the request.
+    async fn lock_init(&self) -> Result<HeldLock> {
+        let path = self.path.clone();
+        let attempt = tokio::task::spawn_blocking(move || {
+            try_lock_file(Arc::new(Self::open_init_lock(&path)?), None, None)
+        })
+        .await
+        .map_err(|_| Error::Storage("State worker failed".into()))??;
+        match attempt {
+            Attempt::Held(held) => Ok(held),
+            Attempt::Busy(waiting) => {
+                let expiry = tokio::time::Instant::now() + INIT_LOCK_TIMEOUT;
+                self.wait_for_lock(waiting, expiry, init_busy).await
+            }
+        }
+    }
+    /// Take the init lock on the calling thread, polling for it for at most
+    /// `wait`: a synchronous caller has no future to drop and no deadline to
+    /// follow.
+    fn lock_init_blocking(&self, wait: Duration) -> Result<HeldLock> {
+        let file = Arc::new(Self::open_init_lock(&self.path)?);
+        let started = std::time::Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    return Ok(HeldLock {
+                        file,
+                        owner: None,
+                        _turn: None,
+                    });
+                }
+                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => return Err(init_busy()),
+                Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
+            }
+        }
+    }
+    /// Open the state file, building it first if it does not exist, and say
+    /// whether it is current. Takes no lock: a new file is moved into place
+    /// whole or not at all (see the module documentation).
+    fn open_unlocked(&self) -> Result<Opened> {
         let parent = self
             .path
             .parent()
             .ok_or_else(|| Error::Config("State path requires a directory".into()))?;
         crate::security::ensure_private_directory(parent)?;
-        let lock =
-            crate::auth::token_store::open_lock_file(&self.path.with_extension("init.lock"))?;
-        let started = std::time::Instant::now();
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < INIT_LOCK_TIMEOUT => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(Error::Storage("State initialization lock timed out".into()));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
-            }
-        }
         if !self.path.exists() {
-            crate::security::secure_file_write(&self.path, &[])?;
+            self.create_new_file(parent)?;
         }
         crate::security::verify_file_permissions(&self.path)?;
-        let mut connection = open_connection(&self.path)?;
+        let connection = open_connection(&self.path)?;
+        remove_stale_builds(&self.path, STALE_BUILD_AGE);
+        Ok(if self.is_current(&connection) {
+            Opened::Ready(connection)
+        } else {
+            Opened::Behind(connection)
+        })
+    }
+    /// Whether `connection`'s file is complete, in WAL mode and at the newest
+    /// schema, with nothing left to import. Anything else, including a file
+    /// that cannot be read, is for the locked path to judge: another opener
+    /// of an older release may be part way through creating it.
+    fn is_current(&self, connection: &Connection) -> bool {
+        let current = || -> Result<bool> {
+            if !table_exists(connection, "meta")?
+                || schema_version(connection)? != Some(SCHEMA_VERSION)
+                || !baseline_tables_present(connection)?
+            {
+                return Ok(false);
+            }
+            let mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+                .map_err(sql)?;
+            if !mode.eq_ignore_ascii_case("wal") {
+                return Ok(false);
+            }
+            let imported = meta::exists(connection, "legacy_imported")?;
+            Ok(imported || !self.legacy.as_deref().is_some_and(Path::exists))
+        };
+        current().unwrap_or(false)
+    }
+    /// Build a new state file and move it into place, unless another opener
+    /// moves theirs first, in which case theirs stands and this one's copy is
+    /// discarded.
+    fn create_new_file(&self, parent: &Path) -> Result<()> {
+        let mut name = self.path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{}.tmp", uuid::Uuid::new_v4().simple()));
+        let temp = self.path.with_file_name(name);
+        let created = (|| {
+            // As private as the state file, from the moment it exists.
+            let file = reserve_backup_file(&temp)?;
+            failpoint("reserved");
+            build_database(&temp, self.legacy.as_deref())?;
+            failpoint("built");
+            // The one flush: everything in the file is on disk before it has
+            // the state file's name.
+            file.sync_all()?;
+            failpoint("flushed");
+            match crate::security::rename_noclobber(&temp, &self.path) {
+                Ok(()) => {}
+                // Lost the race: the winner's file is complete.
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+            failpoint("moved");
+            // The new name is on disk before any write to the file is.
+            crate::security::sync_directory(parent)?;
+            #[cfg(windows)]
+            file.sync_all()?;
+            failpoint("published");
+            Ok(())
+        })();
+        discard_build(&temp);
+        created
+    }
+    /// Prepare an existing file that is behind, under the init lock, which is
+    /// released when this returns, so that two openers cannot race the
+    /// migration.
+    fn prepare(&self, mut connection: Connection, held: HeldLock) -> Result<Connection> {
         connection
             .execute_batch("PRAGMA journal_mode=WAL")
             .map_err(sql)?;
@@ -624,8 +877,105 @@ impl Inner {
         if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
             import_legacy(&mut connection, legacy)?;
         }
-        drop(lock);
+        drop(held);
         Ok(connection)
+    }
+}
+/// The file a database's SQLite sidecar of `suffix` (`-wal`, `-shm`,
+/// `-journal`) is named after `path`.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+/// Build the complete database at `path`, an empty file made for it, and leave
+/// it closed, in WAL mode and with no file beside it.
+///
+/// Nothing here has to survive a crash: the file is not the state file until
+/// it is moved, and a crash leaves it a stray to remove. So the schema goes in
+/// with no rollback journal on disk and no flush, and one flush by the caller
+/// makes it durable. The file is switched to WAL mode last, which SQLite
+/// records in the file's header, so that the first connection to open the
+/// state file finds it ready and does not change its mode, and a closed
+/// database has no write-ahead log or shared-memory file.
+fn build_database(path: &Path, legacy: Option<&Path>) -> Result<()> {
+    let mut connection = Connection::open(path).map_err(sql)?;
+    connection
+        .execute_batch("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY")
+        .map_err(sql)?;
+    migrate(&mut connection)?;
+    if let Some(legacy) = legacy.filter(|p| p.exists()) {
+        import_legacy(&mut connection, legacy)?;
+    }
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(sql)?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Err(Error::Storage(
+            "A new state file would not switch to WAL mode".into(),
+        ));
+    }
+    // The last connection to close checkpoints the log, which has nothing in
+    // it, and deletes it and the shared-memory file.
+    connection.close().map_err(|(_, error)| sql(error))?;
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let beside = sidecar(path, suffix);
+        let Ok(metadata) = std::fs::metadata(&beside) else {
+            continue;
+        };
+        // Moving the database without a log that holds anything would lose
+        // that, and a journal that exists is a hot one: neither is ours to
+        // delete. An empty log and the shared-memory index hold nothing.
+        if metadata.len() != 0 && suffix != "-shm" {
+            return Err(Error::Storage(format!(
+                "A new state file was left with a {suffix} file"
+            )));
+        }
+        std::fs::remove_file(&beside)?;
+    }
+    Ok(())
+}
+/// Remove a build that was not moved into place, and whatever SQLite left
+/// beside it. Best effort: a stray is removed later (see
+/// [`remove_stale_builds`]).
+fn discard_build(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(sidecar(path, suffix));
+    }
+}
+/// Remove the temporary files that a crash while building the state file at
+/// `path` left beside it, and their SQLite files, once they are `older_than`.
+/// A build that is still running is younger than that. Best effort.
+fn remove_stale_builds(path: &Path, older_than: Duration) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|f| f.strip_prefix(name))
+            .and_then(|f| f.strip_prefix('.'))
+        else {
+            continue;
+        };
+        let build = ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
+            rest.strip_suffix(suffix)
+                .and_then(|r| r.strip_suffix(".tmp"))
+                .is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= older_than);
+        if build && old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 fn open_connection(path: &Path) -> Result<Connection> {
@@ -1020,10 +1370,9 @@ mod tests {
         assert!(order.windows(2).all(|w| w[0] != w[1]), "{order:?}");
     }
 
-    /// A write whose turn does not come fails as `database is locked` and
-    /// never runs; the turn it was waiting for passes to the next writer.
+    /// A write whose turn does not come fails as busy and never runs; the turn it was waiting for passes to the next writer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_write_that_gets_no_turn_fails_as_locked_and_never_runs() {
+    async fn a_write_that_gets_no_turn_fails_as_busy_and_never_runs() {
         let dir = tempfile::tempdir().unwrap();
         let database = StateDatabase::new(dir.path().join("held.json"));
         database.run(|_| Ok(())).await.unwrap();
@@ -1038,7 +1387,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&refused, Error::Storage(m) if m.starts_with("database is locked")),
+            matches!(&refused, Error::StateBusy(m) if m.contains("write turn")),
             "{refused:?}"
         );
         held.unlock().unwrap();
@@ -1159,32 +1508,513 @@ mod tests {
         }
     }
 
-    /// Commits in `database`'s write-ahead log: its frames that close a
-    /// transaction record the size of the database after it.
-    fn wal_commits(database: &StateDatabase) -> usize {
-        let wal = std::fs::read(database.path().with_extension("sqlite3-wal")).unwrap();
-        let page_size = u32::from_be_bytes(wal[8..12].try_into().unwrap()) as usize;
-        wal[32..]
-            .chunks_exact(24 + page_size)
-            .filter(|frame| frame[4..8] != [0; 4])
-            .count()
+    /// A handle on a state file that an earlier release left one migration
+    /// behind, so that opening it must take the init lock.
+    fn one_release_behind(dir: &Path, name: &str) -> StateDatabase {
+        let first = StateDatabase::new(dir.join(name));
+        first.open().unwrap();
+        Connection::open(first.path())
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE activity;
+                 DELETE FROM schema_migrations WHERE version=6;
+                 UPDATE meta SET value='5' WHERE key='schema'",
+            )
+            .unwrap();
+        StateDatabase::new(first.path().to_owned())
     }
 
-    /// Every flush to disk costs a commit, and on a slow disk a new file's
-    /// six migrations took seconds: all of them are one commit.
-    #[tokio::test]
-    async fn a_new_state_file_is_created_in_one_commit() {
+    /// Another opener in the middle of preparing the file: the init lock,
+    /// locked from a handle of its own.
+    fn hold_init_lock(database: &StateDatabase) -> std::fs::File {
+        let held = Inner::open_init_lock(database.path()).unwrap();
+        held.lock().unwrap();
+        held
+    }
+
+    /// Unlock `held` after `delay`, from a thread of its own.
+    fn release_after(held: std::fs::File, delay: Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            held.unlock().unwrap();
+        })
+    }
+
+    /// Once the init lock is free again, nothing holds it: the request of a
+    /// caller that went away was granted the lock, found nobody waiting and
+    /// gave it back, so another can take it, and the handle's lock thread is
+    /// free for the next request.
+    async fn assert_lock_given_back(database: &StateDatabase) {
+        let probe = Inner::open_init_lock(database.path()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match probe.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("the lock was never given back: {error:?}"),
+            }
+        }
+        probe.unlock().unwrap();
+        database.write(|c| insert(c, "next")).await.unwrap();
+    }
+
+    /// An async caller sets its own deadline by dropping the future (here,
+    /// `tokio::time::timeout`): while another opener keeps the file, the call
+    /// ends at that deadline and not at the five seconds of the wait itself,
+    /// the write never runs, and no lock or waiting thread is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_deadline_ends_the_wait_for_a_busy_opener() {
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("fresh.json"));
-        database.run(|_| Ok(())).await.unwrap();
-        assert_eq!(wal_commits(&database), 1);
-        let versions: i64 = database
-            .run(|c| {
-                c.query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
-                    .map_err(sql)
-            })
+        let database = one_release_behind(dir.path(), "deadline.json");
+        let held = hold_init_lock(&database);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let started = std::time::Instant::now();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            database.write(move |c| {
+                flag.store(true, Ordering::Relaxed);
+                insert(c, "early")
+            }),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(waited.is_err(), "the lock was held: {waited:?}");
+        assert!(elapsed >= Duration::from_millis(290), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        held.unlock().unwrap();
+        assert_lock_given_back(&database).await;
+        assert!(!ran.load(Ordering::Relaxed));
+        assert!(!database.run(|c| meta::exists(c, "early")).await.unwrap());
+    }
+
+    /// A write waits for a busy opener and goes ahead once it lets go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_waits_for_a_busy_opener_that_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "patient.json");
+        let released = release_after(hold_init_lock(&database), Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        // A caller's deadline that outlasts the other opener.
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            database.write(|c| insert(c, "patient")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(290));
+        released.join().unwrap();
+        assert!(database.run(|c| meta::exists(c, "patient")).await.unwrap());
+    }
+
+    /// The turn to write has its own wait, counted from when the file is
+    /// open: a write that had to wait for another opener still gets all of
+    /// it. Here opening takes 1 s of a 2 s wait and the turn comes at 2.5 s,
+    /// which is after the wait would have run out had it started with the
+    /// call.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_opening_does_not_shorten_the_wait_for_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "slow.json");
+        let opener = release_after(hold_init_lock(&database), Duration::from_secs(1));
+        let writer = release_after(hold_write_lock(&database), Duration::from_millis(2500));
+        let started = std::time::Instant::now();
+        database
+            .write_within(Duration::from_secs(2), |c| insert(c, "slow"))
             .await
             .unwrap();
-        assert_eq!(versions, MIGRATIONS.len() as i64);
+        assert!(started.elapsed() >= Duration::from_millis(2400));
+        opener.join().unwrap();
+        writer.join().unwrap();
+        assert!(database.run(|c| meta::exists(c, "slow")).await.unwrap());
+    }
+
+    /// Openers on one handle that wait for the init lock each follow their own
+    /// caller: one that stops waiting does not hold up the one in front.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn openers_on_one_handle_each_end_their_wait_with_their_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "queue.json");
+        let held = hold_init_lock(&database);
+        let patient = {
+            let database = database.clone();
+            tokio::spawn(async move { database.write(|c| insert(c, "patient")).await })
+        };
+        // The patient opener is waiting for the lock by now; the impatient
+        // one is behind it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            database.write(|c| insert(c, "impatient")),
+        )
+        .await;
+        assert!(waited.is_err(), "{waited:?}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        held.unlock().unwrap();
+        patient.await.unwrap().unwrap();
+        assert!(
+            !database
+                .run(|c| meta::exists(c, "impatient"))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The constructor has no future's deadline to follow, so it keeps a
+    /// bound of its own: `open_within` takes it as an argument.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_constructor_waits_for_another_opener_within_its_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "constructor.json");
+        let held = hold_init_lock(&database);
+        let started = std::time::Instant::now();
+        let refused = database
+            .open_within(Duration::from_millis(300))
+            .unwrap_err();
+        assert!(
+            matches!(&refused, Error::StateBusy(m) if m.contains("initialization")),
+            "{refused:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(290));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        held.unlock().unwrap();
+        let released = release_after(hold_init_lock(&database), Duration::from_millis(300));
+        database.open_within(Duration::from_secs(20)).unwrap();
+        released.join().unwrap();
+    }
+
+    /// The bounds that `open` and `run` have, with no deadline of their own,
+    /// are the five seconds the opener has always had: no wait gets longer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_and_run_give_up_on_a_busy_opener_after_five_seconds() {
+        assert_eq!(INIT_LOCK_TIMEOUT, Duration::from_secs(5));
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "bound.json");
+        let held = hold_init_lock(&database);
+        let constructor = {
+            let database = database.clone();
+            tokio::task::spawn_blocking(move || {
+                let started = std::time::Instant::now();
+                (database.open(), started.elapsed())
+            })
+        };
+        let started = std::time::Instant::now();
+        let refused = database.run(|_| Ok(())).await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(refused, Error::StateBusy(_)), "{refused:?}");
+        assert!(waited >= Duration::from_millis(4900), "{waited:?}");
+        assert!(waited < Duration::from_secs(8), "{waited:?}");
+        let (opened, waited) = constructor.await.unwrap();
+        assert!(matches!(opened, Err(Error::StateBusy(_))), "{opened:?}");
+        assert!(waited >= Duration::from_millis(4900), "{waited:?}");
+        assert!(waited < Duration::from_secs(8), "{waited:?}");
+        held.unlock().unwrap();
+    }
+
+    /// A caller that stops waiting for the file takes its request with it: no
+    /// thread keeps waiting for the lock once it is free, and nothing holds
+    /// it afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_opener_whose_caller_went_away_leaves_no_lock_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = one_release_behind(dir.path(), "abandoned.json");
+        let held = hold_init_lock(&database);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        // Dropped by its own timeout.
+        let waited = tokio::time::timeout(
+            Duration::from_millis(200),
+            database.write(move |c| {
+                flag.store(true, Ordering::Relaxed);
+                insert(c, "timed-out")
+            }),
+        )
+        .await;
+        assert!(waited.is_err(), "the lock was held: {waited:?}");
+        // Aborted.
+        let flag = ran.clone();
+        let handle = database.clone();
+        let task = tokio::spawn(async move {
+            handle
+                .write(move |c| {
+                    flag.store(true, Ordering::Relaxed);
+                    insert(c, "aborted")
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        task.abort();
+        let _ = task.await;
+        held.unlock().unwrap();
+        assert_lock_given_back(&database).await;
+        assert!(!ran.load(Ordering::Relaxed));
+        for key in ["timed-out", "aborted"] {
+            let present = database.run(move |c| meta::exists(c, key)).await.unwrap();
+            assert!(!present, "{key}");
+        }
+    }
+
+    /// `path` is a complete state file, closed: in WAL mode by its header,
+    /// intact, at the newest schema, with every baseline table.
+    fn assert_complete(path: &Path) {
+        let header = std::fs::read(path).unwrap();
+        assert_eq!(header[18..20], [2, 2], "not in WAL mode: {path:?}");
+        let connection = Connection::open(path).unwrap();
+        integrity_check(&connection).unwrap();
+        assert_eq!(schema_version(&connection).unwrap(), Some(SCHEMA_VERSION));
+        assert!(baseline_tables_present(&connection).unwrap());
+        let applied: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(applied, MIGRATIONS.len() as i64);
+    }
+
+    /// Files in `dir` that a build leaves, or SQLite leaves beside the state
+    /// file or a build.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp") || n.ends_with("-journal"))
+            .collect()
+    }
+
+    /// Every flush to disk costs, and on a slow disk a new file's migrations
+    /// took seconds: the file is built whole, in one transaction, in a private
+    /// file, and moved into place with one flush. It is closed, with no log
+    /// beside it, and its first opener finds it ready and writes nothing.
+    #[tokio::test]
+    async fn a_new_state_file_is_built_whole_and_opens_without_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("fresh.json"));
+        let state = database.path().to_owned();
+        let parent = state.parent().unwrap();
+        crate::security::ensure_private_directory(parent).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        assert_complete(&state);
+        crate::security::verify_file_permissions(&state).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["state.sqlite3"]);
+        // Opening it needs no init lock and changes nothing in the file.
+        let held = hold_init_lock(&database);
+        let before = std::fs::read(&state).unwrap();
+        database.run(|_| Ok(())).await.unwrap();
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        let log = std::fs::metadata(state.with_extension("sqlite3-wal"));
+        assert!(
+            log.is_ok_and(|log| log.len() == 0) || !state.with_extension("sqlite3-wal").exists()
+        );
+        held.unlock().unwrap();
+    }
+
+    /// A new file is created whole, or not at all: the opener that loses the
+    /// race leaves the winner's file as it was and removes its own.
+    #[test]
+    fn an_opener_that_loses_the_race_to_create_leaves_the_winners_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("race.json"));
+        let state = database.path().to_owned();
+        let parent = state.parent().unwrap();
+        crate::security::ensure_private_directory(parent).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        let before = std::fs::read(&state).unwrap();
+        database.inner.create_new_file(parent).unwrap();
+        assert_eq!(std::fs::read(&state).unwrap(), before);
+        assert!(leftovers(parent).is_empty(), "{:?}", leftovers(parent));
+    }
+
+    /// Openers that create one file at the same moment, in separate handles
+    /// as separate processes would have, all end with the one complete file.
+    #[test]
+    fn openers_racing_to_create_a_state_file_share_one_complete_file() {
+        for round in 0..10 {
+            let dir = tempfile::tempdir().unwrap();
+            let state = dir.path().join("state").join("state.sqlite3");
+            let start = Arc::new(std::sync::Barrier::new(8));
+            let openers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (state, start) = (state.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let database = StateDatabase::new(state);
+                        start.wait();
+                        database.open().map(|()| database)
+                    })
+                })
+                .collect();
+            let databases: Vec<_> = openers
+                .into_iter()
+                .map(|o| {
+                    o.join()
+                        .unwrap()
+                        .unwrap_or_else(|e| panic!("round {round}: {e}"))
+                })
+                .collect();
+            drop(databases);
+            assert_complete(&state);
+            let parent = state.parent().unwrap();
+            assert!(leftovers(parent).is_empty(), "{:?}", leftovers(parent));
+        }
+    }
+
+    /// A new file is not prepared under the init lock, and neither is a
+    /// current one: another opener holding it does not keep them waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_file_that_is_behind_waits_for_the_init_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let new = StateDatabase::new(dir.path().join("new.json"));
+        let held = hold_init_lock(&new);
+        new.write_within(Duration::from_millis(500), |c| insert(c, "a"))
+            .await
+            .unwrap();
+        held.unlock().unwrap();
+        let current = StateDatabase::new(new.path().to_owned());
+        let held = hold_init_lock(&current);
+        current
+            .write_within(Duration::from_millis(500), |c| insert(c, "b"))
+            .await
+            .unwrap();
+        held.unlock().unwrap();
+        let behind = one_release_behind(dir.path(), "behind.json");
+        let held = hold_init_lock(&behind);
+        let waited =
+            tokio::time::timeout(Duration::from_millis(300), behind.write(|c| insert(c, "c")))
+                .await;
+        assert!(waited.is_err(), "{waited:?}");
+        held.unlock().unwrap();
+    }
+
+    /// The temporary files a crashed build leaves are removed once they are
+    /// old enough to have no owner, together with SQLite's files beside them,
+    /// and nothing else is.
+    #[test]
+    fn stale_builds_are_removed_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.sqlite3");
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let build = format!("state.sqlite3.{id}.tmp");
+        let ours = [
+            build.clone(),
+            format!("{build}-wal"),
+            format!("{build}-shm"),
+            format!("{build}-journal"),
+        ];
+        let theirs = [
+            "state.sqlite3".to_owned(),
+            "state.sqlite3-wal".to_owned(),
+            "state.sqlite3-shm".to_owned(),
+            "state.write.lock".to_owned(),
+            "state.init.lock".to_owned(),
+            "state.sqlite3.backup".to_owned(),
+            format!("other.sqlite3.{id}.tmp"),
+            "state.sqlite3.notahexid.tmp".to_owned(),
+        ];
+        for name in ours.iter().chain(&theirs) {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        // Too young to be anybody's stray: a build may be running.
+        remove_stale_builds(&state, STALE_BUILD_AGE);
+        assert!(ours.iter().all(|n| dir.path().join(n).exists()));
+        remove_stale_builds(&state, Duration::ZERO);
+        assert!(ours.iter().all(|n| !dir.path().join(n).exists()));
+        assert!(theirs.iter().all(|n| dir.path().join(n).exists()));
+    }
+
+    /// A child process for the crash tests: it opens a new state file in the
+    /// directory it is given, and the parent stops it. It does nothing when
+    /// run as one of the unit tests.
+    #[test]
+    fn crash_test_child() {
+        if let Some(dir) = std::env::var_os("RUSTYSCHWAB_TEST_CRASH_DIR") {
+            StateDatabase::new(PathBuf::from(dir).join("state.sqlite3"))
+                .open()
+                .unwrap();
+        }
+    }
+
+    fn child(dir: &Path) -> std::process::Command {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "storage::tests::crash_test_child",
+                "--test-threads=1",
+            ])
+            .env("RUSTYSCHWAB_TEST_CRASH_DIR", dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        child
+    }
+
+    /// What a state location holds after a crash: no state file, or a
+    /// complete one, and a later opener gets a working file either way.
+    fn assert_recovers(dir: &Path) {
+        let state = dir.join("state.sqlite3");
+        if state.exists() {
+            assert_complete(&state);
+        }
+        let database = StateDatabase::new(state.clone());
+        database.open().unwrap();
+        assert_complete(&state);
+        remove_stale_builds(&state, Duration::ZERO);
+        assert!(leftovers(dir).is_empty(), "{:?}", leftovers(dir));
+    }
+
+    /// A process that dies while it builds the state file leaves no state
+    /// file: only the temporary one, which the next opener removes once it is
+    /// old. One that dies after the move leaves the complete file.
+    #[test]
+    fn a_crash_before_the_move_leaves_no_state_file() {
+        for point in ["reserved", "built", "flushed"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let status = child(&dir)
+                .env("RUSTYSCHWAB_TEST_CRASH_AT", point)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{point}: the child did not crash");
+            assert!(!dir.join("state.sqlite3").exists(), "{point}");
+            assert_eq!(leftovers(&dir).len(), 1, "{point}");
+            assert_recovers(&dir);
+        }
+    }
+
+    #[test]
+    fn a_crash_after_the_move_leaves_the_complete_file() {
+        for point in ["moved", "published"] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let status = child(&dir)
+                .env("RUSTYSCHWAB_TEST_CRASH_AT", point)
+                .status()
+                .unwrap();
+            assert!(!status.success(), "{point}: the child did not crash");
+            assert!(leftovers(&dir).is_empty(), "{point}");
+            assert_complete(&dir.join("state.sqlite3"));
+            assert_recovers(&dir);
+        }
+    }
+
+    /// Killed at any instant, not only the ones named: the same holds.
+    #[test]
+    fn a_process_killed_at_any_instant_leaves_no_file_or_a_complete_one() {
+        for delay in (0..160).step_by(5) {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("state");
+            let mut child = child(&dir).spawn().unwrap();
+            std::thread::sleep(Duration::from_millis(delay));
+            let _ = child.kill();
+            let _ = child.wait();
+            assert_recovers(&dir);
+        }
     }
 }
