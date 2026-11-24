@@ -8,7 +8,7 @@ import threading
 import time
 
 import pytest
-from conftest import MockSchwab
+from conftest import MockSchwab, Recorded, Reply
 
 import rustyschwab
 from rustyschwab import errors
@@ -63,24 +63,43 @@ async def test_requests_overlap_on_the_shared_runtime(
 async def test_the_gil_is_free_while_a_request_is_in_flight(
     client: rustyschwab.Client, server: MockSchwab
 ) -> None:
-    server.on("GET", "/marketdata/v1/quotes", QUOTE, delay=0.5)
+    # Another thread takes the GIL twenty times, starting once the server has
+    # the request, and the reply waits for it. So every tick falls inside the
+    # call's wait, however slow the runner's timer. A call that held the GIL
+    # while it waited would stall the server and the ticks alike, so the
+    # failure says how many ticks it saw: the call times out, or the reply
+    # gives up on them after four seconds.
+    arrived = threading.Event()
+    ticked = threading.Event()
     ticks = 0
-    stop = threading.Event()
+    ticks_at_reply: list[int] = []
 
-    def spin() -> None:
+    def reply(_request: Recorded) -> Reply:
+        arrived.set()
+        ticked.wait(timeout=4)
+        ticks_at_reply.append(ticks)
+        return Reply(200, QUOTE)
+
+    def tick() -> None:
         nonlocal ticks
-        while not stop.is_set():
-            ticks += 1
+        if not arrived.wait(timeout=20):
+            return
+        for _ in range(20):
             time.sleep(0.005)
+            ticks += 1
+        ticked.set()
 
-    worker = threading.Thread(target=spin)
-    worker.start()
+    server.on_call("GET", "/marketdata/v1/quotes", reply)
+    ticker = threading.Thread(target=tick)
+    ticker.start()
     try:
-        await client.quotes(["AAPL"])
+        found = await client.quotes(["AAPL"])
+    except errors.SchwabError as error:
+        pytest.fail(f"the call failed after {ticks} GIL acquisitions while it waited: {error}")
     finally:
-        stop.set()
-        worker.join()
-    assert ticks > 20
+        ticker.join()
+    assert ticks_at_reply == [20], f"GIL acquisitions while the call waited: {ticks_at_reply}"
+    assert found["AAPL"]["symbol"] == "AAPL"
 
 
 async def test_cancelling_a_call_returns_promptly_and_leaves_the_client_usable(
