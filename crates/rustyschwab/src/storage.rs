@@ -60,6 +60,10 @@
 //! as it is granted. The constructor (`StateDatabase::open`, which
 //! `SchwabClient::new` calls) cannot take a future's deadline: it polls for the
 //! lock on the calling thread for at most five seconds.
+//!
+//! The deadline is for waits that may not end, such as a lock another process
+//! holds. An opener that finds another on its own handle already building the
+//! file waits for that work to finish, as it would for any work under way.
 use crate::error::{Error, Result};
 use rusqlite::{Connection, backup::Progress};
 use std::{
@@ -232,9 +236,9 @@ struct Inner {
     path: PathBuf,
     legacy: Option<PathBuf>,
     initialized: tokio::sync::OnceCell<()>,
-    /// Openers on this handle take turns, so that the ones behind the first
-    /// find the file ready instead of each preparing it, and wait no longer
-    /// than their own deadlines.
+    /// Openers on this handle take turns at creating or opening the file, so
+    /// that the ones behind the first find it ready instead of each building
+    /// one.
     opening: tokio::sync::Mutex<()>,
     slots: Arc<tokio::sync::Semaphore>,
     idle: parking_lot::Mutex<Vec<Connection>>,
@@ -429,23 +433,32 @@ impl StateDatabase {
         if self.inner.initialized.initialized() {
             return Ok(());
         }
-        let _opening = tokio::time::timeout_at(expiry, self.inner.opening.lock())
-            .await
-            .map_err(|_| init_busy())?;
-        if self.inner.initialized.initialized() {
-            return Ok(());
-        }
         // A file that is current is opened without the init lock. The work of
-        // creating or preparing one runs on a blocking task to its end, even
-        // if this future is dropped meanwhile.
-        let inner = self.inner.clone();
-        let connection = match tokio::task::spawn_blocking(move || inner.open_unlocked())
-            .await
-            .map_err(|_| Error::Storage("State worker failed".into()))??
-        {
+        // creating a file runs on a blocking task to its end, even if this
+        // future is dropped meanwhile. Openers on this handle take turns at
+        // it, and one behind another waits for that work as it waits for any
+        // other that is running: the deadline is for waits that may not end,
+        // such as a lock another process holds, and does not cut short work
+        // that is under way.
+        let opened = {
+            let _working = self.inner.opening.lock().await;
+            if self.inner.initialized.initialized() {
+                return Ok(());
+            }
+            let inner = self.inner.clone();
+            tokio::task::spawn_blocking(move || inner.open_unlocked())
+                .await
+                .map_err(|_| Error::Storage("State worker failed".into()))??
+        };
+        let connection = match opened {
             Opened::Ready(connection) => connection,
             Opened::Behind(connection) => {
                 let held = self.inner.lock_init(expiry).await?;
+                // Another opener on this handle may have prepared it while
+                // this one waited for the lock.
+                if self.inner.initialized.initialized() {
+                    return Ok(());
+                }
                 let inner = self.inner.clone();
                 tokio::task::spawn_blocking(move || inner.prepare(connection, held))
                     .await
@@ -1572,8 +1585,8 @@ mod tests {
         assert!(database.run(|c| meta::exists(c, "patient")).await.unwrap());
     }
 
-    /// Openers on one handle take turns, and one that is not first waits no
-    /// longer than its own deadline for the one in front.
+    /// Openers on one handle that wait for the init lock each follow their own
+    /// deadline: the one that is not first waits no longer than its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn openers_on_one_handle_each_follow_their_own_deadline() {
         let dir = tempfile::tempdir().unwrap();
