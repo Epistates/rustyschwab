@@ -145,39 +145,35 @@ held order").
 ### Changed — a busy state file is its own error
 
 - **Breaking (Rust):** a write that does not get its turn within five
-  seconds, and an opener that waits out another's initialization of a new
-  state file, now fail with the new `Error::StateBusy` (`ErrorKind::StateBusy`,
-  `"state_busy"`). They failed with `Error::Storage("database is locked: ...")`
-  and `Error::Storage("State initialization lock timed out")`, and
-  `Storage` says that durable state failed and should be checked. Here
-  nothing was written, the state is not damaged, and the same call can be
-  made again. The message says which wait ran out: `the write turn did not
-  come in time` or `the initialization lock was not granted in time`.
-  Migration: a caller that matched `ErrorKind::Storage` or
-  `Error::Storage(_)` for a lock timeout matches `StateBusy` for it
-  (`ErrorKind` and `Error` are non-exhaustive, so code that falls through
-  on unknown kinds compiles unchanged). `is_retryable()` is false, as for
-  `LeaseBusy`: nothing was written and the caller may retry, but the SDK does
-  not retry for it, so it adds nothing to the contention that caused the
-  wait, and a busy state file does not count against the circuit breaker. A state write that follows work an order has
-  already done (the intent journaled, the order sent) that finds the file
-  busy is reported as before (`SubmissionUnknown` or `Storage`), since there
-  the order may be at the broker. The remote authority answers it `503` with
-  `Retry-After: 1` and relays its message. A failure SQLite itself reports (`database is
-  locked` from a connection's busy timeout) is still `Storage`.
+  seconds, and an opener that waits out another's initialization of a state
+  file, now fail with the new `Error::StateBusy` (`ErrorKind::StateBusy`,
+  `"state_busy"`), where they failed with `Error::Storage`. `Storage` says
+  that durable state failed and should be checked; here nothing was written
+  and the state is not damaged. The message says which wait ran out (`the
+  write turn did not come in time` or `the initialization lock was not
+  granted in time`). Migration: a caller that matched `ErrorKind::Storage`
+  or `Error::Storage(_)` for a lock timeout matches `StateBusy` for it.
+  A failure SQLite itself reports (`database is locked` from a connection's
+  busy timeout) is still `Storage`.
+- `StateBusy::is_retryable()` is false, as for `LeaseBusy`: nothing was
+  written and the caller may retry, but the SDK does not retry for it, so it
+  adds nothing to the contention that caused the wait, and a busy state file
+  does not count against the circuit breaker. A state write that follows
+  work an order has already done (the intent journaled, the order sent) and
+  finds the file busy is reported as before (`SubmissionUnknown` or
+  `Storage`), since there the order may be at the broker. The remote
+  authority answers `503` with `Retry-After: 1` and relays the message.
 - **Behavior change:** the wait for another opener to finish preparing a
   state file now ends when the caller drops the future (for example, with
   `tokio::time::timeout` around the call). It used to poll for five seconds
-  on a thread of Tokio's blocking pool whatever the caller did, and the
-  thread kept polling after the future was dropped. The wait is now in the
-  operating system, on the thread the SDK already keeps for write locks, and
-  a dropped future gives the lock back as soon as it is granted. The five
-  seconds are still the longest it waits, counted from when it starts, and
-  running out fails with `StateBusy` instead of `Storage`. A write's wait for
-  its turn, five seconds, starts once the file is open. `SchwabClient::new`
-  has no future to drop: it still waits at most five seconds for another
-  opener, then fails with `StateBusy`, which a Python caller sees from the
-  constructor as `StateBusy` (a `StorageError`).
+  on a blocking-pool thread whatever the caller did, and the thread kept
+  polling after the future was dropped. The wait is now in the operating
+  system and a dropped future gives the lock back as soon as it is granted.
+  Five seconds is still the longest it waits, counted from when it starts,
+  and running out fails with `StateBusy`. A write's five seconds for its
+  turn start once the file is open. `SchwabClient::new` has no future to
+  drop: it waits at most five seconds for another opener, then fails with
+  `StateBusy` (in Python, a `StorageError` subclass).
 - **Behavior change:** a new state file is built whole in a private
   temporary file beside it (`state.sqlite3.<id>.tmp`, as private as the
   state file), flushed once, and moved into place with a rename that fails
