@@ -591,41 +591,108 @@ impl Inner {
     /// Cross-process initialization is serialized by a lock file so two
     /// openers cannot race the schema migration.
     fn initialize(&self) -> Result<Connection> {
+        let mut diag = Diag::new(self);
         let parent = self
             .path
             .parent()
             .ok_or_else(|| Error::Config("State path requires a directory".into()))?;
         crate::security::ensure_private_directory(parent)?;
+        diag.step("dir");
         let lock =
             crate::auth::token_store::open_lock_file(&self.path.with_extension("init.lock"))?;
+        diag.step("open_lock");
         let started = std::time::Instant::now();
+        let mut attempts = 0u32;
         loop {
+            attempts += 1;
             match lock.try_lock() {
                 Ok(()) => break,
                 Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < INIT_LOCK_TIMEOUT => {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
+                    diag.step("LOCK_TIMEOUT");
+                    diag.attempts = attempts;
+                    diag.print();
                     return Err(Error::Storage("State initialization lock timed out".into()));
                 }
                 Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
             }
         }
+        diag.attempts = attempts;
+        diag.step("acquire");
         if !self.path.exists() {
             crate::security::secure_file_write(&self.path, &[])?;
         }
+        diag.step("create");
         crate::security::verify_file_permissions(&self.path)?;
+        diag.step("perms");
         let mut connection = open_connection(&self.path)?;
+        diag.step("open_conn");
         connection
             .execute_batch("PRAGMA journal_mode=WAL")
             .map_err(sql)?;
+        diag.step("wal");
         validate_existing(&connection)?;
+        diag.step("validate");
         migrate(&mut connection)?;
+        diag.step("migrate");
         if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
             import_legacy(&mut connection, legacy)?;
         }
+        diag.step("legacy");
         drop(lock);
+        diag.step("drop");
+        diag.print();
         Ok(connection)
+    }
+}
+/// Temporary timing diagnostics.
+struct Diag {
+    tag: String,
+    t0: std::time::Instant,
+    last: std::time::Instant,
+    steps: String,
+    attempts: u32,
+}
+impl Diag {
+    fn epoch() -> std::time::Instant {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        *EPOCH.get_or_init(std::time::Instant::now)
+    }
+    fn new(inner: &Inner) -> Self {
+        let _ = Self::epoch();
+        let shared = inner
+            .legacy
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "shared.json");
+        let now = std::time::Instant::now();
+        Self {
+            tag: format!("{}{:?}", if shared { "SHARED " } else { "" }, std::thread::current().id()),
+            t0: now,
+            last: now,
+            steps: String::new(),
+            attempts: 0,
+        }
+    }
+    fn step(&mut self, name: &str) {
+        let now = std::time::Instant::now();
+        let at = now.duration_since(Self::epoch()).as_millis();
+        self.steps.push_str(&format!(
+            " {name}={}ms@{at}",
+            now.duration_since(self.last).as_millis()
+        ));
+        self.last = now;
+    }
+    fn print(&self) {
+        let total = self.last.duration_since(self.t0).as_millis();
+        if self.tag.starts_with("SHARED") || total > 1000 {
+            eprintln!(
+                "DIAG init {} total={total}ms attempts={}{}",
+                self.tag, self.attempts, self.steps
+            );
+        }
     }
 }
 fn open_connection(path: &Path) -> Result<Connection> {
