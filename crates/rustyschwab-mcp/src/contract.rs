@@ -173,6 +173,7 @@ pub fn refusal_keeps_approval(kind: rustyschwab::ErrorKind) -> bool {
             | ErrorKind::CircuitOpen
             | ErrorKind::OwnershipLost
             | ErrorKind::LeaseBusy
+            | ErrorKind::StateBusy
             | ErrorKind::Auth
             | ErrorKind::RateLimit
             | ErrorKind::Timeout
@@ -304,7 +305,8 @@ impl From<rustyschwab::Error> for ToolFailure {
             | ErrorKind::Suspended
             | ErrorKind::CircuitOpen
             | ErrorKind::OwnershipLost
-            | ErrorKind::LeaseBusy => Self::new(FailureCode::Unavailable, e.to_string()),
+            | ErrorKind::LeaseBusy
+            | ErrorKind::StateBusy => Self::new(FailureCode::Unavailable, e.to_string()),
             ErrorKind::RateLimit => Self::new(FailureCode::RateLimited, e.to_string()),
             ErrorKind::Timeout => Self::new(FailureCode::Timeout, e.to_string()),
             _ if e.is_retryable() => {
@@ -579,6 +581,22 @@ mod tests {
         });
         assert_eq!(outage.code, FailureCode::Unavailable);
         assert!(outage.retryable);
+    }
+
+    /// A busy state file is the service being unavailable for a moment, not
+    /// an internal fault: the model may try again and the approval is kept.
+    #[test]
+    fn a_busy_state_file_is_unavailable_and_keeps_the_approval() {
+        let busy = rustyschwab::Error::StateBusy("the write turn did not come in time".into());
+        assert!(refusal_keeps_approval(busy.kind()));
+        let failure = ToolFailure::from(busy);
+        assert_eq!(failure.code, FailureCode::Unavailable);
+        assert!(failure.retryable);
+        assert!(
+            failure.message.contains("write turn"),
+            "{}",
+            failure.message
+        );
     }
 
     #[test]

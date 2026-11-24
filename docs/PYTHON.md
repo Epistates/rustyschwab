@@ -867,6 +867,7 @@ Every failure is a `rustyschwab.SchwabError`. The subclasses mirror the SDK's `E
 | `SubmissionUnknown`, `ReconciliationRequired` (both `PendingSubmissionError`) | An order may have reached Schwab | `attempt_id`, `tag`, `cause` (`SubmissionUnknown`) |
 | `StreamError`, `SubscriptionError`, `WebSocketError`, `ConnectionClosed` | The streamer | |
 | `StorageError`, `IoError`, `SerializationError`, `InvalidUrl`, `UnknownError` | Local state and everything else | |
+| `StateBusy` (a `StorageError`) | The state file stayed busy for the whole wait; nothing was written and the same call can be made again. `retryable` is false: the SDK does not repeat it | |
 
 Every instance has `kind` (the SDK's `snake_case` classification), `retryable` (the SDK's judgement that the failure is transient) and `message`.
 

@@ -15,6 +15,7 @@ KIND_TO_CLASS = {
     "storage": errors.StorageError,
     "ownership_lost": errors.OwnershipLost,
     "lease_busy": errors.LeaseBusy,
+    "state_busy": errors.StateBusy,
     "circuit_open": errors.CircuitOpen,
     "reconciliation_required": errors.ReconciliationRequired,
     "halted": errors.Halted,
@@ -80,6 +81,19 @@ def test_detail_attributes_are_set() -> None:
     assert unknown.attempt_id == "a-1" and unknown.cause == "closed"
     auth = errors.from_native("auth", "m", {"reauthorization_required": True})
     assert auth.reauthorization_required is True
+
+
+def test_a_busy_state_file_is_still_a_storage_error() -> None:
+    error = errors.from_native("state_busy", "State busy: write turn", {"retryable": False})
+    assert type(error) is errors.StateBusy
+    assert isinstance(error, errors.StorageError)
+    assert error.kind == "state_busy" and error.retryable is False
+    try:
+        raise error
+    except errors.StorageError as caught:
+        assert caught is error
+    # A plain storage failure is not a busy one.
+    assert not isinstance(errors.from_native("storage", "m", {}), errors.StateBusy)
 
 
 def test_pending_submission_errors_share_a_base() -> None:

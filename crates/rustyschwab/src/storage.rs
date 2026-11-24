@@ -21,8 +21,9 @@
 //! poll. The wait is best effort in order: `flock` does not promise to serve
 //! waiters first come, first served. The operating system releases the lock
 //! when its holder exits or crashes. A write whose turn has not come within
-//! five seconds, or whose caller gave up first, fails with `database is
-//! locked` and never runs.
+//! five seconds, or whose caller gave up first, fails with
+//! [`Error::StateBusy`] and never runs: nothing was written, and the same
+//! call can be made again.
 //!
 //! A writer first tries for the lock where a blocking task runs. If another
 //! handle or process holds it, the wait goes to a thread of its own per
@@ -43,8 +44,9 @@ use std::{
 /// documentation), so a small pool bounds blocking threads without starving
 /// readers or backups.
 const POOL_SIZE: usize = 4;
-/// How long a write waits for its turn, and a connection for a lock held
-/// outside the turn order, before failing with `database is locked`.
+/// How long a write waits for its turn before failing with
+/// [`Error::StateBusy`], and how long a connection waits for a lock held
+/// outside the turn order before SQLite fails it with `database is locked`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const INIT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -183,8 +185,18 @@ struct Inner {
     locker: parking_lot::Mutex<Option<mpsc::Sender<LockRequest>>>,
 }
 
-fn locked() -> Error {
-    Error::Storage("database is locked: another writer holds the state file".into())
+/// A write whose turn did not come in time: it never ran.
+fn write_turn_busy() -> Error {
+    Error::StateBusy(
+        "the write turn did not come in time: another writer holds the state file".into(),
+    )
+}
+/// An opener that gave up waiting for another to finish preparing the file.
+fn init_busy() -> Error {
+    Error::StateBusy(
+        "the initialization lock was not granted in time: another opener is still preparing the state file"
+            .into(),
+    )
 }
 
 /// The write lock file beside a database, opened on first use. It is shared
@@ -381,7 +393,7 @@ impl StateDatabase {
     /// [`run`](Self::run) for an operation that writes: `f` runs once it is
     /// this handle's turn to write and no other handle or process is writing
     /// in turn (see the module documentation). If the turn has not come
-    /// within five seconds this fails with `database is locked` and `f`
+    /// within five seconds this fails with [`Error::StateBusy`] and `f`
     /// never runs, and neither does it if the caller stops waiting first (the
     /// future is dropped); once `f` has started it runs to the end.
     pub(crate) async fn write<T: Send + 'static>(
@@ -404,7 +416,7 @@ impl StateDatabase {
         // wait cannot deadlock.
         let permit = tokio::time::timeout_at(expiry, self.inner.slots.clone().acquire_owned())
             .await
-            .map_err(|_| locked())?
+            .map_err(|_| write_turn_busy())?
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
         let inner = self.inner.clone();
         let (outcome, finished) = tokio::sync::oneshot::channel();
@@ -516,7 +528,7 @@ impl Inner {
     async fn lock_for_write(&self, expiry: tokio::time::Instant) -> Result<HeldLock> {
         let turn = tokio::time::timeout_at(expiry, self.turn.clone().lock_owned())
             .await
-            .map_err(|_| locked())?;
+            .map_err(|_| write_turn_busy())?;
         // The lock is free more often than not, and a try for it is quick:
         // make it where a blocking task would run, so that a paused clock
         // (`tokio::time::pause`) waits for it as it does for any other.
@@ -569,7 +581,7 @@ impl Inner {
         }
         tokio::time::timeout_at(expiry, granted)
             .await
-            .map_err(|_| locked())?
+            .map_err(|_| write_turn_busy())?
             .map_err(|_| stopped())?
     }
     fn checkout(&self) -> Result<Connection> {
@@ -606,7 +618,7 @@ impl Inner {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(Error::Storage("State initialization lock timed out".into()));
+                    return Err(init_busy());
                 }
                 Err(std::fs::TryLockError::Error(error)) => return Err(Error::Io(error)),
             }
@@ -1020,10 +1032,9 @@ mod tests {
         assert!(order.windows(2).all(|w| w[0] != w[1]), "{order:?}");
     }
 
-    /// A write whose turn does not come fails as `database is locked` and
-    /// never runs; the turn it was waiting for passes to the next writer.
+    /// A write whose turn does not come fails as busy and never runs; the turn it was waiting for passes to the next writer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_write_that_gets_no_turn_fails_as_locked_and_never_runs() {
+    async fn a_write_that_gets_no_turn_fails_as_busy_and_never_runs() {
         let dir = tempfile::tempdir().unwrap();
         let database = StateDatabase::new(dir.path().join("held.json"));
         database.run(|_| Ok(())).await.unwrap();
@@ -1038,7 +1049,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(&refused, Error::Storage(m) if m.starts_with("database is locked")),
+            matches!(&refused, Error::StateBusy(m) if m.contains("write turn")),
             "{refused:?}"
         );
         held.unlock().unwrap();

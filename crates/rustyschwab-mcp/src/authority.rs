@@ -345,6 +345,7 @@ fn status_for(envelope: &ErrorEnvelope) -> StatusCode {
         | ErrorKind::Remote
         | ErrorKind::CircuitOpen
         | ErrorKind::LeaseBusy
+        | ErrorKind::StateBusy
         | ErrorKind::Suspended => StatusCode::SERVICE_UNAVAILABLE,
         ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -367,6 +368,7 @@ fn envelope(error: &rustyschwab::Error) -> ErrorEnvelope {
             | ErrorKind::SubmissionUnknown
             | ErrorKind::OwnershipLost
             | ErrorKind::LeaseBusy
+            | ErrorKind::StateBusy
             | ErrorKind::CircuitOpen
             | ErrorKind::RateLimit
             | ErrorKind::Timeout

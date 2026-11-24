@@ -250,7 +250,9 @@ impl SchwabPaperFeed {
             match self.publish(event).await {
                 Ok(_) => {}
                 // The venue's own state failing is the feed failing.
-                Err(error @ (Error::Storage(_) | Error::Io(_))) => return Err(error),
+                Err(error @ (Error::Storage(_) | Error::StateBusy(_) | Error::Io(_))) => {
+                    return Err(error);
+                }
                 Err(error) => {
                     tracing::warn!(%symbol, %error, "paper feed: the venue refused a quote; skipped");
                 }
