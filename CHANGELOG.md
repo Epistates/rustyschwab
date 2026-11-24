@@ -155,7 +155,7 @@ held order").
   or `Error::Storage(_)` for a lock timeout matches `StateBusy` for it.
   A failure SQLite itself reports (`database is locked` from a connection's
   busy timeout) is still `Storage`.
-- `StateBusy::is_retryable()` is false, as for `LeaseBusy`: nothing was
+- `is_retryable()` is false for `StateBusy`, as for `LeaseBusy`: nothing was
   written and the caller may retry, but the SDK does not retry for it, so it
   adds nothing to the contention that caused the wait, and a busy state file
   does not count against the circuit breaker. A state write that follows
