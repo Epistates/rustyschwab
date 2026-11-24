@@ -560,7 +560,6 @@ pub enum ErrorKind {
     Storage,
     OwnershipLost,
     LeaseBusy,
-    StateBusy,
     CircuitOpen,
     ReconciliationRequired,
     Halted,
@@ -587,10 +586,13 @@ pub enum ErrorKind {
     Subscription,
     Stream,
     Io,
+    // A new kind takes the next discriminant after `Unknown`'s, so that no
+    // existing kind's value changes; `Unknown` stays last for `serde(other)`.
+    StateBusy = 30,
     /// Also any kind a newer peer sends that this release does not know, so
     /// an envelope from a newer authority still decodes.
     #[serde(other)]
-    Unknown,
+    Unknown = 29,
 }
 
 impl ErrorKind {
