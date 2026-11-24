@@ -240,6 +240,8 @@ jobs:
             python: "3.14"
           - os: macos-latest
             python: "3.13"
+          - os: windows-latest
+            python: "3.13"
           - os: ubuntu-latest
             python: "3.12"
             nautilus: true
