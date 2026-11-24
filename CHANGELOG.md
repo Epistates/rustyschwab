@@ -157,8 +157,9 @@ held order").
   `Error::Storage(_)` for a lock timeout matches `StateBusy` for it
   (`ErrorKind` and `Error` are non-exhaustive, so code that falls through
   on unknown kinds compiles unchanged). `is_retryable()` is false, as for
-  `LeaseBusy`: the SDK repeats neither, and a busy state file does not count
-  against the circuit breaker. A state write that follows work an order has
+  `LeaseBusy`: nothing was written and the caller may retry, but the SDK does
+  not retry for it, so it adds nothing to the contention that caused the
+  wait, and a busy state file does not count against the circuit breaker. A state write that follows work an order has
   already done (the intent journaled, the order sent) that finds the file
   busy is reported as before (`SubmissionUnknown` or `Storage`), since there
   the order may be at the broker. The remote authority answers it `503` with

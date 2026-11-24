@@ -109,6 +109,13 @@ pub enum Error {
     /// made again. The message says which wait ran out. Unlike
     /// [`Error::Storage`], the state is not damaged; no check of the database
     /// or its backups is needed.
+    ///
+    /// [`is_retryable`](Error::is_retryable) is false all the same: the
+    /// caller may retry, but the SDK does not retry for it, so it adds
+    /// nothing to the contention that caused the wait. A write that follows
+    /// work the operation has already done (an order journaled or sent) is
+    /// not reported this way, because there "nothing was written" does not
+    /// mean nothing happened.
     #[error("State busy: {0}")]
     StateBusy(String),
     #[error("Circuit breaker is open")]

@@ -203,7 +203,8 @@ class StateBusy(StorageError):
     call can be made again. The state is not damaged. It is a
     :class:`StorageError`, so a handler for that still catches it; catch
     ``StateBusy`` first to tell the two apart. ``retryable`` is false, as for
-    :class:`LeaseBusy`: the SDK does not repeat the call itself.
+    :class:`LeaseBusy`, although you may retry: the SDK does not retry for
+    you, so it adds nothing to the contention that caused the wait.
     """
 
     kind = "state_busy"
