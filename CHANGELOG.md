@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — a timeout names the failure behind it
+
+A call's deadline covers all of its retries. When it fell while an attempt
+was in flight, the caller was told only `Timeout occurred after N seconds`,
+and the earlier attempts' errors, a refused connection that was retried
+until the time ran out, were lost. The error of the last attempt that
+finished is now the timeout's cause. Its message, `kind()` and
+`is_retryable()` are unchanged. A deadline that fell during the first
+attempt has no cause.
+
+- **Breaking (Rust):** `Error::Timeout` has a new field, `source:
+  Option<Box<Error>>`, the last finished attempt's error, returned by
+  `std::error::Error::source()`. The variant is now `#[non_exhaustive]`, so
+  fields added later will not break a match again. Migration: match it as
+  `Error::Timeout { duration, .. }`, and build one with the new
+  `Error::timeout(duration)` where you wrote `Error::Timeout { duration }`.
+- **Python:** the raised `Timeout` has the converted cause exception as its
+  `__cause__`, with its own class and message, for example `NetworkError`
+  or `HttpError`.
+- The cause stays on the side that produced it: an authority relaying a
+  timeout still sends only its duration, because the failures behind it
+  describe the authority's own connection to Schwab. `ErrorEnvelope` is
+  unchanged, and a timeout decoded from one has no cause.
+
 ### Changed — a trading principal must set a price collar
 
 - **Breaking (policy files):** a principal that holds `place_order` or

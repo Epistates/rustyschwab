@@ -158,6 +158,43 @@ fn describe_error(error: &Error) -> (&'static str, String, Map<String, Value>) {
     (error.kind().as_str(), error.to_string(), details)
 }
 
+/// The error behind a failure, when the SDK named one: a timeout's last
+/// finished attempt.
+fn cause_of(failure: &Failure) -> Option<&Error> {
+    match failure {
+        Failure::Sdk(error) => cause_of_error(error),
+        Failure::Submission { failure, .. } => cause_of(failure),
+        _ => None,
+    }
+}
+
+fn cause_of_error(error: &Error) -> Option<&Error> {
+    match error {
+        Error::Timeout { source, .. } => source.as_deref(),
+        _ => None,
+    }
+}
+
+/// The exception `rustyschwab.errors.from_native` builds for a classified
+/// failure, with `cause` (and its causes in turn) as its `__cause__`.
+fn exception(
+    py: Python<'_>,
+    (kind, message, details): (&str, String, Map<String, Value>),
+    cause: Option<&Error>,
+) -> PyResult<PyErr> {
+    let details = pythonize(py, &details)?;
+    let exception = py
+        .import("rustyschwab.errors")?
+        .getattr("from_native")?
+        .call1((kind, message, details))?;
+    let error = PyErr::from_value(exception);
+    if let Some(cause) = cause {
+        let described = describe_error(cause);
+        error.set_cause(py, Some(exception(py, described, cause_of_error(cause))?));
+    }
+    Ok(error)
+}
+
 /// The Python exception for `failure`, built by `rustyschwab.errors`.
 ///
 /// If that module cannot be imported or fails, the import error is returned
@@ -166,16 +203,7 @@ pub fn to_pyerr(py: Python<'_>, failure: Failure) -> PyErr {
     if matches!(failure, Failure::EndOfStream) {
         return PyStopAsyncIteration::new_err(());
     }
-    let (kind, message, details) = describe(&failure);
-    let build = || -> PyResult<PyErr> {
-        let details = pythonize(py, &details)?;
-        let exception = py
-            .import("rustyschwab.errors")?
-            .getattr("from_native")?
-            .call1((kind, message, details))?;
-        Ok(PyErr::from_value(exception))
-    };
-    build().unwrap_or_else(|error| error)
+    exception(py, describe(&failure), cause_of(&failure)).unwrap_or_else(|error| error)
 }
 
 #[cfg(test)]
@@ -201,6 +229,23 @@ mod tests {
         assert_eq!(kind, "submission_unknown");
         assert!(message.contains("a-1"));
         assert_eq!(details["attempt_id"], json!("a-1"));
+    }
+
+    #[test]
+    fn a_timeout_names_its_cause_even_inside_a_submission() {
+        let timeout = || Error::Timeout {
+            duration: 5,
+            source: Some(Box::new(Error::ConnectionClosed)),
+        };
+        let cause = cause_of(&Failure::Sdk(timeout())).expect("the timeout has a cause");
+        assert_eq!(describe_error(cause).0, "connection_closed");
+        let submission = Failure::Submission {
+            tag: "rs-1".into(),
+            failure: Box::new(Failure::Sdk(timeout())),
+        };
+        assert!(cause_of(&submission).is_some());
+        assert!(cause_of(&Failure::Sdk(Error::timeout(5))).is_none());
+        assert!(cause_of(&Failure::Sdk(Error::ConnectionClosed)).is_none());
     }
 
     #[test]

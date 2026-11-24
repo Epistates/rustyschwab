@@ -871,6 +871,8 @@ Every failure is a `rustyschwab.SchwabError`. The subclasses mirror the SDK's `E
 
 Every instance has `kind` (the SDK's `snake_case` classification), `retryable` (the SDK's judgement that the failure is transient) and `message`.
 
+A `Timeout` whose deadline fell between the attempts of a retried call has the last attempt that finished as its `__cause__`, so a refused connection that was retried until the time ran out is not lost. It has no cause when the first attempt was still in flight.
+
 ```python
 try:
     await client.place_order(account_hash, order)

@@ -743,6 +743,9 @@ impl SchwabClient {
                 .await
                 .map_err(Error::Auth)?;
             let deadline = tokio::time::Instant::now() + timeout;
+            // The error of the last attempt that finished, kept for the
+            // timeout if the deadline falls while the next one is in flight.
+            let last_failure = parking_lot::Mutex::new(None);
             let operation = async {
                 let mut first_token = Some(first_token);
                 let mut refreshed = false;
@@ -783,9 +786,7 @@ impl SchwabClient {
                             if deadline.saturating_duration_since(tokio::time::Instant::now())
                                 < MIN_SEND_WINDOW.min(timeout / 2)
                             {
-                                return Err(Error::Timeout {
-                                    duration: timeout.as_secs(),
-                                });
+                                return Err(Error::timeout(timeout.as_secs()));
                             }
                             // Last step before the request leaves: from here
                             // on the intent may have reached the broker.
@@ -805,7 +806,11 @@ impl SchwabClient {
                                 } else {
                                     self.inner
                                         .retry_policy
-                                        .execute_until(Some(deadline), attempt)
+                                        .execute_until_recording(
+                                            Some(deadline),
+                                            &last_failure,
+                                            attempt,
+                                        )
                                         .await
                                 }
                             })
@@ -826,6 +831,7 @@ impl SchwabClient {
                             .await
                             .map_err(Error::Auth)?;
                         refreshed = true;
+                        *last_failure.lock() = result.err();
                         continue;
                     }
                     return result;
@@ -843,6 +849,7 @@ impl SchwabClient {
                         }
                         Err(Error::Timeout {
                             duration: timeout.as_secs(),
+                            source: last_failure.lock().take().map(Box::new),
                         })
                     })
             };

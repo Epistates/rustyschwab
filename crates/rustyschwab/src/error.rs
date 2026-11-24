@@ -265,9 +265,20 @@ pub enum Error {
 
     /// Request timed out after specified duration
     ///
+    /// When the call's deadline fell between attempts of a retried call, the
+    /// error of the last attempt that finished is the cause, available from
+    /// [`source`](std::error::Error::source). A deadline that fell during the
+    /// first attempt has no cause. Build one with [`Error::timeout`]; the
+    /// variant is `#[non_exhaustive]`, so match it with `..`.
+    ///
     /// **Recovery**: Retry with longer timeout or check server status
     #[error("Timeout occurred after {duration} seconds")]
-    Timeout { duration: u64 },
+    #[non_exhaustive]
+    Timeout {
+        duration: u64,
+        #[source]
+        source: Option<Box<Error>>,
+    },
 
     /// WebSocket connection unexpectedly closed
     ///
@@ -414,6 +425,14 @@ pub enum StreamError {
 pub use crate::types::market_data::{ApiError, ErrorSource};
 
 impl Error {
+    /// A [`Error::Timeout`] after `duration` seconds, with no cause.
+    pub fn timeout(duration: u64) -> Self {
+        Self::Timeout {
+            duration,
+            source: None,
+        }
+    }
+
     /// Stable classification of this error, independent of its payload.
     pub fn kind(&self) -> ErrorKind {
         match self {
@@ -716,7 +735,9 @@ impl From<&Error> for ErrorEnvelope {
                 envelope.message = error.to_string();
             }
             Error::RateLimit { retry_after } => envelope.retry_after = Some(*retry_after),
-            Error::Timeout { duration } => envelope.duration = Some(*duration),
+            // The cause stays behind: an authority's own failures (a refused
+            // connection to Schwab, say) are logged there, not relayed.
+            Error::Timeout { duration, .. } => envelope.duration = Some(*duration),
             Error::Api { code, message } => {
                 envelope.code = Some(code.clone());
                 envelope.message = message.clone();
@@ -812,7 +833,7 @@ impl From<ErrorEnvelope> for Error {
             ErrorKind::Config => Error::Config(envelope.message),
             ErrorKind::InvalidParameter => Error::InvalidParameter(envelope.message),
             ErrorKind::Timeout => match envelope.duration {
-                Some(duration) => Error::Timeout { duration },
+                Some(duration) => Error::timeout(duration),
                 None => malformed(&envelope),
             },
             ErrorKind::ConnectionClosed => Error::ConnectionClosed,
@@ -838,7 +859,7 @@ mod tests {
     #[test]
     fn test_error_is_retryable() {
         // Timeout errors should be retryable
-        assert!(Error::Timeout { duration: 30 }.is_retryable());
+        assert!(Error::timeout(30).is_retryable());
 
         // Rate limit errors should be retryable
         assert!(Error::RateLimit { retry_after: 60 }.is_retryable());
@@ -985,8 +1006,11 @@ mod tests {
             Error::RateLimit { retry_after: 7 }
         ));
         assert!(matches!(
-            round_trip(Error::Timeout { duration: 30 }),
-            Error::Timeout { duration: 30 }
+            round_trip(Error::timeout(30)),
+            Error::Timeout {
+                duration: 30,
+                source: None
+            }
         ));
         assert!(matches!(
             round_trip(Error::Remote {
@@ -1003,6 +1027,35 @@ mod tests {
         assert!(matches!(
             round_trip(Error::Io(std::io::Error::other("disk"))),
             Error::Io(e) if e.to_string() == "disk"
+        ));
+    }
+
+    #[test]
+    fn a_timeouts_cause_stays_behind_and_the_envelope_decodes_either_way() {
+        use std::error::Error as _;
+        let timeout = Error::Timeout {
+            duration: 30,
+            source: Some(Box::new(Error::ConnectionClosed)),
+        };
+        assert!(timeout.source().is_some());
+        assert_eq!(timeout.to_string(), "Timeout occurred after 30 seconds");
+        let wire = serde_json::to_value(ErrorEnvelope::from(&timeout)).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({"kind": "timeout", "message": "", "duration": 30})
+        );
+        let decoded = round_trip(timeout);
+        assert!(matches!(decoded, Error::Timeout { duration: 30, .. }));
+        assert!(decoded.source().is_none());
+
+        // A later peer's extra fields do not break decoding
+        let later: ErrorEnvelope = serde_json::from_str(
+            r#"{"kind":"timeout","message":"","duration":9,"cause":{"kind":"network","message":"m"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Error::from(later),
+            Error::Timeout { duration: 9, .. }
         ));
     }
 
@@ -1058,7 +1111,7 @@ mod tests {
         );
 
         // Timeout is NOT an auth error
-        assert!(!Error::Timeout { duration: 30 }.is_auth_error());
+        assert!(!Error::timeout(30).is_auth_error());
 
         // ConnectionClosed is NOT an auth error
         assert!(!Error::ConnectionClosed.is_auth_error());
