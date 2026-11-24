@@ -161,8 +161,8 @@ held order").
   against the circuit breaker. A state write that follows work an order has
   already done (the intent journaled, the order sent) that finds the file
   busy is reported as before (`SubmissionUnknown` or `Storage`), since there
-  the order may be at the broker. The remote authority answers it `503` and
-  relays its message. A failure SQLite itself reports (`database is
+  the order may be at the broker. The remote authority answers it `503` with
+  `Retry-After: 1` and relays its message. A failure SQLite itself reports (`database is
   locked` from a connection's busy timeout) is still `Storage`.
 - **Behavior change:** the wait for another opener to finish preparing a
   state file now ends when the caller drops the future (for example, with
