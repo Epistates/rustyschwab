@@ -161,6 +161,22 @@ held order").
   against the circuit breaker. The remote authority answers it `503` and
   relays its message. A failure SQLite itself reports (`database is
   locked` from a connection's busy timeout) is still `Storage`.
+- **Behavior change:** the wait for another opener to finish preparing a
+  state file follows the caller's deadline, as a write's wait for its turn
+  does. It used to poll for five seconds on a thread of Tokio's blocking
+  pool, however short the caller's own deadline was, and dropping the future
+  left that thread polling. Now the wait is in the operating system, on the
+  thread the SDK already keeps for write locks, and a write's one deadline
+  (five seconds, or the caller's `wait`) covers opening the file and its
+  turn together: a first write could wait five seconds to open and five more
+  for its turn. When the wait runs out the call fails with `StateBusy`
+  ("the initialization lock was not granted in time") instead of `Storage`,
+  and a dropped future gives the lock back as soon as it is granted. No wait
+  gets longer. `SchwabClient::new` cannot take a deadline: it still waits at
+  most five seconds for another opener, then fails with `StateBusy`, which a
+  Python caller sees as `StateBusy` (a `StorageError`) from the
+  constructor. An operation with no deadline of its own, the first call on
+  a journal, waits at most five seconds too.
 - Python: the new `StateBusy` exception is a subclass of `StorageError`, so
   an existing `except StorageError` still catches it.
 - **Behavior change:** a paper venue mutation whose write turn does not come
