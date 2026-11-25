@@ -39,6 +39,6 @@ These live in GitHub and the registries, not in the repository, so no review see
 
 ## After publishing
 
-- Install from the registries in a clean environment (`cargo install rustyschwab-mcp`, `pip install rustyschwab`) and run the README quickstarts.
+- Install from the registries in a clean environment (`cargo install rustyschwab-mcp`, `pip install rustyschwab`) and run the README quickstarts. Leave out `--locked` here, unlike the README: this install resolves the dependencies afresh, so it shows whether a dependency release has broken the build for anyone installing without the lockfile.
 - Check the docs.rs builds of all five crates.
 - Watch for a stable TurboMCP 4.x; `rustyschwab-mcp` pins `=4.0.0-beta.1` until then (see [SUPPORT.md](SUPPORT.md#support-tiers)).

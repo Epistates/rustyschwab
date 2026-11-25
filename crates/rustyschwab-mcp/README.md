@@ -12,7 +12,7 @@ transports, and a local paper venue for trading without real money.
 > setup in paper mode first.
 
 ```bash
-cargo install rustyschwab-mcp
+cargo install --locked rustyschwab-mcp
 rustyschwab-mcp                     # stdio, for desktop MCP clients
 ```
 

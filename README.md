@@ -84,7 +84,7 @@ asyncio.run(main())
 ### MCP
 
 ```bash
-cargo install rustyschwab-mcp    # installs the server and its operator tools
+cargo install --locked rustyschwab-mcp    # installs the server and its operator tools
 claude mcp add schwab -e SCHWAB_APP_KEY=… -e SCHWAB_APP_SECRET=… \
   -e SCHWAB_TOKENS_FILE="$PWD/schwab_tokens.json" \
   -- "$(command -v rustyschwab-mcp)"
