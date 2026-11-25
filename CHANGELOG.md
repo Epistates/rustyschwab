@@ -238,6 +238,15 @@ one. Signatures are unchanged.
 
 ### Fixed
 
+- Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
+  0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0
+  requires TurboMCP `=4.0.0-alpha.5`, and that release's WebSocket
+  transport now resolves to a newer TurboMCP pre-release it does not
+  compile against. 0.4.0 depends on TurboMCP 4.0.0-beta.1, whose crates
+  require each other at exact versions, and installs cleanly. The install
+  instructions now use `cargo install --locked`, which builds with the
+  dependency versions the release was tested with.
+
 - Windows: the SDK refused the private files and directories it had just
   created, so the file and encrypted token stores, the OAuth callback
   state, the refresh lock, the coordination lease and the durable state

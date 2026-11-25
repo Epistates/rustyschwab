@@ -24,7 +24,7 @@
 It reads the same environment as the server, `.env` included, so start it from the same directory with the same settings:
 
 ```bash
-cargo install rustyschwab-dash           # or: cargo run -p rustyschwab-dash
+cargo install --locked rustyschwab-dash  # or: cargo run -p rustyschwab-dash
 rustyschwab-dash                         # live: SCHWAB_TOKENS_FILE, SCHWAB_MCP_POLICY_FILE
 SCHWAB_MCP_PAPER_CONFIG=ops/paper/config.json SCHWAB_MCP_PAPER_STATE=state/paper.sqlite3 \
   SCHWAB_MCP_POLICY_FILE=policy.json rustyschwab-dash      # paper

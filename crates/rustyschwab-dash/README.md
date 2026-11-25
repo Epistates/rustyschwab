@@ -8,7 +8,7 @@ delegate an approval mode for a time or until cancelled, halt, resume and
 kill.
 
 ```bash
-cargo install rustyschwab-dash
+cargo install --locked rustyschwab-dash
 rustyschwab-dash        # reads the same .env as rustyschwab-mcp
 ```
 
