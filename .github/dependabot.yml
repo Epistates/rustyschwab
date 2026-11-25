@@ -22,7 +22,11 @@ updates:
         patterns: ["*"]
         update-types: [major]
         group-by: dependency-name
-  - package-ecosystem: pip
+  # The Python bindings: pyproject.toml, and the requirements CI installs,
+  # which `uv pip compile` pins with hashes. The uv ecosystem reruns the
+  # command in each file's header, so the hashes and the per-Python markers
+  # survive an update.
+  - package-ecosystem: uv
     directory: /crates/schwab-py
     schedule:
       interval: weekly

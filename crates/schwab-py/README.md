@@ -72,4 +72,6 @@ pip install -e ".[nautilus]"   # then pytest also runs the NautilusTrader adapte
 cargo test                     # Rust unit tests
 ```
 
+CI installs its tools and test dependencies from `requirements/`, pinned with hashes (`pip install --require-hashes -r requirements/ci.txt`). Each file's header holds the `uv pip compile` command that regenerates it.
+
 Licensed under MIT or Apache-2.0, at your option.
