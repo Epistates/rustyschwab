@@ -855,7 +855,11 @@ class Stream:
         self.join(timeout)
 
     def close(self) -> None:
-        """Stop the thread and log out and disconnect. Idempotent."""
+        """Stop the thread and log out and disconnect. Idempotent.
+
+        Disconnecting waits for the streamer to answer the close: one round
+        trip, and never more than 2 seconds.
+        """
         try:
             self.stop()
         finally:
@@ -939,8 +943,9 @@ class Schedule:
     def stop(self, timeout: float | None = None) -> None:
         """Cancel the schedule, close its stream and wait. Idempotent.
 
-        Raises what had already stopped it, such as a receiver error with
-        ``on_error="raise"``.
+        Closing the stream waits for the streamer to answer the close: one
+        round trip, and never more than 2 seconds. Raises what had already
+        stopped it, such as a receiver error with ``on_error="raise"``.
         """
         if not self._runner.alive:
             # `shutdown` already cancelled the task along with the loop.
