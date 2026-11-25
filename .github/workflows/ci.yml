@@ -289,11 +289,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
+      # The baseline is each crate's latest release on crates.io, the API its
+      # users have. Main carries the next version from the bump onwards, and
+      # that version may break anything until it ships; after a release, a
+      # break fails here until the version is bumped again.
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
-        with:
-          baseline-rev: ${{ github.event.pull_request.base.sha }}
 
   soak:
     runs-on: ubuntu-latest
