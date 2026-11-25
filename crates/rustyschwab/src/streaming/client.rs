@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, interval, sleep};
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -35,6 +37,13 @@ const OUTGOING_CAPACITY: usize = 1024;
 /// Frames held while subscriptions replay on a new session, delivered once
 /// it is ready; beyond this they are dropped and counted as lost.
 const REPLAY_HOLD_LIMIT: usize = 4096;
+
+/// The longest [`StreamClient::disconnect`] waits for the streamer to answer
+/// its close. The LOGOUT and a Close frame go out first, then the peer's
+/// Close (or the end of the socket) is awaited, as RFC 6455 describes; on a
+/// healthy connection that takes one round trip. A peer that hasn't answered
+/// by then is cut off.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The command that subscribes `service`'s keys. `ADD` is additive (`SUBS`
 /// would replace the service's key list server-side); account activity has
@@ -125,8 +134,9 @@ struct StreamClientInner {
     identity: StreamerIdentity,
     /// Exponential backoff delay (starts at 2s, caps at 128s)
     backoff_delay: Arc<RwLock<Duration>>,
-    /// Sender for outgoing WebSocket messages (text and ping) - swapped on each connection
-    outgoing_tx: Arc<RwLock<Option<mpsc::Sender<OutgoingMessage>>>>,
+    /// Sender for the writer task's frames, swapped on each connection. The
+    /// writer stops after a Close frame, which `disconnect` queues last.
+    outgoing_tx: Arc<RwLock<Option<mpsc::Sender<Message>>>>,
     /// Writer task handle to allow clean abort on disconnect
     writer_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Pending acks keyed by request id
@@ -604,10 +614,14 @@ impl StreamClient {
         }
     }
 
-    /// Stop the reconnect loop and close the underlying socket.
+    /// Stop the reconnect loop, log out and close the socket.
     ///
-    /// Sends a best-effort `ADMIN/LOGOUT` first (as the reference client
-    /// does) so the streamer can release the session promptly.
+    /// A logged-in session sends `ADMIN/LOGOUT` (as the reference client
+    /// does) so the streamer releases the session promptly, then a Close
+    /// frame, and waits for the streamer's Close or the end of the socket:
+    /// the closing handshake of RFC 6455. That takes one round trip on a
+    /// healthy connection and never more than 2 seconds; a streamer that
+    /// hasn't answered by then is cut off, which isn't an error.
     ///
     /// Idempotent. After calling `disconnect`, a subsequent `connect`
     /// will spin up a fresh loop.
@@ -615,31 +629,18 @@ impl StreamClient {
         let _lifecycle = self.inner.lifecycle_lock.lock().await;
         self.inner.shutting_down.store(true, Ordering::SeqCst);
 
-        // Best-effort LOGOUT: queue the frame and give the writer task a
-        // moment to flush it before we abort everything.
-        if self.is_authenticated() {
-            let logout = self.inner.build_request(
-                StreamCommand::Logout,
-                &StreamService::Admin,
-                StreamParameters {
-                    keys: None,
-                    fields: None,
-                    authorization: None,
-                    schwab_client_channel: None,
-                    schwab_client_function_id: None,
-                },
-            );
-            let queued = serde_json::to_string(&StreamRequests {
-                requests: vec![logout],
-            })
-            .is_ok_and(|json| self.inner.queue(OutgoingMessage::Text(json)).is_ok());
-            if queued {
-                tokio::time::sleep(Duration::from_millis(150)).await;
+        let closing = self.is_authenticated() && self.inner.queue_logout_and_close();
+        let task = self.inner.connection_task.write().take();
+        if let Some(mut task) = task {
+            // The connection task ends by itself once the streamer answers
+            // the close; one that can't close (or isn't logged in) is cut off.
+            let answered = closing && tokio::time::timeout(CLOSE_TIMEOUT, &mut task).await.is_ok();
+            if !answered {
+                if closing {
+                    debug!(timeout = ?CLOSE_TIMEOUT, "Streamer didn't answer the close; dropping it");
+                }
+                task.abort();
             }
-        }
-
-        if let Some(handle) = self.inner.connection_task.write().take() {
-            handle.abort();
         }
         if let Some(handle) = self.inner.writer_task.write().take() {
             handle.abort();
@@ -971,6 +972,14 @@ impl StreamClientInner {
                 Err(error) => Err(error),
             };
             self.cleanup();
+            // `disconnect` closed this session, and the streamer answered
+            // (or the socket ended): it ends as the caller asked, whatever
+            // the close looked like.
+            if self.shutting_down.load(Ordering::SeqCst) {
+                info!("Stream closed on request");
+                self.message_tx.end(StreamEnd::Disconnected);
+                return Ok(());
+            }
             // `max_retries` bounds consecutive failed attempts: a session
             // that logged in starts the count over, so a stream that recovers
             // now and then is not ended after its n-th reconnect in a week.
@@ -1099,24 +1108,25 @@ impl StreamClientInner {
         // Reset last_pong timestamp for new connection
         *self.last_pong.write() = Instant::now();
 
-        // Create a writer task that forwards messages from a channel to the socket
-        let (tx, mut rx) = mpsc::channel::<OutgoingMessage>(OUTGOING_CAPACITY);
+        // Create a writer task that forwards frames from a channel to the socket
+        let (tx, mut rx) = mpsc::channel::<Message>(OUTGOING_CAPACITY);
         *self.outgoing_tx.write() = Some(tx);
 
         let (mut write_half, mut read_half) = ws_stream.split();
+        let shutting_down = self.shutting_down.clone();
         let writer = tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let ws_msg = match msg {
-                    OutgoingMessage::Text(text) => {
-                        tokio_tungstenite::tungstenite::Message::Text(text.into())
+            while let Some(frame) = rx.recv().await {
+                let close = frame.is_close();
+                if let Err(e) = write_half.send(frame).await {
+                    if shutting_down.load(Ordering::SeqCst) {
+                        debug!("WebSocket write error while closing: {}", e);
+                    } else {
+                        error!("WebSocket write error: {}", e);
                     }
-                    OutgoingMessage::Ping => {
-                        tokio_tungstenite::tungstenite::Message::Ping(vec![].into())
-                    }
-                };
-
-                if let Err(e) = write_half.send(ws_msg).await {
-                    error!("WebSocket write error: {}", e);
+                    break;
+                }
+                // Nothing may follow a Close frame (RFC 6455, section 5.5.1).
+                if close {
                     break;
                 }
             }
@@ -1274,16 +1284,45 @@ impl StreamClientInner {
 
     /// Queue a frame for the writer task.
     fn queue(&self, message: OutgoingMessage) -> Result<()> {
+        self.queue_frame(message.into_frame())
+    }
+
+    fn queue_frame(&self, frame: Message) -> Result<()> {
         let sender = self.outgoing_tx.read().clone().ok_or_else(|| {
             Error::Stream(StreamError::ConnectionFailed(
                 "No active connection".to_string(),
             ))
         })?;
-        sender.try_send(message).map_err(|e| {
+        sender.try_send(frame).map_err(|e| {
             Error::Stream(StreamError::ConnectionFailed(format!(
                 "Failed to queue request: {e}"
             )))
         })
+    }
+
+    /// Queue the LOGOUT and, after it, a normal-closure Close frame, which
+    /// the writer sends last. Whether both were queued.
+    fn queue_logout_and_close(&self) -> bool {
+        let logout = self.build_request(
+            StreamCommand::Logout,
+            &StreamService::Admin,
+            StreamParameters {
+                keys: None,
+                fields: None,
+                authorization: None,
+                schwab_client_channel: None,
+                schwab_client_function_id: None,
+            },
+        );
+        let close = Message::Close(Some(CloseFrame {
+            code: CloseCode::Normal,
+            reason: "".into(),
+        }));
+        serde_json::to_string(&StreamRequests {
+            requests: vec![logout],
+        })
+        .is_ok_and(|json| self.queue(OutgoingMessage::Text(json)).is_ok())
+            && self.queue_frame(close).is_ok()
     }
 
     /// Replay every tracked subscription on a fresh session, one service at
@@ -1498,7 +1537,11 @@ impl StreamClientInner {
                     };
                 }
                 Err(e) => {
-                    error!("WebSocket error: {}", e);
+                    if self.shutting_down.load(Ordering::SeqCst) {
+                        debug!("WebSocket error while closing: {}", e);
+                    } else {
+                        error!("WebSocket error: {}", e);
+                    }
                     return Err(Error::from(e));
                 }
                 _ => {}
@@ -1513,6 +1556,7 @@ impl StreamClientInner {
         let timeout_duration = self.config.ping_timeout;
         let outgoing_tx = self.outgoing_tx.clone();
         let last_pong = self.last_pong.clone();
+        let shutting_down = self.shutting_down.clone();
 
         // The clock starts now, not at the handshake: login and replay must
         // not count against the first ping.
@@ -1523,6 +1567,9 @@ impl StreamClientInner {
 
             loop {
                 heartbeat.tick().await;
+                if shutting_down.load(Ordering::SeqCst) {
+                    break;
+                }
 
                 // Check if last pong was too long ago
                 let elapsed = last_pong.read().elapsed();
@@ -1537,7 +1584,7 @@ impl StreamClientInner {
 
                 // Send ping via writer channel
                 if let Some(sender) = outgoing_tx.read().clone() {
-                    if let Err(e) = sender.try_send(OutgoingMessage::Ping) {
+                    if let Err(e) = sender.try_send(OutgoingMessage::Ping.into_frame()) {
                         warn!("Failed to send ping (connection likely closed): {}", e);
                         break;
                     }
@@ -1546,6 +1593,12 @@ impl StreamClientInner {
                     warn!("No active connection for heartbeat");
                     break;
                 }
+            }
+            // A session that `disconnect` is closing has its own bound
+            // (`CLOSE_TIMEOUT`): the watchdog mustn't end it first and cut
+            // the closing handshake short.
+            if shutting_down.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
             }
         })
     }

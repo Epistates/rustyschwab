@@ -3,12 +3,15 @@ use rustyschwab::{
     auth::{AuthManager, FileTokenStore, OAuthConfig, TokenSet, TokenStore, TokenStoreKind},
     config::{ChannelKind, StreamConfig},
     streaming::{StreamClient, StreamerIdentity},
-    types::streaming::{StreamMessage, StreamService},
+    types::streaming::{StreamEnd, StreamMessage, StreamService},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{Message, protocol::frame::coding::CloseCode},
+};
 
 fn client(url: String, capacity: usize) -> (StreamClient, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -64,6 +67,68 @@ async fn login(listener: &TcpListener) -> WebSocketStream<TcpStream> {
     .await
     .unwrap();
     ws
+}
+
+/// `disconnect` returns only once the closing handshake is done: the
+/// streamer has the LOGOUT and then a normal-closure Close frame, and has
+/// answered it. Before, `disconnect` gave the writer a fixed 150 ms and cut
+/// the socket, so a busy machine lost the LOGOUT and no Close was ever sent.
+#[tokio::test]
+async fn disconnect_logs_out_and_closes_the_socket_before_it_returns() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let (received, mut frames) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut ws = login(&listener).await;
+        let mut seen = Vec::new();
+        while let Some(Ok(frame)) = ws.next().await {
+            let close = frame.is_close();
+            seen.push(frame);
+            if close {
+                break;
+            }
+        }
+        // Recorded before the next read, which sends the answering Close.
+        received.send(seen).unwrap();
+        while ws.next().await.is_some() {}
+    });
+    client.connect().await.unwrap();
+    client.disconnect().await;
+    let frames = frames
+        .try_recv()
+        .expect("disconnect returned before the streamer had its Close");
+    let logout = frames
+        .iter()
+        .filter_map(|frame| frame.to_text().ok())
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .find(|request| request["requests"][0]["command"] == "LOGOUT");
+    assert!(logout.is_some(), "no LOGOUT before the Close: {frames:?}");
+    match frames.last() {
+        Some(Message::Close(Some(close))) => assert_eq!(close.code, CloseCode::Normal),
+        other => panic!("the last frame must be a normal Close: {other:?}"),
+    }
+    assert_eq!(client.status().ended, Some(StreamEnd::Disconnected));
+    server.await.unwrap();
+}
+
+/// A streamer that never answers the Close can't hold `disconnect` up past
+/// its bound, and the stream still ends as the caller asked.
+#[tokio::test]
+async fn disconnect_does_not_wait_on_a_streamer_that_never_answers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    let server = tokio::spawn(async move {
+        // Logged in, then never reads again, so the Close goes unanswered.
+        let _ws = login(&listener).await;
+        std::future::pending::<()>().await;
+    });
+    client.connect().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), client.disconnect())
+        .await
+        .expect("disconnect must give up on a silent streamer");
+    assert_eq!(client.status().ended, Some(StreamEnd::Disconnected));
+    assert!(!client.is_authenticated());
+    server.abort();
 }
 
 #[tokio::test]

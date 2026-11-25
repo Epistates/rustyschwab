@@ -664,7 +664,9 @@ def test_a_market_hours_schedule_streams_for_the_session_and_closes(
     assert schedule.join(15) == 1
     assert not schedule.running
     # The session ended: the stream logged out and the receiver saw it end.
-    assert streamer.streamer.sent("LOGOUT")
+    # The SDK sent the LOGOUT before closing; the mock records it on its own
+    # thread, which may come after its library has answered the Close.
+    wait_for(lambda: bool(streamer.streamer.sent("LOGOUT")))
     assert got[-1]["type"] == "state" and got[-1]["ended"] == {"reason": "disconnected"}
     assert threads == {"rustyschwab-receiver_0"}
     (request,) = (r for r in server.requests if r.path == "/marketdata/v1/markets")
@@ -683,7 +685,7 @@ def test_a_schedule_can_be_stopped_and_closes_its_stream(
     schedule.stop(10)
     schedule.stop(10)  # idempotent
     assert not schedule.running and schedule.join() is None
-    assert streamer.streamer.sent("LOGOUT")
+    wait_for(lambda: bool(streamer.streamer.sent("LOGOUT")))
 
 
 def test_a_function_can_open_the_blocking_stream(
@@ -744,7 +746,7 @@ def test_schedule_errors_surface_from_join(
     with pytest.raises(ValueError, match="fatal receiver"):
         schedule.join(15)
     schedule.join()  # reported once
-    assert streamer.streamer.sent("LOGOUT")
+    wait_for(lambda: bool(streamer.streamer.sent("LOGOUT")))
 
 
 def test_schedule_rejects_coroutine_receivers(blocking: sync.Client) -> None:

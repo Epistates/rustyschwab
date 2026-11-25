@@ -2,7 +2,7 @@
 //!
 //! The ack-resolution, heartbeat, and read-loop logic live on
 //! `StreamClientInner` in `client.rs` — this module only defines the
-//! frame types the writer task understands.
+//! messages the client queues for the writer task.
 
 /// Messages that can be sent over the WebSocket
 #[derive(Clone)]
@@ -11,6 +11,17 @@ pub enum OutgoingMessage {
     Text(String),
     /// WebSocket Ping frame for heartbeat
     Ping,
+}
+
+impl OutgoingMessage {
+    /// The WebSocket frame the writer task sends for this message.
+    pub(crate) fn into_frame(self) -> tokio_tungstenite::tungstenite::Message {
+        use tokio_tungstenite::tungstenite::Message;
+        match self {
+            Self::Text(text) => Message::Text(text.into()),
+            Self::Ping => Message::Ping(Vec::new().into()),
+        }
+    }
 }
 
 /// A text frame may be a LOGIN carrying the access token, so `Debug` shows
