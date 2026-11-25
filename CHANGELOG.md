@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-29
+
+### Upgrading from 0.3
+
+What to change when you upgrade. The entries below give the details and
+each migration.
+
+- **Rust 1.95** is the minimum, for the five crates and for building the
+  Python bindings from source.
+- **Policy files:** each principal that holds `place_order` or
+  `replace_order` must set `price_collar_bps`, or the file is refused at
+  startup and on reload.
+- **WebSocket clients** connect to `ws://host:port/`, and a missing or bad
+  credential is an HTTP `401` before the upgrade, where it was a close with
+  `1008` after it.
+- **Windows:** the MCP policy, grants, identity and risk files are refused
+  when another account can change them or their directory (see Security).
+- **Rust API:**
+  - `Error::Timeout` has a `source` field and is `#[non_exhaustive]`: match
+    it as `Error::Timeout { duration, .. }` and build one with
+    `Error::timeout(duration)`.
+  - A state file whose lock is not granted in time fails with
+    `Error::StateBusy`, where it failed with `Error::Storage`.
+  - `contract::FailureCode` has a `Cancelled` variant and is
+    `#[non_exhaustive]`.
+  - The order builders return `rustyschwab_types::ValidationError` instead
+    of `String`.
+  - Eight modules of `rustyschwab-mcp` are private.
+
 ### Changed — a timeout names the failure behind it
 
 A call's deadline covers all of its retries. When it fell while an attempt
