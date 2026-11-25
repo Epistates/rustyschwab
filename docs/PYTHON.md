@@ -914,4 +914,4 @@ cargo test                 # Rust unit tests (links the interpreter)
 
 The NautilusTrader adapter tests (`tests/nautilus`) run when `nautilus_trader` is installed (`pip install "nautilus_trader>=1.231,<2"` on Python 3.12 or later) and skip themselves otherwise.
 
-CI builds the wheel and runs the suite on Linux and macOS (`ci.yml`, job `python`), with the `nautilus` extra on one Linux row. Tags build the release wheels and sdist and publish them through PyPI trusted publishing (`publish-python.yml`, behind the `pypi` environment).
+CI builds the wheel and runs the suite on Linux, macOS and Windows (`ci.yml`, job `python`), with the `nautilus` extra on one Linux row. Tags build the release wheels and sdist and publish them through PyPI trusted publishing (`publish-python.yml`, behind the `pypi` environment).
