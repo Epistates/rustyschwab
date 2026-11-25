@@ -247,6 +247,15 @@ one. Signatures are unchanged.
   instructions now use `cargo install --locked`, which builds with the
   dependency versions the release was tested with.
 
+- Closing a stream could lose its LOGOUT on a busy machine.
+  `StreamClient::disconnect` (Python `Stream.close()`, and
+  `Schedule.stop()` through it) gave the LOGOUT a fixed 150 ms to go out,
+  then dropped the socket without a WebSocket Close frame. It now sends
+  the LOGOUT and a Close frame and waits for the streamer to answer, the
+  closing handshake of RFC 6455: one round trip on a healthy connection,
+  and never more than 2 seconds. A streamer that hasn't answered by then
+  is cut off, which isn't an error.
+
 - Windows: the SDK refused the private files and directories it had just
   created, so the file and encrypted token stores, the OAuth callback
   state, the refresh lock, the coordination lease and the durable state

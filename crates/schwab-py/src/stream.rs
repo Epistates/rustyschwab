@@ -330,6 +330,10 @@ impl Stream {
     }
 
     /// Log out and close the connection. The iterator then ends.
+    ///
+    /// Waits for the streamer to answer the close: one round trip, and never
+    /// more than 2 seconds. A streamer that hasn't answered by then is cut
+    /// off, which isn't an error.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         awaitable(py, async move {
