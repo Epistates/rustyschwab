@@ -1,26 +1,36 @@
 version: 2
 updates:
+  # Three lockfiles: the workspace, the Python bindings (outside the
+  # workspace) and the fuzz targets. Compatible updates arrive as one pull
+  # request across all three; a major update, as one pull request per crate.
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - /
+      - /crates/schwab-py
+      - /fuzz
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    # A release takes no crate version under seven days old, so none is
+    # proposed before then; a crate that publishes several fixes in a week
+    # arrives once. Security updates are not delayed.
+    cooldown:
+      default-days: 7
     groups:
       compatible-rust-updates:
         update-types: [minor, patch]
-  # The Python bindings are outside the workspace, with their own lockfile.
-  - package-ecosystem: cargo
-    directory: /crates/schwab-py
-    schedule:
-      interval: weekly
-    open-pull-requests-limit: 5
-    groups:
-      compatible-rust-updates:
-        update-types: [minor, patch]
+      major-rust-updates:
+        patterns: ["*"]
+        update-types: [major]
+        group-by: dependency-name
   - package-ecosystem: pip
     directory: /crates/schwab-py
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      compatible-python-updates:
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:
@@ -30,3 +40,6 @@ updates:
     # Security updates are not delayed.
     cooldown:
       default-days: 7
+    groups:
+      compatible-action-updates:
+        update-types: [minor, patch]
