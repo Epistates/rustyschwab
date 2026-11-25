@@ -291,9 +291,41 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      # The baseline is the pull request's base, which builds with today's
+      # dependencies; cargo-semver-checks resolves a baseline afresh, and a
+      # published release can stop resolving. Main carries the next version
+      # from its bump onwards, so the change allowed is the one from the
+      # latest release tag to that version, classified as cargo-semver-checks
+      # does (0.y.z: y is major, z is minor). At the released version it is
+      # derived from the version number as usual.
+      - id: release
+        name: Release type since the latest tag
+        run: |
+          current=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rustyschwab") | .version')
+          tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          IFS=.- read -r cmaj cmin cpat _ <<< "$current"
+          IFS=.- read -r rmaj rmin rpat _ <<< "${tag#v}"
+          if [ "$current" = "${tag#v}" ]; then type=""
+          elif [ "$cmaj" != "$rmaj" ]; then type="major"
+          elif [ "$cmin" != "$rmin" ]; then
+            if [ "$cmaj" = 0 ]; then type="major"; else type="minor"; fi
+          elif [ "$cpat" != "$rpat" ]; then
+            if [ "$cmaj" != 0 ]; then type="patch"
+            elif [ "$cmin" = 0 ]; then type="major"
+            else type="minor"; fi
+          else type="major"
+          fi
+          echo "Latest release $tag, version $current: ${type:-derived} release"
+          echo "type=$type" >> "$GITHUB_OUTPUT"
       - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
+          rust-toolchain: manual
           baseline-rev: ${{ github.event.pull_request.base.sha }}
+          release-type: ${{ steps.release.outputs.type }}
 
   soak:
     runs-on: ubuntu-latest
