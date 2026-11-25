@@ -38,9 +38,7 @@ pub fn trading_day_start(now: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 fn deadline_exceeded() -> Error {
-    Error::Timeout {
-        duration: FEED_DEADLINE.as_secs(),
-    }
+    Error::timeout(FEED_DEADLINE.as_secs())
 }
 
 pub fn regular_session_open(hours: &MarketHours, date: &str, at_ms: i64) -> Result<bool> {

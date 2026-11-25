@@ -88,6 +88,24 @@ impl RetryPolicy {
     pub async fn execute_until<F, Fut, T>(
         &self,
         deadline: Option<tokio::time::Instant>,
+        f: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        self.execute_until_recording(deadline, &parking_lot::Mutex::new(None), f)
+            .await
+    }
+
+    /// As [`execute_until`](Self::execute_until), and each error it retries
+    /// over is moved into `last_failure` before the wait, replacing the one
+    /// before. A caller that drops this future at its deadline can then
+    /// still say what the last finished attempt failed with.
+    pub(crate) async fn execute_until_recording<F, Fut, T>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        last_failure: &parking_lot::Mutex<Option<Error>>,
         mut f: F,
     ) -> Result<T>
     where
@@ -154,6 +172,7 @@ impl RetryPolicy {
                         debug!("Retry would outlast the caller's deadline; giving up");
                         return Err(error);
                     }
+                    *last_failure.lock() = Some(error);
                     tokio::time::sleep(delay).await;
                     retries += 1;
                 }
@@ -293,5 +312,70 @@ mod tests {
 
         assert!(result.is_err(), "Should fail after max retries");
         assert_eq!(attempts, 3, "Should attempt initial + 2 retries = 3 total");
+    }
+
+    fn http(attempt: u32) -> Error {
+        Error::Http {
+            status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            message: format!("attempt {attempt}"),
+        }
+    }
+
+    /// Each error retried over is handed to the slot, the latest replacing
+    /// the one before, so a caller that drops the call at its deadline can
+    /// still read the last attempt that finished.
+    #[tokio::test(start_paused = true)]
+    async fn test_retried_errors_are_recorded_for_the_deadline() {
+        let policy = RetryPolicy::new(&RetryConfig {
+            max_retries: 5,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(10),
+            backoff_multiplier: 1.0,
+            retry_on_status: vec![503],
+        });
+        let last_failure = parking_lot::Mutex::new(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut attempts = 0;
+
+        let result = tokio::time::timeout_at(
+            deadline,
+            policy.execute_until_recording(Some(deadline), &last_failure, || {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt < 3 {
+                        Err::<i32, _>(http(attempt))
+                    } else {
+                        std::future::pending().await
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert!(result.is_err(), "the third attempt is still in flight");
+        let recorded = last_failure.lock().take();
+        assert!(
+            matches!(&recorded, Some(Error::Http { message, .. }) if message == "attempt 2"),
+            "{recorded:?}"
+        );
+    }
+
+    /// A retry that would outlast the deadline is not started: the error
+    /// that asked for it comes back itself, and the slot stays empty.
+    #[tokio::test(start_paused = true)]
+    async fn test_giving_up_before_the_deadline_returns_the_error_itself() {
+        let policy = RetryPolicy::new(&RetryConfig::default());
+        let last_failure = parking_lot::Mutex::new(None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+
+        let result: Result<i32> = policy
+            .execute_until_recording(Some(deadline), &last_failure, || async {
+                Err(Error::RateLimit { retry_after: 60 })
+            })
+            .await;
+
+        assert!(matches!(result, Err(Error::RateLimit { retry_after: 60 })));
+        assert!(last_failure.lock().is_none());
     }
 }

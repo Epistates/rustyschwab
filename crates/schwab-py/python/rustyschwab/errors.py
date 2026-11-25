@@ -153,7 +153,12 @@ class RateLimited(SchwabError):
 
 
 class Timeout(SchwabError, TimeoutError):
-    """The call did not finish within the client's timeout (``duration`` s)."""
+    """The call did not finish within the client's timeout (``duration`` s).
+
+    When the deadline fell between the attempts of a retried call, the error
+    of the last attempt that finished is ``__cause__``. If the first attempt
+    was still in flight, there is no cause.
+    """
 
     kind = "timeout"
     duration: int | None = None

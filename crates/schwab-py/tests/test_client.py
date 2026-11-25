@@ -349,6 +349,55 @@ async def test_an_unreachable_server_raises_a_retryable_network_error(
     assert caught.value.retryable is True
 
 
+async def test_a_timeout_between_attempts_carries_the_last_failed_attempt_as_its_cause(
+    server: MockSchwab, make_client: Make
+) -> None:
+    # Two attempts fail after 0.4 s each; the third is still in flight when the
+    # two-second deadline falls. The transport's own timeout (also two seconds,
+    # counted from that attempt's send) is then still about a second off, so
+    # the deadline is what ends the call on every platform.
+    path = "/marketdata/v1/quotes"
+
+    def reply(_request: Any) -> Reply:
+        if len(server.calls("GET", path)) <= 2:
+            return Reply(503, {"message": "busy"}, delay=0.4)
+        return Reply(200, {}, delay=4.0)
+
+    server.on_call("GET", path, reply)
+    client = make_client(client={"timeout": 2.0})
+    with pytest.raises(errors.Timeout) as caught:
+        await client.quotes(["AAPL"])
+    assert str(caught.value) == "Timeout occurred after 2 seconds"
+    cause = caught.value.__cause__
+    assert isinstance(cause, errors.BrokerError)
+    assert cause.status == 503
+    assert cause.__cause__ is None
+
+
+async def test_a_timeout_during_the_first_attempt_has_no_cause(
+    server: MockSchwab, make_client: Make
+) -> None:
+    # The request budget allows one request a second with no burst to spare,
+    # so the second call waits a second for its turn and its deadline falls
+    # before the transport's own timeout could.
+    path = "/marketdata/v1/quotes"
+
+    def reply(_request: Any) -> Reply:
+        return Reply(200, {}) if len(server.calls("GET", path)) == 1 else Reply(200, {}, delay=4.0)
+
+    server.on_call("GET", path, reply)
+    client = make_client(
+        client={
+            "timeout": 2.0,
+            "rate_limit": {"enabled": True, "requests_per_second": 1, "burst_size": 1},
+        }
+    )
+    await client.quotes(["AAPL"])
+    with pytest.raises(errors.Timeout) as caught:
+        await client.quotes(["AAPL"])
+    assert caught.value.__cause__ is None
+
+
 async def test_an_uncertain_placement_raises_submission_unknown_with_the_journal_attempt(
     client: rustyschwab.Client, server: MockSchwab
 ) -> None:

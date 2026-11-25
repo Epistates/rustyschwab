@@ -53,9 +53,7 @@ impl Shared {
         let started = tokio::time::Instant::now();
         let sdk = tokio::time::timeout(timeout, self.ready())
             .await
-            .map_err(|_| Error::Timeout {
-                duration: timeout.as_secs(),
-            })??;
+            .map_err(|_| Error::timeout(timeout.as_secs()))??;
         Ok((sdk, Some(timeout.saturating_sub(started.elapsed()))))
     }
 }

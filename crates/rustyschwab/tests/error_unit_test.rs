@@ -180,7 +180,7 @@ fn test_error_conversions_from_stream_error() {
 
 #[test]
 fn test_error_timeout_variant() {
-    let error = Error::Timeout { duration: 30 };
+    let error = Error::timeout(30);
 
     assert!(error.is_retryable(), "Timeout errors should be retryable");
     assert_eq!(error.to_string(), "Timeout occurred after 30 seconds");

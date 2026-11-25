@@ -408,6 +408,95 @@ async fn a_retry_after_past_the_deadline_is_reported_as_the_rate_limit() {
     );
 }
 
+/// A deadline that falls while an attempt is in flight is a timeout, and
+/// the error of the last attempt that finished is its cause.
+///
+/// The request budget admits one request a second, so the second and third
+/// attempts each wait their turn before they are sent. The third goes out two
+/// seconds in, and the five-second deadline falls well before the transport's
+/// own request timeout (also five seconds, from the send) does.
+#[tokio::test]
+async fn a_deadline_during_an_attempt_keeps_the_last_failure_as_the_cause() {
+    use std::error::Error as _;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(120)))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let (client, _dir, _) = common::mock_client_with(&server, false, slow_budget(5));
+    let error = client.get_account_numbers().await.unwrap_err();
+    assert!(
+        matches!(error, Error::Timeout { duration: 5, .. }),
+        "{error:?}"
+    );
+    assert_eq!(error.to_string(), "Timeout occurred after 5 seconds");
+    let Error::Timeout {
+        source: Some(cause),
+        ..
+    } = &error
+    else {
+        panic!("the failed attempts are the cause: {error:?}");
+    };
+    assert!(
+        matches!(&**cause, Error::Http { status, .. } if status.as_u16() == 503),
+        "{cause:?}"
+    );
+    assert_eq!(
+        error.source().map(ToString::to_string),
+        Some(cause.to_string())
+    );
+    server.verify().await;
+}
+
+/// With no attempt finished there is nothing to blame: the timeout has no
+/// cause. An earlier call has used the budget's one request of burst, so the
+/// attempt waits a second for its turn and the two-second deadline falls
+/// well before the transport's own timeout.
+#[tokio::test]
+async fn a_deadline_during_the_first_attempt_has_no_cause() {
+    use std::error::Error as _;
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(120)))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let (client, _dir, _) = common::mock_client_with(&server, false, slow_budget(2));
+    assert!(client.get_account_numbers().await.unwrap().is_empty());
+    let error = client.get_account_numbers().await.unwrap_err();
+    assert!(
+        matches!(error, Error::Timeout { duration: 2, .. }),
+        "{error:?}"
+    );
+    assert!(error.source().is_none(), "{error:?}");
+}
+
+/// A deadline of `seconds`, two retries, and a request budget of one request
+/// a second with no burst to spare.
+fn slow_budget(seconds: u64) -> impl FnOnce(&mut SchwabConfig) {
+    move |config| {
+        config.client.timeout = Duration::from_secs(seconds);
+        config.client.retry.max_retries = 2;
+        config.client.rate_limit.enabled = true;
+        config.client.rate_limit.requests_per_second = 1;
+        config.client.rate_limit.burst_size = 1;
+    }
+}
+
 /// The client's state is opened when it is built: the file exists before the
 /// first request, and a state location that cannot be used is the
 /// constructor's error rather than the first call's.
