@@ -990,9 +990,10 @@ fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
 /// The built-in provider bounds an equity order by its limit price, so it
 /// judges LIMIT and STOP_LIMIT orders only: a market or stop order has no
 /// price to bound it, and a trailing stop limit's price moves with the
-/// market. It judges long equity only: a short sale or a cover, or another
-/// asset, needs a deployment's own provider. Each is refused as
-/// `RiskDenied`, however small.
+/// market. It judges long equity only: a short sale or a cover, an ETF
+/// (judged as a stock, a leveraged or inverse fund's risk would be
+/// understated), or another asset, needs a deployment's own provider. Each
+/// is refused as `RiskDenied`, however small.
 #[tokio::test]
 async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
     let dir = tempfile::tempdir().unwrap();
@@ -1019,8 +1020,17 @@ async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
     trailing_limit["price"] = json!("1");
     let limit = json!({"price": "10"});
     let fund = single("LIMIT", "BUY", "MUTUAL_FUND", "VFIAX", limit.clone());
+    let etf = single(
+        "LIMIT",
+        "BUY",
+        "COLLECTIVE_INVESTMENT",
+        "SPY",
+        limit.clone(),
+    );
     let unpriced = "Built-in portfolio risk requires a limit order";
     let not_long_equity = "Built-in portfolio risk supports long equity exposure";
+    let not_etfs = "Built-in portfolio risk covers long equity only; ETFs need a \
+        deployment's own risk provider";
     for (case, (order, reason)) in [
         (equity("MARKET", "BUY", json!({})), unpriced),
         (equity("STOP", "BUY", json!({"stopPrice": "10"})), unpriced),
@@ -1042,6 +1052,7 @@ async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
             not_long_equity,
         ),
         (fund, not_long_equity),
+        (etf, not_etfs),
     ]
     .into_iter()
     .enumerate()

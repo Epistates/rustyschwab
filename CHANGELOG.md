@@ -259,6 +259,22 @@ request is sent:
   `order_id` is `None`. Reconciliation places the order by its tag, as it
   does an accepted order with no `Location`.
 
+### Changed — the built-in risk provider leaves ETFs out on purpose
+
+`PortfolioRisk` covers long equity and defined-risk option strategies.
+ETFs are not covered: judged as a stock, a leveraged or inverse fund's
+risk would be understated, so ETF support is left to a later release on
+purpose.
+
+- An order whose leg is `COLLECTIVE_INVESTMENT` was already refused as
+  another asset; it is now refused with a `RiskDenied` that names ETFs
+  and the remedy, a deployment's own risk provider.
+- The provider cannot tell an ETF ordered as `EQUITY` from a stock, and
+  judges it as one. A deployment that trades ETFs should use its own
+  provider.
+- `OrderRequest::validate` still accepts `COLLECTIVE_INVESTMENT` legs,
+  for providers that take ETFs and for clients without a risk provider.
+
 ### Fixed
 
 - An order ID that isn't a whole number could leave an account unable to
