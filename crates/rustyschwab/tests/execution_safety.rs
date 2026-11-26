@@ -1426,19 +1426,18 @@ async fn assert_answers(store: &dyn ExecutionStore, s: &Standings) {
         attempts(store.unresolved_records("B").await.unwrap()),
         BTreeSet::from([s.neighbour.clone()])
     );
-    for (account, tag, latest) in [
+    for (case, (account, tag, latest)) in [
         ("A", "t1", Some(&s.placed)),
         ("A", "t3", Some(&s.retried)),
         ("B", "t3", Some(&s.neighbour)),
         ("B", "t1", None),
         ("A", "t9", None),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let found = store.submission_by_tag(account, tag).await.unwrap();
-        assert_eq!(
-            found.map(|r| r.attempt_id).as_ref(),
-            latest,
-            "{account} {tag}"
-        );
+        assert_eq!(found.map(|r| r.attempt_id).as_ref(), latest, "case {case}");
     }
     assert_eq!(store.pending_count().await.unwrap(), 2);
     let intents: BTreeSet<_> = store
