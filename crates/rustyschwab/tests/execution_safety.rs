@@ -833,6 +833,172 @@ async fn a_replacement_does_not_count_the_order_it_replaces() {
     risk.revalidate("A", "moved", &moved).await.unwrap();
 }
 
+/// The built-in provider bounds an equity order by its limit price, so it
+/// judges LIMIT and STOP_LIMIT orders only: a market or stop order has no
+/// price to bound it, and a trailing stop limit's price moves with the
+/// market. It judges long equity only: a short sale or a cover, or another
+/// asset, needs a deployment's own provider. Each is refused as
+/// `RiskDenied`, however small.
+#[tokio::test]
+async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let single = |kind: &str, instruction: &str, asset: &str, symbol: &str, prices: Value| {
+        let mut order = json!({"orderStrategyType": "SINGLE", "orderType": kind,
+            "session": "NORMAL", "duration": "DAY",
+            "orderLegCollection": [{"quantity": 1, "instruction": instruction,
+                "instrument": {"symbol": symbol, "assetType": asset}}]});
+        order
+            .as_object_mut()
+            .unwrap()
+            .extend(prices.as_object().unwrap().clone());
+        serde_json::from_value::<OrderRequest>(order).unwrap()
+    };
+    let equity = |kind: &str, instruction: &str, prices: Value| {
+        single(kind, instruction, "EQUITY", "AAPL", prices)
+    };
+    let trailing = json!({"stopPriceLinkBasis": "LAST", "stopPriceLinkType": "VALUE",
+        "stopPriceOffset": "1"});
+    let mut trailing_limit = trailing.clone();
+    trailing_limit["price"] = json!("1");
+    let limit = json!({"price": "10"});
+    let fund = single("LIMIT", "BUY", "MUTUAL_FUND", "VFIAX", limit.clone());
+    let unpriced = "Built-in portfolio risk requires a limit order";
+    let not_long_equity = "Built-in portfolio risk supports long equity exposure";
+    for (case, (order, reason)) in [
+        (equity("MARKET", "BUY", json!({})), unpriced),
+        (equity("STOP", "BUY", json!({"stopPrice": "10"})), unpriced),
+        (equity("TRAILING_STOP", "BUY", trailing), unpriced),
+        (
+            equity("TRAILING_STOP_LIMIT", "BUY", trailing_limit),
+            unpriced,
+        ),
+        (
+            equity("LIMIT", "SELL_SHORT", limit.clone()),
+            not_long_equity,
+        ),
+        (
+            equity("LIMIT", "SELL_SHORT_EXEMPT", limit.clone()),
+            not_long_equity,
+        ),
+        (
+            equity("LIMIT", "BUY_TO_COVER", limit.clone()),
+            not_long_equity,
+        ),
+        (fund, not_long_equity),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = risk.check("A", &order, None).await;
+        assert!(
+            matches!(&refused, Err(rustyschwab::Error::RiskDenied(r)) if r.starts_with(reason)),
+            "case {case}: {refused:?}"
+        );
+    }
+    risk.check("A", &equity("LIMIT", "BUY", limit), None)
+        .await
+        .unwrap();
+    risk.check(
+        "A",
+        &equity(
+            "STOP_LIMIT",
+            "BUY",
+            json!({"price": "10", "stopPrice": "9"}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// The position cap bounds one symbol's shares once its working buys fill,
+/// at the broker and here: a buy that would hold exactly the cap goes, and
+/// one share more is refused. An option strategy holds contracts, not the
+/// symbol's shares, so the cap does not bound it.
+#[tokio::test]
+async fn the_position_cap_bounds_shares_and_not_option_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working_buy = json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+        "orderType": "LIMIT", "quantity": 30, "filledQuantity": 0, "remainingQuantity": 30,
+        "price": 1, "orderLegCollection": [{"instruction": "BUY", "quantity": 30,
+            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]});
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 10000},
+            "positions": [{"longQuantity": 150, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![working_buy],
+    )
+    .await;
+    let capped = |max_position_quantity: u32| {
+        risk(
+            &journal,
+            PortfolioLimits {
+                max_open_quantity: 1000.into(),
+                max_position_quantity: max_position_quantity.into(),
+                ..verified()
+            },
+        )
+    };
+    let risk = capped(200);
+    // 150 held, 30 working at the broker and 15 reserved here: 5 more is 200.
+    risk.reserve("A", "ours", &order("BUY", "AAPL", 15, "1"))
+        .await
+        .unwrap();
+    risk.check("A", &order("BUY", "AAPL", 5, "1"), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.check("A", &order("BUY", "AAPL", 6, "1"), None).await,
+        Err(rustyschwab::Error::RiskDenied(reason)) if reason.starts_with("Position quantity")
+    ));
+    // Two contracts of a vertical against a cap of one share.
+    let vertical = strategy(
+        "NET_DEBIT",
+        "2",
+        &[("BUY_TO_OPEN", C100, 1), ("SELL_TO_OPEN", C105, 1)],
+    );
+    capped(1).check("A", &vertical, None).await.unwrap();
+}
+
+/// Just before an order is sent, it is rechecked against the reservation
+/// made for that attempt: one whose quantity or notional differs from what
+/// was reserved is refused, however far within the limits, and so is an
+/// attempt that reserved nothing.
+#[tokio::test]
+async fn dispatch_refuses_an_order_other_than_the_one_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let reserved = order("BUY", "AAPL", 2, "10");
+    risk.reserve("A", "held", &reserved).await.unwrap();
+    for (case, (attempt, sent)) in [
+        // The same quantity at another price.
+        ("held", order("BUY", "AAPL", 2, "11")),
+        // The same notional in another quantity.
+        ("held", order("BUY", "AAPL", 4, "5")),
+        ("held", order("BUY", "AAPL", 1, "10")),
+        ("unreserved", reserved.clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = risk.revalidate("A", attempt, &sent).await;
+        assert!(
+            matches!(&refused, Err(rustyschwab::Error::Storage(reason))
+                if reason == "Dispatch reservation missing or changed"),
+            "case {case}: {refused:?}"
+        );
+    }
+    risk.revalidate("A", "held", &reserved).await.unwrap();
+}
+
 /// A tag the broker is seen to hold is spent, even with no submission in
 /// this store (a restored backup that predates the order).
 #[tokio::test]
