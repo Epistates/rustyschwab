@@ -1,0 +1,6 @@
+# The tools CI runs around the wheel. The test dependencies come from the
+# `test` (and `nautilus`) extras in pyproject.toml, so ci.txt and
+# ci-nautilus.txt are compiled from both files, with hashes. Each compiled
+# file's header holds the command that regenerates it.
+maturin>=1.9.4,<2
+mypy

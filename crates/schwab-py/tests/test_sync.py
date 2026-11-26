@@ -19,6 +19,8 @@ from conftest import (
     ACCESS_TOKEN,
     ACCOUNT_HASH,
     MockSchwab,
+    Recorded,
+    Reply,
     client_config,
     limit_order,
 )
@@ -182,13 +184,48 @@ def test_a_call_timeout_cancels_and_the_client_stays_usable(
     assert client.quotes(["AAPL"])["AAPL"]["symbol"] == "AAPL"
 
 
+def test_a_timeout_raised_by_the_sdk_keeps_its_type_and_its_cause(
+    server: MockSchwab, tokens: Path
+) -> None:
+    # The client has no timeout of its own here: the SDK's deadline ends the
+    # call, and the caller gets that error, not a new one that forgets why.
+    # Two attempts fail after 0.4 s each; the third is still in flight when
+    # the two-second deadline falls.
+    path = "/marketdata/v1/quotes"
+
+    def reply(_request: Recorded) -> Reply:
+        if len(server.calls("GET", path)) <= 2:
+            return Reply(503, {"message": "busy"}, delay=0.4)
+        return Reply(200, {}, delay=4.0)
+
+    server.on_call("GET", path, reply)
+    config = client_config(server, tokens)
+    config["client"]["timeout"] = 2.0
+    client = sync.Client(config)
+    # The first call loads the tokens and verifies the state file, and the
+    # deadline covers that too. Do it first, so that the deadline runs from
+    # the first attempt and not from a slow disk.
+    client.init()
+    with pytest.raises(errors.Timeout) as caught:
+        client.quotes(["AAPL"])
+    assert str(caught.value) == "Timeout occurred after 2 seconds"
+    cause = caught.value.__cause__
+    assert isinstance(cause, errors.BrokerError) and cause.status == 503
+
+
 def test_a_submission_past_the_timeout_is_unknown_with_its_tag_not_a_bare_timeout(
     server: MockSchwab, tokens: Path
 ) -> None:
     server.on(
         "POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/7"}, delay=1.5
     )
-    client = sync.Client(client_config(server, tokens), timeout=0.3)
+    client = sync.Client(client_config(server, tokens))
+    # The first call loads the tokens and verifies the state file, and the
+    # submission's timeout covers that too: on a slow disk it can run out
+    # before anything is sent, which is a plain Timeout. Do that work first, so
+    # that the timeout can only run out on the broker's answer.
+    client.init()
+    client.timeout = 0.3
     with pytest.raises(errors.SubmissionUnknown) as caught:
         client.place_order(ACCOUNT_HASH, limit_order(tag="slow"))
     assert caught.value.tag == "slow" and caught.value.cause == "timeout"
@@ -451,11 +488,18 @@ def test_recv_timeouts_lose_no_message(
         next_of_type(stream, "state")
         stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
         frames = 300
+        # A read times out only when nothing is queued, and on a fast machine
+        # the consumer may never find the queue empty. After every ten frames
+        # the producer waits for a read to time out, so reads time out all
+        # through the stream.
+        timed_out = threading.Event()
 
         def produce() -> None:
             for number in range(frames):
                 streamer.push(level_one(**{"1": number}))
-                time.sleep(0.001)
+                if number % 10 == 0:
+                    timed_out.clear()
+                    timed_out.wait(20)
 
         producer = threading.Thread(target=produce)
         producer.start()
@@ -467,6 +511,7 @@ def test_recv_timeouts_lose_no_message(
                 message = stream.recv(0.001)
             except TimeoutError:
                 timeouts += 1
+                timed_out.set()
                 continue
             assert message is not None
             if message["type"] == "data":

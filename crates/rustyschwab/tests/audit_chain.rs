@@ -343,8 +343,9 @@ async fn activity_pages_in_order_and_keeps_only_the_newest() {
     );
 }
 
-/// A setting is set and cleared with an audited `setting_changed` event,
-/// in a namespace that cannot touch the journal's own entries.
+/// A setting is set and cleared with an audited `setting_changed` event.
+/// Each setting keeps its own value, in a namespace that cannot touch the
+/// journal's own entries.
 #[tokio::test]
 async fn settings_are_audited_and_namespaced() {
     let dir = tempfile::tempdir().unwrap();
@@ -363,6 +364,14 @@ async fn settings_are_audited_and_namespaced() {
         .await
         .unwrap();
     assert_eq!(journal.operator_halt().await.unwrap(), None);
+    assert_eq!(
+        journal.setting("operator_halt").await.unwrap(),
+        Some(json!("not a halt"))
+    );
+    assert_eq!(
+        journal.setting("delegation").await.unwrap(),
+        Some(json!({"mode": "autonomous"}))
+    );
     journal
         .set_setting("delegation", None, "bob")
         .await

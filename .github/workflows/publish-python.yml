@@ -86,8 +86,13 @@ jobs:
         if: matrix.name != 'macos-x86_64'
         shell: bash
         working-directory: crates/schwab-py
+        # The wheel's own dependencies (tzdata, on Windows) come pinned with
+        # hashes; the wheel goes in without them, and `pip check` confirms
+        # the pinned set satisfies what it declares.
         run: |
-          python -m pip install --no-index --find-links dist rustyschwab
+          python -m pip install --require-hashes -r requirements/runtime.txt
+          python -m pip install --no-deps dist/*.whl
+          python -m pip check
           python -c "import rustyschwab; print(rustyschwab.__version__, rustyschwab.__sdk_version__); rustyschwab.stream_fields('LEVELONE_EQUITIES')"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -132,8 +137,11 @@ jobs:
         with:
           name: python-wheel-linux-x86_64
           path: crates/schwab-py/dist
-      - name: Install the wheel with the test extras
-        run: python -m pip install "$(echo dist/*.whl)[test]" mypy
+      - name: Install the pinned test dependencies and the wheel
+        run: |
+          python -m pip install --require-hashes -r requirements/ci.txt
+          python -m pip install --no-deps dist/*.whl
+          python -m pip check
       - run: python -m pytest
       - run: python -m mypy --strict python/rustyschwab
 

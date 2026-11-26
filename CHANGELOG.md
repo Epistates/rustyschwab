@@ -265,7 +265,88 @@ build the client where blocking for a moment is acceptable; creating a new
 state file takes tens of milliseconds on most disks and longer on a slow
 one. Signatures are unchanged.
 
+### Changed — order IDs are checked before anything is sent
+
+An order ID is now a whole number from 0 to 18446744073709551615, written
+in plain digits with no sign, space or leading zero
+(`rustyschwab::execution::is_broker_order_id`). Schwab's order IDs, and the
+paper venue's, all are. Anything else is refused locally, before any
+request is sent:
+
+- `get_order`, `cancel_order` and `replace_order` return `InvalidParameter`
+  for a non-numeric or out-of-range order ID. Schwab used to answer such a
+  request with a 4xx.
+- `finish` refuses, as `InvalidParameter`, an `Accepted` outcome whose order
+  ID isn't one.
+- `PortfolioRisk` refuses, as `InvalidParameter`, a replacement (or a check
+  of one) that names the order it replaces by anything else.
+- `record_order` and `track_order` refuse such an ID, as a JSON string or a
+  JSON number, and a reconciliation pass doesn't keep an order listed under
+  one.
+- An accepted order whose `Location` header doesn't end in such an ID is
+  recorded as accepted without an order ID, and `OrderSubmitResponse`'s
+  `order_id` is `None`. Reconciliation places the order by its tag, as it
+  does an accepted order with no `Location`.
+
+### Changed — the built-in risk provider leaves ETFs out on purpose
+
+`PortfolioRisk` covers long equity and defined-risk option strategies.
+ETFs are not covered: judged as a stock, a leveraged or inverse fund's
+risk would be understated, so ETF support is left to a later release on
+purpose.
+
+- An order whose leg is `COLLECTIVE_INVESTMENT` was already refused as
+  another asset; it is now refused with a `RiskDenied` that names ETFs
+  and the remedy, a deployment's own risk provider.
+- The provider cannot tell an ETF ordered as `EQUITY` from a stock, and
+  judges it as one. A deployment that trades ETFs should use its own
+  provider.
+- `OrderRequest::validate` still accepts `COLLECTIVE_INVESTMENT` legs,
+  for providers that take ETFs and for clients without a risk provider.
+
 ### Fixed
+
+- An order ID that isn't a whole number could leave an account unable to
+  trade until its state file was edited by hand. `record_order` (used by
+  `replace_order` and by the authority's `RecordOrder` request) and a
+  reconciliation pass stored an order under any string ID, such as `"abc"`,
+  `"-5"` or `""`. Every later pass then failed with "Invalid stored broker
+  order ID", so the account stayed unreconciled and refused orders.
+  - Order IDs are now checked wherever they come in (see "Changed — order
+    IDs are checked before anything is sent").
+  - A state file that already holds such an ID needs no edit. The first
+    time this release opens it, a one-time migration repairs every order ID
+    it holds outside the audit trail, finished history included.
+  - An ID that is a whole number written another way, such as `"007"` or
+    `"+8"`, names a real order and is rewritten in its own digits. If the
+    order is also stored as `"7"`, the two records merge: the later
+    observation of the order is kept, each observed activity is kept once,
+    and every submission accepted under either text, and any reservation for
+    a replacement of it, names `"7"`. Each rewrite is audited as
+    `order_id_canonicalized` with the old text.
+  - Any other ID, such as `"abc"`, `"-5"`, `""` or one past
+    18446744073709551615, is set aside. The order stored under it is
+    dropped, a submission accepted under it returns to placement by its tag,
+    and the ID is logged as an error and audited as `order_id_set_aside` with
+    what was stored. No broker order has such an ID, so nothing real is
+    given up, but such a submission keeps its account unreconciled until a
+    pass finds its order by tag or an operator resolves it.
+  - The audit trail is not rewritten: its entries record what was true when
+    each was written, and the migration's entries record the mapping.
+  - Every open now checks that the store holds only broker order IDs outside
+    its audit trail. A file that doesn't, which only a hand edit or damage
+    after the migration can cause, fails to open with the new
+    `Error::NonCanonicalOrderId` (kind `storage`), naming the table, the row
+    and the text.
+  - `rustyschwab-admin repair-order-ids` repairs such a file with the
+    migration's own audited canonicalization. `--dry-run` lists each change
+    (table, row, the text stored, and the ID it becomes or "set aside") and
+    changes nothing. With `--operator <name>` it takes the store's init lock,
+    makes the changes in one transaction, audits each as the migration does
+    and the repair as `order_ids_repaired` under that name, and the file
+    opens again. In the SDK these are `StateDatabase::order_id_repairs` and
+    `StateDatabase::repair_order_ids`, which give each change as a
+    `reconciliation::OrderIdRepair`. docs/OPERATIONS.md gives the recovery.
 
 - Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
   0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0
@@ -275,6 +356,14 @@ one. Signatures are unchanged.
   require each other at exact versions, and installs cleanly. The install
   instructions now use `cargo install --locked`, which builds with the
   dependency versions the release was tested with.
+
+- Python: a blocking call (`rustyschwab.sync`) that ended in the SDK's own
+  `Timeout` raised a bare `TimeoutError("no result within None seconds")`
+  on Python 3.11 and later. The type, the message, `duration` and the
+  failure behind it were lost, and `except rustyschwab.errors.Timeout` never
+  matched. The caller now gets the `Timeout` the SDK raised, as on Python
+  3.10. A call that outlasts the client's own `timeout=` still raises a
+  plain `TimeoutError`.
 
 - Closing a stream could lose its LOGOUT on a busy machine.
   `StreamClient::disconnect` (Python `Stream.close()`, and
@@ -452,6 +541,20 @@ one. Signatures are unchanged.
   trader had read that error as a definite refusal, recorded the order as
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
+- A reconciliation pass that failed could leave an account unready right
+  after a pass of a newer generation had reconciled it: the failed pass
+  invalidated the baseline whenever its stored generation differed from
+  its own, so orders were refused until the next pass. A failed pass now
+  leaves a newer generation's baseline standing. It still invalidates a
+  baseline of its own generation, unless a pass that began after it took
+  that baseline.
+- The built-in risk provider (`PortfolioRisk`) counted a working order
+  at the broker for no shares as no exposure and kept trading, while a
+  working option strategy for no units already stopped every order on
+  the account. An order for nothing is not one the SDK sends
+  (`OrderRequest::validate` refuses it), so its figures cannot be
+  trusted: it now stops every order on the account as well, as
+  `RiskDenied`, until the broker no longer lists it as working.
 
 ### Changed — typed errors from the order builders
 

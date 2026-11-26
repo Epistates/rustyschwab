@@ -58,6 +58,10 @@ serde_with = "3.17"
 # Encoding
 base64 = "0.23.1"
 
+# Durable state: the SDK's SQLite store, and the operator tests that write
+# a damaged one directly.
+rusqlite = { version = "0.43", features = ["bundled", "backup"] }
+
 # Error handling
 thiserror = "2.0.21"
 anyhow = "1.0.60"

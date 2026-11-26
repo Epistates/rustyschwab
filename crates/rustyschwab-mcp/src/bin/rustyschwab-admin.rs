@@ -134,6 +134,18 @@ enum DurableCommand {
         #[arg(long)]
         evidence: String,
     },
+    /// Repair a state file that does not open because it holds an order ID
+    /// that is not one (edited by hand or damaged after its migration),
+    /// with the migration's own audited canonicalization. Prints each
+    /// change, one per line: the table and row, the text as stored, and
+    /// the order ID it becomes or `set aside`.
+    RepairOrderIds {
+        /// List the changes and make none.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, required_unless_present = "dry_run")]
+        operator: Option<String>,
+    },
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -318,6 +330,16 @@ async fn main() -> anyhow::Result<()> {
         }
         DurableCommand::Revoke { digest, operator } => {
             journal.revoke_approval(&digest, &operator).await?
+        }
+        DurableCommand::RepairOrderIds { dry_run, operator } => {
+            let database = journal.database();
+            let repairs = match operator.filter(|_| !dry_run) {
+                Some(operator) => database.repair_order_ids(&operator).await?,
+                None => database.order_id_repairs().await?,
+            };
+            for repair in repairs {
+                println!("{repair}");
+            }
         }
         DurableCommand::Resolve { attempt, evidence } => {
             journal

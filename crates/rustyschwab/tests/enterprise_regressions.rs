@@ -248,6 +248,25 @@ fn limit_order() -> OrderRequest {
     )
 }
 
+/// An order for no shares is an invalid parameter, refused before anything
+/// is journaled or sent, so no order for nothing can be working at the
+/// broker through this SDK.
+#[tokio::test]
+async fn an_order_for_no_shares_is_refused_before_it_is_sent() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    let mut order = limit_order();
+    order.order_leg_collection[0].quantity = Decimal::ZERO;
+    let refused = client.place_order("hash", &order).await.unwrap_err();
+    assert_eq!(refused.kind(), rustyschwab::ErrorKind::InvalidParameter);
+    assert!(
+        refused.to_string().contains("quantity must be positive"),
+        "{refused}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(client.order_journal().records().await.unwrap().is_empty());
+}
+
 /// A caller that stops waiting abandons only the answer: the submission
 /// still runs to its outcome, so the account is not left blocked behind an
 /// intent nobody will finish.
@@ -893,6 +912,103 @@ async fn dispatch_revalidation_runs_after_quota_and_before_wire() {
         client.order_journal().records().await.unwrap()[0].outcome,
         Some(rustyschwab::execution::SubmissionOutcome::Rejected)
     ));
+}
+
+/// A risk provider that implements only what the trait requires: it keeps
+/// no daily-loss control and cannot recheck an order at dispatch.
+struct ReservesOnly;
+
+#[async_trait::async_trait]
+impl rustyschwab::risk::RiskProvider for ReservesOnly {
+    async fn reserve(&self, _: &str, _: &str, _: &OrderRequest) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+    async fn release(&self, _: &str) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+}
+
+/// A provider that cannot recheck an order just before it is sent fails
+/// closed: the trait's defaults refuse the recheck, plain or inside a
+/// gateway's dispatch fence, so nothing reaches the broker and each intent
+/// resolves as refused, never armed.
+#[tokio::test]
+async fn a_provider_without_dispatch_revalidation_sends_nothing() {
+    use rustyschwab::coordination::Coordinator;
+    use std::sync::Arc;
+    let server = MockServer::start().await;
+    let (base, _dir, _) = client(&server, false);
+    let client = base.with_risk_provider(Arc::new(ReservesOnly)).unwrap();
+    let lease = client
+        .order_journal()
+        .database()
+        .acquire("gateway", "trader", Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .place_order_fenced("hash", &limit_order(), &lease)
+            .await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        client.place_order("hash", &limit_order()).await,
+        Err(Error::Config(_))
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let records = client.order_journal().records().await.unwrap();
+    assert_eq!(records.len(), 2);
+    for record in records {
+        assert!(matches!(
+            record.outcome,
+            Some(rustyschwab::execution::SubmissionOutcome::Rejected)
+        ));
+        assert!(!record.armed);
+    }
+}
+
+/// Reading the day's transfers costs a request per transfer type, and only
+/// a daily-loss control needs them: reconciling for a provider that keeps
+/// none reads the order list and the account, and no transactions.
+#[tokio::test]
+async fn reconciliation_reads_no_transfers_for_a_provider_without_a_daily_loss_control() {
+    use std::sync::Arc;
+    let server = MockServer::start().await;
+    let (base, _dir, _) = client(&server, false);
+    let client = base.with_risk_provider(Arc::new(ReservesOnly)).unwrap();
+    Mock::given(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/trader/v1/accounts/hash"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "securitiesAccount": {"positions": [], "currentBalances": {"availableFunds": 1000}}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(path("/trader/v1/accounts/hash/transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(0)
+        .mount(&server)
+        .await;
+    assert!(
+        client
+            .reconcile_account("hash", 1)
+            .await
+            .unwrap()
+            .reconciled
+    );
+    let baseline = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    assert!(baseline.get("_dayNetTransfers").is_none(), "{baseline}");
+    server.verify().await;
 }
 
 #[tokio::test]

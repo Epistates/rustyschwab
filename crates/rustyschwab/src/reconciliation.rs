@@ -3,12 +3,14 @@ use crate::{
     SchwabClient,
     client::Op,
     error::{Error, Result},
+    execution::is_broker_order_id,
     storage::{StateDatabase, audit, sql},
     types::trading::OrdersParams,
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 
 const INVALIDATE_ACCOUNT: &str = "INSERT INTO accounts VALUES(?1,?2,0,0,'{}') \
      ON CONFLICT(account) DO UPDATE SET valid=0,generation=MAX(generation,excluded.generation)";
@@ -70,6 +72,25 @@ const SELECT_LINKED_HELD_RESERVATIONS: &str = "SELECT r.id,r.quantity,r.notional
      WHERE r.state='held' AND s.account=?1";
 const SHRINK_HELD_RESERVATION: &str =
     "UPDATE reservations SET quantity=?1,notional=?2 WHERE id=?3 AND state='held'";
+const SELECT_ORDER_ROW: &str =
+    "SELECT observed_at,payload FROM orders WHERE account=?1 AND order_id=?2";
+/// Accepted submissions on `?1` that name broker order `?2`.
+const SELECT_ACCEPTED_FOR_ORDER: &str = "SELECT id FROM submissions WHERE account=?1 \
+     AND json_extract(outcome,'$.status')='accepted' AND json_extract(outcome,'$.order_id')=?2 \
+     ORDER BY created_at,id";
+/// Gives order `?2`'s observed activities order `?3`'s ID, keeping one of
+/// each: an activity's key is its order's ID and a digest of its content,
+/// so the same activity observed under both IDs has one key once moved.
+const MOVE_ORDER_EXECUTIONS: &str = "INSERT OR IGNORE INTO executions(account,execution_id,payload) \
+     SELECT account,?3 || substr(execution_id,length(?2)+1),payload FROM executions \
+     WHERE account=?1 AND execution_id>=?2 || ':' AND execution_id<?2 || ';'";
+/// Reservations on `?1` for a replacement of order `?2` name order `?3`.
+const RENAME_REPLACED_ORDER: &str =
+    "UPDATE reservations SET replaces=?3 WHERE account=?1 AND replaces=?2";
+/// Reservations on `?1` for a replacement of `?2`, which names no order, no
+/// longer name the order they replace.
+const FORGET_REPLACED_ORDER: &str =
+    "UPDATE reservations SET replaces=NULL WHERE account=?1 AND replaces=?2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -105,6 +126,36 @@ pub struct ReconciliationReport {
     /// nothing; the stored account state is the newer one's.
     #[serde(default)]
     pub superseded: bool,
+}
+/// A stored order ID that is not a broker order ID (the store's invariant,
+/// which [`Error::NonCanonicalOrderId`] reports), and what the repair does
+/// with it: rewrites it as `canonical`, the same order in its own digits,
+/// or sets it aside when it names no order at all. Listed by
+/// [`StateDatabase::order_id_repairs`] and made by
+/// [`StateDatabase::repair_order_ids`]. Displayed as one line:
+/// `orders (account …1234): "007" -> "7"`, or `-> set aside`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OrderIdRepair {
+    /// The table that holds it.
+    pub table: String,
+    /// Its row, as [`Error::NonCanonicalOrderId`] names it.
+    pub row: String,
+    /// The account it is stored under.
+    pub account: String,
+    /// The text as stored.
+    pub order_id: String,
+    /// The order ID it becomes; `None` when it is set aside.
+    pub canonical: Option<String>,
+}
+impl std::fmt::Display for OrderIdRepair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}): {:?} -> ", self.table, self.row, self.order_id)?;
+        match &self.canonical {
+            Some(canonical) => write!(f, "{canonical:?}"),
+            None => f.write_str("set aside"),
+        }
+    }
 }
 impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
@@ -186,16 +237,9 @@ impl StateDatabase {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            // The pass's start becomes the baseline's age. A start ahead of
-            // this store's clock (a skewed remote worker) would make the
-            // baseline look fresher than it is.
-            let now = chrono::Utc::now().timestamp_millis();
-            if started_at > now + MAX_CLOCK_LEAD_MS {
-                return Err(Error::Storage(
-                    "Reconciliation started ahead of the state store's clock".into(),
-                ));
-            }
-            let started_at = started_at.min(now);
+            // The pass's start becomes the baseline's age.
+            let started_at =
+                baseline_observed_at(started_at, chrono::Utc::now().timestamp_millis())?;
             let current: Option<(i64, i64, bool)> = tx
                 .query_row(SELECT_ACCOUNT_GENERATION, [&account], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -394,6 +438,355 @@ impl StateDatabase {
         })
         .await
     }
+    /// Every change [`repair_order_ids`](Self::repair_order_ids) would make
+    /// to this file as it stands, in table and then row order. Changes
+    /// nothing. Like the repair, it reads a file that fails to open with
+    /// [`Error::NonCanonicalOrderId`]; an empty list means there is nothing
+    /// to repair.
+    pub async fn order_id_repairs(&self) -> Result<Vec<OrderIdRepair>> {
+        self.repairing(|c| stored_order_id_repairs(c)).await
+    }
+    /// Repair a file that fails to open with [`Error::NonCanonicalOrderId`]
+    /// (edited by hand or damaged after its migration), in `operator`'s
+    /// name: the migration's canonicalization, run on demand. Under the init
+    /// lock and in one transaction, every stored order ID that is not a
+    /// broker order ID is rewritten in its own digits, merging with the
+    /// records for the same order, or set aside when it names none, each
+    /// audited as the migration audits it; then `order_ids_repaired` records
+    /// the operator and the changes. Afterwards the file opens. Returns the
+    /// changes made, as [`order_id_repairs`](Self::order_id_repairs) listed
+    /// them; with nothing to repair it writes nothing.
+    ///
+    /// The file must be at this release's schema version: opening one that
+    /// is behind migrates it, which makes the same repair.
+    pub async fn repair_order_ids(&self, operator: &str) -> Result<Vec<OrderIdRepair>> {
+        if operator.trim().is_empty() {
+            return Err(Error::InvalidParameter("Operator is required".into()));
+        }
+        let operator = operator.to_owned();
+        self.repairing(move |c| {
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let repairs = stored_order_id_repairs(&tx)?;
+            if repairs.is_empty() {
+                return Ok(repairs);
+            }
+            repair_stored_order_ids(&tx, &repairs)?;
+            check_stored_order_ids(&tx)?;
+            audit(
+                &tx,
+                "order_ids_repaired",
+                &operator,
+                &serde_json::json!({ "changes": repairs }),
+            )?;
+            tx.commit().map_err(sql)?;
+            Ok(repairs)
+        })
+        .await
+    }
+}
+/// One order ID as this store holds it outside its audit trail: where it is
+/// (`table`, and the row as an error names it), its account and its text.
+struct StoredOrderId {
+    table: &'static str,
+    row: String,
+    account: String,
+    order_id: String,
+}
+/// Visit every order ID this store holds outside its audit trail (see
+/// [`check_stored_order_ids`] for what that leaves out, and why): each
+/// stored order and reference, each observed activity (keyed by its
+/// order's ID and a digest of its content), each accepted submission's
+/// order, and each reservation's replaced order, table by table in that
+/// order and each table in its key's order. Reads row by row.
+fn for_each_stored_order_id(
+    c: &rusqlite::Connection,
+    mut visit: impl FnMut(StoredOrderId) -> Result<()>,
+) -> Result<()> {
+    let masked = crate::utils::mask_account;
+    // Each query gives the account, the row's key and the order ID's text.
+    let mut scan = |table: &'static str,
+                    query: &str,
+                    describe: &dyn Fn(&str, &str, String) -> (String, String)|
+     -> Result<()> {
+        let mut statement = c.prepare(query).map_err(sql)?;
+        let mut rows = statement.query([]).map_err(sql)?;
+        while let Some(r) = rows.next().map_err(sql)? {
+            let account: String = r.get(0).map_err(sql)?;
+            let key: String = r.get(1).map_err(sql)?;
+            let (row, order_id) = describe(&account, &key, r.get(2).map_err(sql)?);
+            visit(StoredOrderId {
+                table,
+                row,
+                account,
+                order_id,
+            })?;
+        }
+        Ok(())
+    };
+    scan(
+        "orders",
+        "SELECT account,order_id,order_id FROM orders ORDER BY account,order_id",
+        &|account, _, order_id| (format!("account {}", masked(account)), order_id),
+    )?;
+    scan(
+        "executions",
+        "SELECT account,execution_id,execution_id FROM executions \
+         ORDER BY account,execution_id",
+        &|account, key, _| {
+            let order_id = key.rsplit_once(':').map_or(key, |(order_id, _)| order_id);
+            (
+                format!("account {}, activity {key}", masked(account)),
+                order_id.to_owned(),
+            )
+        },
+    )?;
+    scan(
+        "submissions",
+        "SELECT account,id,json_extract(outcome,'$.order_id') FROM submissions \
+         WHERE json_extract(outcome,'$.status')='accepted' \
+           AND json_extract(outcome,'$.order_id') IS NOT NULL ORDER BY id",
+        &|_, id, order_id| (format!("submission {id}"), order_id),
+    )?;
+    scan(
+        "reservations",
+        "SELECT account,id,replaces FROM reservations WHERE replaces IS NOT NULL ORDER BY id",
+        &|_, id, order_id| (format!("reservation {id}"), order_id),
+    )
+}
+/// The store's invariant on order IDs: every one it holds outside its audit
+/// trail is a broker order ID ([`is_broker_order_id`]), so each order has
+/// exactly one text form in every table that names it. Checked each time
+/// the store opens, after migrating (`StateDatabase`); new input is held to
+/// the same rule where it comes in. A file that breaks it was edited by
+/// hand or damaged after its migration, so this fails closed with
+/// [`Error::NonCanonicalOrderId`] rather than repair it silently.
+///
+/// What is left out, on purpose:
+/// - The audit trail. Its rows are append-only evidence, hash-chained
+///   (`audit_chain`), of what was true when each was written; an ID an
+///   earlier release stored stays in them as it was written, and the
+///   `order_id_canonicalized` entry the migration wrote records the
+///   mapping. Rewriting them would falsify that evidence and break the
+///   chain.
+/// - What was asked for rather than what this store follows: each
+///   submission's request as submitted (for an MCP principal, the input of
+///   the approval digest it consumed), the intents awaiting approval, and
+///   the activity log.
+/// - The text inside an order's payload, the broker's view as it reported
+///   it (a parent order's copies of its children's IDs, say). The migration
+///   rewrites the `orderId` of an order it moves; the rest is as reported.
+pub(crate) fn check_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
+    for_each_stored_order_id(c, |stored| {
+        if is_broker_order_id(&stored.order_id) {
+            return Ok(());
+        }
+        Err(Error::NonCanonicalOrderId {
+            table: stored.table,
+            row: stored.row,
+            order_id: stored.order_id,
+        })
+    })
+}
+/// The one-time migration to canonical order IDs (schema version 7), run in
+/// the transaction that records it: every order ID this store holds outside
+/// its audit trail, finished history included, is rewritten in its own
+/// digits when it names an order written another way, merging the records
+/// for the same order ([`canonicalize_order_id`]), and set aside when it
+/// names no order at all ([`set_aside_order_id`]). Each change is audited;
+/// the audit rows already written are not touched (see
+/// [`check_stored_order_ids`]). Afterwards the store meets its invariant.
+/// An operator's repair ([`StateDatabase::repair_order_ids`]) makes the
+/// same changes on demand.
+pub(crate) fn canonicalize_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
+    repair_stored_order_ids(c, &stored_order_id_repairs(c)?)
+}
+/// Every stored order ID that breaks the invariant
+/// ([`check_stored_order_ids`]), in the order the store holds them, and
+/// what the canonicalization makes of it: the same order in its own
+/// digits, or `None` when it names no order and is set aside.
+fn stored_order_id_repairs(c: &rusqlite::Connection) -> Result<Vec<OrderIdRepair>> {
+    let mut repairs = Vec::new();
+    for_each_stored_order_id(c, |stored| {
+        if !is_broker_order_id(&stored.order_id) {
+            repairs.push(OrderIdRepair {
+                canonical: crate::execution::canonical_order_id(&stored.order_id),
+                table: stored.table.to_owned(),
+                row: stored.row,
+                account: stored.account,
+                order_id: stored.order_id,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(repairs)
+}
+/// Make `repairs`, which [`stored_order_id_repairs`] listed on `c`, once
+/// for each stored ID on each account however many rows name it: rewrite
+/// ([`canonicalize_order_id`]) or set aside ([`set_aside_order_id`]).
+fn repair_stored_order_ids(c: &rusqlite::Connection, repairs: &[OrderIdRepair]) -> Result<()> {
+    let ids: std::collections::BTreeSet<_> = repairs
+        .iter()
+        .map(|r| (&r.account, &r.order_id, &r.canonical))
+        .collect();
+    for (account, id, canonical) in ids {
+        match canonical {
+            Some(canonical) => canonicalize_order_id(c, account, id, canonical)?,
+            None => set_aside_order_id(c, account, id)?,
+        }
+    }
+    Ok(())
+}
+/// The accepted submissions on `account` that name order `id`.
+fn accepted_for_order(c: &rusqlite::Connection, account: &str, id: &str) -> Result<Vec<String>> {
+    let mut stmt = c.prepare(SELECT_ACCEPTED_FOR_ORDER).map_err(sql)?;
+    stmt.query_map(params![account, id], |r| r.get(0))
+        .map_err(sql)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(sql)
+}
+/// When order `id` was last observed and how, if this store holds it.
+fn order_row(c: &rusqlite::Connection, account: &str, id: &str) -> Result<Option<(i64, String)>> {
+    c.query_row(SELECT_ORDER_ROW, params![account, id], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .optional()
+    .map_err(sql)
+}
+/// Rewrite stored ID `stored`, which names broker order `canonical` written
+/// another way, in its own digits, merging it with whatever this store
+/// already holds under `canonical`. Both describe the same broker order,
+/// so the merge loses nothing about it:
+/// - the order's record is the later of the two observations, the
+///   broker's latest view (on a tie, the record under its own digits);
+/// - each observed activity is kept once: activities are keyed by their
+///   content, so one observed under both IDs is the same activity;
+/// - every submission accepted under `stored` is accepted under
+///   `canonical`, and a reservation for a replacement of `stored` names
+///   `canonical`, so risk and reconciliation link them to the order as
+///   before.
+///
+/// Audited as `order_id_canonicalized`, with `stored` as the subject.
+fn canonicalize_order_id(
+    tx: &rusqlite::Connection,
+    account: &str,
+    stored: &str,
+    canonical: &str,
+) -> Result<()> {
+    let existing = order_row(tx, account, canonical)?;
+    if let Some((observed_at, payload)) = order_row(tx, account, stored)? {
+        if existing
+            .as_ref()
+            .is_none_or(|(existing_at, _)| observed_at > *existing_at)
+        {
+            let mut order: Value = serde_json::from_str(&payload)?;
+            if let Some(fields) = order.as_object_mut() {
+                fields.insert("orderId".into(), Value::String(canonical.to_owned()));
+            }
+            tx.execute(
+                UPSERT_ORDER,
+                params![
+                    account,
+                    canonical,
+                    observed_at,
+                    serde_json::to_string(&order)?
+                ],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(crate::execution::DELETE_ORDER, params![account, stored])
+            .map_err(sql)?;
+        tx.execute(MOVE_ORDER_EXECUTIONS, params![account, stored, canonical])
+            .map_err(sql)?;
+        tx.execute(
+            crate::execution::DELETE_ORDER_EXECUTIONS,
+            params![account, stored],
+        )
+        .map_err(sql)?;
+    }
+    let attempts = accepted_for_order(tx, account, stored)?;
+    let accepted = serde_json::to_string(&crate::execution::SubmissionOutcome::Accepted {
+        order_id: Some(canonical.to_owned()),
+    })?;
+    for attempt in &attempts {
+        tx.execute(RESOLVE_SUBMISSION_OUTCOME, params![accepted, attempt])
+            .map_err(sql)?;
+    }
+    tx.execute(RENAME_REPLACED_ORDER, params![account, stored, canonical])
+        .map_err(sql)?;
+    tracing::warn!(
+        order_id = ?stored,
+        canonical,
+        account = %crate::utils::mask_account(account),
+        "A stored order ID was written another way; it was rewritten in its own digits \
+         (audited as order_id_canonicalized)"
+    );
+    audit(
+        tx,
+        "order_id_canonicalized",
+        stored,
+        &serde_json::json!({
+            "account": account,
+            "order_id": canonical,
+            "merged": existing.is_some(),
+            "attempts": attempts,
+        }),
+    )
+}
+/// Set aside stored ID `id`, which names no broker order at all, so nothing
+/// real is given up: the order stored under it and its observed activity
+/// are dropped, a submission accepted under it goes back to being placed by
+/// its tag (keeping its reservation), and a reservation for a replacement
+/// of it no longer names one, which can only count more against the
+/// account. Audited as `order_id_set_aside` with what was stored.
+fn set_aside_order_id(tx: &rusqlite::Connection, account: &str, id: &str) -> Result<()> {
+    let order: Option<Value> = order_row(tx, account, id)?
+        .map(|(_, payload)| serde_json::from_str(&payload))
+        .transpose()?;
+    tx.execute(crate::execution::DELETE_ORDER, params![account, id])
+        .map_err(sql)?;
+    tx.execute(
+        crate::execution::DELETE_ORDER_EXECUTIONS,
+        params![account, id],
+    )
+    .map_err(sql)?;
+    let attempts = accepted_for_order(tx, account, id)?;
+    let unplaced =
+        serde_json::to_string(&crate::execution::SubmissionOutcome::Accepted { order_id: None })?;
+    for attempt in &attempts {
+        tx.execute(RESOLVE_SUBMISSION_OUTCOME, params![unplaced, attempt])
+            .map_err(sql)?;
+    }
+    tx.execute(FORGET_REPLACED_ORDER, params![account, id])
+        .map_err(sql)?;
+    tracing::error!(
+        order_id = ?id,
+        account = %crate::utils::mask_account(account),
+        attempts = attempts.len(),
+        "A stored order ID cannot name a broker order; it was set aside \
+         (audited as order_id_set_aside)"
+    );
+    audit(
+        tx,
+        "order_id_set_aside",
+        id,
+        &serde_json::json!({"account": account, "order": order, "attempts": attempts}),
+    )
+}
+/// When the baseline of a pass that began at `started_at` counts as
+/// observed, by a store whose clock reads `now` (both in ms since the
+/// epoch). A start ahead of this store's clock (a remote worker whose clock
+/// runs fast) would make the baseline look fresher than it is: up to
+/// [`MAX_CLOCK_LEAD_MS`] ahead it counts from now, and further ahead it is
+/// refused.
+fn baseline_observed_at(started_at: i64, now: i64) -> Result<i64> {
+    if started_at > now + MAX_CLOCK_LEAD_MS {
+        return Err(Error::Storage(
+            "Reconciliation started ahead of the state store's clock".into(),
+        ));
+    }
+    Ok(started_at.min(now))
 }
 /// Cut each held reservation down to what its working order can still fill.
 /// A partial fill is already out of the broker's available funds, so a
@@ -465,12 +858,32 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
     }
     Ok(shrunk)
 }
+/// Drop the placeholder for one broker order under each text it was stored
+/// as (`stored`, one ID written one or more ways); whether any was dropped.
+async fn forget_placeholders(
+    store: &dyn crate::execution::ExecutionStore,
+    account: &str,
+    stored: &[String],
+) -> Result<bool> {
+    let mut forgot = false;
+    for id in stored {
+        if store.forget_placeholder(account, id).await? {
+            forgot = true;
+        }
+    }
+    Ok(forgot)
+}
+/// The broker order ID an order payload's `orderId` holds, as a JSON
+/// string or a JSON number: one rule ([`is_broker_order_id`]) for both, so
+/// `"7"` and `7` name the same order and neither form reaches past
+/// `u64::MAX`.
 pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
-    value.and_then(|v| match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) if n.is_u64() => Some(n.to_string()),
-        _ => None,
-    })
+    let id = match value? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    is_broker_order_id(&id).then_some(id)
 }
 fn matches_request(request: &Value, order: &Value) -> bool {
     // Match explicit request fields recursively, tolerating broker-added fields
@@ -562,8 +975,15 @@ pub const SINCE_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DayTransfers {
     date: chrono::NaiveDate,
-    read_at: std::time::Instant,
+    read_at: tokio::time::Instant,
     net: rust_decimal::Decimal,
+}
+impl DayTransfers {
+    /// The net transfers read, while the reading is of trading day `today`
+    /// and younger than [`DAY_TRANSFERS_TTL`].
+    fn current(&self, today: chrono::NaiveDate) -> Option<rust_decimal::Decimal> {
+        (self.date == today && self.read_at.elapsed() < DAY_TRANSFERS_TTL).then_some(self.net)
+    }
 }
 /// How long a reading of the day's transfers is reused: they are rare, and
 /// each reading costs one request per transfer type.
@@ -604,11 +1024,8 @@ impl SchwabClient {
         let now = chrono::Utc::now();
         let today = crate::paper::feed::trading_date(now);
         let cached = self.day_transfers().lock().get(account).copied();
-        if let Some(cached) = cached
-            && cached.date == today
-            && cached.read_at.elapsed() < DAY_TRANSFERS_TTL
-        {
-            return Some(cached.net);
+        if let Some(net) = cached.and_then(|reading| reading.current(today)) {
+            return Some(net);
         }
         let read = async {
             let midnight = crate::paper::feed::trading_day_start(now);
@@ -628,7 +1045,7 @@ impl SchwabClient {
             account.to_owned(),
             DayTransfers {
                 date: today,
-                read_at: std::time::Instant::now(),
+                read_at: tokio::time::Instant::now(),
                 net,
             },
         );
@@ -684,21 +1101,21 @@ impl SchwabClient {
             let mut windows = vec![(from, started)];
             let mut orders = std::collections::BTreeMap::new();
             let mut pages = 0;
+            // Each turn reads one page and counts it against the budget, so
+            // the loop ends within the budget however its windows are cut.
             while let Some((from, to)) = windows.pop() {
-                // One day inside Schwab's 60-day order list horizon. A wider
-                // window is answered with what it holds, so splitting keeps
-                // each request's span meaningful rather than silently short.
-                if to - from > chrono::Duration::days(59) {
-                    let split = from + chrono::Duration::days(59);
-                    windows.push((split, to));
-                    windows.push((from, split));
-                    continue;
-                }
                 pages += 1;
                 if pages > options.max_pages {
                     return Err(Error::Storage(
                         "Reconciliation page budget exhausted".into(),
                     ));
+                }
+                // One day inside Schwab's 60-day order list horizon. A wider
+                // window is answered with what it holds, so the rest of it is
+                // read next rather than silently missed.
+                let end = to.min(from + chrono::Duration::days(59));
+                if end < to {
+                    windows.push((end, to));
                 }
                 let page: Vec<Value> = self
                     .request_with_query(
@@ -707,18 +1124,18 @@ impl SchwabClient {
                         &crate::client::account_path(account, "/orders")?,
                         &OrdersParams {
                             max_results: Some(3000),
-                            ..OrdersParams::new(from, to)
+                            ..OrdersParams::new(from, end)
                         },
                     )
                     .await?;
                 if page.len() >= 3000 {
-                    if (to - from).num_milliseconds() <= 1000 {
+                    if (end - from).num_milliseconds() <= 1000 {
                         return Err(Error::Storage(
                             "Order history remains truncated at minimum interval".into(),
                         ));
                     }
-                    let mid = from + (to - from) / 2;
-                    windows.push((mid, to));
+                    let mid = from + (end - from) / 2;
+                    windows.push((mid, end));
                     windows.push((from, mid));
                     continue;
                 }
@@ -729,22 +1146,32 @@ impl SchwabClient {
                 }
             }
             // A target the list just returned is already current; fetching it
-            // again would cost one request per working order per pass.
-            let targets: Vec<String> = database
-                .reconciliation_targets(account)
-                .await?
-                .into_iter()
-                .filter(|id| !orders.contains_key(id))
-                .collect();
+            // again would cost one request per working order per pass. This
+            // store holds only broker order IDs, but one that was never
+            // migrated (an authority on an earlier release, say) can return
+            // one written another way ("007"): it is read as the order it
+            // names (7), once however many ways it is stored. One that names
+            // no order at all has nothing to fetch.
+            let mut targets = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for stored in database.reconciliation_targets(account).await? {
+                match crate::execution::canonical_order_id(&stored) {
+                    Some(id) if !orders.contains_key(&id) => {
+                        targets.entry(id).or_default().push(stored);
+                    }
+                    Some(_) => {}
+                    None => tracing::warn!(
+                        order_id = ?stored,
+                        account = %crate::utils::mask_account(account),
+                        "A stored order ID cannot name a broker order; not fetched"
+                    ),
+                }
+            }
             if targets.len() > options.max_targeted_orders {
                 return Err(Error::Storage(
                     "Reconciliation targeted-order budget exhausted".into(),
                 ));
             }
-            for id in targets {
-                if !id.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
-                    return Err(Error::Storage("Invalid stored broker order ID".into()));
-                }
+            for (id, stored) in targets {
                 let order: Value = match self
                     .request(
                         Op::recovery("reconcile_order"),
@@ -755,11 +1182,12 @@ impl SchwabClient {
                 {
                     Ok(order) => order,
                     // The broker has no such order. That ends a reference
-                    // this store never saw answered; an order it did
-                    // observe vanishing still needs an operator.
+                    // this store never saw answered, whatever text it was
+                    // stored as; an order it did observe vanishing still
+                    // needs an operator.
                     Err(error)
                         if error.http_status() == Some(reqwest::StatusCode::NOT_FOUND)
-                            && database.forget_placeholder(account, &id).await? =>
+                            && forget_placeholders(database.as_ref(), account, &stored).await? =>
                     {
                         continue;
                     }
@@ -813,14 +1241,36 @@ impl SchwabClient {
                 .await
                 .unwrap_or_else(|_| Err(Error::Storage("Reconciliation deadline exceeded".into())));
         // A superseded pass wrote nothing and returned Ok: the newer state
-        // stands. A pass that could not finish invalidates the baseline,
-        // unless one that began after it has already replaced it.
-        if result.is_err()
-            && database.account_state(account).await?.is_none_or(|state| {
-                state.generation != generation || state.observed_at <= started.timestamp_millis()
-            })
-        {
-            database.invalidate_account(account, generation).await?;
+        // stands. A pass that could not finish judges the baseline it finds
+        // by that baseline's generation:
+        // - a newer generation's baseline is no business of this pass, and
+        //   stands;
+        // - a baseline of its own generation stands only if a pass that
+        //   began after this one took it, and is invalidated otherwise;
+        // - an older generation cannot be stored, since this pass raised the
+        //   account to its own when it began. One found anyway means that
+        //   assumption broke, so the baseline is invalidated, not trusted.
+        if result.is_err() {
+            let state = database.account_state(account).await?;
+            let stands = match &state {
+                Some(state) => match state.generation.cmp(&generation) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => state.observed_at > started.timestamp_millis(),
+                    Ordering::Less => false,
+                },
+                None => false,
+            };
+            if !stands {
+                database.invalidate_account(account, generation).await?;
+            }
+            // Only after invalidating: the assertion reports a broken
+            // assumption once the store has already failed closed.
+            let older = state.is_some_and(|state| state.generation < generation);
+            debug_assert!(
+                !older,
+                "a pass found its account's stored generation older than its own, \
+                 which it raised when it began"
+            );
         }
         result
     }
@@ -861,5 +1311,45 @@ mod tests {
             let in_sql = SELECT_TERMINAL_SUBMISSIONS.contains(&wire.replace('"', "'"));
             assert_eq!(in_sql, status.is_terminal(), "{status:?}");
         }
+    }
+
+    /// A baseline is never dated ahead of the store's clock: a pass that
+    /// began earlier keeps its start, one that began up to
+    /// `MAX_CLOCK_LEAD_MS` ahead counts from now, and one further ahead is
+    /// refused.
+    #[test]
+    fn a_baseline_is_dated_no_later_than_the_store_clock() {
+        let now = 1_764_000_000_000;
+        assert_eq!(baseline_observed_at(now - 1, now).unwrap(), now - 1);
+        assert_eq!(baseline_observed_at(now, now).unwrap(), now);
+        assert_eq!(baseline_observed_at(now + 1, now).unwrap(), now);
+        assert_eq!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS, now).unwrap(),
+            now
+        );
+        assert!(matches!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS + 1, now),
+            Err(Error::Storage(_))
+        ));
+    }
+
+    /// A reading of the day's transfers is reused while it is of the same
+    /// trading day and younger than `DAY_TRANSFERS_TTL`; at that age, or on
+    /// the next day, it is read again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfers_reading_is_current_for_its_ttl_on_its_own_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+        let reading = DayTransfers {
+            date: day,
+            read_at: tokio::time::Instant::now(),
+            net: 7.into(),
+        };
+        assert_eq!(reading.current(day), Some(7.into()));
+        assert_eq!(reading.current(day.succ_opt().unwrap()), None);
+        let just_under = DAY_TRANSFERS_TTL - std::time::Duration::from_millis(1);
+        tokio::time::advance(just_under).await;
+        assert_eq!(reading.current(day), Some(7.into()));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert_eq!(reading.current(day), None);
     }
 }
