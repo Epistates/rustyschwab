@@ -7,7 +7,7 @@ mod common;
 
 use common::mock_client;
 use rustyschwab::{
-    Error,
+    Error, SchwabClient,
     execution::{OrderJournal, SubmissionOutcome},
     reconciliation::{NEVER_DISPATCHED_AFTER, ReconciliationOptions, ReconciliationReport},
     risk::{PortfolioLimits, PortfolioRisk, RiskProvider},
@@ -895,52 +895,206 @@ impl Respond for HeldList {
     }
 }
 
-/// A pass that fails leaves a newer baseline standing: once a pass that
-/// began after it has committed, the account stays as that pass left it.
+/// A pass of `generation` over account "hash" held at its order-list
+/// request, which fails once let go: what a test does meanwhile happens
+/// while the pass is in flight.
+struct HeldPass {
+    pass: tokio::task::JoinHandle<rustyschwab::Result<ReconciliationReport>>,
+    /// When the pass began, in ms since the epoch.
+    started: i64,
+    release: std::sync::mpsc::Sender<()>,
+}
+impl HeldPass {
+    async fn start(server: &MockServer, client: &SchwabClient, generation: u64) -> Self {
+        let (arrived, mut started) = tokio::sync::mpsc::unbounded_channel();
+        let (release, held) = std::sync::mpsc::channel();
+        Mock::given(method("GET"))
+            .and(path("/trader/v1/accounts/hash/orders"))
+            .respond_with(HeldList {
+                arrived,
+                release: Mutex::new(held),
+                answer: ResponseTemplate::new(400),
+            })
+            .mount(server)
+            .await;
+        let mut pass = tokio::spawn({
+            let client = client.clone();
+            async move { client.reconcile_account("hash", generation).await }
+        });
+        let started = tokio::select! {
+            started = started.recv() => started.unwrap(),
+            ended = &mut pass => panic!("the pass ended before it listed orders: {ended:?}"),
+        };
+        Self {
+            pass,
+            started,
+            release,
+        }
+    }
+
+    /// Let the pass go, and how it ended.
+    async fn fail(
+        self,
+    ) -> Result<rustyschwab::Result<ReconciliationReport>, tokio::task::JoinError> {
+        self.release.send(()).unwrap();
+        self.pass.await
+    }
+}
+
+/// A reconciled baseline for account "hash" of `generation`, taken at
+/// `started_at`.
+async fn baseline_of(
+    client: &SchwabClient,
+    generation: u64,
+    started_at: i64,
+) -> ReconciliationReport {
+    let store = client.execution_store();
+    store.invalidate_account("hash", generation).await.unwrap();
+    let report = store
+        .reconcile_snapshot("hash", generation, started_at, funded(), vec![])
+        .await
+        .unwrap();
+    assert!(report.reconciled && !report.superseded, "{report:?}");
+    report
+}
+
+/// A pass that fails leaves its own generation's baseline standing when a
+/// pass that began after it has already replaced it: the account stays as
+/// that pass left it.
 #[tokio::test]
 async fn a_failed_pass_leaves_a_newer_baseline_standing() {
     let server = MockServer::start().await;
     let (client, _dir, _) = mock_client(&server, false);
-    let (arrived, mut started) = tokio::sync::mpsc::unbounded_channel();
-    let (release, held) = std::sync::mpsc::channel();
-    Mock::given(method("GET"))
-        .and(path("/trader/v1/accounts/hash/orders"))
-        .respond_with(HeldList {
-            arrived,
-            release: Mutex::new(held),
-            answer: ResponseTemplate::new(400),
-        })
-        .mount(&server)
-        .await;
-    let mut failing = tokio::spawn({
-        let client = client.clone();
-        async move { client.reconcile_account("hash", 1).await }
-    });
-    let started = tokio::select! {
-        started = started.recv() => started.unwrap(),
-        ended = &mut failing => panic!("the pass ended before it listed orders: {ended:?}"),
-    };
+    let held = HeldPass::start(&server, &client, 1).await;
     // The newer pass begins in a later millisecond than the held one: the
     // store dates baselines in milliseconds.
-    while chrono::Utc::now().timestamp_millis() <= started {
+    while chrono::Utc::now().timestamp_millis() <= held.started {
         tokio::task::yield_now().await;
     }
-    let store = client.execution_store();
-    let newer = store
-        .reconcile_snapshot(
-            "hash",
-            1,
-            chrono::Utc::now().timestamp_millis(),
-            funded(),
-            vec![],
-        )
-        .await
-        .unwrap();
-    assert!(newer.reconciled);
-    release.send(()).unwrap();
+    let newer = baseline_of(&client, 1, chrono::Utc::now().timestamp_millis()).await;
 
-    assert!(failing.await.unwrap().is_err());
-    let state = store.account_state("hash").await.unwrap().unwrap();
+    assert!(held.fail().await.unwrap().is_err());
+    let state = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap();
     assert!(state.reconciled);
     assert_eq!(state.observed_at, newer.started_at);
+}
+
+/// A pass that fails says nothing about a newer generation's baseline: one
+/// that a pass of a newer generation committed while it ran stands, even
+/// when that pass began before the failed one.
+#[tokio::test]
+async fn a_failed_pass_leaves_a_newer_generations_baseline_standing() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    baseline_of(&client, 1, chrono::Utc::now().timestamp_millis() - 10_000).await;
+    let held = HeldPass::start(&server, &client, 1).await;
+    let newer = baseline_of(&client, 2, held.started - 1000).await;
+
+    assert!(held.fail().await.unwrap().is_err());
+    let state = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.generation, 2);
+    assert!(state.reconciled);
+    assert_eq!(state.observed_at, newer.started_at);
+}
+
+/// Refuses every baseline it is shown, as a daily-loss control that trips
+/// does: the pass that wrote the baseline then fails.
+struct RefusesBaselines;
+#[async_trait::async_trait]
+impl RiskProvider for RefusesBaselines {
+    async fn reserve(&self, _: &str, _: &str, _: &OrderRequest) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+    async fn observe_baseline(&self, _: &str) -> rustyschwab::Result<()> {
+        Err(Error::Halted("refused for the test".into()))
+    }
+    async fn release(&self, _: &str) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+}
+
+/// A pass that fails invalidates its own generation's baseline when no
+/// later pass replaced it: one taken before the pass began, and one the
+/// pass itself wrote before a later step failed.
+#[tokio::test]
+async fn a_failed_pass_invalidates_its_own_generations_baseline() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    baseline_of(&client, 1, chrono::Utc::now().timestamp_millis()).await;
+    Mock::given(method("GET"))
+        .and(path("/trader/v1/accounts/hash/orders"))
+        .respond_with(ResponseTemplate::new(400))
+        .mount(&server)
+        .await;
+    assert!(client.reconcile_account("hash", 1).await.is_err());
+    let state = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.reconciled, "a baseline from before the pass stood");
+
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    let client = client
+        .with_risk_provider(std::sync::Arc::new(RefusesBaselines))
+        .unwrap();
+    mount_empty_account(&server).await;
+    let refused = client.reconcile_account("hash", 1).await.unwrap_err();
+    assert!(matches!(refused, Error::Halted(_)), "{refused:?}");
+    let state = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state.observed_at > 0, "the pass wrote its baseline");
+    assert!(!state.reconciled, "the failed pass's own baseline stood");
+}
+
+/// An account's stored generation never falls below a pass's own: the pass
+/// raised it to its own when it began. A store that breaks that rule anyway
+/// is not trusted: the failed pass invalidates the baseline it finds, and a
+/// debug build panics as well, so the broken assumption is seen.
+#[tokio::test]
+async fn a_failed_pass_fails_closed_on_an_older_stored_generation() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = mock_client(&server, false);
+    baseline_of(&client, 1, chrono::Utc::now().timestamp_millis() - 10_000).await;
+    let held = HeldPass::start(&server, &client, 1).await;
+    rusqlite::Connection::open(client.order_journal().path())
+        .unwrap()
+        .execute("UPDATE accounts SET generation=0 WHERE account='hash'", [])
+        .unwrap();
+
+    let ended = held.fail().await;
+    if cfg!(debug_assertions) {
+        let panic = ended.unwrap_err().into_panic();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("generation"), "{message}");
+    } else {
+        assert!(ended.unwrap().is_err());
+    }
+    let state = client
+        .execution_store()
+        .account_state("hash")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!state.reconciled, "a baseline of an older generation stood");
 }

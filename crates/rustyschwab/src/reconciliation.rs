@@ -9,6 +9,7 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 
 const INVALIDATE_ACCOUNT: &str = "INSERT INTO accounts VALUES(?1,?2,0,0,'{}') \
      ON CONFLICT(account) DO UPDATE SET valid=0,generation=MAX(generation,excluded.generation)";
@@ -824,14 +825,36 @@ impl SchwabClient {
                 .await
                 .unwrap_or_else(|_| Err(Error::Storage("Reconciliation deadline exceeded".into())));
         // A superseded pass wrote nothing and returned Ok: the newer state
-        // stands. A pass that could not finish invalidates the baseline,
-        // unless one that began after it has already replaced it.
-        if result.is_err()
-            && database.account_state(account).await?.is_none_or(|state| {
-                state.generation != generation || state.observed_at <= started.timestamp_millis()
-            })
-        {
-            database.invalidate_account(account, generation).await?;
+        // stands. A pass that could not finish judges the baseline it finds
+        // by that baseline's generation:
+        // - a newer generation's baseline is no business of this pass, and
+        //   stands;
+        // - a baseline of its own generation stands only if a pass that
+        //   began after this one took it, and is invalidated otherwise;
+        // - an older generation cannot be stored, since this pass raised the
+        //   account to its own when it began. One found anyway means that
+        //   assumption broke, so the baseline is invalidated, not trusted.
+        if result.is_err() {
+            let state = database.account_state(account).await?;
+            let stands = match &state {
+                Some(state) => match state.generation.cmp(&generation) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => state.observed_at > started.timestamp_millis(),
+                    Ordering::Less => false,
+                },
+                None => false,
+            };
+            if !stands {
+                database.invalidate_account(account, generation).await?;
+            }
+            // Only after invalidating: the assertion reports a broken
+            // assumption once the store has already failed closed.
+            let stored = state.map(|state| state.generation);
+            debug_assert!(
+                stored.is_none_or(|stored| stored >= generation),
+                "the account's stored generation {stored:?} is older than the generation \
+                 {generation} of a pass that raised it when it began"
+            );
         }
         result
     }

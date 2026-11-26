@@ -423,6 +423,13 @@ one. Signatures are unchanged.
   trader had read that error as a definite refusal, recorded the order as
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
+- A reconciliation pass that failed could leave an account unready right
+  after a pass of a newer generation had reconciled it: the failed pass
+  invalidated the baseline whenever its stored generation differed from
+  its own, so orders were refused until the next pass. A failed pass now
+  leaves a newer generation's baseline standing. It still invalidates a
+  baseline of its own generation, unless a pass that began after it took
+  that baseline.
 
 ### Changed — typed errors from the order builders
 
