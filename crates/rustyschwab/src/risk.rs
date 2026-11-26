@@ -791,7 +791,9 @@ impl RiskProvider for PortfolioRisk {
 
 /// Conservative exposure for broker orders not covered by local holds:
 /// what their unfilled remainder could still buy or sell. A working option
-/// strategy counts the unfilled share of its defined risk.
+/// strategy counts the unfilled share of its defined risk. An order for no
+/// shares or no units cannot be bounded: no order the SDK sends is one
+/// (`validate` refuses it), so its figures are not to be trusted.
 fn external_exposure(
     order: &serde_json::Value,
     multipliers: &HashMap<String, Decimal>,
@@ -849,7 +851,7 @@ fn external_exposure(
         .or_else(|| total.checked_sub(filled))
         .ok_or_else(deny)?;
     let price = decimal(order.get("price")).ok_or_else(deny)?;
-    if total < Decimal::ZERO
+    if total <= Decimal::ZERO
         || filled < Decimal::ZERO
         || filled > total
         || remaining < Decimal::ZERO
