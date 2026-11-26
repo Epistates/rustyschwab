@@ -816,11 +816,14 @@ async fn a_failed_pass_leaves_a_newer_baseline_standing() {
         })
         .mount(&server)
         .await;
-    let failing = tokio::spawn({
+    let mut failing = tokio::spawn({
         let client = client.clone();
         async move { client.reconcile_account("hash", 1).await }
     });
-    let started = started.recv().await.unwrap();
+    let started = tokio::select! {
+        started = started.recv() => started.unwrap(),
+        ended = &mut failing => panic!("the pass ended before it listed orders: {ended:?}"),
+    };
     // The newer pass begins in a later millisecond than the held one: the
     // store dates baselines in milliseconds.
     while chrono::Utc::now().timestamp_millis() <= started {
