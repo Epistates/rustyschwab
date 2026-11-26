@@ -927,6 +927,66 @@ async fn a_replacement_does_not_count_the_order_it_replaces() {
     risk.revalidate("A", "moved", &moved).await.unwrap();
 }
 
+/// A risk provider that judges nothing and keeps each reservation it is
+/// asked for: `(account, attempt, order)`.
+#[derive(Default)]
+struct Reservations(std::sync::Mutex<Vec<(String, String, OrderRequest)>>);
+
+#[async_trait::async_trait]
+impl RiskProvider for Reservations {
+    async fn reserve(
+        &self,
+        account: &str,
+        attempt_id: &str,
+        order: &OrderRequest,
+    ) -> rustyschwab::Result<()> {
+        let reserved = (account.to_owned(), attempt_id.to_owned(), order.clone());
+        self.0.lock().unwrap().push(reserved);
+        Ok(())
+    }
+    async fn release(&self, _: &str) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+}
+
+/// A provider that cannot tell a replacement apart from the order it
+/// replaces reserves it as a new order: the trait's default reserves it
+/// through `reserve`, which counts both and so only over-reserves.
+#[tokio::test]
+async fn a_provider_reserves_a_replacement_as_a_new_order_by_default() {
+    let provider = Reservations::default();
+    let moved = order("SELL", "AAPL", 100, "135");
+    provider
+        .reserve_replacement("A", "moved", &moved, "9")
+        .await
+        .unwrap();
+    assert_eq!(
+        *provider.0.lock().unwrap(),
+        vec![("A".to_owned(), "moved".to_owned(), moved)]
+    );
+}
+
+/// Reading the day's cash transfers costs reconciliation a request per
+/// transfer type, and only the daily-loss control needs them: the built-in
+/// provider asks for them for an account whose policy has a daily-loss
+/// cap, and for no other account, one without a policy included.
+#[test]
+fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let capped = PortfolioLimits {
+        max_daily_loss: Some(500.into()),
+        ..limits()
+    };
+    let risk = PortfolioRisk {
+        database: journal.database().clone(),
+        accounts: HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
+    };
+    assert!(risk.needs_day_transfers("capped"));
+    assert!(!risk.needs_day_transfers("uncapped"));
+    assert!(!risk.needs_day_transfers("unknown"));
+}
+
 /// The built-in provider bounds an equity order by its limit price, so it
 /// judges LIMIT and STOP_LIMIT orders only: a market or stop order has no
 /// price to bound it, and a trailing stop limit's price moves with the
@@ -1858,11 +1918,12 @@ fn unbounded(result: &rustyschwab::Result<()>) -> bool {
 }
 
 /// A working order at the broker counts what its unfilled remainder could
-/// still buy or sell, nothing once it is filled in full. One the provider
-/// cannot bound stops every order on the account, even a sell of another
-/// symbol: one with no status, that is not a single order, that no limit
-/// price bounds, with no legs or a leg that is not a long equity buy or
-/// sell, without a positive price, or whose figures do not hold together.
+/// still buy or sell: nothing once it is filled in full, or when it is for
+/// no shares at all. One the provider cannot bound stops every order on
+/// the account, even a sell of another symbol: one with no status, that
+/// is not a single order, that no limit price bounds, with no legs or a
+/// leg that is not a long equity buy or sell, without a positive price,
+/// or whose figures do not hold together.
 /// Each figure is checked on its own, so a negative quantity is refused
 /// even where it is too small to change a sum of very large ones.
 #[tokio::test]
@@ -1914,6 +1975,7 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
         json!({"orderType": "STOP_LIMIT", "stopPrice": 9}),
         json!({"filledQuantity": 2, "remainingQuantity": null}),
         json!({"filledQuantity": 5, "remainingQuantity": 0}),
+        json!({"quantity": 0, "remainingQuantity": 0}),
     ]
     .into_iter()
     .enumerate()
