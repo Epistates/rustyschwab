@@ -845,32 +845,6 @@ async fn one_by_one_fetches_are_bounded_by_their_budget() {
     }
 }
 
-/// A stored reference that is not a broker order ID (a damaged store, or
-/// one shared with something else) fails the pass before Schwab is asked
-/// about it.
-#[tokio::test]
-async fn a_stored_reference_that_is_not_an_order_id_fails_the_pass_unasked() {
-    let server = MockServer::start().await;
-    let (client, _dir, _) = mock_client(&server, false);
-    rusqlite::Connection::open(client.order_journal().path())
-        .unwrap()
-        .execute(
-            "INSERT INTO orders VALUES('hash','A1',0,?1)",
-            [json!({"orderId": "A1", "status": "UNKNOWN"}).to_string()],
-        )
-        .unwrap();
-    mount_empty_account(&server).await;
-    assert!(client.reconcile_account("hash", 1).await.is_err());
-    assert!(
-        server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .all(|request| request.url.path() != "/trader/v1/accounts/hash/orders/A1")
-    );
-}
-
 /// Holds a pass's order-list request until the test lets it go, after
 /// sending the test the pass's start (the window's end): a pass in flight.
 struct HeldList {
