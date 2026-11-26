@@ -646,7 +646,8 @@ impl ValidationFinding {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct OrderSubmitResponse {
-    /// Order ID parsed from the `Location` header's last path segment.
+    /// Order ID parsed from the `Location` header's last path segment;
+    /// `None` when that segment is not a whole number.
     pub order_id: Option<String>,
     /// Full `Location` header value, when present.
     pub location: Option<String>,

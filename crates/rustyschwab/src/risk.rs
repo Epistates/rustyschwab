@@ -2,7 +2,7 @@
 use crate::{
     coordination::{Lease, lease_held},
     error::{Error, Result},
-    execution::{ensure_not_halted, trip_halt},
+    execution::{ensure_not_halted, is_broker_order_id, trip_halt},
     storage::{StateDatabase, sql},
     types::{
         common::AssetType,
@@ -315,6 +315,18 @@ impl PortfolioRisk {
         check: Check,
     ) -> Result<()> {
         order.validate()?;
+        if let Check::Reserve {
+            replaces: Some(replaces),
+        }
+        | Check::DryRun {
+            replaces: Some(replaces),
+        } = &check
+            && !is_broker_order_id(replaces)
+        {
+            return Err(Error::InvalidParameter(
+                "A replacement must name the order it replaces by its broker order ID".into(),
+            ));
+        }
         let limits = self
             .accounts
             .get(account)

@@ -238,6 +238,28 @@ one. Signatures are unchanged.
 
 ### Fixed
 
+- An order ID that isn't a whole number could leave an account unable to
+  trade until its state file was edited by hand. `record_order` (used by
+  `replace_order` and by the authority's `RecordOrder` request) and a
+  reconciliation pass stored an order under any string ID, such as `"abc"`,
+  `"-5"` or `""`. Every later pass then failed with "Invalid stored broker
+  order ID", so the account stayed unreconciled and refused orders.
+  - A broker order ID is now a whole number wherever one comes in, under one
+    rule, `rustyschwab::execution::is_broker_order_id`: `record_order`,
+    `track_order`, `finish` with an accepted order ID, a pass's order list,
+    the order a `PortfolioRisk` replacement replaces, and the order ID given
+    to `get_order`, `cancel_order` and `replace_order`. These refuse
+    anything else as `InvalidParameter`, before any request is sent.
+  - An order whose `Location` header doesn't end in a whole number is
+    recorded as accepted without an order ID, and reconciliation places it
+    by its tag.
+  - A state file that already holds such an ID needs no edit. The next pass
+    sets each one aside: it drops the order stored under it, returns a
+    submission accepted under it to placement by its tag, audits it as
+    `order_id_set_aside` with what was stored, logs it as an error, and lists
+    it in `ReconciliationReport::set_aside_order_ids`. No broker order has
+    such an ID, so nothing real is given up.
+
 - Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
   0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0
   requires TurboMCP `=4.0.0-alpha.5`, and that release's WebSocket

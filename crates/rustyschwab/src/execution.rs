@@ -78,10 +78,10 @@ const SELECT_PRUNABLE_ORDERS: &str = "SELECT account,order_id FROM orders WHERE 
      AND NOT EXISTS(SELECT 1 FROM reservations r JOIN submissions s ON s.id=r.id \
        WHERE r.state='held' AND s.account=orders.account \
          AND json_extract(s.outcome,'$.order_id')=orders.order_id)";
-const DELETE_ORDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2";
+pub(crate) const DELETE_ORDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2";
 /// An order's observed activities are keyed `{order_id}:{digest}`; `;`
 /// sorts right after `:`, so this is exactly that order's range.
-const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
+pub(crate) const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
      AND execution_id>=?2 || ':' AND execution_id<?2 || ';'";
 /// Released reservations whose submission is pruned or resolved before `?1`.
 const PRUNE_RELEASED_RESERVATIONS: &str = "DELETE FROM reservations WHERE state='released' \
@@ -104,7 +104,7 @@ const PRUNE_RESOLVED_SUBMISSIONS: &str = "DELETE FROM submissions \
                IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')))";
 /// Open broker orders plus accepted submissions whose order is not yet known
 /// to be terminal.
-const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
+pub(crate) const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
      WHERE account=?1 AND COALESCE(json_extract(payload,'$.status'),'UNKNOWN') \
        NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') \
      UNION \
@@ -115,6 +115,14 @@ const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
            AND json_extract(o.payload,'$.status') \
              IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))";
 const OPERATOR_HALT_KEY: &str = "operator_halt";
+
+/// Whether `id` can name a broker order. Schwab's order IDs, and the paper
+/// venue's, are whole numbers, written as a non-empty run of ASCII digits.
+/// The journal stores, reconciliation follows and the client sends no
+/// other.
+pub fn is_broker_order_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Admission check shared by every dispatch path, live and paper: fail closed
 /// while an operator halt is recorded in the same state file.
@@ -365,13 +373,23 @@ impl OrderJournal {
     /// found is counted from the broker's own order list. `Accepted` also
     /// succeeds when reconciliation already accepted the submission under
     /// the same order ID (or this call has none), and `Rejected` when
-    /// recovery already resolved it as never dispatched.
+    /// recovery already resolved it as never dispatched. An `Accepted`
+    /// order ID must be a broker order ID ([`is_broker_order_id`]).
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
             && evidence.trim().is_empty()
         {
             return Err(Error::InvalidParameter(
                 "Reconciliation evidence is required".into(),
+            ));
+        }
+        if let SubmissionOutcome::Accepted {
+            order_id: Some(order_id),
+        } = &outcome
+            && !is_broker_order_id(order_id)
+        {
+            return Err(Error::InvalidParameter(
+                "Numeric broker order ID required".into(),
             ));
         }
         let id = id.to_owned();
@@ -1208,9 +1226,13 @@ pub trait ExecutionStore: Send + Sync {
         self.pending_count().await
     }
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>>;
+    /// Keep a reference to broker order `order_id` for reconciliation to
+    /// read; refused unless it is a broker order ID ([`is_broker_order_id`]).
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
     /// Store the broker's current view of one order (its payload as
     /// `GET .../orders/{id}` returns it), as a reconciliation pass would.
+    /// Refused unless its `orderId` is a broker order ID: a string of
+    /// digits or a non-negative whole number.
     async fn record_order(&self, account: &str, order: serde_json::Value) -> Result<()>;
     async fn operator_halt(&self) -> Result<Option<String>>;
     async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()>;
@@ -1230,7 +1252,7 @@ impl ExecutionStore for OrderJournal {
             .await
     }
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()> {
-        if order_id.is_empty() || !order_id.bytes().all(|b| b.is_ascii_digit()) {
+        if !is_broker_order_id(order_id) {
             return Err(Error::InvalidParameter(
                 "Numeric broker order ID required".into(),
             ));

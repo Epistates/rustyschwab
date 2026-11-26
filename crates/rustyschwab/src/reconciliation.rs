@@ -3,6 +3,7 @@ use crate::{
     SchwabClient,
     client::Op,
     error::{Error, Result},
+    execution::is_broker_order_id,
     storage::{StateDatabase, audit, sql},
     types::trading::OrdersParams,
 };
@@ -70,6 +71,11 @@ const SELECT_LINKED_HELD_RESERVATIONS: &str = "SELECT r.id,r.quantity,r.notional
      WHERE r.state='held' AND s.account=?1";
 const SHRINK_HELD_RESERVATION: &str =
     "UPDATE reservations SET quantity=?1,notional=?2 WHERE id=?3 AND state='held'";
+const SELECT_ORDER_PAYLOAD: &str = "SELECT payload FROM orders WHERE account=?1 AND order_id=?2";
+/// Accepted submissions on `?1` that name broker order `?2`.
+const SELECT_ACCEPTED_FOR_ORDER: &str = "SELECT id FROM submissions WHERE account=?1 \
+     AND json_extract(outcome,'$.status')='accepted' AND json_extract(outcome,'$.order_id')=?2 \
+     ORDER BY created_at,id";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -101,6 +107,12 @@ pub struct ReconciliationReport {
     /// [`NEVER_DISPATCHED_AFTER`]).
     #[serde(default)]
     pub never_dispatched_attempts: Vec<String>,
+    /// Stored order IDs this pass set aside because they cannot name a
+    /// broker order ([`is_broker_order_id`]); an earlier release could store
+    /// them. Each is audited as `order_id_set_aside` with what was stored
+    /// under it.
+    #[serde(default)]
+    pub set_aside_order_ids: Vec<String>,
     /// A newer pass or invalidation committed first, so this one wrote
     /// nothing; the stored account state is the newer one's.
     #[serde(default)]
@@ -213,12 +225,14 @@ impl StateDatabase {
                 reconciled: false,
                 terminal_attempts: vec![],
                 never_dispatched_attempts: vec![],
+                set_aside_order_ids: vec![],
                 superseded: false,
             };
             if current.is_some_and(|(g, at, _)| g != generation as i64 || at > started_at) {
                 report.superseded = true;
                 return Ok(report);
             }
+            report.set_aside_order_ids = set_aside_unusable_order_ids(&tx, &account)?;
             for order in &orders {
                 persist_order(
                     &tx,
@@ -370,6 +384,7 @@ impl StateDatabase {
             let changed = !report.resolved_attempts.is_empty()
                 || !report.terminal_attempts.is_empty()
                 || !report.never_dispatched_attempts.is_empty()
+                || !report.set_aside_order_ids.is_empty()
                 || report.newly_observed_activities > 0
                 || orphaned > 0
                 || shrunk > 0
@@ -394,6 +409,74 @@ impl StateDatabase {
         })
         .await
     }
+}
+/// Set aside each order ID the account's reconciliation would follow that
+/// cannot name a broker order ([`is_broker_order_id`]). An earlier release
+/// could store one, and every pass that tried to read it failed. No broker
+/// order has such an ID, so nothing real is given up: the order stored
+/// under it and its observed activity are dropped, a submission accepted
+/// under it goes back to being placed by its tag (keeping its reservation),
+/// and each ID is audited as `order_id_set_aside` with what was stored.
+/// Returns the IDs, in order.
+fn set_aside_unusable_order_ids(
+    tx: &rusqlite::Transaction<'_>,
+    account: &str,
+) -> Result<Vec<String>> {
+    let mut unusable: Vec<String> = {
+        let mut stmt = tx
+            .prepare(crate::execution::SELECT_RECONCILIATION_TARGETS)
+            .map_err(sql)?;
+        stmt.query_map([account], |r| r.get(0))
+            .map_err(sql)?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(sql)?
+    };
+    unusable.retain(|id| !is_broker_order_id(id));
+    unusable.sort();
+    let unplaced =
+        serde_json::to_string(&crate::execution::SubmissionOutcome::Accepted { order_id: None })?;
+    for id in &unusable {
+        let order: Option<Value> = tx
+            .query_row(SELECT_ORDER_PAYLOAD, params![account, id], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(sql)?
+            .map(|payload| serde_json::from_str(&payload))
+            .transpose()?;
+        tx.execute(crate::execution::DELETE_ORDER, params![account, id])
+            .map_err(sql)?;
+        tx.execute(
+            crate::execution::DELETE_ORDER_EXECUTIONS,
+            params![account, id],
+        )
+        .map_err(sql)?;
+        let attempts: Vec<String> = {
+            let mut stmt = tx.prepare(SELECT_ACCEPTED_FOR_ORDER).map_err(sql)?;
+            stmt.query_map(params![account, id], |r| r.get(0))
+                .map_err(sql)?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(sql)?
+        };
+        for attempt in &attempts {
+            tx.execute(RESOLVE_SUBMISSION_OUTCOME, params![unplaced, attempt])
+                .map_err(sql)?;
+        }
+        tracing::error!(
+            order_id = ?id,
+            account = %crate::utils::mask_account(account),
+            attempts = attempts.len(),
+            "A stored order ID cannot name a broker order; reconciliation set it aside \
+             (audited as order_id_set_aside)"
+        );
+        audit(
+            tx,
+            "order_id_set_aside",
+            id,
+            &serde_json::json!({"account": account, "order": order, "attempts": attempts}),
+        )?;
+    }
+    Ok(unusable)
 }
 /// Cut each held reservation down to what its working order can still fill.
 /// A partial fill is already out of the broker's available funds, so a
@@ -465,9 +548,11 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
     }
     Ok(shrunk)
 }
+/// The broker order ID an order payload's `orderId` holds: a string of
+/// digits ([`is_broker_order_id`]) or a non-negative whole number.
 pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
     value.and_then(|v| match v {
-        Value::String(s) => Some(s.clone()),
+        Value::String(s) if is_broker_order_id(s) => Some(s.clone()),
         Value::Number(n) if n.is_u64() => Some(n.to_string()),
         _ => None,
     })
@@ -729,22 +814,27 @@ impl SchwabClient {
                 }
             }
             // A target the list just returned is already current; fetching it
-            // again would cost one request per working order per pass.
-            let targets: Vec<String> = database
-                .reconciliation_targets(account)
-                .await?
-                .into_iter()
-                .filter(|id| !orders.contains_key(id))
-                .collect();
+            // again would cost one request per working order per pass. An ID
+            // that cannot name a broker order has nothing to fetch, and the
+            // snapshot this pass writes sets it aside.
+            let mut targets = Vec::new();
+            for id in database.reconciliation_targets(account).await? {
+                if !is_broker_order_id(&id) {
+                    tracing::warn!(
+                        order_id = ?id,
+                        account = %crate::utils::mask_account(account),
+                        "A stored order ID cannot name a broker order; not fetched"
+                    );
+                } else if !orders.contains_key(&id) {
+                    targets.push(id);
+                }
+            }
             if targets.len() > options.max_targeted_orders {
                 return Err(Error::Storage(
                     "Reconciliation targeted-order budget exhausted".into(),
                 ));
             }
             for id in targets {
-                if !id.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
-                    return Err(Error::Storage("Invalid stored broker order ID".into()));
-                }
                 let order: Value = match self
                     .request(
                         Op::recovery("reconcile_order"),

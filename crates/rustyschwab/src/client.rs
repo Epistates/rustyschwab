@@ -1438,19 +1438,26 @@ pub(crate) fn account_path(account_hash: &str, suffix: &str) -> Result<String> {
 }
 
 /// Build a `/trader/v1/accounts/{account_hash}/orders/{order_id}` path.
+/// `order_id` must be a broker order ID
+/// ([`is_broker_order_id`](crate::execution::is_broker_order_id)).
 pub(crate) fn order_path(account_hash: &str, order_id: &str) -> Result<String> {
-    path_segment("order_id", order_id)?;
+    if !crate::execution::is_broker_order_id(order_id) {
+        return Err(Error::InvalidParameter(
+            "order_id must be a Schwab order ID, a whole number".into(),
+        ));
+    }
     account_path(account_hash, &format!("/orders/{order_id}"))
 }
 
-/// Extract the order ID from a `Location` header value — the last
-/// non-empty path segment of the order resource URL.
+/// The order ID a `Location` header value names: the last non-empty path
+/// segment of the order resource URL, when it is a broker order ID
+/// ([`is_broker_order_id`](crate::execution::is_broker_order_id)).
 fn order_id_from_location(location: &str) -> Option<String> {
     location
         .trim_end_matches('/')
         .rsplit('/')
         .next()
-        .filter(|s| !s.is_empty())
+        .filter(|s| crate::execution::is_broker_order_id(s))
         .map(str::to_string)
 }
 
@@ -1549,8 +1556,12 @@ mod tests {
             order_path("hash", "123456").unwrap(),
             "/trader/v1/accounts/hash/orders/123456"
         );
-        assert!(order_path("hash", "").is_err());
-        assert!(order_path("hash", "1/2").is_err());
+        for not_an_order_id in ["", "1/2", "abc", "-5", "7.0"] {
+            assert!(
+                order_path("hash", not_an_order_id).is_err(),
+                "{not_an_order_id:?}"
+            );
+        }
         assert!(order_path("", "1").is_err());
     }
 
@@ -1578,5 +1589,11 @@ mod tests {
             Some("456789".to_string())
         );
         assert_eq!(super::order_id_from_location(""), None);
+        assert_eq!(
+            super::order_id_from_location(
+                "https://api.schwabapi.com/trader/v1/accounts/ABC123/orders/abc"
+            ),
+            None
+        );
     }
 }
