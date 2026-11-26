@@ -60,6 +60,38 @@ fn funded() -> Value {
     json!({"securitiesAccount": {"currentBalances": {"availableFunds": "1000"}, "positions": []}})
 }
 
+/// Two calls on one underlying and one expiration, a vertical's legs.
+const C100: &str = "XYZ   260116C00100000";
+const C105: &str = "XYZ   260116C00105000";
+
+/// An option strategy priced `kind` at `price`, with legs of
+/// `(instruction, symbol, quantity)`.
+fn strategy(kind: &str, price: &str, legs: &[(&str, &str, u32)]) -> OrderRequest {
+    let legs: Vec<Value> = legs
+        .iter()
+        .map(|(instruction, symbol, quantity)| {
+            json!({"instruction": instruction, "quantity": quantity,
+                "instrument": {"symbol": symbol, "assetType": "OPTION"}})
+        })
+        .collect();
+    serde_json::from_value(json!({"orderStrategyType": "SINGLE", "orderType": kind,
+        "session": "NORMAL", "duration": "DAY", "price": price,
+        "orderLegCollection": legs}))
+    .unwrap()
+}
+
+/// Limits that know both legs' contract multipliers (100), so a vertical
+/// on them can be bounded.
+fn verified() -> PortfolioLimits {
+    PortfolioLimits {
+        option_multipliers: HashMap::from([
+            (C100.to_owned(), 100.into()),
+            (C105.to_owned(), 100.into()),
+        ]),
+        ..limits()
+    }
+}
+
 fn age_submissions(journal: &OrderJournal, by: Duration) {
     let connection = rusqlite::Connection::open(journal.path()).unwrap();
     connection
@@ -1174,21 +1206,6 @@ async fn intents_awaiting_approval_are_recorded_with_their_state() {
 /// has not verified, is refused.
 #[tokio::test]
 async fn option_strategies_reserve_their_defined_risk() {
-    const C100: &str = "XYZ   260116C00100000";
-    const C105: &str = "XYZ   260116C00105000";
-    fn strategy(kind: &str, price: &str, legs: &[(&str, &str, u32)]) -> OrderRequest {
-        let legs: Vec<Value> = legs
-            .iter()
-            .map(|(instruction, symbol, quantity)| {
-                json!({"instruction": instruction, "quantity": quantity,
-                    "instrument": {"symbol": symbol, "assetType": "OPTION"}})
-            })
-            .collect();
-        serde_json::from_value(json!({"orderStrategyType": "SINGLE", "orderType": kind,
-            "session": "NORMAL", "duration": "DAY", "price": price,
-            "orderLegCollection": legs}))
-        .unwrap()
-    }
     let dir = tempfile::tempdir().unwrap();
     let journal = OrderJournal::new(dir.path().join("orders.json"));
     // Two units of a 2.00 debit vertical, one filled: 200 still at risk.
@@ -1206,13 +1223,6 @@ async fn option_strategies_reserve_their_defined_risk() {
         vec![working],
     )
     .await;
-    let verified = PortfolioLimits {
-        option_multipliers: HashMap::from([
-            (C100.to_owned(), 100.into()),
-            (C105.to_owned(), 100.into()),
-        ]),
-        ..limits()
-    };
     let debit = |units| {
         strategy(
             "NET_DEBIT",
@@ -1231,7 +1241,7 @@ async fn option_strategies_reserve_their_defined_risk() {
         Err(rustyschwab::Error::RiskDenied(_))
     ));
 
-    let risk = risk(&journal, verified);
+    let risk = risk(&journal, verified());
     // 200 working + 600 + 200 = the 1000 of funds; one more unit is 1200.
     risk.reserve("A", "three", &debit(3)).await.unwrap();
     risk.reserve("A", "one", &debit(1)).await.unwrap();
