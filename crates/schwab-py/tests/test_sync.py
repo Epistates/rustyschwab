@@ -457,11 +457,18 @@ def test_recv_timeouts_lose_no_message(
         next_of_type(stream, "state")
         stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
         frames = 300
+        # A read times out only when nothing is queued, and on a fast machine
+        # the consumer may never find the queue empty. After every ten frames
+        # the producer waits for a read to time out, so reads time out all
+        # through the stream.
+        timed_out = threading.Event()
 
         def produce() -> None:
             for number in range(frames):
                 streamer.push(level_one(**{"1": number}))
-                time.sleep(0.001)
+                if number % 10 == 0:
+                    timed_out.clear()
+                    timed_out.wait(20)
 
         producer = threading.Thread(target=produce)
         producer.start()
@@ -473,6 +480,7 @@ def test_recv_timeouts_lose_no_message(
                 message = stream.recv(0.001)
             except TimeoutError:
                 timeouts += 1
+                timed_out.set()
                 continue
             assert message is not None
             if message["type"] == "data":
