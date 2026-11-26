@@ -60,6 +60,38 @@ fn funded() -> Value {
     json!({"securitiesAccount": {"currentBalances": {"availableFunds": "1000"}, "positions": []}})
 }
 
+/// Two calls on one underlying and one expiration, a vertical's legs.
+const C100: &str = "XYZ   260116C00100000";
+const C105: &str = "XYZ   260116C00105000";
+
+/// An option strategy priced `kind` at `price`, with legs of
+/// `(instruction, symbol, quantity)`.
+fn strategy(kind: &str, price: &str, legs: &[(&str, &str, u32)]) -> OrderRequest {
+    let legs: Vec<Value> = legs
+        .iter()
+        .map(|(instruction, symbol, quantity)| {
+            json!({"instruction": instruction, "quantity": quantity,
+                "instrument": {"symbol": symbol, "assetType": "OPTION"}})
+        })
+        .collect();
+    serde_json::from_value(json!({"orderStrategyType": "SINGLE", "orderType": kind,
+        "session": "NORMAL", "duration": "DAY", "price": price,
+        "orderLegCollection": legs}))
+    .unwrap()
+}
+
+/// Limits that know both legs' contract multipliers (100), so a vertical
+/// on them can be bounded.
+fn verified() -> PortfolioLimits {
+    PortfolioLimits {
+        option_multipliers: HashMap::from([
+            (C100.to_owned(), 100.into()),
+            (C105.to_owned(), 100.into()),
+        ]),
+        ..limits()
+    }
+}
+
 fn age_submissions(journal: &OrderJournal, by: Duration) {
     let connection = rusqlite::Connection::open(journal.path()).unwrap();
     connection
@@ -428,6 +460,100 @@ async fn an_operator_releases_a_reservation_only_for_a_resolved_submission() {
     );
 }
 
+/// A refusal or an operator's resolution frees the reservation held for
+/// the intent and audits the release as `risk_released`; an acceptance
+/// keeps it, and an intent that holds none releases nothing and audits no
+/// release.
+#[tokio::test]
+async fn a_resolution_audits_the_release_of_the_reservation_it_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let buy = order("BUY", "AAPL", 1, "10");
+    let resolve = |reserved: bool, outcome: SubmissionOutcome| {
+        let (journal, risk, buy) = (&journal, &risk, &buy);
+        async move {
+            let id = journal
+                .begin("A", "place_order", serde_json::to_value(buy).unwrap())
+                .await
+                .unwrap();
+            if reserved {
+                risk.reserve("A", &id, buy).await.unwrap();
+            }
+            journal.finish(&id, outcome).await.unwrap();
+            id
+        }
+    };
+    let refused = resolve(true, SubmissionOutcome::Rejected).await;
+    resolve(false, SubmissionOutcome::Rejected).await;
+    let accepted = SubmissionOutcome::Accepted {
+        order_id: Some("42".into()),
+    };
+    resolve(true, accepted).await;
+    let evidence = "broker shows no such order".into();
+    let settled = resolve(true, SubmissionOutcome::Reconciled { evidence }).await;
+    let released: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "risk_released")
+        .map(|e| e.subject)
+        .collect();
+    assert_eq!(released, vec![refused, settled]);
+}
+
+/// A dispatcher that comes back late to an intent recovery already
+/// resolved as never sent may still report it refused: the same answer is
+/// not a conflict. Any other answer for it is.
+#[tokio::test]
+async fn a_late_refusal_of_an_intent_recovery_resolved_is_not_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let id = journal
+        .begin("A", "place_order", json!({"tag": "t1"}))
+        .await
+        .unwrap();
+    age_submissions(&journal, Duration::from_secs(11 * 60));
+    let report = journal
+        .database()
+        .reconcile_snapshot(
+            "A",
+            1,
+            chrono::Utc::now().timestamp_millis(),
+            funded(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.never_dispatched_attempts, vec![id.clone()]);
+    journal
+        .finish(&id, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    for (case, outcome) in [
+        SubmissionOutcome::Accepted {
+            order_id: Some("42".into()),
+        },
+        SubmissionOutcome::Accepted { order_id: None },
+        SubmissionOutcome::Reconciled {
+            evidence: "broker shows order 42".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                journal.finish(&id, outcome).await,
+                Err(rustyschwab::Error::Duplicate(_))
+            ),
+            "case {case}"
+        );
+    }
+}
+
 /// A cash account has `cashAvailableForTrading`, not `availableFunds`:
 /// it can buy within its cash and sell what it holds.
 #[tokio::test]
@@ -620,6 +746,158 @@ async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
     risk.reserve("A", "fresh", &buy).await.unwrap();
 }
 
+/// A policy whose caps are not positive, whose baseline age is outside 1
+/// to 60000 milliseconds, or whose daily-loss cap is not positive is a
+/// misconfiguration: any one of them refuses every order on the account
+/// as `Config`, a sell of what it holds included.
+#[tokio::test]
+async fn a_policy_with_any_limit_out_of_range_refuses_every_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![],
+    )
+    .await;
+    let sell = order("SELL", "AAPL", 1, "10");
+    for (case, limits) in [
+        PortfolioLimits {
+            max_open_quantity: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_open_quantity: (-1).into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_open_notional: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_position_quantity: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_snapshot_age_ms: 0,
+            ..limits()
+        },
+        PortfolioLimits {
+            max_snapshot_age_ms: 60_001,
+            ..limits()
+        },
+        PortfolioLimits {
+            max_daily_loss: Some(0.into()),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_daily_loss: Some((-1).into()),
+            ..limits()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                risk(&journal, limits).reserve("A", "sell", &sell).await,
+                Err(rustyschwab::Error::Config(_))
+            ),
+            "case {case}"
+        );
+    }
+    // A minute is the longest a policy may trust a baseline.
+    let longest = PortfolioLimits {
+        max_snapshot_age_ms: 60_000,
+        ..limits()
+    };
+    risk(&journal, longest)
+        .reserve("A", "sell", &sell)
+        .await
+        .unwrap();
+}
+
+/// A baseline dated after now, as it is once the clock steps back after
+/// the reconciliation that wrote it, is not trusted: an order against it
+/// is refused as stale.
+#[tokio::test]
+async fn a_baseline_dated_after_now_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let buy = order("BUY", "AAPL", 1, "10");
+    risk.check("A", &buy, None).await.unwrap();
+    // As if the clock had stepped back a minute since the pass.
+    rusqlite::Connection::open(journal.path())
+        .unwrap()
+        .execute("UPDATE accounts SET observed_at=observed_at+60000", [])
+        .unwrap();
+    assert!(matches!(
+        risk.reserve("A", "ahead", &buy).await,
+        Err(rustyschwab::Error::BaselineStale { .. })
+    ));
+}
+
+/// The daily-loss control halts once the day's loss exceeds its cap: a
+/// loss of exactly the cap still trades, judged on reconciliation and on
+/// reservation alike, and a cent more halts.
+#[tokio::test]
+async fn a_daily_loss_of_exactly_the_cap_still_trades() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let reconciled_at = |liquidation_value: &str| {
+        let database = journal.database().clone();
+        let snapshot = json!({
+            "securitiesAccount": {
+                "initialBalances": {"liquidationValue": "10000"},
+                "currentBalances": {"liquidationValue": liquidation_value, "availableFunds": "1000"},
+                "positions": []
+            },
+            "_dayNetTransfers": "0"
+        });
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis(),
+                    snapshot,
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let risk = risk(
+        &journal,
+        PortfolioLimits {
+            max_daily_loss: Some(500.into()),
+            ..limits()
+        },
+    );
+    let buy = order("BUY", "AAPL", 1, "10");
+
+    reconciled_at("9500").await;
+    risk.observe_baseline("A").await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    risk.reserve("A", "at-the-cap", &buy).await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+
+    reconciled_at("9499.99").await;
+    assert!(matches!(
+        risk.reserve("A", "past-the-cap", &buy).await,
+        Err(rustyschwab::Error::Halted(reason))
+            if reason.starts_with("Daily loss 500.01 exceeds the 500 limit")
+    ));
+    journal.set_operator_halt(None, "operator").await.unwrap();
+    risk.observe_baseline("A").await.unwrap();
+    assert!(journal.operator_halt().await.unwrap().is_some());
+}
+
 /// Replacing a working order does not count it alongside its replacement:
 /// a protective sell of the whole position can be moved.
 #[tokio::test]
@@ -647,6 +925,232 @@ async fn a_replacement_does_not_count_the_order_it_replaces() {
         .unwrap();
     // The replacement remembers what it replaces when rechecked at dispatch.
     risk.revalidate("A", "moved", &moved).await.unwrap();
+}
+
+/// A risk provider that judges nothing and keeps each reservation it is
+/// asked for: `(account, attempt, order)`.
+#[derive(Default)]
+struct Reservations(std::sync::Mutex<Vec<(String, String, OrderRequest)>>);
+
+#[async_trait::async_trait]
+impl RiskProvider for Reservations {
+    async fn reserve(
+        &self,
+        account: &str,
+        attempt_id: &str,
+        order: &OrderRequest,
+    ) -> rustyschwab::Result<()> {
+        let reserved = (account.to_owned(), attempt_id.to_owned(), order.clone());
+        self.0.lock().unwrap().push(reserved);
+        Ok(())
+    }
+    async fn release(&self, _: &str) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+}
+
+/// A provider that cannot tell a replacement apart from the order it
+/// replaces reserves it as a new order: the trait's default reserves it
+/// through `reserve`, which counts both and so only over-reserves.
+#[tokio::test]
+async fn a_provider_reserves_a_replacement_as_a_new_order_by_default() {
+    let provider = Reservations::default();
+    let moved = order("SELL", "AAPL", 100, "135");
+    provider
+        .reserve_replacement("A", "moved", &moved, "9")
+        .await
+        .unwrap();
+    assert_eq!(
+        *provider.0.lock().unwrap(),
+        vec![("A".to_owned(), "moved".to_owned(), moved)]
+    );
+}
+
+/// Reading the day's cash transfers costs reconciliation a request per
+/// transfer type, and only the daily-loss control needs them: the built-in
+/// provider asks for them for an account whose policy has a daily-loss
+/// cap, and for no other account, one without a policy included.
+#[test]
+fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let capped = PortfolioLimits {
+        max_daily_loss: Some(500.into()),
+        ..limits()
+    };
+    let risk = PortfolioRisk {
+        database: journal.database().clone(),
+        accounts: HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
+    };
+    assert!(risk.needs_day_transfers("capped"));
+    assert!(!risk.needs_day_transfers("uncapped"));
+    assert!(!risk.needs_day_transfers("unknown"));
+}
+
+/// The built-in provider bounds an equity order by its limit price, so it
+/// judges LIMIT and STOP_LIMIT orders only: a market or stop order has no
+/// price to bound it, and a trailing stop limit's price moves with the
+/// market. It judges long equity only: a short sale or a cover, or another
+/// asset, needs a deployment's own provider. Each is refused as
+/// `RiskDenied`, however small.
+#[tokio::test]
+async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let single = |kind: &str, instruction: &str, asset: &str, symbol: &str, prices: Value| {
+        let mut order = json!({"orderStrategyType": "SINGLE", "orderType": kind,
+            "session": "NORMAL", "duration": "DAY",
+            "orderLegCollection": [{"quantity": 1, "instruction": instruction,
+                "instrument": {"symbol": symbol, "assetType": asset}}]});
+        order
+            .as_object_mut()
+            .unwrap()
+            .extend(prices.as_object().unwrap().clone());
+        serde_json::from_value::<OrderRequest>(order).unwrap()
+    };
+    let equity = |kind: &str, instruction: &str, prices: Value| {
+        single(kind, instruction, "EQUITY", "AAPL", prices)
+    };
+    let trailing = json!({"stopPriceLinkBasis": "LAST", "stopPriceLinkType": "VALUE",
+        "stopPriceOffset": "1"});
+    let mut trailing_limit = trailing.clone();
+    trailing_limit["price"] = json!("1");
+    let limit = json!({"price": "10"});
+    let fund = single("LIMIT", "BUY", "MUTUAL_FUND", "VFIAX", limit.clone());
+    let unpriced = "Built-in portfolio risk requires a limit order";
+    let not_long_equity = "Built-in portfolio risk supports long equity exposure";
+    for (case, (order, reason)) in [
+        (equity("MARKET", "BUY", json!({})), unpriced),
+        (equity("STOP", "BUY", json!({"stopPrice": "10"})), unpriced),
+        (equity("TRAILING_STOP", "BUY", trailing), unpriced),
+        (
+            equity("TRAILING_STOP_LIMIT", "BUY", trailing_limit),
+            unpriced,
+        ),
+        (
+            equity("LIMIT", "SELL_SHORT", limit.clone()),
+            not_long_equity,
+        ),
+        (
+            equity("LIMIT", "SELL_SHORT_EXEMPT", limit.clone()),
+            not_long_equity,
+        ),
+        (
+            equity("LIMIT", "BUY_TO_COVER", limit.clone()),
+            not_long_equity,
+        ),
+        (fund, not_long_equity),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = risk.check("A", &order, None).await;
+        assert!(
+            matches!(&refused, Err(rustyschwab::Error::RiskDenied(r)) if r.starts_with(reason)),
+            "case {case}: {refused:?}"
+        );
+    }
+    risk.check("A", &equity("LIMIT", "BUY", limit), None)
+        .await
+        .unwrap();
+    risk.check(
+        "A",
+        &equity(
+            "STOP_LIMIT",
+            "BUY",
+            json!({"price": "10", "stopPrice": "9"}),
+        ),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+/// The position cap bounds one symbol's shares once its working buys fill,
+/// at the broker and here: a buy that would hold exactly the cap goes, and
+/// one share more is refused. An option strategy holds contracts, not the
+/// symbol's shares, so the cap does not bound it.
+#[tokio::test]
+async fn the_position_cap_bounds_shares_and_not_option_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working_buy = json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+        "orderType": "LIMIT", "quantity": 30, "filledQuantity": 0, "remainingQuantity": 30,
+        "price": 1, "orderLegCollection": [{"instruction": "BUY", "quantity": 30,
+            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]});
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 10000},
+            "positions": [{"longQuantity": 150, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![working_buy],
+    )
+    .await;
+    let capped = |max_position_quantity: u32| {
+        risk(
+            &journal,
+            PortfolioLimits {
+                max_open_quantity: 1000.into(),
+                max_position_quantity: max_position_quantity.into(),
+                ..verified()
+            },
+        )
+    };
+    let risk = capped(200);
+    // 150 held, 30 working at the broker and 15 reserved here: 5 more is 200.
+    risk.reserve("A", "ours", &order("BUY", "AAPL", 15, "1"))
+        .await
+        .unwrap();
+    risk.check("A", &order("BUY", "AAPL", 5, "1"), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.check("A", &order("BUY", "AAPL", 6, "1"), None).await,
+        Err(rustyschwab::Error::RiskDenied(reason)) if reason.starts_with("Position quantity")
+    ));
+    // Two contracts of a vertical against a cap of one share.
+    let vertical = strategy(
+        "NET_DEBIT",
+        "2",
+        &[("BUY_TO_OPEN", C100, 1), ("SELL_TO_OPEN", C105, 1)],
+    );
+    capped(1).check("A", &vertical, None).await.unwrap();
+}
+
+/// Just before an order is sent, it is rechecked against the reservation
+/// made for that attempt: one whose quantity or notional differs from what
+/// was reserved is refused, however far within the limits, and so is an
+/// attempt that reserved nothing.
+#[tokio::test]
+async fn dispatch_refuses_an_order_other_than_the_one_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let reserved = order("BUY", "AAPL", 2, "10");
+    risk.reserve("A", "held", &reserved).await.unwrap();
+    for (case, (attempt, sent)) in [
+        // The same quantity at another price.
+        ("held", order("BUY", "AAPL", 2, "11")),
+        // The same notional in another quantity.
+        ("held", order("BUY", "AAPL", 4, "5")),
+        ("held", order("BUY", "AAPL", 1, "10")),
+        ("unreserved", reserved.clone()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = risk.revalidate("A", attempt, &sent).await;
+        assert!(
+            matches!(&refused, Err(rustyschwab::Error::Storage(reason))
+                if reason == "Dispatch reservation missing or changed"),
+            "case {case}: {refused:?}"
+        );
+    }
+    risk.revalidate("A", "held", &reserved).await.unwrap();
 }
 
 /// A tag the broker is seen to hold is spent, even with no submission in
@@ -1117,6 +1621,47 @@ async fn an_approval_names_the_operator_who_granted_it() {
     );
 }
 
+/// An approval needs an operator who is not the principal, by name, for
+/// the intent's SHA-256 digest: exactly 64 hexadecimal digits. It must
+/// expire after now and at most an hour from now. Anything else is refused
+/// and grants nothing.
+#[tokio::test]
+async fn an_approval_needs_another_operator_a_digest_and_an_expiry_within_the_hour() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "d".repeat(64);
+    let (short, long, not_hex) = ("d".repeat(63), "d".repeat(65), "g".repeat(64));
+    let now = chrono::Utc::now().timestamp();
+    for (case, (operator, digest, expires_at)) in [
+        ("desk", &digest, now + 600),
+        (" ", &digest, now + 600),
+        ("operator", &short, now + 600),
+        ("operator", &long, now + 600),
+        ("operator", &not_hex, now + 600),
+        ("operator", &digest, now - 1),
+        ("operator", &digest, now),
+        ("operator", &digest, now + 7200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                journal.approve("desk", digest, operator, expires_at).await,
+                Err(rustyschwab::Error::InvalidParameter(_))
+            ),
+            "case {case}"
+        );
+    }
+    assert_eq!(journal.approval_operator(&digest).await.unwrap(), None);
+    // An hour from now is the longest an approval may last.
+    journal
+        .approve("desk", &digest, "operator", now + 3600)
+        .await
+        .unwrap();
+    assert!(journal.is_approved("desk", &digest).await.unwrap());
+}
+
 /// An intent awaiting approval is recorded with its arguments, and its
 /// state follows the approval through grant, use and lapse.
 #[tokio::test]
@@ -1168,27 +1713,105 @@ async fn intents_awaiting_approval_are_recorded_with_their_state() {
     assert_eq!(state(&journal).await.state, IntentState::Spent);
 }
 
+/// An intent reads as lapsed once its approval expires unused, and as
+/// revoked once an operator revokes it, whether it was approved, spent, or
+/// never approved at all.
+#[tokio::test]
+async fn an_intent_reads_as_lapsed_or_revoked() {
+    use rustyschwab::execution::IntentState;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let state = |digest: &str| {
+        let (journal, digest) = (journal.clone(), digest.to_owned());
+        async move {
+            journal
+                .intents(Some(&digest), 0, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .state
+        }
+    };
+    let (lapsed, spent, unapproved) = ("e".repeat(64), "f".repeat(64), "0".repeat(64));
+    for digest in [&lapsed, &spent, &unapproved] {
+        journal
+            .record_intent("desk", digest, "place_order", &json!({}))
+            .await
+            .unwrap();
+    }
+    let later = chrono::Utc::now().timestamp() + 600;
+    for digest in [&lapsed, &spent] {
+        journal
+            .approve("desk", digest, "operator", later)
+            .await
+            .unwrap();
+    }
+    let lapse = lapsed.clone();
+    journal
+        .database()
+        .run(move |c| {
+            c.execute("UPDATE approvals SET expires_at=1 WHERE digest=?1", [lapse])
+                .map_err(|e| rustyschwab::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&lapsed).await, IntentState::Lapsed);
+    journal
+        .begin_once("desk", "place_order", json!({}), Some(spent.clone()))
+        .await
+        .unwrap();
+    assert_eq!(state(&spent).await, IntentState::Spent);
+    for digest in [&lapsed, &spent, &unapproved] {
+        journal.revoke_approval(digest, "operator").await.unwrap();
+        assert_eq!(state(digest).await, IntentState::Revoked, "{digest}");
+    }
+}
+
+/// Setting or clearing the operator halt names who did it, and a halt
+/// gives its reason: a blank operator or reason is refused and changes
+/// nothing. Each change is audited under its operator.
+#[tokio::test]
+async fn the_operator_halt_is_set_and_cleared_by_name_and_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let refused = |result: rustyschwab::Result<()>| {
+        matches!(result, Err(rustyschwab::Error::InvalidParameter(_)))
+    };
+    let review = || Some("review".to_owned());
+    assert!(refused(journal.set_operator_halt(review(), " ").await));
+    assert!(refused(
+        journal.set_operator_halt(Some(" ".into()), "alice").await
+    ));
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    journal.set_operator_halt(review(), "alice").await.unwrap();
+    assert!(refused(journal.set_operator_halt(None, "").await));
+    assert_eq!(journal.operator_halt().await.unwrap(), review());
+    journal.set_operator_halt(None, "bob").await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    let changes: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "operator_halt_changed")
+        .map(|e| (e.subject, e.payload))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("alice".to_owned(), json!({"reason": "review"})),
+            ("bob".to_owned(), json!({"reason": null})),
+        ]
+    );
+}
+
 /// An option strategy counts the most it can lose at expiration against the
 /// account's funds and buy caps, a working one at the broker its unfilled
 /// share; one with no bound, or with a leg whose multiplier the operator
 /// has not verified, is refused.
 #[tokio::test]
 async fn option_strategies_reserve_their_defined_risk() {
-    const C100: &str = "XYZ   260116C00100000";
-    const C105: &str = "XYZ   260116C00105000";
-    fn strategy(kind: &str, price: &str, legs: &[(&str, &str, u32)]) -> OrderRequest {
-        let legs: Vec<Value> = legs
-            .iter()
-            .map(|(instruction, symbol, quantity)| {
-                json!({"instruction": instruction, "quantity": quantity,
-                    "instrument": {"symbol": symbol, "assetType": "OPTION"}})
-            })
-            .collect();
-        serde_json::from_value(json!({"orderStrategyType": "SINGLE", "orderType": kind,
-            "session": "NORMAL", "duration": "DAY", "price": price,
-            "orderLegCollection": legs}))
-        .unwrap()
-    }
     let dir = tempfile::tempdir().unwrap();
     let journal = OrderJournal::new(dir.path().join("orders.json"));
     // Two units of a 2.00 debit vertical, one filled: 200 still at risk.
@@ -1206,13 +1829,6 @@ async fn option_strategies_reserve_their_defined_risk() {
         vec![working],
     )
     .await;
-    let verified = PortfolioLimits {
-        option_multipliers: HashMap::from([
-            (C100.to_owned(), 100.into()),
-            (C105.to_owned(), 100.into()),
-        ]),
-        ..limits()
-    };
     let debit = |units| {
         strategy(
             "NET_DEBIT",
@@ -1231,7 +1847,7 @@ async fn option_strategies_reserve_their_defined_risk() {
         Err(rustyschwab::Error::RiskDenied(_))
     ));
 
-    let risk = risk(&journal, verified);
+    let risk = risk(&journal, verified());
     // 200 working + 600 + 200 = the 1000 of funds; one more unit is 1200.
     risk.reserve("A", "three", &debit(3)).await.unwrap();
     risk.reserve("A", "one", &debit(1)).await.unwrap();
@@ -1259,6 +1875,161 @@ async fn option_strategies_reserve_their_defined_risk() {
     );
     let refused = risk.check("A", &naked, None).await.unwrap_err();
     assert!(refused.to_string().contains("no bound"), "{refused}");
+}
+
+/// `base` with each field of `change` set to its value, or removed where
+/// the value is null.
+fn changed(mut base: Value, change: Value) -> Value {
+    for (field, value) in change.as_object().unwrap() {
+        if value.is_null() {
+            base.as_object_mut().unwrap().remove(field);
+        } else {
+            base[field] = value.clone();
+        }
+    }
+    base
+}
+
+/// How the provider judges a sell of one of the 100 MSFT shares the
+/// account holds, with `working` at the broker and `limits`: a sell draws
+/// on no buy capacity, so only a working order it cannot bound stops it.
+async fn sell_beside(working: Value, limits: PortfolioLimits) -> rustyschwab::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}]
+        }),
+        vec![working],
+    )
+    .await;
+    risk(&journal, limits)
+        .check("A", &order("SELL", "MSFT", 1, "10"), None)
+        .await
+}
+
+/// Whether `result` refuses an order because a working order at the
+/// broker cannot be bounded.
+fn unbounded(result: &rustyschwab::Result<()>) -> bool {
+    matches!(result, Err(rustyschwab::Error::RiskDenied(reason))
+        if reason == "External open order needs a supported, bounded risk model")
+}
+
+/// A working order at the broker counts what its unfilled remainder could
+/// still buy or sell: nothing once it is filled in full, or when it is for
+/// no shares at all. One the provider cannot bound stops every order on
+/// the account, even a sell of another symbol: one with no status, that
+/// is not a single order, that no limit price bounds, with no legs or a
+/// leg that is not a long equity buy or sell, without a positive price,
+/// or whose figures do not hold together.
+/// Each figure is checked on its own, so a negative quantity is refused
+/// even where it is too small to change a sum of very large ones.
+#[tokio::test]
+async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
+    let working = |change: Value| {
+        changed(
+            json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+                "orderType": "LIMIT", "quantity": 5, "filledQuantity": 0, "remainingQuantity": 5,
+                "price": 10, "orderLegCollection": [{"instruction": "BUY", "quantity": 5,
+                    "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]}),
+            change,
+        )
+    };
+    let leg = |instruction: &str, asset: &str, symbol: &str| {
+        json!([{"instruction": instruction, "quantity": 5,
+            "instrument": {"assetType": asset, "symbol": symbol}}])
+    };
+    // Shares past what a decimal holds to the billionth, so that a billionth
+    // more or less rounds away in a sum.
+    let huge = "100000000000000000000";
+    for (case, change) in [
+        json!({"status": null}),
+        json!({"orderStrategyType": "TRIGGER"}),
+        json!({"orderType": "MARKET", "price": null}),
+        json!({"orderType": "TRAILING_STOP_LIMIT"}),
+        json!({"orderLegCollection": []}),
+        json!({"orderLegCollection": leg("BUY", "MUTUAL_FUND", "VFIAX")}),
+        json!({"orderLegCollection": leg("SELL_SHORT", "EQUITY", "AAPL")}),
+        json!({"price": 0}),
+        json!({"filledQuantity": null}),
+        // Filled past the order, or a negative fill or remainder.
+        json!({"filledQuantity": 6, "remainingQuantity": -1}),
+        json!({"filledQuantity": -1, "remainingQuantity": 6}),
+        json!({"quantity": -5, "remainingQuantity": -5}),
+        // A remainder past the order, or parts that miss the total.
+        json!({"remainingQuantity": 6}),
+        json!({"filledQuantity": 2, "remainingQuantity": 2}),
+        json!({"quantity": huge, "filledQuantity": "-0.000000001", "remainingQuantity": huge}),
+        json!({"quantity": huge, "filledQuantity": huge, "remainingQuantity": "-0.000000001"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), limits()).await;
+        assert!(unbounded(&judged), "case {case}: {judged:?}");
+    }
+    for (case, change) in [
+        json!({}),
+        json!({"orderType": "STOP_LIMIT", "stopPrice": 9}),
+        json!({"filledQuantity": 2, "remainingQuantity": null}),
+        json!({"filledQuantity": 5, "remainingQuantity": 0}),
+        json!({"quantity": 0, "remainingQuantity": 0}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), limits()).await;
+        assert!(judged.is_ok(), "case {case}: {judged:?}");
+    }
+}
+
+/// A working option strategy at the broker counts the unfilled share of
+/// its defined risk, from all of it while unfilled to none once filled in
+/// full. One the provider cannot bound stops every order on the account:
+/// one with no status, that is not a single order, or whose unfilled
+/// count is below zero or above the order's.
+#[tokio::test]
+async fn a_working_strategy_counts_its_unfilled_share_or_stops_every_order() {
+    let working = |change: Value| {
+        changed(
+            json!({"orderId": 8, "status": "WORKING", "orderStrategyType": "SINGLE",
+                "orderType": "NET_DEBIT", "session": "NORMAL", "duration": "DAY", "price": 2,
+                "quantity": 2, "filledQuantity": 1, "remainingQuantity": 1,
+                "orderLegCollection": [
+                    {"orderLegType": "OPTION", "instruction": "BUY_TO_OPEN", "quantity": 2,
+                     "instrument": {"assetType": "OPTION", "symbol": C100}},
+                    {"orderLegType": "OPTION", "instruction": "SELL_TO_OPEN", "quantity": 2,
+                     "instrument": {"assetType": "OPTION", "symbol": C105}}]}),
+            change,
+        )
+    };
+    for (case, change) in [
+        json!({"status": null}),
+        json!({"orderStrategyType": "TRIGGER"}),
+        json!({"filledQuantity": 3, "remainingQuantity": -1}),
+        json!({"filledQuantity": 0, "remainingQuantity": 3}),
+        json!({"quantity": 0, "filledQuantity": 0, "remainingQuantity": 0}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), verified()).await;
+        assert!(unbounded(&judged), "case {case}: {judged:?}");
+    }
+    for (case, change) in [
+        json!({}),
+        json!({"filledQuantity": 0, "remainingQuantity": 2}),
+        json!({"filledQuantity": 2, "remainingQuantity": 0}),
+        json!({"remainingQuantity": null}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), verified()).await;
+        assert!(judged.is_ok(), "case {case}: {judged:?}");
+    }
 }
 
 /// A store that implements only what [`ExecutionStore`] requires, over a
