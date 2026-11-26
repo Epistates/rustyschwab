@@ -9,65 +9,48 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: never
+  RUSTFLAGS: -D warnings
+
 jobs:
   stress:
-    name: stress (${{ matrix.mode }} / ${{ matrix.shard }})
+    name: stress (ci / ${{ matrix.shard }})
     runs-on: windows-latest
-    timeout-minutes: 150
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
-        # fresh: each iteration runs a new copy of the test binary, once.
-        # rebuild: each iteration relinks the test binary and runs it.
-        mode: [fresh, rebuild]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Defender status
-        shell: pwsh
-        run: Get-MpComputerStatus | Format-List RealTimeProtectionEnabled,AntivirusEnabled,AMRunningMode,OnAccessProtectionEnabled
-        continue-on-error: true
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo test -p rustyschwab --lib --all-features --locked --no-run
-      - name: loop the lib tests
+      # As CI does, before its test step.
+      - run: cargo build --workspace --all-targets --locked
+      - name: loop CI's test command
         shell: bash
         env:
           ITERATIONS: '200'
-          BUDGET_SECONDS: '3000'
-          MODE: ${{ matrix.mode }}
+          BUDGET_SECONDS: '9000'
           SHARD: ${{ matrix.shard }}
         run: |
           set -u
           mkdir -p diag
-          root="$PWD"
-          events="$(cygpath -w "$root/diag/events.tsv")"
+          events="$(cygpath -w "$PWD/diag/events.tsv")"
           : > diag/summary.txt
-          exe=$(cargo test -p rustyschwab --lib --all-features --locked --no-run --message-format=json 2>/dev/null \
-            | jq -r 'select(.reason=="compiler-artifact" and .profile.test==true and .target.name=="rustyschwab") | .executable' | tail -1)
-          exe=$(cygpath -u "$exe")
-          echo "test binary: $exe"
           start=$SECONDS
           i=0
           failed=0
           while [ "$i" -lt "$ITERATIONS" ] && [ $((SECONDS - start)) -lt "$BUDGET_SECONDS" ]; do
             i=$((i + 1))
             t0=$SECONDS
-            if [ "$MODE" = fresh ]; then
-              fresh="$(dirname "$exe")/fresh-$SHARD-$i.exe"
-              cp "$exe" "$fresh"
-              (cd crates/rustyschwab && DIAG_ITER="$MODE-$SHARD-$i" DIAG_FILE="$events" "$fresh") > diag/out.txt 2>&1
-              status=$?
-              rm -f "$fresh" 2>/dev/null || true
-            else
-              touch crates/rustyschwab/src/lib.rs
-              DIAG_ITER="$MODE-$SHARD-$i" DIAG_FILE="$events" \
-                cargo test -p rustyschwab --lib --all-features --locked > diag/out.txt 2>&1
-              status=$?
-            fi
-            if [ "$status" -eq 0 ]; then
+            # Relink everything that depends on the SDK, as a fresh CI run does.
+            touch crates/rustyschwab/src/lib.rs
+            if DIAG_ITER="ci-$SHARD-$i" DIAG_FILE="$events" \
+              cargo test --workspace --all-targets --all-features --locked > diag/out.txt 2>&1; then
               echo "$i pass $((SECONDS - t0))s" >> diag/summary.txt
             else
               failed=$((failed + 1))
@@ -78,9 +61,9 @@ jobs:
           done
           rm -f diag/out.txt
           cat diag/summary.txt
-          echo "mode=$MODE shard=$SHARD iterations=$i failed=$failed"
+          echo "shard=$SHARD iterations=$i failed=$failed"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         if: always()
         with:
-          name: diag-${{ matrix.mode }}-${{ matrix.shard }}
+          name: diag-ci-${{ matrix.shard }}
           path: diag/
