@@ -17,7 +17,8 @@
 //! - [`Error::InvalidParameter`] - Fix parameter values
 //! - [`Error::Config`] - Validate configuration settings
 //! - [`Error::NonCanonicalOrderId`] - The state file was edited by hand or
-//!   damaged; restore a backup or repair it (see docs/OPERATIONS.md)
+//!   damaged; repair it with `rustyschwab-admin repair-order-ids` (see
+//!   docs/OPERATIONS.md)
 //! - HTTP 4xx errors (except 429) - Fix request parameters
 //!
 //! ## Trading Control Errors (Resolve the condition, then submit a new intent)
@@ -106,7 +107,9 @@ pub enum Error {
     /// stored, so the file was edited by hand or damaged since. The store
     /// does not open: an order the journal names two ways could be tracked,
     /// counted against risk or released twice. Of kind
-    /// [`ErrorKind::Storage`]; recovery is in docs/OPERATIONS.md.
+    /// [`ErrorKind::Storage`]. The repair is the migration's, run on demand
+    /// ([`StateDatabase::repair_order_ids`](crate::storage::StateDatabase::repair_order_ids),
+    /// `rustyschwab-admin repair-order-ids`); see docs/OPERATIONS.md.
     #[error("Durable state holds an order ID that is not one: {order_id:?} in {table} ({row})")]
     NonCanonicalOrderId {
         table: &'static str,

@@ -292,7 +292,16 @@ request is sent:
     its audit trail. A file that doesn't, which only a hand edit or damage
     after the migration can cause, fails to open with the new
     `Error::NonCanonicalOrderId` (kind `storage`), naming the table, the row
-    and the text. docs/OPERATIONS.md gives the recovery.
+    and the text.
+  - `rustyschwab-admin repair-order-ids` repairs such a file with the
+    migration's own audited canonicalization. `--dry-run` lists each change
+    (table, row, the text stored, and the ID it becomes or "set aside") and
+    changes nothing. With `--operator <name>` it takes the store's init lock,
+    makes the changes in one transaction, audits each as the migration does
+    and the repair as `order_ids_repaired` under that name, and the file
+    opens again. In the SDK these are `StateDatabase::order_id_repairs` and
+    `StateDatabase::repair_order_ids`, which give each change as a
+    `reconciliation::OrderIdRepair`. docs/OPERATIONS.md gives the recovery.
 
 - Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
   0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0

@@ -126,6 +126,36 @@ pub struct ReconciliationReport {
     #[serde(default)]
     pub superseded: bool,
 }
+/// A stored order ID that is not a broker order ID (the store's invariant,
+/// which [`Error::NonCanonicalOrderId`] reports), and what the repair does
+/// with it: rewrites it as `canonical`, the same order in its own digits,
+/// or sets it aside when it names no order at all. Listed by
+/// [`StateDatabase::order_id_repairs`] and made by
+/// [`StateDatabase::repair_order_ids`]. Displayed as one line:
+/// `orders (account …1234): "007" -> "7"`, or `-> set aside`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OrderIdRepair {
+    /// The table that holds it.
+    pub table: String,
+    /// Its row, as [`Error::NonCanonicalOrderId`] names it.
+    pub row: String,
+    /// The account it is stored under.
+    pub account: String,
+    /// The text as stored.
+    pub order_id: String,
+    /// The order ID it becomes; `None` when it is set aside.
+    pub canonical: Option<String>,
+}
+impl std::fmt::Display for OrderIdRepair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}): {:?} -> ", self.table, self.row, self.order_id)?;
+        match &self.canonical {
+            Some(canonical) => write!(f, "{canonical:?}"),
+            None => f.write_str("set aside"),
+        }
+    }
+}
 impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
         let account = account.to_owned();
@@ -414,6 +444,53 @@ impl StateDatabase {
         })
         .await
     }
+    /// Every change [`repair_order_ids`](Self::repair_order_ids) would make
+    /// to this file as it stands, in table and then row order. Changes
+    /// nothing. Like the repair, it reads a file that fails to open with
+    /// [`Error::NonCanonicalOrderId`]; an empty list means there is nothing
+    /// to repair.
+    pub async fn order_id_repairs(&self) -> Result<Vec<OrderIdRepair>> {
+        self.repairing(|c| stored_order_id_repairs(c)).await
+    }
+    /// Repair a file that fails to open with [`Error::NonCanonicalOrderId`]
+    /// (edited by hand or damaged after its migration), in `operator`'s
+    /// name: the migration's canonicalization, run on demand. Under the init
+    /// lock and in one transaction, every stored order ID that is not a
+    /// broker order ID is rewritten in its own digits, merging with the
+    /// records for the same order, or set aside when it names none, each
+    /// audited as the migration audits it; then `order_ids_repaired` records
+    /// the operator and the changes. Afterwards the file opens. Returns the
+    /// changes made, as [`order_id_repairs`](Self::order_id_repairs) listed
+    /// them; with nothing to repair it writes nothing.
+    ///
+    /// The file must be at this release's schema version: opening one that
+    /// is behind migrates it, which makes the same repair.
+    pub async fn repair_order_ids(&self, operator: &str) -> Result<Vec<OrderIdRepair>> {
+        if operator.trim().is_empty() {
+            return Err(Error::InvalidParameter("Operator is required".into()));
+        }
+        let operator = operator.to_owned();
+        self.repairing(move |c| {
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let repairs = stored_order_id_repairs(&tx)?;
+            if repairs.is_empty() {
+                return Ok(repairs);
+            }
+            repair_stored_order_ids(&tx, &repairs)?;
+            check_stored_order_ids(&tx)?;
+            audit(
+                &tx,
+                "order_ids_repaired",
+                &operator,
+                &serde_json::json!({ "changes": repairs }),
+            )?;
+            tx.commit().map_err(sql)?;
+            Ok(repairs)
+        })
+        .await
+    }
 }
 /// One order ID as this store holds it outside its audit trail: where it is
 /// (`table`, and the row as an error names it), its account and its text.
@@ -427,7 +504,8 @@ struct StoredOrderId {
 /// [`check_stored_order_ids`] for what that leaves out, and why): each
 /// stored order and reference, each observed activity (keyed by its
 /// order's ID and a digest of its content), each accepted submission's
-/// order, and each reservation's replaced order. Reads row by row.
+/// order, and each reservation's replaced order, table by table in that
+/// order and each table in its key's order. Reads row by row.
 fn for_each_stored_order_id(
     c: &rusqlite::Connection,
     mut visit: impl FnMut(StoredOrderId) -> Result<()>,
@@ -455,12 +533,13 @@ fn for_each_stored_order_id(
     };
     scan(
         "orders",
-        "SELECT account,order_id,order_id FROM orders",
+        "SELECT account,order_id,order_id FROM orders ORDER BY account,order_id",
         &|account, _, order_id| (format!("account {}", masked(account)), order_id),
     )?;
     scan(
         "executions",
-        "SELECT account,execution_id,execution_id FROM executions",
+        "SELECT account,execution_id,execution_id FROM executions \
+         ORDER BY account,execution_id",
         &|account, key, _| {
             let order_id = key.rsplit_once(':').map_or(key, |(order_id, _)| order_id);
             (
@@ -473,12 +552,12 @@ fn for_each_stored_order_id(
         "submissions",
         "SELECT account,id,json_extract(outcome,'$.order_id') FROM submissions \
          WHERE json_extract(outcome,'$.status')='accepted' \
-           AND json_extract(outcome,'$.order_id') IS NOT NULL",
+           AND json_extract(outcome,'$.order_id') IS NOT NULL ORDER BY id",
         &|_, id, order_id| (format!("submission {id}"), order_id),
     )?;
     scan(
         "reservations",
-        "SELECT account,id,replaces FROM reservations WHERE replaces IS NOT NULL",
+        "SELECT account,id,replaces FROM reservations WHERE replaces IS NOT NULL ORDER BY id",
         &|_, id, order_id| (format!("reservation {id}"), order_id),
     )
 }
@@ -524,18 +603,43 @@ pub(crate) fn check_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
 /// names no order at all ([`set_aside_order_id`]). Each change is audited;
 /// the audit rows already written are not touched (see
 /// [`check_stored_order_ids`]). Afterwards the store meets its invariant.
+/// An operator's repair ([`StateDatabase::repair_order_ids`]) makes the
+/// same changes on demand.
 pub(crate) fn canonicalize_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
-    let mut repairs = std::collections::BTreeSet::new();
+    repair_stored_order_ids(c, &stored_order_id_repairs(c)?)
+}
+/// Every stored order ID that breaks the invariant
+/// ([`check_stored_order_ids`]), in the order the store holds them, and
+/// what the canonicalization makes of it: the same order in its own
+/// digits, or `None` when it names no order and is set aside.
+fn stored_order_id_repairs(c: &rusqlite::Connection) -> Result<Vec<OrderIdRepair>> {
+    let mut repairs = Vec::new();
     for_each_stored_order_id(c, |stored| {
         if !is_broker_order_id(&stored.order_id) {
-            repairs.insert((stored.account, stored.order_id));
+            repairs.push(OrderIdRepair {
+                canonical: crate::execution::canonical_order_id(&stored.order_id),
+                table: stored.table.to_owned(),
+                row: stored.row,
+                account: stored.account,
+                order_id: stored.order_id,
+            });
         }
         Ok(())
     })?;
-    for (account, id) in repairs {
-        match crate::execution::canonical_order_id(&id) {
-            Some(canonical) => canonicalize_order_id(c, &account, &id, &canonical)?,
-            None => set_aside_order_id(c, &account, &id)?,
+    Ok(repairs)
+}
+/// Make `repairs`, which [`stored_order_id_repairs`] listed on `c`, once
+/// for each stored ID on each account however many rows name it: rewrite
+/// ([`canonicalize_order_id`]) or set aside ([`set_aside_order_id`]).
+fn repair_stored_order_ids(c: &rusqlite::Connection, repairs: &[OrderIdRepair]) -> Result<()> {
+    let ids: std::collections::BTreeSet<_> = repairs
+        .iter()
+        .map(|r| (&r.account, &r.order_id, &r.canonical))
+        .collect();
+    for (account, id, canonical) in ids {
+        match canonical {
+            Some(canonical) => canonicalize_order_id(c, account, id, canonical)?,
+            None => set_aside_order_id(c, account, id)?,
         }
     }
     Ok(())

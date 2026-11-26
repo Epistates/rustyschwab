@@ -12,7 +12,9 @@ use common::mock_client as client;
 use rustyschwab::{
     Error, SchwabClient, SchwabConfig,
     execution::{ExecutionStore, OrderJournal, SubmissionOutcome, is_broker_order_id},
+    reconciliation::OrderIdRepair,
     risk::{PortfolioRisk, RiskProvider},
+    storage::StateDatabase,
     types::{
         Decimal,
         trading::{OrderInstruction, OrderRequest, OrderRequestLeg},
@@ -1030,4 +1032,187 @@ async fn a_replacement_names_the_order_it_replaces_by_a_whole_number() {
             .await,
         Err(Error::RiskDenied(_))
     ));
+}
+
+/// The repair for a file that fails the open check (edited by hand past
+/// its migration) is the migration's own audited canonicalization, run on
+/// demand. Listing the changes first changes nothing. Applying them, in an
+/// operator's name, rewrites or sets aside every stored order ID that is
+/// not one (orders, accepted submissions and reservations alike), audits
+/// each as the migration does, and the file opens. A second run finds
+/// nothing to do.
+#[tokio::test]
+async fn a_state_file_that_fails_the_open_check_is_repaired_on_demand() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    journal
+        .record_order("A", json!({"orderId": 7, "status": "WORKING"}))
+        .await
+        .unwrap();
+    let attempt = journal.begin("A", "place_order", json!({})).await.unwrap();
+    journal.finish(&attempt, accepted(Some("1"))).await.unwrap();
+    let path = journal.path().to_owned();
+    let state = rusqlite::Connection::open(&path).unwrap();
+    // Order 7 again as "007", observed later and finished; a submission
+    // accepted under "abc"; a reservation for a replacement of "+8".
+    let filled = json!({"orderId": "007", "status": "FILLED"});
+    store_order(&state, "A", "007", i64::MAX, &filled);
+    accept_under(&state, &attempt, "abc");
+    state
+        .execute(
+            "INSERT INTO reservations(id,account,quantity,notional,state,replaces) \
+             VALUES('moving','A','1','10','held','+8')",
+            [],
+        )
+        .unwrap();
+    assert!(matches!(
+        OrderJournal::new(path.clone()).records().await,
+        Err(Error::NonCanonicalOrderId { .. })
+    ));
+    let everything = || {
+        [
+            rows(
+                &state,
+                "SELECT order_id||' '||payload FROM orders ORDER BY 1",
+            ),
+            rows(
+                &state,
+                "SELECT id||' '||coalesce(outcome,'') FROM submissions ORDER BY 1",
+            ),
+            rows(
+                &state,
+                "SELECT id||' '||coalesce(replaces,'') FROM reservations ORDER BY 1",
+            ),
+            rows(
+                &state,
+                "SELECT sequence||' '||hash FROM audit ORDER BY sequence",
+            ),
+        ]
+        .concat()
+    };
+    let changes = |repairs: Vec<OrderIdRepair>| {
+        repairs
+            .into_iter()
+            .map(|r| (r.table, r.order_id, r.canonical))
+            .collect::<Vec<_>>()
+    };
+    let expected = vec![
+        (
+            "orders".to_string(),
+            "007".to_string(),
+            Some("7".to_string()),
+        ),
+        ("submissions".into(), "abc".into(), None),
+        ("reservations".into(), "+8".into(), Some("8".into())),
+    ];
+    let database = StateDatabase::new(path.clone());
+    let before = everything();
+    assert_eq!(
+        changes(database.order_id_repairs().await.unwrap()),
+        expected
+    );
+    assert!(matches!(
+        database.repair_order_ids(" ").await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(everything(), before);
+
+    assert_eq!(
+        changes(database.repair_order_ids("operator").await.unwrap()),
+        expected
+    );
+    let repaired = OrderJournal::new(path.clone());
+    let repairs: Vec<(String, String)> = repaired
+        .audit_page(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind.starts_with("order_id"))
+        .map(|e| (e.kind, e.subject))
+        .collect();
+    let entry = |kind: &str, subject: &str| (kind.to_string(), subject.to_string());
+    assert_eq!(
+        repairs,
+        vec![
+            entry("order_id_canonicalized", "+8"),
+            entry("order_id_canonicalized", "007"),
+            entry("order_id_set_aside", "abc"),
+            entry("order_ids_repaired", "operator"),
+        ]
+    );
+    repaired.verify_audit().await.unwrap();
+    assert_eq!(
+        repaired.database().known_orders("A", 10).await.unwrap(),
+        vec![json!({"orderId": "7", "status": "FILLED"})]
+    );
+    assert!(matches!(
+        repaired.record(&attempt).await.unwrap().unwrap().outcome,
+        Some(SubmissionOutcome::Accepted { order_id: None })
+    ));
+    assert_eq!(
+        rows(
+            &state,
+            "SELECT replaces FROM reservations WHERE id='moving'"
+        ),
+        vec!["8"]
+    );
+
+    let after = everything();
+    assert!(
+        database
+            .repair_order_ids("operator")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(everything(), after);
+}
+
+/// The repair leaves alone a file it is not for, and writes nothing: one
+/// that does not exist is not created, and one at an earlier schema version
+/// is for opening, whose migration makes the same repair.
+#[tokio::test]
+async fn the_order_id_repair_leaves_alone_a_file_it_is_not_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let nowhere = dir.path().join("nowhere");
+    let missing = StateDatabase::new(nowhere.join("state.sqlite3"));
+    assert!(matches!(
+        missing.order_id_repairs().await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        missing.repair_order_ids("operator").await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(!nowhere.exists());
+
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    journal.records().await.unwrap();
+    let path = journal.path().to_owned();
+    let state = as_left_by_an_earlier_release(&path);
+    let working = json!({"orderId": "007", "status": "WORKING"});
+    store_order(&state, "A", "007", 1, &working);
+    let stored = || {
+        rows(
+            &state,
+            "SELECT order_id||' '||payload FROM orders \
+             UNION ALL SELECT key||' '||value FROM meta \
+             UNION ALL SELECT sequence||' '||hash FROM audit",
+        )
+    };
+    let before = stored();
+    let behind = StateDatabase::new(path.clone());
+    assert!(matches!(
+        behind.order_id_repairs().await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        behind.repair_order_ids("operator").await,
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(stored(), before);
+    assert_eq!(
+        behind.known_orders("A", 10).await.unwrap(),
+        vec![json!({"orderId": "7", "status": "WORKING"})]
+    );
 }
