@@ -205,6 +205,19 @@ const MIGRATIONS: &[Migration] = &[
         sql: "CREATE TABLE IF NOT EXISTS activity(sequence INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, subject TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);",
         backfill: None,
     },
+    // Every order ID is a broker order ID, one text form per order (see
+    // `execution::is_broker_order_id`). An earlier release could store one
+    // written another way ("007"), which names a real order and is
+    // rewritten, merging with any records for the same number, or one that
+    // names no order at all, which is set aside. The audit trail keeps what
+    // it recorded. Opening the store checks the result every time
+    // (`reconciliation::check_stored_order_ids`).
+    Migration {
+        version: 7,
+        name: "canonical_order_ids",
+        sql: "",
+        backfill: Some(crate::reconciliation::canonicalize_stored_order_ids),
+    },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
@@ -789,7 +802,9 @@ impl Inner {
     }
     /// Open the state file, building it first if it does not exist, and say
     /// whether it is current. Takes no lock: a new file is moved into place
-    /// whole or not at all (see the module documentation).
+    /// whole or not at all (see the module documentation). A current file
+    /// must meet the store's invariants; one that is behind is checked once
+    /// it is migrated ([`prepare`](Self::prepare)).
     fn open_unlocked(&self) -> Result<Opened> {
         let parent = self
             .path
@@ -803,6 +818,7 @@ impl Inner {
         let connection = open_connection(&self.path)?;
         remove_stale_builds(&self.path, STALE_BUILD_AGE);
         Ok(if self.is_current(&connection) {
+            crate::reconciliation::check_stored_order_ids(&connection)?;
             Opened::Ready(connection)
         } else {
             Opened::Behind(connection)
@@ -877,6 +893,7 @@ impl Inner {
         if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
             import_legacy(&mut connection, legacy)?;
         }
+        crate::reconciliation::check_stored_order_ids(&connection)?;
         drop(held);
         Ok(connection)
     }
@@ -1105,7 +1122,9 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
         .map_err(sql)
 }
 /// One-time import of the pre-SQLite JSON journal, recorded in `meta` so a
-/// retained legacy file is never replayed.
+/// retained legacy file is never replayed. It runs after the migrations, so
+/// the order IDs it brings in are made canonical here, as the migration
+/// does for those already stored.
 fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
     if meta::exists(connection, "legacy_imported")? {
         return Ok(());
@@ -1151,6 +1170,7 @@ fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
                 .map_err(sql)?;
         }
     }
+    crate::reconciliation::canonicalize_stored_order_ids(&tx)?;
     meta::put(&tx, "legacy_imported", "1")?;
     tx.commit().map_err(sql)?;
     Ok(())
@@ -1516,9 +1536,8 @@ mod tests {
         Connection::open(first.path())
             .unwrap()
             .execute_batch(
-                "DROP TABLE activity;
-                 DELETE FROM schema_migrations WHERE version=6;
-                 UPDATE meta SET value='5' WHERE key='schema'",
+                "DELETE FROM schema_migrations WHERE version=7;
+                 UPDATE meta SET value='6' WHERE key='schema'",
             )
             .unwrap();
         StateDatabase::new(first.path().to_owned())

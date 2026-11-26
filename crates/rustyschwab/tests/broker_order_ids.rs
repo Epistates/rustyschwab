@@ -1,14 +1,16 @@
 //! A broker order ID is a whole number that fits in a `u64`: Schwab's are,
 //! and so are the paper venue's. As a JSON string it is that number's own
 //! digits (no sign, space or leading zero); as a JSON number, that number.
-//! No other ID enters the journal or reaches Schwab in a request, and one a
-//! state file already holds (an earlier release stored them) is set aside
-//! by the next reconciliation pass.
+//! No other ID enters the journal or reaches Schwab in a request. One a
+//! state file already holds (an earlier release stored them) is rewritten
+//! in its own digits, or set aside if it names no order, when the store
+//! first opens the file, and the store refuses to open a file that holds
+//! one after that.
 mod common;
 
 use common::mock_client as client;
 use rustyschwab::{
-    Error,
+    Error, SchwabClient, SchwabConfig,
     execution::{ExecutionStore, OrderJournal, SubmissionOutcome, is_broker_order_id},
     risk::{PortfolioRisk, RiskProvider},
     types::{
@@ -17,7 +19,10 @@ use rustyschwab::{
     },
 };
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -288,40 +293,96 @@ async fn a_location_without_an_order_id_leaves_the_order_to_its_tag() {
     server.verify().await;
 }
 
-/// A state file an earlier release wrote can hold orders stored under IDs
-/// that are not whole numbers, and an accepted submission naming one. No
-/// broker order has such an ID, so the next pass sets each aside instead of
-/// failing on it: the order stored under it is dropped and audited with
-/// what was stored, a submission that named it goes back to being placed by
-/// its tag, and the account reconciles. Nothing is fetched for them.
-#[tokio::test]
-async fn a_state_file_holding_ids_that_are_not_whole_numbers_reconciles() {
-    let server = MockServer::start().await;
-    let (client, _dir, _) = client(&server, false);
-    let journal = client.order_journal();
-    let lost = journal
-        .begin("hash", "place_order", json!({"tag": "rs-lost"}))
-        .await
+/// Wind the state file at `path` back to schema version 6, the last release
+/// before order IDs were canonical, as that release left it: the canonical
+/// ID migration changes no tables, so this is exactly such a file. Returns
+/// a connection to write what that release could store.
+fn as_left_by_an_earlier_release(path: &Path) -> rusqlite::Connection {
+    let state = rusqlite::Connection::open(path).unwrap();
+    state
+        .execute_batch(
+            "DELETE FROM schema_migrations WHERE version>6;
+             UPDATE meta SET value='6' WHERE key='schema';",
+        )
         .unwrap();
-    // What the earlier release stored, written as it wrote it.
-    let state = rusqlite::Connection::open(journal.database().path()).unwrap();
-    for id in NOT_ORDER_IDS {
-        let order = json!({"orderId": id, "status": "WORKING"}).to_string();
-        state
-            .execute(
-                "INSERT INTO orders VALUES('hash',?1,0,?2)",
-                rusqlite::params![id, order],
-            )
-            .unwrap();
-    }
-    let outcome = json!({"status": "accepted", "order_id": "abc"}).to_string();
+    state
+}
+
+/// Store an order under `order_id`, observed at `observed_at`, as an
+/// earlier release could.
+fn store_order(
+    state: &rusqlite::Connection,
+    account: &str,
+    order_id: &str,
+    observed_at: i64,
+    payload: &Value,
+) {
+    state
+        .execute(
+            "INSERT INTO orders VALUES(?1,?2,?3,?4)",
+            rusqlite::params![account, order_id, observed_at, payload.to_string()],
+        )
+        .unwrap();
+}
+
+/// Record submission `attempt` as accepted under order `order_id`, as an
+/// earlier release could.
+fn accept_under(state: &rusqlite::Connection, attempt: &str, order_id: &str) {
+    let outcome = json!({"status": "accepted", "order_id": order_id}).to_string();
     state
         .execute(
             "UPDATE submissions SET outcome=?1 WHERE id=?2",
-            rusqlite::params![outcome, lost],
+            rusqlite::params![outcome, attempt],
         )
         .unwrap();
+}
+
+/// Each row `query` returns, its one column as text.
+fn rows(state: &rusqlite::Connection, query: &str) -> Vec<String> {
+    let mut statement = state.prepare(query).unwrap();
+    statement
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// The client again, on the same state file, as a process started after an
+/// upgrade opens it.
+fn reopened(client: &SchwabClient) -> SchwabClient {
+    SchwabClient::new(SchwabConfig {
+        oauth: client.auth_manager().config().clone(),
+        client: client.client_config().clone(),
+        streaming: None,
+    })
+    .unwrap()
+}
+
+/// A state file an earlier release wrote can hold orders stored under IDs
+/// that are not whole numbers, and an accepted submission naming one. No
+/// broker order has such an ID, so opening the file sets each aside rather
+/// than leave every pass to fail on it: the order stored under it is
+/// dropped and audited with what was stored, a submission that named it
+/// goes back to being placed by its tag, and the account reconciles.
+/// Nothing is fetched for them.
+#[tokio::test]
+async fn a_state_file_holding_ids_that_are_not_whole_numbers_reconciles() {
+    let server = MockServer::start().await;
+    let (earlier, _dir, _) = client(&server, false);
+    let lost = earlier
+        .order_journal()
+        .begin("hash", "place_order", json!({"tag": "rs-lost"}))
+        .await
+        .unwrap();
+    let state = as_left_by_an_earlier_release(earlier.order_journal().database().path());
+    for id in NOT_ORDER_IDS {
+        let working = json!({"orderId": id, "status": "WORKING"});
+        store_order(&state, "hash", id, 0, &working);
+    }
+    accept_under(&state, &lost, "abc");
     drop(state);
+    let client = reopened(&earlier);
+    let journal = client.order_journal();
     // Schwab lists the order the submission placed, under its tag.
     Mock::given(method("GET"))
         .and(path("/trader/v1/accounts/hash/orders"))
@@ -342,7 +403,6 @@ async fn a_state_file_holding_ids_that_are_not_whole_numbers_reconciles() {
 
     let report = client.reconcile_account("hash", 1).await.unwrap();
     assert!(report.reconciled);
-    assert_eq!(report.set_aside_order_ids, vec!["", "-5", "abc"]);
     assert_eq!(report.resolved_attempts, vec![lost.clone()]);
     assert!(matches!(
         journal.record(&lost).await.unwrap().unwrap().outcome,
@@ -379,104 +439,39 @@ async fn a_state_file_holding_ids_that_are_not_whole_numbers_reconciles() {
     );
 
     // Nothing is left to set aside, and the account stays reconciled.
-    let again = client.reconcile_account("hash", 1).await.unwrap();
-    assert!(again.reconciled);
-    assert!(again.set_aside_order_ids.is_empty());
+    assert!(
+        client
+            .reconcile_account("hash", 1)
+            .await
+            .unwrap()
+            .reconciled
+    );
     assert_eq!(set_aside().await, audited);
     server.verify().await;
 }
 
-/// Write an order into `journal`'s state file under `order_id`, as an
-/// earlier release could, observed at `observed_at`.
-fn store_order_as_written_before(
-    journal: &OrderJournal,
-    account: &str,
-    order_id: &str,
-    observed_at: i64,
-    payload: &Value,
-) {
-    rusqlite::Connection::open(journal.database().path())
-        .unwrap()
-        .execute(
-            "INSERT INTO orders VALUES(?1,?2,?3,?4)",
-            rusqlite::params![account, order_id, observed_at, payload.to_string()],
-        )
-        .unwrap();
-}
-
-/// The store repairs stored IDs itself, as an authority does for its
-/// workers, and a pass whose only change is setting one aside, or writing
-/// one in its own digits, is audited as a change to the account like any
-/// other.
-#[tokio::test]
-async fn a_pass_that_only_repairs_a_stored_id_is_audited() {
-    let dir = tempfile::tempdir().unwrap();
-    let journal = OrderJournal::new(dir.path().join("orders.json"));
-    let database = journal.database();
-    let now = chrono::Utc::now().timestamp_millis();
-    let pass = |started_at: i64| {
-        let database = database.clone();
-        async move {
-            database
-                .reconcile_snapshot("A", 1, started_at, json!({}), vec![])
-                .await
-                .unwrap()
-        }
-    };
-    pass(now - 2000).await;
-    for (order_id, started_at) in [("abc", now - 1000), ("007", now)] {
-        let working = json!({"orderId": order_id, "status": "WORKING"});
-        store_order_as_written_before(&journal, "A", order_id, 0, &working);
-        assert!(pass(started_at).await.reconciled, "{order_id:?}");
-    }
-    assert_eq!(
-        journal.reconciliation_targets("A").await.unwrap(),
-        vec!["7"]
-    );
-    let audited: Vec<_> = journal
-        .audit_page(0, 100)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|e| e.kind)
-        .filter(|kind| kind != "intent")
-        .collect();
-    assert_eq!(
-        audited,
-        vec![
-            "account_reconciled",
-            "order_id_set_aside",
-            "account_reconciled",
-            "order_id_canonicalized",
-            "account_reconciled"
-        ]
-    );
-}
-
 /// A stored ID that is a whole number written another way (an earlier
 /// release took `"007"`) names a real order, 7, so it is never set aside:
-/// the next pass rewrites it in its own digits, audited with the text it
-/// had, and follows the order under its own ID from then on. A submission
-/// accepted under the old text is accepted under the order's own ID.
+/// opening the file rewrites it in its own digits, audited with the text it
+/// had, and the account's passes follow the order under its own ID. A
+/// submission accepted under the old text is accepted under the order's
+/// own ID.
 #[tokio::test]
 async fn a_stored_id_written_another_way_still_names_its_order() {
     let server = MockServer::start().await;
-    let (client, _dir, _) = client(&server, false);
-    let journal = client.order_journal();
-    let placed = journal
+    let (earlier, _dir, _) = client(&server, false);
+    let placed = earlier
+        .order_journal()
         .begin("hash", "place_order", json!({"tag": "rs-seven"}))
         .await
         .unwrap();
+    let state = as_left_by_an_earlier_release(earlier.order_journal().database().path());
     let working = json!({"orderId": "007", "status": "WORKING"});
-    store_order_as_written_before(journal, "hash", "007", 0, &working);
-    let outcome = json!({"status": "accepted", "order_id": "007"}).to_string();
-    rusqlite::Connection::open(journal.database().path())
-        .unwrap()
-        .execute(
-            "UPDATE submissions SET outcome=?1 WHERE id=?2",
-            rusqlite::params![outcome, placed],
-        )
-        .unwrap();
+    store_order(&state, "hash", "007", 0, &working);
+    accept_under(&state, &placed, "007");
+    drop(state);
+    let client = reopened(&earlier);
+    let journal = client.order_journal();
     // Schwab lists the order under its own ID.
     let listed = json!({"orderId": 7, "status": "WORKING", "tag": "rs-seven"});
     Mock::given(method("GET"))
@@ -504,10 +499,7 @@ async fn a_stored_id_written_another_way_still_names_its_order() {
             .collect::<Vec<_>>()
     };
 
-    let report = client.reconcile_account("hash", 1).await.unwrap();
-    assert!(report.reconciled);
-    assert_eq!(report.canonicalized_order_ids, vec!["007"]);
-    assert!(report.set_aside_order_ids.is_empty());
+    // Opening the file rewrote it, before any pass.
     let repaired = audited().await;
     assert_eq!(
         repaired,
@@ -516,6 +508,13 @@ async fn a_stored_id_written_another_way_still_names_its_order() {
             "007".to_string(),
             json!({"account": "hash", "order_id": "7", "merged": false, "attempts": [placed]})
         )]
+    );
+    assert!(
+        client
+            .reconcile_account("hash", 1)
+            .await
+            .unwrap()
+            .reconciled
     );
     assert_eq!(
         journal.reconciliation_targets("hash").await.unwrap(),
@@ -542,27 +541,31 @@ async fn a_stored_id_written_another_way_still_names_its_order() {
     server.verify().await;
 }
 
-/// A stored ID written another way is fetched as the order it names, so a
-/// working order older than the order list's window is still read in the
-/// same pass. A reference the broker has no order for is dropped under the
-/// text it was stored as; an order the store did observe vanishing still
-/// needs an operator.
+/// A store that was never migrated (an authority still on an earlier
+/// release, say) can return stored IDs written another way. The client
+/// reads each as the order it names, once however many ways it is stored,
+/// so a working order older than the order list's window is still read in
+/// the same pass. A reference the broker has no order for is dropped under
+/// the text it was stored as; an order the store did observe vanishing
+/// still needs an operator.
 #[tokio::test]
 async fn stored_ids_written_another_way_are_read_as_the_orders_they_name() {
     let server = MockServer::start().await;
     let (client, _dir, _) = client(&server, false);
     let journal = client.order_journal();
-    // An observed working order stored as "+8", and a reference to order 9
+    // Written into the open store, which returns them as such a store would:
+    // an observed working order stored as "+8", and a reference to order 9
     // that the broker never answered for, stored as "09".
-    store_order_as_written_before(
-        journal,
+    let state = rusqlite::Connection::open(journal.database().path()).unwrap();
+    store_order(
+        &state,
         "hash",
         "+8",
         0,
         &json!({"orderId": "+8", "status": "WORKING"}),
     );
-    store_order_as_written_before(
-        journal,
+    store_order(
+        &state,
         "hash",
         "09",
         0,
@@ -580,8 +583,7 @@ async fn stored_ids_written_another_way_are_read_as_the_orders_they_name() {
         })))
         .mount(&server)
         .await;
-    let fetched =
-        json!({"orderId": 8, "status": "WORKING", "enteredTime": "2026-01-02T15:00:00+0000"});
+    let fetched = json!({"orderId": 8, "status": "WORKING"});
     let order_eight = || {
         Mock::given(method("GET"))
             .and(path("/trader/v1/accounts/hash/orders/8"))
@@ -603,22 +605,16 @@ async fn stored_ids_written_another_way_are_read_as_the_orders_they_name() {
                 .unwrap()
                 .reconciled
         );
-        assert_eq!(
-            journal.reconciliation_targets("hash").await.unwrap(),
-            vec!["8"]
-        );
-        assert_eq!(
-            journal.database().known_orders("hash", 10).await.unwrap(),
-            vec![fetched.clone()]
-        );
+        let targets = journal.reconciliation_targets("hash").await.unwrap();
+        assert!(!targets.contains(&"09".to_string()), "{targets:?}");
     }
     drop(read_each_pass);
     drop(no_order_nine);
 
     // An observed working order the broker no longer has, stored as "010".
     order_eight().mount(&server).await;
-    store_order_as_written_before(
-        journal,
+    store_order(
+        &state,
         "hash",
         "010",
         0,
@@ -630,17 +626,16 @@ async fn stored_ids_written_another_way_are_read_as_the_orders_they_name() {
         .mount(&server)
         .await;
     assert!(client.reconcile_account("hash", 1).await.is_err());
-    let mut targets = journal.reconciliation_targets("hash").await.unwrap();
-    targets.sort();
-    assert_eq!(targets, vec!["010", "8"]);
+    let targets = journal.reconciliation_targets("hash").await.unwrap();
+    assert!(targets.contains(&"010".to_string()), "{targets:?}");
 }
 
-/// A stored ID written another way may name an order also stored under its
-/// own digits. The two records merge into one under the order's own ID:
-/// the broker's latest view of the order is kept (on a tie, the record
-/// under its own digits), each observed activity is kept once, every
-/// submission accepted under either text is accepted under the order's own
-/// ID, and a reservation for a replacement of it names that ID.
+/// When an earlier release's file holds one order under its own digits and
+/// under another text, opening it merges the two into one record under the
+/// order's own ID: the broker's latest view of the order is kept (on a tie,
+/// the record under its own digits), each observed activity is kept once,
+/// every submission accepted under either text is accepted under the
+/// order's own ID, and a reservation for a replacement of it names that ID.
 #[tokio::test]
 async fn a_stored_id_written_another_way_merges_with_its_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -665,13 +660,22 @@ async fn a_stored_id_written_another_way_merges_with_its_order() {
         .record_order("A", working(json!(70), 2, vec![fill(1), fill(2)]))
         .await
         .unwrap();
-    let state = rusqlite::Connection::open(journal.database().path()).unwrap();
+    let mut attempts = vec![];
+    for _ in 0..2 {
+        let attempt = journal.begin("A", "place_order", json!({})).await.unwrap();
+        journal.finish(&attempt, accepted(Some("1"))).await.unwrap();
+        attempts.push(attempt);
+    }
+    let path = journal.path().to_owned();
+    let state = as_left_by_an_earlier_release(&path);
     state
         .execute_batch(
             "UPDATE orders SET order_id='007', observed_at=observed_at+1000, \
                payload=json_set(payload,'$.orderId','007') WHERE account='A' AND order_id='70';
              UPDATE executions SET execution_id='007'||substr(execution_id,3) \
-               WHERE account='A' AND execution_id LIKE '70:%';",
+               WHERE account='A' AND execution_id LIKE '70:%';
+             INSERT INTO reservations(id,account,quantity,notional,state,symbol,side,replaces) \
+               VALUES('moving','A','1','10','held','AAPL','BUY','007');",
         )
         .unwrap();
     // Order 8 under both texts, observed at the same moment.
@@ -682,67 +686,27 @@ async fn a_stored_id_written_another_way_merges_with_its_order() {
             |r| r.get(0),
         )
         .unwrap();
-    store_order_as_written_before(
-        &journal,
-        "A",
-        "8",
-        observed_at,
-        &working(json!(8), 0, vec![]),
-    );
-    store_order_as_written_before(
-        &journal,
+    store_order(&state, "A", "8", observed_at, &working(json!(8), 0, vec![]));
+    store_order(
+        &state,
         "A",
         "08",
         observed_at,
         &working(json!("08"), 1, vec![]),
     );
-    // Submissions accepted under each text, and a replacement of "007".
-    let mut attempts = vec![];
-    for order_id in ["7", "007"] {
-        let attempt = journal.begin("A", "place_order", json!({})).await.unwrap();
-        state
-            .execute(
-                "UPDATE submissions SET outcome=?1 WHERE id=?2",
-                rusqlite::params![
-                    json!({"status": "accepted", "order_id": order_id}).to_string(),
-                    attempt
-                ],
-            )
-            .unwrap();
-        attempts.push(attempt);
-    }
-    state
-        .execute(
-            "INSERT INTO reservations(id,account,quantity,notional,state,symbol,side,replaces) \
-             VALUES('moving','A','1','10','held','AAPL','BUY','007')",
-            [],
+    accept_under(&state, &attempts[0], "7");
+    accept_under(&state, &attempts[1], "007");
+    let activities = || {
+        rows(
+            &state,
+            "SELECT substr(execution_id,1,instr(execution_id,':')-1) FROM executions \
+             WHERE account='A' ORDER BY execution_id",
         )
-        .unwrap();
-    let activities = |state: &rusqlite::Connection| {
-        let mut stmt = state
-            .prepare("SELECT execution_id FROM executions WHERE account='A' ORDER BY execution_id")
-            .unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(|id| id.unwrap().split(':').next().unwrap().to_owned())
-            .collect::<Vec<_>>()
     };
-    assert_eq!(activities(&state), vec!["007", "007", "7"]);
+    assert_eq!(activities(), vec!["007", "007", "7"]);
 
-    let report = journal
-        .database()
-        .reconcile_snapshot(
-            "A",
-            1,
-            chrono::Utc::now().timestamp_millis(),
-            json!({}),
-            vec![],
-        )
-        .await
-        .unwrap();
-    assert_eq!(report.canonicalized_order_ids, vec!["007", "08"]);
-    assert!(report.set_aside_order_ids.is_empty());
-    let mut known = journal.database().known_orders("A", 10).await.unwrap();
+    let upgraded = OrderJournal::new(path);
+    let mut known = upgraded.database().known_orders("A", 10).await.unwrap();
     known.sort_by_key(|order| order["orderId"].to_string());
     assert_eq!(
         known,
@@ -751,22 +715,21 @@ async fn a_stored_id_written_another_way_merges_with_its_order() {
             working(json!(8), 0, vec![]),
         ]
     );
-    assert_eq!(activities(&state), vec!["7", "7"]);
+    assert_eq!(activities(), vec!["7", "7"]);
     for attempt in &attempts {
         assert!(matches!(
-            journal.record(attempt).await.unwrap().unwrap().outcome,
+            upgraded.record(attempt).await.unwrap().unwrap().outcome,
             Some(SubmissionOutcome::Accepted { order_id: Some(order_id) }) if order_id == "7"
         ));
     }
-    let replaces: String = state
-        .query_row(
-            "SELECT replaces FROM reservations WHERE id='moving'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(replaces, "7");
-    let canonicalized: BTreeMap<String, Value> = journal
+    assert_eq!(
+        rows(
+            &state,
+            "SELECT replaces FROM reservations WHERE id='moving'"
+        ),
+        vec!["7"]
+    );
+    let canonicalized: BTreeMap<String, Value> = upgraded
         .audit_page(0, 1000)
         .await
         .unwrap()
@@ -787,6 +750,252 @@ async fn a_stored_id_written_another_way_merges_with_its_order() {
             ),
         ])
     );
+}
+
+/// Opening an earlier release's state file rewrites every order ID it holds
+/// outside the audit trail, once, in the transaction that records the new
+/// schema version: finished orders and their observed activity as well as
+/// working orders and references, and every link to them (accepted
+/// submissions, reservations for a replacement). Records for the same
+/// number merge, and an ID that names no order at all is set aside. Each
+/// change is audited; the audit rows already written stay as they were and
+/// the chain still verifies; and opening the file again changes nothing.
+#[tokio::test]
+async fn opening_an_earlier_state_file_canonicalizes_every_order_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let fill = |quantity: u32| json!({"activityType": "EXECUTION", "quantity": quantity});
+    let order = |order_id: Value, status: &str, fills: Vec<Value>| json!({"orderId": order_id, "status": status, "orderActivityCollection": fills});
+    // Recorded under scratch IDs so that their activities are keyed as this
+    // release keys them, then moved under the text the earlier release
+    // stored: "007", finished, the same order as the working "7" and
+    // observed after it; "+8", finished, alone.
+    for (order_id, status, fills) in [
+        (7, "WORKING", vec![fill(1)]),
+        (70, "FILLED", vec![fill(1), fill(2)]),
+        (80, "CANCELED", vec![fill(3)]),
+    ] {
+        journal
+            .record_order("A", order(json!(order_id), status, fills))
+            .await
+            .unwrap();
+    }
+    let mut attempts = BTreeMap::new();
+    for order_id in ["7", "007", "+8", "abc"] {
+        let attempt = journal.begin("A", "place_order", json!({})).await.unwrap();
+        journal.finish(&attempt, accepted(Some("1"))).await.unwrap();
+        attempts.insert(order_id, attempt);
+    }
+    let path = journal.path().to_owned();
+    let state = as_left_by_an_earlier_release(&path);
+    state
+        .execute_batch(
+            "UPDATE orders SET order_id='007', observed_at=observed_at+1000, \
+               payload=json_set(payload,'$.orderId','007') WHERE order_id='70';
+             UPDATE executions SET execution_id='007'||substr(execution_id,3) \
+               WHERE execution_id LIKE '70:%';
+             UPDATE orders SET order_id='+8', payload=json_set(payload,'$.orderId','+8') \
+               WHERE order_id='80';
+             UPDATE executions SET execution_id='+8'||substr(execution_id,3) \
+               WHERE execution_id LIKE '80:%';
+             INSERT INTO reservations(id,account,quantity,notional,state,symbol,side,replaces) \
+               VALUES('replaces-007','A','1','10','held','AAPL','BUY','007'),\
+                     ('replaces-abc','A','1','10','held','AAPL','BUY','abc');",
+        )
+        .unwrap();
+    store_order(
+        &state,
+        "A",
+        "09",
+        0,
+        &json!({"orderId": "09", "status": "UNKNOWN"}),
+    );
+    store_order(
+        &state,
+        "A",
+        "abc",
+        0,
+        &order(json!("abc"), "FILLED", vec![]),
+    );
+    for (order_id, attempt) in &attempts {
+        accept_under(&state, attempt, order_id);
+    }
+    let audit = || {
+        rows(
+            &state,
+            "SELECT sequence||' '||kind||' '||subject||' '||payload||' '||hash FROM audit \
+             ORDER BY sequence",
+        )
+    };
+    let written_before = audit();
+
+    // A process started after the upgrade opens the file.
+    let upgraded = OrderJournal::new(path.clone());
+    upgraded.records().await.unwrap();
+    assert_eq!(
+        rows(&state, "SELECT value FROM meta WHERE key='schema'"),
+        vec!["7"]
+    );
+    // Every table that links to orders holds only their own IDs.
+    assert_eq!(
+        rows(&state, "SELECT order_id FROM orders ORDER BY order_id"),
+        vec!["7", "8", "9"]
+    );
+    assert_eq!(
+        rows(
+            &state,
+            "SELECT substr(execution_id,1,instr(execution_id,':')-1) FROM executions \
+             ORDER BY execution_id"
+        ),
+        vec!["7", "7", "8"]
+    );
+    for (order_id, linked) in [
+        ("7", Some("7")),
+        ("007", Some("7")),
+        ("+8", Some("8")),
+        ("abc", None),
+    ] {
+        let outcome = upgraded
+            .record(&attempts[order_id])
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome;
+        assert!(
+            matches!(&outcome, Some(SubmissionOutcome::Accepted { order_id }) if order_id.as_deref() == linked),
+            "{order_id}: {outcome:?}"
+        );
+    }
+    assert_eq!(
+        rows(
+            &state,
+            "SELECT id||' '||coalesce(replaces,'none') FROM reservations ORDER BY id"
+        ),
+        vec!["replaces-007 7", "replaces-abc none"]
+    );
+    // The finished "007" was observed after the working "7": its view of
+    // the order stands, under the order's own ID.
+    let mut known = upgraded.database().known_orders("A", 10).await.unwrap();
+    known.sort_by_key(|order| order["orderId"].to_string());
+    assert_eq!(
+        known,
+        vec![
+            order(json!("7"), "FILLED", vec![fill(1), fill(2)]),
+            order(json!("8"), "CANCELED", vec![fill(3)]),
+            json!({"orderId": "9", "status": "UNKNOWN"}),
+        ]
+    );
+    let repairs: BTreeMap<(String, String), Value> = upgraded
+        .audit_page(0, 1000)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "order_id_canonicalized" || e.kind == "order_id_set_aside")
+        .map(|e| ((e.kind, e.subject), e.payload))
+        .collect();
+    let canonicalized = |from: &str| ("order_id_canonicalized".to_string(), from.to_string());
+    assert_eq!(
+        repairs,
+        BTreeMap::from([
+            (
+                canonicalized("007"),
+                json!({"account": "A", "order_id": "7", "merged": true,
+                    "attempts": [attempts["007"]]})
+            ),
+            (
+                canonicalized("+8"),
+                json!({"account": "A", "order_id": "8", "merged": false,
+                    "attempts": [attempts["+8"]]})
+            ),
+            (
+                canonicalized("09"),
+                json!({"account": "A", "order_id": "9", "merged": false, "attempts": []})
+            ),
+            (
+                ("order_id_set_aside".to_string(), "abc".to_string()),
+                json!({"account": "A", "order": order(json!("abc"), "FILLED", vec![]),
+                    "attempts": [attempts["abc"]]})
+            ),
+        ])
+    );
+    // The audit rows already written are as they were, and the chain still
+    // verifies with the new entries after them.
+    assert_eq!(audit()[..written_before.len()], written_before[..]);
+    upgraded.verify_audit().await.unwrap();
+
+    // Opening it again changes nothing.
+    let everything = || {
+        [
+            audit(),
+            rows(
+                &state,
+                "SELECT order_id||' '||payload FROM orders ORDER BY 1",
+            ),
+            rows(&state, "SELECT execution_id FROM executions ORDER BY 1"),
+            rows(
+                &state,
+                "SELECT id||' '||coalesce(outcome,'') FROM submissions ORDER BY 1",
+            ),
+        ]
+        .concat()
+    };
+    let migrated = everything();
+    OrderJournal::new(path).records().await.unwrap();
+    assert_eq!(everything(), migrated);
+}
+
+/// After its one-time migration, a state file can hold an order ID that is
+/// not one only if it was edited by hand or damaged. Such a file does not
+/// open: nothing is read or written through it, and the error names the
+/// table, the row and the text it found.
+#[tokio::test]
+async fn a_state_file_that_breaks_the_order_id_invariant_does_not_open() {
+    for (table, write) in [
+        (
+            "orders",
+            "INSERT INTO orders VALUES('A','007',0,'{\"orderId\":\"007\",\"status\":\"WORKING\"}')",
+        ),
+        (
+            "executions",
+            "INSERT INTO executions VALUES('A','007:0a1b','{}')",
+        ),
+        (
+            "submissions",
+            "INSERT INTO submissions(id,account,operation,created_at,request,outcome) \
+             VALUES('s1','A','place_order',1,'{}','{\"status\":\"accepted\",\"order_id\":\"007\"}')",
+        ),
+        (
+            "reservations",
+            "INSERT INTO reservations(id,account,quantity,notional,state,replaces) \
+             VALUES('r1','A','1','10','held','007')",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = OrderJournal::new(dir.path().join("orders.json"));
+        journal.records().await.unwrap();
+        rusqlite::Connection::open(journal.path())
+            .unwrap()
+            .execute(write, [])
+            .unwrap();
+        let refused = OrderJournal::new(journal.path().to_owned())
+            .records()
+            .await
+            .unwrap_err();
+        let message = refused.to_string();
+        assert!(
+            message.contains(table) && message.contains("\"007\""),
+            "{table}: {message}"
+        );
+        assert!(
+            matches!(
+                &refused,
+                Error::NonCanonicalOrderId { table: found, row, order_id }
+                    if *found == table && !row.is_empty() && order_id == "007"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.kind(), rustyschwab::ErrorKind::Storage);
+    }
 }
 
 /// A replacement names the order it replaces by its broker order ID: risk

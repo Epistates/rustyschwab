@@ -16,6 +16,8 @@
 //! - [`Error::Auth`] - Re-authenticate with fresh OAuth flow
 //! - [`Error::InvalidParameter`] - Fix parameter values
 //! - [`Error::Config`] - Validate configuration settings
+//! - [`Error::NonCanonicalOrderId`] - The state file was edited by hand or
+//!   damaged; restore a backup or repair it (see docs/OPERATIONS.md)
 //! - HTTP 4xx errors (except 429) - Fix request parameters
 //!
 //! ## Trading Control Errors (Resolve the condition, then submit a new intent)
@@ -97,6 +99,20 @@ pub enum Error {
     /// [`Error::StateBusy`], not this.
     #[error("Durable state failure: {0}")]
     Storage(String),
+    /// The state file holds an order ID that is not a broker order ID
+    /// ([`is_broker_order_id`](crate::execution::is_broker_order_id)): the
+    /// text `order_id` in `table`, at `row`. The one-time migration that
+    /// opening the file runs first rewrites every ID an earlier release
+    /// stored, so the file was edited by hand or damaged since. The store
+    /// does not open: an order the journal names two ways could be tracked,
+    /// counted against risk or released twice. Of kind
+    /// [`ErrorKind::Storage`]; recovery is in docs/OPERATIONS.md.
+    #[error("Durable state holds an order ID that is not one: {order_id:?} in {table} ({row})")]
+    NonCanonicalOrderId {
+        table: &'static str,
+        row: String,
+        order_id: String,
+    },
     #[error("Ownership lease lost; reconcile in-flight operations")]
     OwnershipLost,
     /// Another operation holds the lease right now; nothing was attempted.
@@ -446,7 +462,7 @@ impl Error {
     /// Stable classification of this error, independent of its payload.
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Self::Storage(_) => ErrorKind::Storage,
+            Self::Storage(_) | Self::NonCanonicalOrderId { .. } => ErrorKind::Storage,
             Self::OwnershipLost => ErrorKind::OwnershipLost,
             Self::LeaseBusy => ErrorKind::LeaseBusy,
             Self::StateBusy(_) => ErrorKind::StateBusy,
@@ -756,7 +772,8 @@ impl From<&Error> for ErrorEnvelope {
             Error::Validation(inner) => envelope.message = inner.to_string(),
             Error::Serialization(inner) => envelope.message = inner.to_string(),
             Error::Io(inner) => envelope.message = inner.to_string(),
-            Error::OwnershipLost
+            Error::NonCanonicalOrderId { .. }
+            | Error::OwnershipLost
             | Error::LeaseBusy
             | Error::CircuitOpen
             | Error::ConnectionClosed

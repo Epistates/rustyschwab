@@ -269,21 +269,30 @@ request is sent:
   order ID", so the account stayed unreconciled and refused orders.
   - Order IDs are now checked wherever they come in (see "Changed — order
     IDs are checked before anything is sent").
-  - A state file that already holds such an ID needs no edit; the next pass
-    repairs it. An ID that is a whole number written another way, such as
-    `"007"`, names a real order, so the pass reads that order as 7 and
-    rewrites the ID as `"7"`. If the order is also stored as `"7"`, the two
-    records merge: the later observation of the order is kept, each
-    observed activity is kept once, and every submission accepted under
-    either text is accepted under `"7"`. This is audited as
-    `order_id_canonicalized` with the old text and listed in
-    `ReconciliationReport::canonicalized_order_ids`.
+  - A state file that already holds such an ID needs no edit. The first
+    time this release opens it, a one-time migration repairs every order ID
+    it holds outside the audit trail, finished history included.
+  - An ID that is a whole number written another way, such as `"007"` or
+    `"+8"`, names a real order and is rewritten in its own digits. If the
+    order is also stored as `"7"`, the two records merge: the later
+    observation of the order is kept, each observed activity is kept once,
+    and every submission accepted under either text, and any reservation for
+    a replacement of it, names `"7"`. Each rewrite is audited as
+    `order_id_canonicalized` with the old text.
   - Any other ID, such as `"abc"`, `"-5"`, `""` or one past
-    18446744073709551615, is set aside: the pass drops the order stored
-    under it, returns a submission accepted under it to placement by its
-    tag, audits it as `order_id_set_aside` with what was stored, logs it as
-    an error, and lists it in `ReconciliationReport::set_aside_order_ids`.
-    No broker order has such an ID, so nothing real is given up.
+    18446744073709551615, is set aside. The order stored under it is
+    dropped, a submission accepted under it returns to placement by its tag,
+    and the ID is logged as an error and audited as `order_id_set_aside` with
+    what was stored. No broker order has such an ID, so nothing real is
+    given up, but such a submission keeps its account unreconciled until a
+    pass finds its order by tag or an operator resolves it.
+  - The audit trail is not rewritten: its entries record what was true when
+    each was written, and the migration's entries record the mapping.
+  - Every open now checks that the store holds only broker order IDs outside
+    its audit trail. A file that doesn't, which only a hand edit or damage
+    after the migration can cause, fails to open with the new
+    `Error::NonCanonicalOrderId` (kind `storage`), naming the table, the row
+    and the text. docs/OPERATIONS.md gives the recovery.
 
 - Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
   0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0
