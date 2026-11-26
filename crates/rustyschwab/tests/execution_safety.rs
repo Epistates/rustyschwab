@@ -630,6 +630,61 @@ async fn sells_are_judged_per_symbol() {
     ));
 }
 
+/// A sell only reduces what the account holds, whatever it holds, so the
+/// sell rule alone judges it: an ETF, labelled as Schwab lists the position
+/// (`COLLECTIVE_INVESTMENT`) or as `EQUITY`, sells up to the position less
+/// its other working sells, and no further. A buy of one is still refused,
+/// so the provider can trap no one in a fund it would not let them buy.
+#[tokio::test]
+async fn a_held_etf_sells_down_to_nothing_and_no_further() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 10,
+                "instrument": {"symbol": "TQQQ", "assetType": "COLLECTIVE_INVESTMENT"}}]
+        }),
+        vec![],
+    )
+    .await;
+    let risk = risk(&journal, limits());
+    let leg = |instruction: &str, asset: &str, quantity: u32| -> OrderRequest {
+        let mut order = order(instruction, "TQQQ", quantity, "50");
+        order.order_leg_collection[0].instrument.asset_type =
+            serde_json::from_value(json!(asset)).unwrap();
+        order
+    };
+    for asset in ["COLLECTIVE_INVESTMENT", "EQUITY"] {
+        risk.check("A", &leg("SELL", asset, 10), None)
+            .await
+            .unwrap();
+    }
+    risk.reserve("A", "most", &leg("SELL", "COLLECTIVE_INVESTMENT", 6))
+        .await
+        .unwrap();
+    risk.reserve("A", "rest", &leg("SELL", "EQUITY", 4))
+        .await
+        .unwrap();
+    for asset in ["COLLECTIVE_INVESTMENT", "EQUITY"] {
+        let oversold = risk.reserve("A", "more", &leg("SELL", asset, 1)).await;
+        assert!(
+            matches!(&oversold, Err(rustyschwab::Error::RiskDenied(r))
+                if r == "Sell exceeds the position less the symbol's working sells"),
+            "{asset}: {oversold:?}"
+        );
+    }
+    let buy = risk
+        .check("A", &leg("BUY", "COLLECTIVE_INVESTMENT", 1), None)
+        .await;
+    assert!(
+        matches!(&buy, Err(rustyschwab::Error::RiskDenied(r))
+            if r.starts_with("Built-in portfolio risk covers long equity only; ETFs")),
+        "{buy:?}"
+    );
+}
+
 /// Working buys of a symbol, ours or at the broker, add to the position
 /// rather than offer any of it: the whole position may still be sold, and
 /// only a working sell takes shares out of what may be.
