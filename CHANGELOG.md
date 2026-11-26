@@ -512,6 +512,13 @@ purpose.
   trader had read that error as a definite refusal, recorded the order as
   rejected (out of the daily budget and the dead-man switch's reach) and
   could refund its approval while it was live at Schwab.
+- The built-in risk provider (`PortfolioRisk`) counted a working order
+  at the broker for no shares as no exposure and kept trading, while a
+  working option strategy for no units already stopped every order on
+  the account. An order for nothing is not one the SDK sends
+  (`OrderRequest::validate` refuses it), so its figures cannot be
+  trusted: it now stops every order on the account as well, as
+  `RiskDenied`, until the broker no longer lists it as working.
 
 ### Changed — typed errors from the order builders
 

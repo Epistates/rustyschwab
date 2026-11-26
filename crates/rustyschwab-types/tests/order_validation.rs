@@ -433,6 +433,39 @@ fn legs_are_judged_together() {
     rejects(&single_option, "NORMAL session");
 }
 
+/// An order for nothing is refused before it is sent: a single order for
+/// no shares, a strategy with a leg of no contracts, and a strategy for no
+/// units, each naming the quantity at fault.
+#[test]
+fn an_order_for_nothing_is_refused() {
+    let no_shares = OrderRequest::limit(buy(0), d("150"))
+        .validate()
+        .unwrap_err();
+    assert_eq!(no_shares.kind(), ValidationErrorKind::OutOfRange);
+    assert_eq!(no_shares.field(), Some("orderLegCollection[0].quantity"));
+
+    let call = |strike: &str| format!("AAPL  301218C00{strike}000");
+    let vertical = |contracts: u32| {
+        parse(json!({
+            "orderStrategyType": "SINGLE", "orderType": "NET_DEBIT", "session": "NORMAL",
+            "duration": "DAY", "price": "1.00",
+            "orderLegCollection": [
+                option_leg("BUY_TO_OPEN", &call("150"), contracts),
+                option_leg("SELL_TO_OPEN", &call("160"), contracts)]
+        }))
+        .unwrap()
+    };
+    vertical(1).validate().unwrap();
+    let no_contracts = vertical(0).validate().unwrap_err();
+    assert_eq!(no_contracts.kind(), ValidationErrorKind::OutOfRange);
+    assert_eq!(no_contracts.field(), Some("orderLegCollection[0].quantity"));
+    let mut no_units = vertical(1);
+    no_units.quantity = Some(Decimal::ZERO);
+    let no_units = no_units.validate().unwrap_err();
+    assert_eq!(no_units.kind(), ValidationErrorKind::OutOfRange);
+    assert_eq!(no_units.field(), Some("quantity"));
+}
+
 /// A trailing offset in ticks is a whole number of ticks.
 #[test]
 fn a_tick_offset_is_whole() {

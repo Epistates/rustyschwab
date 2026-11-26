@@ -1929,14 +1929,14 @@ fn unbounded(result: &rustyschwab::Result<()>) -> bool {
 }
 
 /// A working order at the broker counts what its unfilled remainder could
-/// still buy or sell: nothing once it is filled in full, or when it is for
-/// no shares at all. One the provider cannot bound stops every order on
-/// the account, even a sell of another symbol: one with no status, that
-/// is not a single order, that no limit price bounds, with no legs or a
-/// leg that is not a long equity buy or sell, without a positive price,
-/// or whose figures do not hold together.
-/// Each figure is checked on its own, so a negative quantity is refused
-/// even where it is too small to change a sum of very large ones.
+/// still buy or sell: nothing once it is filled in full. One the provider
+/// cannot bound stops every order on the account, even a sell of another
+/// symbol: one with no status, that is not a single order, that no limit
+/// price bounds, with no legs or a leg that is not a long equity buy or
+/// sell, without a positive price, for no shares (as a working strategy
+/// for no units is), or whose figures do not hold together. Each figure is
+/// checked on its own, so a negative quantity is refused even where it is
+/// too small to change a sum of very large ones.
 #[tokio::test]
 async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
     let working = |change: Value| {
@@ -1965,6 +1965,11 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
         json!({"orderLegCollection": leg("SELL_SHORT", "EQUITY", "AAPL")}),
         json!({"price": 0}),
         json!({"filledQuantity": null}),
+        // For no shares, by the order's count or by its one leg's.
+        json!({"quantity": 0, "remainingQuantity": 0}),
+        json!({"quantity": null, "remainingQuantity": 0,
+            "orderLegCollection": [{"instruction": "BUY", "quantity": 0,
+                "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]}),
         // Filled past the order, or a negative fill or remainder.
         json!({"filledQuantity": 6, "remainingQuantity": -1}),
         json!({"filledQuantity": -1, "remainingQuantity": 6}),
@@ -1986,7 +1991,6 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
         json!({"orderType": "STOP_LIMIT", "stopPrice": 9}),
         json!({"filledQuantity": 2, "remainingQuantity": null}),
         json!({"filledQuantity": 5, "remainingQuantity": 0}),
-        json!({"quantity": 0, "remainingQuantity": 0}),
     ]
     .into_iter()
     .enumerate()
@@ -1999,8 +2003,8 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
 /// A working option strategy at the broker counts the unfilled share of
 /// its defined risk, from all of it while unfilled to none once filled in
 /// full. One the provider cannot bound stops every order on the account:
-/// one with no status, that is not a single order, or whose unfilled
-/// count is below zero or above the order's.
+/// one with no status, that is not a single order, for no units, or whose
+/// unfilled count is below zero or above the order's.
 #[tokio::test]
 async fn a_working_strategy_counts_its_unfilled_share_or_stops_every_order() {
     let working = |change: Value| {
