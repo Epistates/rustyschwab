@@ -1306,9 +1306,9 @@ async fn the_daily_loss_limit_refuses_orders_until_transfers_can_be_read() {
     use wiremock::matchers::query_param;
     let server = MockServer::start().await;
     let (base, _dir, _) = client(&server, false);
-    let risk = Arc::new(PortfolioRisk {
-        database: base.order_journal().database().clone(),
-        accounts: HashMap::from([(
+    let risk = Arc::new(PortfolioRisk::new(
+        base.order_journal().database().clone(),
+        HashMap::from([(
             "hash".into(),
             PortfolioLimits {
                 max_open_quantity: 10.into(),
@@ -1319,7 +1319,7 @@ async fn the_daily_loss_limit_refuses_orders_until_transfers_can_be_read() {
                 option_multipliers: Default::default(),
             },
         )]),
-    });
+    ));
     let client = base.with_risk_provider(risk.clone()).unwrap();
     Mock::given(path("/trader/v1/accounts/hash/orders"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -1406,10 +1406,10 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
         option_multipliers: Default::default(),
     };
     let client = base
-        .with_risk_provider(Arc::new(PortfolioRisk {
-            database: db,
-            accounts: HashMap::from([("hash".into(), limits)]),
-        }))
+        .with_risk_provider(Arc::new(PortfolioRisk::new(
+            db,
+            HashMap::from([("hash".into(), limits)]),
+        )))
         .unwrap();
     Mock::given(method("GET"))
         .and(path("/trader/v1/accounts/hash/orders/77"))

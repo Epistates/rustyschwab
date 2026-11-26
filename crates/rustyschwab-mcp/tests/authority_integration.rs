@@ -104,9 +104,9 @@ async fn setup() -> Setup {
     )
     .await
     .unwrap();
-    let risk = Arc::new(PortfolioRisk {
-        database: db,
-        accounts: HashMap::from([(
+    let risk = Arc::new(PortfolioRisk::new(
+        db,
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 2.into(),
@@ -117,7 +117,7 @@ async fn setup() -> Setup {
                 option_multipliers: Default::default(),
             },
         )]),
-    });
+    ));
     let client = Arc::new(client.with_risk_provider(risk.clone()).unwrap());
     // The market every trader's price collar judges an AAPL limit against.
     Mock::given(method("GET"))

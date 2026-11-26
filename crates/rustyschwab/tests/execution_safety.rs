@@ -50,10 +50,10 @@ async fn baseline(journal: &OrderJournal, account: Value, orders: Vec<Value>) {
 }
 
 fn risk(journal: &OrderJournal, limits: PortfolioLimits) -> PortfolioRisk {
-    PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::from([("A".into(), limits)]),
-    }
+    PortfolioRisk::new(
+        journal.database().clone(),
+        HashMap::from([("A".into(), limits)]),
+    )
 }
 
 fn funded() -> Value {
@@ -978,10 +978,10 @@ fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
         max_daily_loss: Some(500.into()),
         ..limits()
     };
-    let risk = PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
-    };
+    let risk = PortfolioRisk::new(
+        journal.database().clone(),
+        HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
+    );
     assert!(risk.needs_day_transfers("capped"));
     assert!(!risk.needs_day_transfers("uncapped"));
     assert!(!risk.needs_day_transfers("unknown"));

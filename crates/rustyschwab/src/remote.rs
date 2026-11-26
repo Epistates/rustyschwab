@@ -1,6 +1,7 @@
 //! Authenticated remote backends sharing one transactional authority.
 //! Use the broker gateway when workers must not possess broker credentials.
 use crate::{
+    SchwabClient,
     coordination::{Coordinator, Lease},
     error::{Error, ErrorEnvelope, ErrorKind, Result},
     execution::{AuditEvent, ExecutionStore, SubmissionOutcome, SubmissionRecord},
@@ -144,6 +145,20 @@ pub enum BackendRequest {
     },
 }
 impl BackendRequest {
+    /// Screen the order a `Reserve`, `ReserveReplacement` or `CheckRisk`
+    /// request carries ([`RiskProvider::screen`]) through `market`, as a
+    /// client does before it journals or checks an order of its own. An
+    /// authority whose provider reads the market calls this ahead of
+    /// [`execute`](Self::execute); the other requests carry no order to
+    /// screen.
+    pub async fn screen(&self, risk: &dyn RiskProvider, market: &SchwabClient) -> Result<()> {
+        match self {
+            Self::Reserve { account, order, .. }
+            | Self::ReserveReplacement { account, order, .. }
+            | Self::CheckRisk { account, order, .. } => risk.screen(account, order, market).await,
+            _ => Ok(()),
+        }
+    }
     /// Low-level state mutation requires a trusted backend-service identity.
     /// These operations are never exposed to ordinary trading principals.
     pub async fn execute(

@@ -1,5 +1,6 @@
 //! Pluggable pre-trade risk with durable reservations for outstanding orders.
 use crate::{
+    SchwabClient,
     coordination::{Lease, lease_held},
     error::{Error, Result},
     execution::{ensure_not_halted, is_broker_order_id, trip_halt},
@@ -46,6 +47,22 @@ pub const DAILY_LOSS_CONTROL: &str = "daily-loss-control";
 
 #[async_trait]
 pub trait RiskProvider: Send + Sync {
+    /// Screen `order` before anything is journaled for it: read what judging
+    /// it needs from the market through `market`, the client's own reads
+    /// (its auth, request budget, timeouts and circuit breaker), and refuse
+    /// it now if what was read settles it. The client calls it, outside
+    /// every transaction, ahead of [`reserve`](Self::reserve),
+    /// [`reserve_replacement`](Self::reserve_replacement) and
+    /// [`check`](Self::check); those still judge the order in full, since a
+    /// dispatcher may call them alone. The default reads nothing.
+    async fn screen(
+        &self,
+        _account: &str,
+        _order: &OrderRequest,
+        _market: &SchwabClient,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Atomically reserve exposure. Implementations must retain it on unknown outcomes.
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()>;
     /// Reserve exposure for `order` replacing broker order `replaces`.
@@ -169,8 +186,8 @@ fn max_age() -> i64 {
 /// it as one, so a deployment that trades ETFs needs its own provider.
 #[derive(Debug)]
 pub struct PortfolioRisk {
-    pub database: StateDatabase,
-    pub accounts: HashMap<String, PortfolioLimits>,
+    database: StateDatabase,
+    accounts: HashMap<String, PortfolioLimits>,
 }
 fn decimal(value: Option<&serde_json::Value>) -> Option<Decimal> {
     value
@@ -318,13 +335,20 @@ fn available_funds(account: &serde_json::Value) -> Option<Decimal> {
     decimal(account.pointer("/currentBalances/availableFunds"))
         .or_else(|| decimal(account.pointer("/currentBalances/cashAvailableForTrading")))
 }
-/// Whether a baseline reconciled at `at` is stale at `now` (Unix
-/// milliseconds) for a policy that trusts one for `max_age_ms`: older than
+/// Whether a reading taken at `at` has expired at `now` (Unix
+/// milliseconds) for a use that trusts one for `max_age_ms`: older than
 /// that, or dated after now, as it is once the clock steps back.
-fn baseline_stale(at: i64, now: i64, max_age_ms: i64) -> bool {
+fn expired(at: i64, now: i64, max_age_ms: i64) -> bool {
     now < at || now - at > max_age_ms
 }
 impl PortfolioRisk {
+    /// The provider for `accounts`, each judged against its reconciled
+    /// baseline in `database`: the state database of the client it is
+    /// installed in (`client.order_journal().database()`). An account with
+    /// no limits here is refused every order.
+    pub fn new(database: StateDatabase, accounts: HashMap<String, PortfolioLimits>) -> Self {
+        Self { database, accounts }
+    }
     async fn validate_and_reserve(
         &self,
         account: &str,
@@ -400,7 +424,7 @@ impl PortfolioRisk {
                     }
                 }
 
-                if !valid || baseline_stale(at, now, limits.max_snapshot_age_ms) {
+                if !valid || expired(at, now, limits.max_snapshot_age_ms) {
                     return Err(stale("Account baseline is stale or unreconciled"));
                 }
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
@@ -938,9 +962,9 @@ mod tests {
     #[test]
     fn a_baseline_is_trusted_from_its_date_through_exactly_the_policys_age() {
         let at = 1_764_000_000_000;
-        assert!(!baseline_stale(at, at, 5000));
-        assert!(!baseline_stale(at, at + 5000, 5000));
-        assert!(baseline_stale(at, at + 5001, 5000));
-        assert!(baseline_stale(at, at - 1, 5000));
+        assert!(!expired(at, at, 5000));
+        assert!(!expired(at, at + 5000, 5000));
+        assert!(expired(at, at + 5001, 5000));
+        assert!(expired(at, at - 1, 5000));
     }
 }

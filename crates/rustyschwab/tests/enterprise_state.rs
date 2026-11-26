@@ -229,10 +229,7 @@ async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidenc
         max_daily_loss: None,
         option_multipliers: Default::default(),
     };
-    let risk = PortfolioRisk {
-        database: db,
-        accounts: HashMap::from([("A".into(), limits)]),
-    };
+    let risk = PortfolioRisk::new(db, HashMap::from([("A".into(), limits)]));
     let order=serde_json::from_value(json!({"orderStrategyType":"SINGLE","session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"60","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})).unwrap();
     risk.reserve("A", "first", &order).await.unwrap();
     assert!(risk.reserve("A", "second", &order).await.is_err());
@@ -257,9 +254,9 @@ async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
     db.reconcile_snapshot("A", 1, now, baseline("10000", "9990"), vec![])
         .await
         .unwrap();
-    let risk = PortfolioRisk {
-        database: db.clone(),
-        accounts: HashMap::from([(
+    let risk = PortfolioRisk::new(
+        db.clone(),
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 2.into(),
@@ -270,7 +267,7 @@ async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
                 option_multipliers: Default::default(),
             },
         )]),
-    };
+    );
     let order=serde_json::from_value(json!({"orderStrategyType":"SINGLE","session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"60","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})).unwrap();
     // Ten down against a cap of fifty: reserved, and nothing to observe.
     risk.reserve("A", "first", &order).await.unwrap();
@@ -615,9 +612,9 @@ async fn external_partial_orders_count_toward_risk_and_dispatch_rechecks_freshne
     )
     .await
     .unwrap();
-    let risk = PortfolioRisk {
-        database: db.clone(),
-        accounts: HashMap::from([(
+    let risk = PortfolioRisk::new(
+        db.clone(),
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 2.into(),
@@ -628,7 +625,7 @@ async fn external_partial_orders_count_toward_risk_and_dispatch_rechecks_freshne
                 option_multipliers: Default::default(),
             },
         )]),
-    };
+    );
     let mut order:rustyschwab::types::trading::OrderRequest=serde_json::from_value(json!({"orderStrategyType":"SINGLE","orderType":"LIMIT","price":"10","session":"NORMAL","duration":"DAY","orderLegCollection":[{"quantity":"2","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})).unwrap();
     assert!(risk.reserve("A", "too-large", &order).await.is_err());
     order.order_leg_collection[0].quantity = 1.into();
@@ -666,9 +663,9 @@ async fn fenced_risk_revalidation_rejects_released_ownership_and_operator_halt()
     )
     .await
     .unwrap();
-    let risk = PortfolioRisk {
-        database: db.clone(),
-        accounts: HashMap::from([(
+    let risk = PortfolioRisk::new(
+        db.clone(),
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 2.into(),
@@ -679,7 +676,7 @@ async fn fenced_risk_revalidation_rejects_released_ownership_and_operator_halt()
                 option_multipliers: Default::default(),
             },
         )]),
-    };
+    );
     let order=serde_json::from_value(json!({"session":"NORMAL","duration":"DAY","orderStrategyType":"SINGLE","orderType":"LIMIT","price":"10","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"assetType":"EQUITY","symbol":"AAPL"}}]})).unwrap();
     risk.reserve("A", "held", &order).await.unwrap();
     let old = db
@@ -976,9 +973,9 @@ async fn partial_fills_shrink_held_reservations() {
     db.reconcile_snapshot("A", 1, now(), baseline.clone(), vec![])
         .await
         .unwrap();
-    let risk = PortfolioRisk {
-        database: db.clone(),
-        accounts: HashMap::from([(
+    let risk = PortfolioRisk::new(
+        db.clone(),
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 10.into(),
@@ -989,7 +986,7 @@ async fn partial_fills_shrink_held_reservations() {
                 option_multipliers: Default::default(),
             },
         )]),
-    };
+    );
     let order = |quantity: u32| -> rustyschwab::types::trading::OrderRequest {
         serde_json::from_value(json!({"orderStrategyType":"SINGLE","orderType":"LIMIT",
             "price":"10","session":"NORMAL","duration":"DAY","orderLegCollection":[

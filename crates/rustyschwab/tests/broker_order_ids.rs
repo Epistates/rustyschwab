@@ -1007,10 +1007,7 @@ async fn a_state_file_that_breaks_the_order_id_invariant_does_not_open() {
 async fn a_replacement_names_the_order_it_replaces_by_a_whole_number() {
     let dir = tempfile::tempdir().unwrap();
     let journal = OrderJournal::new(dir.path().join("orders.json"));
-    let risk = PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::new(),
-    };
+    let risk = PortfolioRisk::new(journal.database().clone(), HashMap::new());
     for id in NOT_ORDER_IDS {
         assert!(
             matches!(
