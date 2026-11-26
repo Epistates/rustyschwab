@@ -894,3 +894,20 @@ fn external_strategy_exposure(
         notional: risk.max_loss.checked_mul(share)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A baseline is trusted from the millisecond it is dated through
+    /// exactly the policy's age: stale a millisecond later, and stale if it
+    /// is dated even a millisecond after now.
+    #[test]
+    fn a_baseline_is_trusted_from_its_date_through_exactly_the_policys_age() {
+        let at = 1_764_000_000_000;
+        assert!(!baseline_stale(at, at, 5000));
+        assert!(!baseline_stale(at, at + 5000, 5000));
+        assert!(baseline_stale(at, at + 5001, 5000));
+        assert!(baseline_stale(at, at - 1, 5000));
+    }
+}

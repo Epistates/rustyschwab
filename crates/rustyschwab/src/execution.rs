@@ -1453,3 +1453,52 @@ impl ExecutionStore for OrderJournal {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An approval may be granted to expire from a second after now through
+    /// exactly an hour from now, and at no other time.
+    #[test]
+    fn an_approval_may_expire_from_a_second_after_now_through_an_hour() {
+        let now = 1_764_000_000;
+        for expires_at in [now + 1, now + 3600] {
+            assert!(
+                !approval_expiry_out_of_range(expires_at, now),
+                "{expires_at}"
+            );
+        }
+        for expires_at in [now - 1, now, now + 3601] {
+            assert!(
+                approval_expiry_out_of_range(expires_at, now),
+                "{expires_at}"
+            );
+        }
+    }
+
+    /// An approval is usable through the second before it expires and has
+    /// lapsed at its expiry, as the approval's own use and `is_approved`
+    /// judge it.
+    #[test]
+    fn an_approval_lapses_at_its_expiry() {
+        let now = 1_764_000_000;
+        let unused = |expires_at| {
+            IntentState::of(
+                Some("alice".into()),
+                Some(expires_at),
+                Some(false),
+                false,
+                now,
+            )
+        };
+        assert_eq!(
+            unused(now + 1),
+            IntentState::Approved {
+                operator: "alice".into(),
+                expires_at: now + 1
+            }
+        );
+        assert_eq!(unused(now), IntentState::Lapsed);
+    }
+}
