@@ -54,7 +54,15 @@ jobs:
       # A mutant that survives in the code deciding whether an order may go
       # is a missing test, so a missed mutant (or a timeout) fails the shard.
       # Round-robin gives every shard a similar share of the slow mutants.
-      - run: >-
+      #
+      # cargo-mutants bounds each mutant's time but not its memory, and a
+      # mutant that loops while allocating took a runner's 16 GB in about a
+      # minute, losing the whole shard. Each test binary runs under a 6 GiB
+      # data limit (prlimit as the target runner, so rustc is unaffected): such
+      # a mutant fails its allocation and is recorded as an outcome.
+      - env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --data=6442450944
+        run: >-
           cargo mutants -p rustyschwab --no-shuffle --timeout 300 --in-place
           --shard ${{ matrix.shard }}/8 --sharding round-robin
           --file crates/rustyschwab/src/risk.rs
@@ -65,6 +73,47 @@ jobs:
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
+
+  # The shards' verdict in one place: it fails unless every shard ran to the
+  # end and no mutant survived or timed out, so a shard that died or never
+  # reported can't read as cancelled or skipped. The summary lists every
+  # surviving and timed-out mutant across the shards.
+  mutants-report:
+    name: mutation testing (every shard reported, no survivors)
+    needs: mutants
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: mutants-shard-*
+          path: reports
+      - name: Check every shard's report
+        env:
+          MUTANTS_RESULT: ${{ needs.mutants.result }}
+        run: |
+          status=0
+          for shard in 0 1 2 3 4 5 6 7; do
+            outcomes="reports/mutants-shard-$shard/outcomes.json"
+            if [ ! -f "$outcomes" ]; then
+              echo "::error::shard $shard left no report"
+              status=1
+            elif ! jq -e '.caught + .missed + .timeout + .unviable + .success == .total_mutants' "$outcomes" >/dev/null; then
+              echo "::error::shard $shard stopped before testing every mutant"
+              status=1
+            fi
+          done
+          {
+            echo "## Surviving mutants"
+            find reports -name missed.txt -exec cat {} + | sort
+            echo "## Mutants that timed out"
+            find reports -name timeout.txt -exec cat {} + | sort
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$MUTANTS_RESULT" != success ]; then
+            echo "::error::mutation testing found surviving or timed-out mutants, or a shard failed"
+            status=1
+          fi
+          exit "$status"
 
   minimal-versions:
     name: minimal dependency versions
