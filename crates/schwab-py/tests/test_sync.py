@@ -19,6 +19,8 @@ from conftest import (
     ACCESS_TOKEN,
     ACCOUNT_HASH,
     MockSchwab,
+    Recorded,
+    Reply,
     client_config,
     limit_order,
 )
@@ -180,6 +182,35 @@ def test_a_call_timeout_cancels_and_the_client_stays_usable(
     assert time.monotonic() - started < 1.2
     server.on("GET", "/marketdata/v1/quotes", {"AAPL": {"symbol": "AAPL"}})
     assert client.quotes(["AAPL"])["AAPL"]["symbol"] == "AAPL"
+
+
+def test_a_timeout_raised_by_the_sdk_keeps_its_type_and_its_cause(
+    server: MockSchwab, tokens: Path
+) -> None:
+    # The client has no timeout of its own here: the SDK's deadline ends the
+    # call, and the caller gets that error, not a new one that forgets why.
+    # Two attempts fail after 0.4 s each; the third is still in flight when
+    # the two-second deadline falls.
+    path = "/marketdata/v1/quotes"
+
+    def reply(_request: Recorded) -> Reply:
+        if len(server.calls("GET", path)) <= 2:
+            return Reply(503, {"message": "busy"}, delay=0.4)
+        return Reply(200, {}, delay=4.0)
+
+    server.on_call("GET", path, reply)
+    config = client_config(server, tokens)
+    config["client"]["timeout"] = 2.0
+    client = sync.Client(config)
+    # The first call loads the tokens and verifies the state file, and the
+    # deadline covers that too. Do it first, so that the deadline runs from
+    # the first attempt and not from a slow disk.
+    client.init()
+    with pytest.raises(errors.Timeout) as caught:
+        client.quotes(["AAPL"])
+    assert str(caught.value) == "Timeout occurred after 2 seconds"
+    cause = caught.value.__cause__
+    assert isinstance(cause, errors.BrokerError) and cause.status == 503
 
 
 def test_a_submission_past_the_timeout_is_unknown_with_its_tag_not_a_bare_timeout(
