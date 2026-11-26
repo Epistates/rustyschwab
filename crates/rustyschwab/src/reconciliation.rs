@@ -10,6 +10,7 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
 
 const INVALIDATE_ACCOUNT: &str = "INSERT INTO accounts VALUES(?1,?2,0,0,'{}') \
      ON CONFLICT(account) DO UPDATE SET valid=0,generation=MAX(generation,excluded.generation)";
@@ -236,16 +237,9 @@ impl StateDatabase {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            // The pass's start becomes the baseline's age. A start ahead of
-            // this store's clock (a skewed remote worker) would make the
-            // baseline look fresher than it is.
-            let now = chrono::Utc::now().timestamp_millis();
-            if started_at > now + MAX_CLOCK_LEAD_MS {
-                return Err(Error::Storage(
-                    "Reconciliation started ahead of the state store's clock".into(),
-                ));
-            }
-            let started_at = started_at.min(now);
+            // The pass's start becomes the baseline's age.
+            let started_at =
+                baseline_observed_at(started_at, chrono::Utc::now().timestamp_millis())?;
             let current: Option<(i64, i64, bool)> = tx
                 .query_row(SELECT_ACCOUNT_GENERATION, [&account], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -780,6 +774,20 @@ fn set_aside_order_id(tx: &rusqlite::Connection, account: &str, id: &str) -> Res
         &serde_json::json!({"account": account, "order": order, "attempts": attempts}),
     )
 }
+/// When the baseline of a pass that began at `started_at` counts as
+/// observed, by a store whose clock reads `now` (both in ms since the
+/// epoch). A start ahead of this store's clock (a remote worker whose clock
+/// runs fast) would make the baseline look fresher than it is: up to
+/// [`MAX_CLOCK_LEAD_MS`] ahead it counts from now, and further ahead it is
+/// refused.
+fn baseline_observed_at(started_at: i64, now: i64) -> Result<i64> {
+    if started_at > now + MAX_CLOCK_LEAD_MS {
+        return Err(Error::Storage(
+            "Reconciliation started ahead of the state store's clock".into(),
+        ));
+    }
+    Ok(started_at.min(now))
+}
 /// Cut each held reservation down to what its working order can still fill.
 /// A partial fill is already out of the broker's available funds, so a
 /// reservation for the full size would count the filled part twice. The
@@ -967,8 +975,15 @@ pub const SINCE_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DayTransfers {
     date: chrono::NaiveDate,
-    read_at: std::time::Instant,
+    read_at: tokio::time::Instant,
     net: rust_decimal::Decimal,
+}
+impl DayTransfers {
+    /// The net transfers read, while the reading is of trading day `today`
+    /// and younger than [`DAY_TRANSFERS_TTL`].
+    fn current(&self, today: chrono::NaiveDate) -> Option<rust_decimal::Decimal> {
+        (self.date == today && self.read_at.elapsed() < DAY_TRANSFERS_TTL).then_some(self.net)
+    }
 }
 /// How long a reading of the day's transfers is reused: they are rare, and
 /// each reading costs one request per transfer type.
@@ -1009,11 +1024,8 @@ impl SchwabClient {
         let now = chrono::Utc::now();
         let today = crate::paper::feed::trading_date(now);
         let cached = self.day_transfers().lock().get(account).copied();
-        if let Some(cached) = cached
-            && cached.date == today
-            && cached.read_at.elapsed() < DAY_TRANSFERS_TTL
-        {
-            return Some(cached.net);
+        if let Some(net) = cached.and_then(|reading| reading.current(today)) {
+            return Some(net);
         }
         let read = async {
             let midnight = crate::paper::feed::trading_day_start(now);
@@ -1033,7 +1045,7 @@ impl SchwabClient {
             account.to_owned(),
             DayTransfers {
                 date: today,
-                read_at: std::time::Instant::now(),
+                read_at: tokio::time::Instant::now(),
                 net,
             },
         );
@@ -1089,21 +1101,21 @@ impl SchwabClient {
             let mut windows = vec![(from, started)];
             let mut orders = std::collections::BTreeMap::new();
             let mut pages = 0;
+            // Each turn reads one page and counts it against the budget, so
+            // the loop ends within the budget however its windows are cut.
             while let Some((from, to)) = windows.pop() {
-                // One day inside Schwab's 60-day order list horizon. A wider
-                // window is answered with what it holds, so splitting keeps
-                // each request's span meaningful rather than silently short.
-                if to - from > chrono::Duration::days(59) {
-                    let split = from + chrono::Duration::days(59);
-                    windows.push((split, to));
-                    windows.push((from, split));
-                    continue;
-                }
                 pages += 1;
                 if pages > options.max_pages {
                     return Err(Error::Storage(
                         "Reconciliation page budget exhausted".into(),
                     ));
+                }
+                // One day inside Schwab's 60-day order list horizon. A wider
+                // window is answered with what it holds, so the rest of it is
+                // read next rather than silently missed.
+                let end = to.min(from + chrono::Duration::days(59));
+                if end < to {
+                    windows.push((end, to));
                 }
                 let page: Vec<Value> = self
                     .request_with_query(
@@ -1112,18 +1124,18 @@ impl SchwabClient {
                         &crate::client::account_path(account, "/orders")?,
                         &OrdersParams {
                             max_results: Some(3000),
-                            ..OrdersParams::new(from, to)
+                            ..OrdersParams::new(from, end)
                         },
                     )
                     .await?;
                 if page.len() >= 3000 {
-                    if (to - from).num_milliseconds() <= 1000 {
+                    if (end - from).num_milliseconds() <= 1000 {
                         return Err(Error::Storage(
                             "Order history remains truncated at minimum interval".into(),
                         ));
                     }
-                    let mid = from + (to - from) / 2;
-                    windows.push((mid, to));
+                    let mid = from + (end - from) / 2;
+                    windows.push((mid, end));
                     windows.push((from, mid));
                     continue;
                 }
@@ -1229,14 +1241,36 @@ impl SchwabClient {
                 .await
                 .unwrap_or_else(|_| Err(Error::Storage("Reconciliation deadline exceeded".into())));
         // A superseded pass wrote nothing and returned Ok: the newer state
-        // stands. A pass that could not finish invalidates the baseline,
-        // unless one that began after it has already replaced it.
-        if result.is_err()
-            && database.account_state(account).await?.is_none_or(|state| {
-                state.generation != generation || state.observed_at <= started.timestamp_millis()
-            })
-        {
-            database.invalidate_account(account, generation).await?;
+        // stands. A pass that could not finish judges the baseline it finds
+        // by that baseline's generation:
+        // - a newer generation's baseline is no business of this pass, and
+        //   stands;
+        // - a baseline of its own generation stands only if a pass that
+        //   began after this one took it, and is invalidated otherwise;
+        // - an older generation cannot be stored, since this pass raised the
+        //   account to its own when it began. One found anyway means that
+        //   assumption broke, so the baseline is invalidated, not trusted.
+        if result.is_err() {
+            let state = database.account_state(account).await?;
+            let stands = match &state {
+                Some(state) => match state.generation.cmp(&generation) {
+                    Ordering::Greater => true,
+                    Ordering::Equal => state.observed_at > started.timestamp_millis(),
+                    Ordering::Less => false,
+                },
+                None => false,
+            };
+            if !stands {
+                database.invalidate_account(account, generation).await?;
+            }
+            // Only after invalidating: the assertion reports a broken
+            // assumption once the store has already failed closed.
+            let older = state.is_some_and(|state| state.generation < generation);
+            debug_assert!(
+                !older,
+                "a pass found its account's stored generation older than its own, \
+                 which it raised when it began"
+            );
         }
         result
     }
@@ -1277,5 +1311,45 @@ mod tests {
             let in_sql = SELECT_TERMINAL_SUBMISSIONS.contains(&wire.replace('"', "'"));
             assert_eq!(in_sql, status.is_terminal(), "{status:?}");
         }
+    }
+
+    /// A baseline is never dated ahead of the store's clock: a pass that
+    /// began earlier keeps its start, one that began up to
+    /// `MAX_CLOCK_LEAD_MS` ahead counts from now, and one further ahead is
+    /// refused.
+    #[test]
+    fn a_baseline_is_dated_no_later_than_the_store_clock() {
+        let now = 1_764_000_000_000;
+        assert_eq!(baseline_observed_at(now - 1, now).unwrap(), now - 1);
+        assert_eq!(baseline_observed_at(now, now).unwrap(), now);
+        assert_eq!(baseline_observed_at(now + 1, now).unwrap(), now);
+        assert_eq!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS, now).unwrap(),
+            now
+        );
+        assert!(matches!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS + 1, now),
+            Err(Error::Storage(_))
+        ));
+    }
+
+    /// A reading of the day's transfers is reused while it is of the same
+    /// trading day and younger than `DAY_TRANSFERS_TTL`; at that age, or on
+    /// the next day, it is read again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfers_reading_is_current_for_its_ttl_on_its_own_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+        let reading = DayTransfers {
+            date: day,
+            read_at: tokio::time::Instant::now(),
+            net: 7.into(),
+        };
+        assert_eq!(reading.current(day), Some(7.into()));
+        assert_eq!(reading.current(day.succ_opt().unwrap()), None);
+        let just_under = DAY_TRANSFERS_TTL - std::time::Duration::from_millis(1);
+        tokio::time::advance(just_under).await;
+        assert_eq!(reading.current(day), Some(7.into()));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert_eq!(reading.current(day), None);
     }
 }
