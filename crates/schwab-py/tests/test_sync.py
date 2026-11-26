@@ -219,7 +219,13 @@ def test_a_submission_past_the_timeout_is_unknown_with_its_tag_not_a_bare_timeou
     server.on(
         "POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/7"}, delay=1.5
     )
-    client = sync.Client(client_config(server, tokens), timeout=0.3)
+    client = sync.Client(client_config(server, tokens))
+    # The first call loads the tokens and verifies the state file, and the
+    # submission's timeout covers that too: on a slow disk it can run out
+    # before anything is sent, which is a plain Timeout. Do that work first, so
+    # that the timeout can only run out on the broker's answer.
+    client.init()
+    client.timeout = 0.3
     with pytest.raises(errors.SubmissionUnknown) as caught:
         client.place_order(ACCOUNT_HASH, limit_order(tag="slow"))
     assert caught.value.tag == "slow" and caught.value.cause == "timeout"
@@ -482,11 +488,18 @@ def test_recv_timeouts_lose_no_message(
         next_of_type(stream, "state")
         stream.subscribe("LEVELONE_EQUITIES", ["AAPL"])
         frames = 300
+        # A read times out only when nothing is queued, and on a fast machine
+        # the consumer may never find the queue empty. After every ten frames
+        # the producer waits for a read to time out, so reads time out all
+        # through the stream.
+        timed_out = threading.Event()
 
         def produce() -> None:
             for number in range(frames):
                 streamer.push(level_one(**{"1": number}))
-                time.sleep(0.001)
+                if number % 10 == 0:
+                    timed_out.clear()
+                    timed_out.wait(20)
 
         producer = threading.Thread(target=produce)
         producer.start()
@@ -498,6 +511,7 @@ def test_recv_timeouts_lose_no_message(
                 message = stream.recv(0.001)
             except TimeoutError:
                 timeouts += 1
+                timed_out.set()
                 continue
             assert message is not None
             if message["type"] == "data":
