@@ -4,12 +4,15 @@
 //! they can actually do.
 use rustyschwab::{
     coordination::Coordinator,
-    execution::{ExecutionStore, OrderJournal, SubmissionOutcome},
+    execution::{ExecutionStore, OrderJournal, SubmissionOutcome, SubmissionRecord},
     risk::{PortfolioLimits, PortfolioRisk, RiskProvider},
     types::trading::OrderRequest,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{BTreeSet, HashMap},
+    time::Duration,
+};
 
 fn order(instruction: &str, symbol: &str, quantity: u32, price: &str) -> OrderRequest {
     serde_json::from_value(json!({
@@ -173,6 +176,19 @@ async fn an_armed_intent_stays_unresolved() {
     assert!(!report.reconciled);
 }
 
+/// A record written before intents were armed (an older authority's answer,
+/// say) has no `armed`. Nothing shows its request stayed on the host, so it
+/// reads as armed: it may have reached the broker.
+#[test]
+fn a_record_from_before_arming_reads_as_possibly_sent() {
+    let record: SubmissionRecord = serde_json::from_value(json!({
+        "attempt_id": "older", "account": "A", "operation": "place_order",
+        "request": {"tag": "t1"}, "created_at": 1, "outcome": null, "dedup_key": null
+    }))
+    .unwrap();
+    assert!(record.armed);
+}
+
 /// Only the tag the SDK sent resolves an unknown submission. An order that
 /// fits the request but carries another tag (the broker may stamp its own,
 /// such as `API_TOS:TraderAPI`) could be a manual twin, so it stays unresolved for
@@ -220,6 +236,95 @@ async fn only_our_tag_resolves_an_unknown_submission() {
     assert_eq!(report.resolved_attempts, vec![id]);
 }
 
+/// Under our tag, the broker's copy of our order resolves the intent:
+/// Schwab adds fields to the order and to each leg, and writes decimals as
+/// numbers, and none of that is a difference. An order under our tag that
+/// differs from the request in anything the request said (the quantity,
+/// the side) is not one we can claim, so the intent stays unresolved for an
+/// operator.
+#[tokio::test]
+async fn only_an_order_that_fits_the_request_resolves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let mut request = serde_json::to_value(order("BUY", "AAPL", 1, "10.00")).unwrap();
+    request["tag"] = json!("rs-ours");
+    let id = journal.begin("A", "place_order", request).await.unwrap();
+    journal.arm(&id).await.unwrap();
+    let listed = |instruction: &str, quantity: f64| {
+        json!({
+            "orderId": 42, "accountNumber": 12345678, "status": "WORKING",
+            "enteredTime": "2026-11-25T15:00:00+0000", "tag": "rs-ours",
+            "session": "NORMAL", "duration": "DAY", "orderType": "LIMIT",
+            "complexOrderStrategyType": "NONE", "orderStrategyType": "SINGLE",
+            "price": 10.0, "quantity": quantity, "filledQuantity": 0.0,
+            "remainingQuantity": quantity, "cancelable": true, "editable": true,
+            "orderLegCollection": [{"orderLegType": "EQUITY", "legId": 1,
+                "instruction": instruction, "quantity": quantity,
+                "positionEffect": "OPENING",
+                "instrument": {"assetType": "EQUITY", "symbol": "AAPL",
+                    "cusip": "037833100", "instrumentId": 1973757747}}]
+        })
+    };
+    let reconcile = |orders: Vec<Value>| {
+        let database = journal.database().clone();
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis(),
+                    json!({}),
+                    orders,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    for differs in [listed("BUY", 2.0), listed("SELL", 1.0)] {
+        let report = reconcile(vec![differs.clone()]).await;
+        assert_eq!(report.unresolved_attempts, vec![id.clone()], "{differs}");
+    }
+    let report = reconcile(vec![listed("BUY", 1.0)]).await;
+    assert_eq!(report.resolved_attempts, vec![id.clone()]);
+    assert!(matches!(
+        journal.record(&id).await.unwrap().unwrap().outcome,
+        Some(SubmissionOutcome::Accepted { order_id: Some(order_id) }) if order_id == "42"
+    ));
+}
+
+/// What reconciliation last read can be shown without a request: the
+/// accounts it holds a baseline for, in order, and each account's orders
+/// as Schwab reported them, most recently observed first and at most
+/// `limit` of them.
+#[tokio::test]
+async fn reconciliation_keeps_what_it_read_for_each_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let database = journal.database();
+    assert!(database.known_accounts().await.unwrap().is_empty());
+    let now = chrono::Utc::now().timestamp_millis();
+    let filled = json!({"orderId": 1, "status": "FILLED", "tag": "first"});
+    let working = json!({"orderId": 2, "status": "WORKING", "tag": "second"});
+    for (account, started_at, orders) in [
+        ("B", now - 1000, vec![filled.clone()]),
+        ("B", now, vec![working.clone()]),
+        ("A", now, vec![]),
+    ] {
+        database
+            .reconcile_snapshot(account, 1, started_at, json!({}), orders)
+            .await
+            .unwrap();
+    }
+    assert_eq!(database.known_accounts().await.unwrap(), vec!["A", "B"]);
+    assert_eq!(
+        database.known_orders("B", 10).await.unwrap(),
+        vec![working.clone(), filled]
+    );
+    assert_eq!(database.known_orders("B", 1).await.unwrap(), vec![working]);
+    assert!(database.known_orders("A", 10).await.unwrap().is_empty());
+}
+
 /// An operator settling an unknown submission releases its reservation in
 /// the same transaction; the account's capacity does not leak.
 #[tokio::test]
@@ -250,6 +355,77 @@ async fn an_operator_resolution_releases_the_reservation() {
         .await
         .unwrap();
     risk.reserve("A", "next", &buy).await.unwrap();
+}
+
+/// An operator may release the risk held for a submission only once it is
+/// resolved (while it is not, its order may be live), and only by name and
+/// with evidence. The release frees the account's capacity, is audited
+/// under the operator, and leaves nothing to release a second time.
+#[tokio::test]
+async fn an_operator_releases_a_reservation_only_for_a_resolved_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({"currentBalances": {"availableFunds": "100"}, "positions": []}),
+        vec![],
+    )
+    .await;
+    let risk = risk(&journal, limits());
+    let buy = order("BUY", "AAPL", 9, "10");
+    let id = journal
+        .begin("A", "place_order", serde_json::to_value(&buy).unwrap())
+        .await
+        .unwrap();
+    risk.reserve("A", &id, &buy).await.unwrap();
+    let refused = |result: rustyschwab::Result<()>| {
+        matches!(result, Err(rustyschwab::Error::InvalidParameter(_)))
+    };
+    let evidence = "order 42 filled and settled";
+
+    assert!(refused(
+        journal.release_reservation(&id, "alice", evidence).await
+    ));
+    journal
+        .finish(
+            &id,
+            SubmissionOutcome::Accepted {
+                order_id: Some("42".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(refused(
+        journal.release_reservation(&id, " ", evidence).await
+    ));
+    assert!(refused(journal.release_reservation(&id, "alice", "").await));
+    assert!(refused(
+        journal
+            .release_reservation("no-such-attempt", "alice", evidence)
+            .await
+    ));
+    assert!(risk.reserve("A", "next", &buy).await.is_err(), "funds held");
+
+    journal
+        .release_reservation(&id, "alice", evidence)
+        .await
+        .unwrap();
+    risk.reserve("A", "next", &buy).await.unwrap();
+    assert!(refused(
+        journal.release_reservation(&id, "alice", evidence).await
+    ));
+    let released: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "risk_released_by_operator")
+        .map(|e| (e.subject, e.payload))
+        .collect();
+    assert_eq!(
+        released,
+        vec![(id, json!({"operator": "alice", "evidence": evidence}))]
+    );
 }
 
 /// A cash account has `cashAvailableForTrading`, not `availableFunds`:
@@ -326,6 +502,122 @@ async fn sells_are_judged_per_symbol() {
             .await,
         Err(rustyschwab::Error::RiskDenied(_))
     ));
+}
+
+/// Working buys of a symbol, ours or at the broker, add to the position
+/// rather than offer any of it: the whole position may still be sold, and
+/// only a working sell takes shares out of what may be.
+#[tokio::test]
+async fn working_buys_do_not_reduce_what_may_be_sold() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working_buy = json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+        "orderType": "LIMIT", "quantity": 5, "filledQuantity": 0, "remainingQuantity": 5,
+        "price": 150, "orderLegCollection": [{"instruction": "BUY", "quantity": 5,
+            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]});
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![working_buy],
+    )
+    .await;
+    let risk = risk(&journal, limits());
+    risk.reserve("A", "buy", &order("BUY", "AAPL", 1, "150"))
+        .await
+        .unwrap();
+    risk.reserve("A", "all", &order("SELL", "AAPL", 100, "150"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.check("A", &order("SELL", "AAPL", 1, "150"), None)
+            .await,
+        Err(rustyschwab::Error::RiskDenied(_))
+    ));
+}
+
+/// One symbol's working orders do not count against another's limits: a
+/// working MSFT buy is no part of the AAPL position the cap bounds, and a
+/// working MSFT sell offers none of the AAPL shares.
+#[tokio::test]
+async fn another_symbols_working_orders_do_not_count_against_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working = |order_id: u32, instruction: &str, quantity: u32| {
+        json!({"orderId": order_id, "status": "WORKING", "orderStrategyType": "SINGLE",
+            "orderType": "LIMIT", "quantity": quantity, "filledQuantity": 0,
+            "remainingQuantity": quantity, "price": 1,
+            "orderLegCollection": [{"instruction": instruction, "quantity": quantity,
+                "instrument": {"assetType": "EQUITY", "symbol": "MSFT"}}]})
+    };
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [
+                {"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}},
+                {"longQuantity": 100, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}
+            ]
+        }),
+        vec![working(7, "BUY", 50), working(8, "SELL", 100)],
+    )
+    .await;
+    let risk = risk(
+        &journal,
+        PortfolioLimits {
+            max_open_quantity: 1000.into(),
+            ..limits()
+        },
+    );
+    // Up to the 200-share cap on AAPL, whatever MSFT has working.
+    risk.reserve("A", "buy", &order("BUY", "AAPL", 100, "1"))
+        .await
+        .unwrap();
+    // All 100 AAPL shares held, while every MSFT share is offered.
+    risk.reserve("A", "sell", &order("SELL", "AAPL", 100, "1"))
+        .await
+        .unwrap();
+}
+
+/// A risk policy that leaves out `max_snapshot_age_ms` trusts a reconciled
+/// baseline for five seconds: an order is judged against a younger one,
+/// and refused as stale against an older one.
+#[tokio::test]
+async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
+    let limits: PortfolioLimits = serde_json::from_value(json!({
+        "max_open_quantity": "100", "max_open_notional": "10000",
+        "max_position_quantity": "200"
+    }))
+    .unwrap();
+    assert_eq!(limits.max_snapshot_age_ms, 5000);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let reconciled_ago = |age_ms: i64| {
+        let database = journal.database().clone();
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis() - age_ms,
+                    funded(),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let risk = risk(&journal, limits);
+    let buy = order("BUY", "AAPL", 1, "10");
+    reconciled_ago(7_500).await;
+    assert!(matches!(
+        risk.reserve("A", "stale", &buy).await,
+        Err(rustyschwab::Error::BaselineStale { .. })
+    ));
+    reconciled_ago(2_500).await;
+    risk.reserve("A", "fresh", &buy).await.unwrap();
 }
 
 /// Replacing a working order does not count it alongside its replacement:
@@ -407,6 +699,53 @@ async fn only_unobserved_placeholders_are_forgotten() {
         journal.reconciliation_targets("A").await.unwrap(),
         vec!["78"]
     );
+}
+
+/// The broker's view of one order, recorded outside a reconciliation pass
+/// (a replacement reads the order it replaces), is kept as a pass keeps
+/// it: among the account's known orders as Schwab reported it, a target
+/// of the next pass while it works, and its tag spent. A payload with no
+/// order ID, or with a number that is not a whole, non-negative one, is
+/// refused and leaves nothing behind.
+#[tokio::test]
+async fn a_recorded_order_is_kept_as_reconciliation_keeps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working = json!({"orderId": 501, "status": "WORKING", "tag": "elsewhere"});
+    journal.record_order("A", working.clone()).await.unwrap();
+    assert_eq!(
+        journal.database().known_orders("A", 10).await.unwrap(),
+        vec![working]
+    );
+    assert_eq!(
+        journal.reconciliation_targets("A").await.unwrap(),
+        vec!["501"]
+    );
+    assert!(journal.tag_spent("A", "elsewhere").await.unwrap());
+
+    for unidentified in [
+        json!({"status": "WORKING", "tag": "unidentified"}),
+        json!({"orderId": -502, "status": "WORKING", "tag": "unidentified"}),
+        json!({"orderId": 502.5, "status": "WORKING", "tag": "unidentified"}),
+    ] {
+        assert!(
+            matches!(
+                journal.record_order("A", unidentified.clone()).await,
+                Err(rustyschwab::Error::InvalidParameter(_))
+            ),
+            "{unidentified}"
+        );
+    }
+    assert_eq!(
+        journal
+            .database()
+            .known_orders("A", 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(!journal.tag_spent("A", "unidentified").await.unwrap());
 }
 
 /// A pass that changes nothing is not an audit event.
@@ -741,6 +1080,43 @@ async fn only_a_lapsed_approval_can_be_granted_again() {
     ));
 }
 
+/// An approval names the operator who granted it, so it is honoured only
+/// while that person still holds the operator's role: after a lapse, the
+/// operator of the new grant. An intent never approved names nobody.
+#[tokio::test]
+async fn an_approval_names_the_operator_who_granted_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "c".repeat(64);
+    let later = || chrono::Utc::now().timestamp() + 600;
+    assert_eq!(journal.approval_operator(&digest).await.unwrap(), None);
+    journal
+        .approve("desk", &digest, "alice", later())
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.approval_operator(&digest).await.unwrap().as_deref(),
+        Some("alice")
+    );
+    let lapse = digest.clone();
+    journal
+        .database()
+        .run(move |c| {
+            c.execute("UPDATE approvals SET expires_at=1 WHERE digest=?1", [lapse])
+                .map_err(|e| rustyschwab::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    journal
+        .approve("desk", &digest, "bob", later())
+        .await
+        .unwrap();
+    assert_eq!(
+        journal.approval_operator(&digest).await.unwrap().as_deref(),
+        Some("bob")
+    );
+}
+
 /// An intent awaiting approval is recorded with its arguments, and its
 /// state follows the approval through grant, use and lapse.
 #[tokio::test]
@@ -883,4 +1259,275 @@ async fn option_strategies_reserve_their_defined_risk() {
     );
     let refused = risk.check("A", &naked, None).await.unwrap_err();
     assert!(refused.to_string().contains("no bound"), "{refused}");
+}
+
+/// A store that implements only what [`ExecutionStore`] requires, over a
+/// journal, so that the trait's own defaults answer everything else.
+struct RequiredOnly(OrderJournal);
+
+#[async_trait::async_trait]
+impl ExecutionStore for RequiredOnly {
+    async fn begin_once(
+        &self,
+        account: &str,
+        operation: &str,
+        request: Value,
+        dedup_key: Option<String>,
+    ) -> rustyschwab::Result<String> {
+        self.0
+            .begin_once(account, operation, request, dedup_key)
+            .await
+    }
+    async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> rustyschwab::Result<()> {
+        self.0.finish(id, outcome).await
+    }
+    async fn arm(&self, id: &str) -> rustyschwab::Result<()> {
+        self.0.arm(id).await
+    }
+    async fn records(&self) -> rustyschwab::Result<Vec<SubmissionRecord>> {
+        self.0.records().await
+    }
+    async fn forget_placeholder(&self, account: &str, order_id: &str) -> rustyschwab::Result<bool> {
+        self.0.forget_placeholder(account, order_id).await
+    }
+    async fn tag_spent(&self, account: &str, tag: &str) -> rustyschwab::Result<bool> {
+        self.0.tag_spent(account, tag).await
+    }
+    async fn invalidate_account(&self, account: &str, generation: u64) -> rustyschwab::Result<()> {
+        self.0.invalidate_account(account, generation).await
+    }
+    async fn account_state(
+        &self,
+        account: &str,
+    ) -> rustyschwab::Result<Option<rustyschwab::reconciliation::AccountState>> {
+        self.0.account_state(account).await
+    }
+    async fn reconcile_snapshot(
+        &self,
+        account: &str,
+        generation: u64,
+        started_at: i64,
+        snapshot: Value,
+        orders: Vec<Value>,
+    ) -> rustyschwab::Result<rustyschwab::reconciliation::ReconciliationReport> {
+        self.0
+            .reconcile_snapshot(account, generation, started_at, snapshot, orders)
+            .await
+    }
+    async fn audit_page(
+        &self,
+        after: i64,
+        limit: u32,
+    ) -> rustyschwab::Result<Vec<rustyschwab::execution::AuditEvent>> {
+        self.0.audit_page(after, limit).await
+    }
+    async fn verify_audit(
+        &self,
+    ) -> rustyschwab::Result<rustyschwab::audit_chain::AuditChainReport> {
+        self.0.verify_audit().await
+    }
+    async fn healthcheck(&self) -> rustyschwab::Result<()> {
+        self.0.healthcheck().await
+    }
+    async fn pending_count(&self) -> rustyschwab::Result<usize> {
+        self.0.pending_count().await
+    }
+    async fn reconciliation_targets(&self, account: &str) -> rustyschwab::Result<Vec<String>> {
+        self.0.reconciliation_targets(account).await
+    }
+    async fn track_order(&self, account: &str, order_id: &str) -> rustyschwab::Result<()> {
+        self.0.track_order(account, order_id).await
+    }
+    async fn record_order(&self, account: &str, order: Value) -> rustyschwab::Result<()> {
+        self.0.record_order(account, order).await
+    }
+    async fn operator_halt(&self) -> rustyschwab::Result<Option<String>> {
+        self.0.operator_halt().await
+    }
+    async fn set_operator_halt(
+        &self,
+        reason: Option<String>,
+        operator: &str,
+    ) -> rustyschwab::Result<()> {
+        self.0.set_operator_halt(reason, operator).await
+    }
+}
+
+/// The attempt IDs of five submissions, one of each standing a store is
+/// asked about.
+struct Standings {
+    /// Accepted under the broker's order ID: placed.
+    placed: String,
+    /// Accepted without the broker's order ID: reconciliation must still
+    /// place it.
+    unplaced: String,
+    /// Refused under tag `t3`, a minute before `retried` took it again.
+    refused: String,
+    /// The retry of `refused`, unresolved.
+    retried: String,
+    /// On account B under tag `t3` as well, unresolved.
+    neighbour: String,
+}
+
+/// Journal [`Standings`] through `store`, which writes to `journal`.
+async fn standings(store: &dyn ExecutionStore, journal: &OrderJournal) -> Standings {
+    let begin = |account: &'static str, tag: &'static str| async move {
+        store
+            .begin_once(account, "place_order", json!({"tag": tag}), None)
+            .await
+            .unwrap()
+    };
+    let accepted = |order_id: Option<&str>| SubmissionOutcome::Accepted {
+        order_id: order_id.map(str::to_owned),
+    };
+    let placed = begin("A", "t1").await;
+    store.finish(&placed, accepted(Some("42"))).await.unwrap();
+    let unplaced = begin("A", "t2").await;
+    store.finish(&unplaced, accepted(None)).await.unwrap();
+    let refused = begin("A", "t3").await;
+    store
+        .finish(&refused, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    age_submissions(journal, Duration::from_secs(60));
+    Standings {
+        placed,
+        unplaced,
+        refused,
+        retried: begin("A", "t3").await,
+        neighbour: begin("B", "t3").await,
+    }
+}
+
+/// What reconciliation, operators and an audit sink ask of any store: every
+/// submission; an account's intents still to place (unresolved, or
+/// accepted without the broker's order ID); the latest submission on an
+/// account under a tag; how many are unresolved; and the audit trail.
+async fn assert_answers(store: &dyn ExecutionStore, s: &Standings) {
+    let attempts = |records: Vec<SubmissionRecord>| {
+        records
+            .into_iter()
+            .map(|r| r.attempt_id)
+            .collect::<BTreeSet<_>>()
+    };
+    let every = BTreeSet::from([
+        s.placed.clone(),
+        s.unplaced.clone(),
+        s.refused.clone(),
+        s.retried.clone(),
+        s.neighbour.clone(),
+    ]);
+    assert_eq!(attempts(store.records().await.unwrap()), every);
+    assert_eq!(
+        attempts(store.unresolved_records("A").await.unwrap()),
+        BTreeSet::from([s.unplaced.clone(), s.retried.clone()])
+    );
+    assert_eq!(
+        attempts(store.unresolved_records("B").await.unwrap()),
+        BTreeSet::from([s.neighbour.clone()])
+    );
+    for (case, (account, tag, latest)) in [
+        ("A", "t1", Some(&s.placed)),
+        ("A", "t3", Some(&s.retried)),
+        ("B", "t3", Some(&s.neighbour)),
+        ("B", "t1", None),
+        ("A", "t9", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let found = store.submission_by_tag(account, tag).await.unwrap();
+        assert_eq!(found.map(|r| r.attempt_id).as_ref(), latest, "case {case}");
+    }
+    assert_eq!(store.pending_count().await.unwrap(), 2);
+    let intents: BTreeSet<_> = store
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "intent")
+        .map(|e| e.subject)
+        .collect();
+    assert_eq!(intents, every);
+}
+
+/// The journal answers from its own tables, and counts what is pending per
+/// account: only A's unresolved intent blocks A.
+#[tokio::test]
+async fn the_journal_answers_what_reconciliation_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let standings = standings(&journal, &journal).await;
+    assert_answers(&journal, &standings).await;
+    assert_eq!(journal.pending_count_for(&["A".into()]).await.unwrap(), 1);
+}
+
+/// A store that implements only what the trait requires gets the same
+/// answers from the trait's defaults, except that the default pending
+/// count for some accounts counts every account's: it may over-report what
+/// blocks them, never under-report it.
+#[tokio::test]
+async fn the_store_defaults_answer_as_the_journal_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = RequiredOnly(OrderJournal::new(dir.path().join("orders.json")));
+    let standings = standings(&store, &store.0).await;
+    assert_answers(&store, &standings).await;
+    assert_eq!(store.pending_count_for(&["A".into()]).await.unwrap(), 2);
+}
+
+/// An account's submissions from a time on (Unix milliseconds, inclusive),
+/// oldest first: the window a daily cap or a dead man's switch counts.
+/// Another account's submissions are not in it.
+#[tokio::test]
+async fn records_since_lists_an_accounts_submissions_from_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let earlier = journal.begin("A", "place_order", json!({})).await.unwrap();
+    journal
+        .finish(&earlier, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    age_submissions(&journal, Duration::from_secs(60));
+    let later = journal.begin("A", "place_order", json!({})).await.unwrap();
+    journal.begin("B", "place_order", json!({})).await.unwrap();
+    let at = journal.record(&later).await.unwrap().unwrap().created_at;
+    let since = |from: i64| {
+        let journal = journal.clone();
+        async move {
+            journal
+                .records_since("A", from)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|r| r.attempt_id)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(since(0).await, vec![earlier, later.clone()]);
+    assert_eq!(since(at).await, vec![later]);
+    assert!(since(at + 1).await.is_empty());
+}
+
+/// The health check is a write. While another writer keeps the state file
+/// for longer than a write waits for its turn, no submission could be
+/// journaled, so the store is not healthy.
+#[tokio::test(start_paused = true)]
+async fn a_state_file_that_cannot_take_a_write_is_unhealthy() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    journal.healthcheck().await.unwrap();
+    // Another process in the middle of a write.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(journal.database().path().with_extension("write.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    assert!(matches!(
+        journal.healthcheck().await,
+        Err(rustyschwab::Error::StateBusy(_))
+    ));
+    held.unlock().unwrap();
 }
