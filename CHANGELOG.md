@@ -277,6 +277,12 @@ purpose.
 
 ### Fixed
 
+- The built-in risk provider (`PortfolioRisk`) refused every sell of a leg
+  labelled `COLLECTIVE_INVESTMENT`, as Schwab lists an ETF position, so a
+  fund bought elsewhere or transferred in could not be sold through it. A
+  sell can only reduce what the account holds, so the sell rule alone now
+  judges it, whatever the instrument: up to the symbol's long position
+  less its other working sells, and no further.
 - An order ID that isn't a whole number could leave an account unable to
   trade until its state file was edited by hand. `record_order` (used by
   `replace_order` and by the authority's `RecordOrder` request) and a

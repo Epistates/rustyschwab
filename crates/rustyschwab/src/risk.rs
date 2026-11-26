@@ -663,24 +663,28 @@ impl Proposed {
             ));
         }
         let leg = &order.order_leg_collection[0];
-        // ETFs are left out on purpose: judged as a stock, a leveraged or
-        // inverse fund's risk would be understated.
-        if leg.instrument.asset_type == AssetType::CollectiveInvestment {
-            return Err(Error::RiskDenied(
-                "Built-in portfolio risk covers long equity only; ETFs need a \
-                 deployment's own risk provider"
-                    .into(),
-            ));
-        }
-        if leg.instrument.asset_type != AssetType::Equity
-            || !matches!(
-                leg.instruction,
-                OrderInstruction::Buy | OrderInstruction::Sell
-            )
-        {
+        if !matches!(
+            leg.instrument.asset_type,
+            AssetType::Equity | AssetType::CollectiveInvestment
+        ) || !matches!(
+            leg.instruction,
+            OrderInstruction::Buy | OrderInstruction::Sell
+        ) {
             return Err(Error::RiskDenied(
                 "Built-in portfolio risk supports long equity exposure; \
                  other assets require an external risk provider"
+                    .into(),
+            ));
+        }
+        let sell = leg.instruction == OrderInstruction::Sell;
+        // A sell can only reduce what the account holds, so the sell rule
+        // bounds it whatever it sells, an ETF included. A buy of an ETF is
+        // left out on purpose: judged as a stock, a leveraged or inverse
+        // fund's risk would be understated.
+        if !sell && leg.instrument.asset_type == AssetType::CollectiveInvestment {
+            return Err(Error::RiskDenied(
+                "Built-in portfolio risk covers long equity only; ETFs need a \
+                 deployment's own risk provider"
                     .into(),
             ));
         }
@@ -689,7 +693,7 @@ impl Proposed {
             .ok_or_else(|| Error::InvalidParameter("Limit price is required".into()))?;
         Ok(Self {
             symbol: leg.instrument.symbol.clone(),
-            sell: leg.instruction == OrderInstruction::Sell,
+            sell,
             quantity: leg.quantity,
             notional: leg
                 .quantity
