@@ -1268,8 +1268,8 @@ impl SchwabClient {
             let stored = state.map(|state| state.generation);
             debug_assert!(
                 stored.is_none_or(|stored| stored >= generation),
-                "the account's stored generation {stored:?} is older than the generation \
-                 {generation} of a pass that raised it when it began"
+                "the account's stored generation is older than the generation {generation} \
+                 of a pass that raised it when it began"
             );
         }
         result

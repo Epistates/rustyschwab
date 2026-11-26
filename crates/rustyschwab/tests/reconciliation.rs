@@ -582,7 +582,7 @@ async fn the_lookback_is_read_in_consecutive_windows_inside_the_horizon() {
         // windows it asked for, whatever it did to the pass.
         let listed = listed_windows(&server).await;
         let Some(((lookback_start, _), _)) = listed.first() else {
-            panic!("a lookback of {lookback_days} days read no orders: {pass:?}");
+            panic!("a lookback of {lookback_days} days read no orders");
         };
         let start = lookback_start + i64::from(lookback_days) * DAY_MS;
         let before = |days: i64| start - days * DAY_MS;
@@ -623,7 +623,7 @@ async fn every_window_counts_against_the_page_budget() {
                 },
             )
             .await;
-        assert_eq!(pass.is_ok(), completes, "{max_pages} pages: {pass:?}");
+        assert_eq!(pass.is_ok(), completes, "{max_pages} pages");
         assert_eq!(listed_windows(&server).await.len(), max_pages);
     }
 }
@@ -828,7 +828,11 @@ async fn one_by_one_fetches_are_bounded_by_their_budget() {
                 },
             )
             .await;
-        assert_eq!(pass.is_ok(), completes, "{max_targeted_orders}: {pass:?}");
+        assert_eq!(
+            pass.is_ok(),
+            completes,
+            "{max_targeted_orders} targeted orders"
+        );
         let fetched = server
             .received_requests()
             .await
