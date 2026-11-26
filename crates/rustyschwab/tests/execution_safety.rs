@@ -504,6 +504,122 @@ async fn sells_are_judged_per_symbol() {
     ));
 }
 
+/// Working buys of a symbol, ours or at the broker, add to the position
+/// rather than offer any of it: the whole position may still be sold, and
+/// only a working sell takes shares out of what may be.
+#[tokio::test]
+async fn working_buys_do_not_reduce_what_may_be_sold() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working_buy = json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+        "orderType": "LIMIT", "quantity": 5, "filledQuantity": 0, "remainingQuantity": 5,
+        "price": 150, "orderLegCollection": [{"instruction": "BUY", "quantity": 5,
+            "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]});
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![working_buy],
+    )
+    .await;
+    let risk = risk(&journal, limits());
+    risk.reserve("A", "buy", &order("BUY", "AAPL", 1, "150"))
+        .await
+        .unwrap();
+    risk.reserve("A", "all", &order("SELL", "AAPL", 100, "150"))
+        .await
+        .unwrap();
+    assert!(matches!(
+        risk.check("A", &order("SELL", "AAPL", 1, "150"), None)
+            .await,
+        Err(rustyschwab::Error::RiskDenied(_))
+    ));
+}
+
+/// One symbol's working orders do not count against another's limits: a
+/// working MSFT buy is no part of the AAPL position the cap bounds, and a
+/// working MSFT sell offers none of the AAPL shares.
+#[tokio::test]
+async fn another_symbols_working_orders_do_not_count_against_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let working = |order_id: u32, instruction: &str, quantity: u32| {
+        json!({"orderId": order_id, "status": "WORKING", "orderStrategyType": "SINGLE",
+            "orderType": "LIMIT", "quantity": quantity, "filledQuantity": 0,
+            "remainingQuantity": quantity, "price": 1,
+            "orderLegCollection": [{"instruction": instruction, "quantity": quantity,
+                "instrument": {"assetType": "EQUITY", "symbol": "MSFT"}}]})
+    };
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [
+                {"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}},
+                {"longQuantity": 100, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}
+            ]
+        }),
+        vec![working(7, "BUY", 50), working(8, "SELL", 100)],
+    )
+    .await;
+    let risk = risk(
+        &journal,
+        PortfolioLimits {
+            max_open_quantity: 1000.into(),
+            ..limits()
+        },
+    );
+    // Up to the 200-share cap on AAPL, whatever MSFT has working.
+    risk.reserve("A", "buy", &order("BUY", "AAPL", 100, "1"))
+        .await
+        .unwrap();
+    // All 100 AAPL shares held, while every MSFT share is offered.
+    risk.reserve("A", "sell", &order("SELL", "AAPL", 100, "1"))
+        .await
+        .unwrap();
+}
+
+/// A risk policy that leaves out `max_snapshot_age_ms` trusts a reconciled
+/// baseline for five seconds: an order is judged against a younger one,
+/// and refused as stale against an older one.
+#[tokio::test]
+async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
+    let limits: PortfolioLimits = serde_json::from_value(json!({
+        "max_open_quantity": "100", "max_open_notional": "10000",
+        "max_position_quantity": "200"
+    }))
+    .unwrap();
+    assert_eq!(limits.max_snapshot_age_ms, 5000);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let reconciled_ago = |age_ms: i64| {
+        let database = journal.database().clone();
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis() - age_ms,
+                    funded(),
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let risk = risk(&journal, limits);
+    let buy = order("BUY", "AAPL", 1, "10");
+    reconciled_ago(7_500).await;
+    assert!(matches!(
+        risk.reserve("A", "stale", &buy).await,
+        Err(rustyschwab::Error::BaselineStale { .. })
+    ));
+    reconciled_ago(2_500).await;
+    risk.reserve("A", "fresh", &buy).await.unwrap();
+}
+
 /// Replacing a working order does not count it alongside its replacement:
 /// a protective sell of the whole position can be moved.
 #[tokio::test]
