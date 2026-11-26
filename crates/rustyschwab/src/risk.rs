@@ -157,6 +157,16 @@ pub struct PortfolioLimits {
 fn max_age() -> i64 {
     5000
 }
+/// The built-in [`RiskProvider`]: each account's [`PortfolioLimits`]
+/// judged against its reconciled baseline, with durable reservations for
+/// working orders. It covers long equity limit and stop-limit orders and
+/// defined-risk option strategies.
+///
+/// ETFs are not covered: judged as a stock, a leveraged or inverse fund's
+/// risk would be understated, so ETF support is left to a later release on
+/// purpose. An order whose leg is `COLLECTIVE_INVESTMENT` is refused. The
+/// provider cannot tell an ETF ordered as `EQUITY` from a stock and judges
+/// it as one, so a deployment that trades ETFs needs its own provider.
 #[derive(Debug)]
 pub struct PortfolioRisk {
     pub database: StateDatabase,
@@ -629,6 +639,15 @@ impl Proposed {
             ));
         }
         let leg = &order.order_leg_collection[0];
+        // ETFs are left out on purpose: judged as a stock, a leveraged or
+        // inverse fund's risk would be understated.
+        if leg.instrument.asset_type == AssetType::CollectiveInvestment {
+            return Err(Error::RiskDenied(
+                "Built-in portfolio risk covers long equity only; ETFs need a \
+                 deployment's own risk provider"
+                    .into(),
+            ));
+        }
         if leg.instrument.asset_type != AssetType::Equity
             || !matches!(
                 leg.instruction,
@@ -791,7 +810,9 @@ impl RiskProvider for PortfolioRisk {
 
 /// Conservative exposure for broker orders not covered by local holds:
 /// what their unfilled remainder could still buy or sell. A working option
-/// strategy counts the unfilled share of its defined risk.
+/// strategy counts the unfilled share of its defined risk. An order for no
+/// shares or no units cannot be bounded: no order the SDK sends is one
+/// (`validate` refuses it), so its figures are not to be trusted.
 fn external_exposure(
     order: &serde_json::Value,
     multipliers: &HashMap<String, Decimal>,
@@ -849,7 +870,7 @@ fn external_exposure(
         .or_else(|| total.checked_sub(filled))
         .ok_or_else(deny)?;
     let price = decimal(order.get("price")).ok_or_else(deny)?;
-    if total < Decimal::ZERO
+    if total <= Decimal::ZERO
         || filled < Decimal::ZERO
         || filled > total
         || remaining < Decimal::ZERO

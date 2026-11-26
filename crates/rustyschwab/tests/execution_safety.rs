@@ -990,9 +990,10 @@ fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
 /// The built-in provider bounds an equity order by its limit price, so it
 /// judges LIMIT and STOP_LIMIT orders only: a market or stop order has no
 /// price to bound it, and a trailing stop limit's price moves with the
-/// market. It judges long equity only: a short sale or a cover, or another
-/// asset, needs a deployment's own provider. Each is refused as
-/// `RiskDenied`, however small.
+/// market. It judges long equity only: a short sale or a cover, an ETF
+/// (judged as a stock, a leveraged or inverse fund's risk would be
+/// understated), or another asset, needs a deployment's own provider. Each
+/// is refused as `RiskDenied`, however small.
 #[tokio::test]
 async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
     let dir = tempfile::tempdir().unwrap();
@@ -1019,8 +1020,17 @@ async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
     trailing_limit["price"] = json!("1");
     let limit = json!({"price": "10"});
     let fund = single("LIMIT", "BUY", "MUTUAL_FUND", "VFIAX", limit.clone());
+    let etf = single(
+        "LIMIT",
+        "BUY",
+        "COLLECTIVE_INVESTMENT",
+        "SPY",
+        limit.clone(),
+    );
     let unpriced = "Built-in portfolio risk requires a limit order";
     let not_long_equity = "Built-in portfolio risk supports long equity exposure";
+    let not_etfs = "Built-in portfolio risk covers long equity only; ETFs need a \
+        deployment's own risk provider";
     for (case, (order, reason)) in [
         (equity("MARKET", "BUY", json!({})), unpriced),
         (equity("STOP", "BUY", json!({"stopPrice": "10"})), unpriced),
@@ -1042,6 +1052,7 @@ async fn the_built_in_provider_judges_only_long_equity_limit_orders() {
             not_long_equity,
         ),
         (fund, not_long_equity),
+        (etf, not_etfs),
     ]
     .into_iter()
     .enumerate()
@@ -1918,14 +1929,14 @@ fn unbounded(result: &rustyschwab::Result<()>) -> bool {
 }
 
 /// A working order at the broker counts what its unfilled remainder could
-/// still buy or sell: nothing once it is filled in full, or when it is for
-/// no shares at all. One the provider cannot bound stops every order on
-/// the account, even a sell of another symbol: one with no status, that
-/// is not a single order, that no limit price bounds, with no legs or a
-/// leg that is not a long equity buy or sell, without a positive price,
-/// or whose figures do not hold together.
-/// Each figure is checked on its own, so a negative quantity is refused
-/// even where it is too small to change a sum of very large ones.
+/// still buy or sell: nothing once it is filled in full. One the provider
+/// cannot bound stops every order on the account, even a sell of another
+/// symbol: one with no status, that is not a single order, that no limit
+/// price bounds, with no legs or a leg that is not a long equity buy or
+/// sell, without a positive price, for no shares (as a working strategy
+/// for no units is), or whose figures do not hold together. Each figure is
+/// checked on its own, so a negative quantity is refused even where it is
+/// too small to change a sum of very large ones.
 #[tokio::test]
 async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
     let working = |change: Value| {
@@ -1954,6 +1965,11 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
         json!({"orderLegCollection": leg("SELL_SHORT", "EQUITY", "AAPL")}),
         json!({"price": 0}),
         json!({"filledQuantity": null}),
+        // For no shares, by the order's count or by its one leg's.
+        json!({"quantity": 0, "remainingQuantity": 0}),
+        json!({"quantity": null, "remainingQuantity": 0,
+            "orderLegCollection": [{"instruction": "BUY", "quantity": 0,
+                "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]}),
         // Filled past the order, or a negative fill or remainder.
         json!({"filledQuantity": 6, "remainingQuantity": -1}),
         json!({"filledQuantity": -1, "remainingQuantity": 6}),
@@ -1975,7 +1991,6 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
         json!({"orderType": "STOP_LIMIT", "stopPrice": 9}),
         json!({"filledQuantity": 2, "remainingQuantity": null}),
         json!({"filledQuantity": 5, "remainingQuantity": 0}),
-        json!({"quantity": 0, "remainingQuantity": 0}),
     ]
     .into_iter()
     .enumerate()
@@ -1988,8 +2003,8 @@ async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
 /// A working option strategy at the broker counts the unfilled share of
 /// its defined risk, from all of it while unfilled to none once filled in
 /// full. One the provider cannot bound stops every order on the account:
-/// one with no status, that is not a single order, or whose unfilled
-/// count is below zero or above the order's.
+/// one with no status, that is not a single order, for no units, or whose
+/// unfilled count is below zero or above the order's.
 #[tokio::test]
 async fn a_working_strategy_counts_its_unfilled_share_or_stops_every_order() {
     let working = |change: Value| {

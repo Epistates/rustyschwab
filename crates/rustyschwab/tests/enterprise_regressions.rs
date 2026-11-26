@@ -248,6 +248,25 @@ fn limit_order() -> OrderRequest {
     )
 }
 
+/// An order for no shares is an invalid parameter, refused before anything
+/// is journaled or sent, so no order for nothing can be working at the
+/// broker through this SDK.
+#[tokio::test]
+async fn an_order_for_no_shares_is_refused_before_it_is_sent() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    let mut order = limit_order();
+    order.order_leg_collection[0].quantity = Decimal::ZERO;
+    let refused = client.place_order("hash", &order).await.unwrap_err();
+    assert_eq!(refused.kind(), rustyschwab::ErrorKind::InvalidParameter);
+    assert!(
+        refused.to_string().contains("quantity must be positive"),
+        "{refused}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    assert!(client.order_journal().records().await.unwrap().is_empty());
+}
+
 /// A caller that stops waiting abandons only the answer: the submission
 /// still runs to its outcome, so the account is not left blocked behind an
 /// intent nobody will finish.
