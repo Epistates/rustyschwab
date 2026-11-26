@@ -76,8 +76,9 @@ jobs:
 
   # The shards' verdict in one place: it fails unless every shard ran to the
   # end and no mutant survived or timed out, so a shard that died or never
-  # reported can't read as cancelled or skipped. The summary lists every
-  # surviving and timed-out mutant across the shards.
+  # reported can't read as cancelled or skipped. A mutant stopped by the
+  # memory cap fails it too: the cap only stops a runaway, and a test has to
+  # catch it. The summary lists every surviving, timed-out and capped mutant.
   mutants-report:
     name: mutation testing (every shard reported, no survivors)
     needs: mutants
@@ -103,11 +104,22 @@ jobs:
               status=1
             fi
           done
+          # Rust prints this line when an allocation fails, which under the
+          # cap means the mutant ran away rather than failing a test.
+          capped=""
+          if capped=$(grep -rl --include='*.log' 'memory allocation of .* bytes failed' reports); then
+            for log in $capped; do
+              echo "::error::a mutant was stopped by the memory cap, no test caught it: $(basename "$log" .log)"
+              status=1
+            done
+          fi
           {
             echo "## Surviving mutants"
             find reports -name missed.txt -exec cat {} + | sort
             echo "## Mutants that timed out"
             find reports -name timeout.txt -exec cat {} + | sort
+            echo "## Mutants stopped by the memory cap"
+            for log in $capped; do basename "$log" .log; done
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$MUTANTS_RESULT" != success ]; then
             echo "::error::mutation testing found surviving or timed-out mutants, or a shard failed"
