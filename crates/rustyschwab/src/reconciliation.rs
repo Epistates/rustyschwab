@@ -186,16 +186,9 @@ impl StateDatabase {
             let tx = c
                 .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
                 .map_err(sql)?;
-            // The pass's start becomes the baseline's age. A start ahead of
-            // this store's clock (a skewed remote worker) would make the
-            // baseline look fresher than it is.
-            let now = chrono::Utc::now().timestamp_millis();
-            if started_at > now + MAX_CLOCK_LEAD_MS {
-                return Err(Error::Storage(
-                    "Reconciliation started ahead of the state store's clock".into(),
-                ));
-            }
-            let started_at = started_at.min(now);
+            // The pass's start becomes the baseline's age.
+            let started_at =
+                baseline_observed_at(started_at, chrono::Utc::now().timestamp_millis())?;
             let current: Option<(i64, i64, bool)> = tx
                 .query_row(SELECT_ACCOUNT_GENERATION, [&account], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -395,6 +388,20 @@ impl StateDatabase {
         .await
     }
 }
+/// When the baseline of a pass that began at `started_at` counts as
+/// observed, by a store whose clock reads `now` (both in ms since the
+/// epoch). A start ahead of this store's clock (a remote worker whose clock
+/// runs fast) would make the baseline look fresher than it is: up to
+/// [`MAX_CLOCK_LEAD_MS`] ahead it counts from now, and further ahead it is
+/// refused.
+fn baseline_observed_at(started_at: i64, now: i64) -> Result<i64> {
+    if started_at > now + MAX_CLOCK_LEAD_MS {
+        return Err(Error::Storage(
+            "Reconciliation started ahead of the state store's clock".into(),
+        ));
+    }
+    Ok(started_at.min(now))
+}
 /// Cut each held reservation down to what its working order can still fill.
 /// A partial fill is already out of the broker's available funds, so a
 /// reservation for the full size would count the filled part twice. The
@@ -562,8 +569,15 @@ pub const SINCE_OVERLAP: chrono::Duration = chrono::Duration::minutes(5);
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DayTransfers {
     date: chrono::NaiveDate,
-    read_at: std::time::Instant,
+    read_at: tokio::time::Instant,
     net: rust_decimal::Decimal,
+}
+impl DayTransfers {
+    /// The net transfers read, while the reading is of trading day `today`
+    /// and younger than [`DAY_TRANSFERS_TTL`].
+    fn current(&self, today: chrono::NaiveDate) -> Option<rust_decimal::Decimal> {
+        (self.date == today && self.read_at.elapsed() < DAY_TRANSFERS_TTL).then_some(self.net)
+    }
 }
 /// How long a reading of the day's transfers is reused: they are rare, and
 /// each reading costs one request per transfer type.
@@ -604,11 +618,8 @@ impl SchwabClient {
         let now = chrono::Utc::now();
         let today = crate::paper::feed::trading_date(now);
         let cached = self.day_transfers().lock().get(account).copied();
-        if let Some(cached) = cached
-            && cached.date == today
-            && cached.read_at.elapsed() < DAY_TRANSFERS_TTL
-        {
-            return Some(cached.net);
+        if let Some(net) = cached.and_then(|reading| reading.current(today)) {
+            return Some(net);
         }
         let read = async {
             let midnight = crate::paper::feed::trading_day_start(now);
@@ -628,7 +639,7 @@ impl SchwabClient {
             account.to_owned(),
             DayTransfers {
                 date: today,
-                read_at: std::time::Instant::now(),
+                read_at: tokio::time::Instant::now(),
                 net,
             },
         );
