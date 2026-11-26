@@ -966,12 +966,18 @@ async fn a_failed_pass_leaves_a_newer_baseline_standing() {
     let server = MockServer::start().await;
     let (client, _dir, _) = mock_client(&server, false);
     let held = HeldPass::start(&server, &client, 1).await;
-    // The newer pass begins in a later millisecond than the held one: the
-    // store dates baselines in milliseconds.
-    while chrono::Utc::now().timestamp_millis() <= held.started {
-        tokio::task::yield_now().await;
-    }
-    let newer = baseline_of(&client, 1, chrono::Utc::now().timestamp_millis()).await;
+    baseline_of(&client, 1, held.started).await;
+    // The baseline of a pass that began one millisecond after the held one.
+    // The store never dates a baseline past its own clock, so the state
+    // file is given that millisecond directly.
+    let newer = held.started + 1;
+    rusqlite::Connection::open(client.order_journal().path())
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET observed_at=?1 WHERE account='hash'",
+            [newer],
+        )
+        .unwrap();
 
     assert!(held.fail().await.unwrap().is_err());
     let state = client
@@ -981,7 +987,7 @@ async fn a_failed_pass_leaves_a_newer_baseline_standing() {
         .unwrap()
         .unwrap();
     assert!(state.reconciled);
-    assert_eq!(state.observed_at, newer.started_at);
+    assert_eq!(state.observed_at, newer);
 }
 
 /// A pass that fails says nothing about a newer generation's baseline: one
