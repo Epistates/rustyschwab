@@ -1,0 +1,75 @@
+name: write-turns-diag
+
+# Temporary diagnostics for the state write-turn tests on Windows. Runs only on
+# pushes to this branch; never merged.
+on:
+  push:
+    branches: [steward/write-turns-diag]
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: stress (${{ matrix.variant }} / ${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+        variant: [main, pr81]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: merge the reconciliation branch
+        if: matrix.variant == 'pr81'
+        shell: bash
+        run: |
+          git fetch origin steward/mutants-reconciliation
+          git -c user.name=diag -c user.email=diag@invalid merge --no-edit FETCH_HEAD
+          git log --oneline -3
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.variant }}
+      - run: cargo test -p rustyschwab --lib --all-features --locked --no-run
+      - name: loop the lib tests
+        shell: bash
+        env:
+          ITERATIONS: '80'
+          BUDGET_SECONDS: '3000'
+          VARIANT: ${{ matrix.variant }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -u
+          mkdir -p diag
+          events="$(cygpath -w "$PWD/diag/events.tsv")"
+          : > diag/summary.txt
+          start=$SECONDS
+          i=0
+          failed=0
+          while [ "$i" -lt "$ITERATIONS" ] && [ $((SECONDS - start)) -lt "$BUDGET_SECONDS" ]; do
+            i=$((i + 1))
+            t0=$SECONDS
+            if DIAG_ITER="$VARIANT-$SHARD-$i" DIAG_FILE="$events" \
+              cargo test -p rustyschwab --lib --all-features --locked > diag/out.txt 2>&1; then
+              echo "$i pass $((SECONDS - t0))s" >> diag/summary.txt
+            else
+              failed=$((failed + 1))
+              cp diag/out.txt "diag/fail-$i.txt"
+              names=$(grep -E '^test .* FAILED$' diag/out.txt | sed -E 's/^test (.*) \.\.\. FAILED$/\1/' | tr '\n' ' ')
+              echo "$i FAIL $((SECONDS - t0))s $names" >> diag/summary.txt
+            fi
+          done
+          rm -f diag/out.txt
+          cat diag/summary.txt
+          echo "variant=$VARIANT shard=$SHARD iterations=$i failed=$failed"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: diag-${{ matrix.variant }}-${{ matrix.shard }}
+          path: diag/

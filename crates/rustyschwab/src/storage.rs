@@ -244,11 +244,48 @@ pub(crate) fn failpoint(name: &str) {
 #[inline(always)]
 pub(crate) fn failpoint(_: &str) {}
 
+/// DIAGNOSTIC (temporary, never for main): a timeline of the write path.
+#[derive(Clone, Default)]
+pub(crate) struct Trace {
+    log: Option<Arc<parking_lot::Mutex<Vec<TraceEvent>>>>,
+    tag: &'static str,
+}
+#[allow(dead_code)]
+pub(crate) struct TraceEvent {
+    pub(crate) at: std::time::Instant,
+    pub(crate) tag: &'static str,
+    pub(crate) what: &'static str,
+    pub(crate) detail: i64,
+    pub(crate) thread: std::thread::ThreadId,
+}
+#[allow(dead_code)]
+impl Trace {
+    pub(crate) fn new(log: Arc<parking_lot::Mutex<Vec<TraceEvent>>>, tag: &'static str) -> Self {
+        Self {
+            log: Some(log),
+            tag,
+        }
+    }
+    pub(crate) fn note(&self, what: &'static str, detail: i64) {
+        if let Some(log) = &self.log {
+            let at = std::time::Instant::now();
+            log.lock().push(TraceEvent {
+                at,
+                tag: self.tag,
+                what,
+                detail,
+                thread: std::thread::current().id(),
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StateDatabase {
     inner: Arc<Inner>,
 }
 struct Inner {
+    trace: Trace,
     path: PathBuf,
     legacy: Option<PathBuf>,
     initialized: tokio::sync::OnceCell<()>,
@@ -311,12 +348,16 @@ struct HeldLock {
     file: Arc<std::fs::File>,
     owner: Option<Arc<LockFile>>,
     _turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+    trace: Trace,
 }
 impl Drop for HeldLock {
     fn drop(&mut self) {
+        self.trace.note("unlock", 0);
+        let unlocked = self.file.unlock();
+        self.trace.note("unlocked", unlocked.is_ok() as i64);
         // A file that cannot be unlocked is closed, which unlocks it, and
         // opened again for the next writer.
-        if self.file.unlock().is_err()
+        if unlocked.is_err()
             && let Some(owner) = &self.owner
         {
             *owner.file.lock() = None;
@@ -330,6 +371,7 @@ struct Waiting {
     file: Arc<std::fs::File>,
     owner: Option<Arc<LockFile>>,
     turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+    trace: Trace,
 }
 
 /// What a first, non-blocking try for a lock file came to.
@@ -343,15 +385,32 @@ fn try_lock_file(
     file: Arc<std::fs::File>,
     owner: Option<Arc<LockFile>>,
     turn: Option<tokio::sync::OwnedMutexGuard<()>>,
+    trace: Trace,
 ) -> Result<Attempt> {
+    trace.note("try", 0);
     match file.try_lock() {
-        Ok(()) => Ok(Attempt::Held(HeldLock {
-            file,
-            owner,
-            _turn: turn,
-        })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(Attempt::Busy(Waiting { file, owner, turn })),
-        Err(std::fs::TryLockError::Error(error)) => Err(Error::Io(error)),
+        Ok(()) => {
+            trace.note("tried", 1);
+            Ok(Attempt::Held(HeldLock {
+                file,
+                owner,
+                _turn: turn,
+                trace,
+            }))
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            trace.note("tried", 0);
+            Ok(Attempt::Busy(Waiting {
+                file,
+                owner,
+                turn,
+                trace,
+            }))
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            trace.note("tried", -1);
+            Err(Error::Io(error))
+        }
     }
 }
 
@@ -380,23 +439,36 @@ struct LockRequest {
 fn lock_thread(requests: mpsc::Receiver<LockRequest>) {
     for request in requests {
         let LockRequest {
-            waiting: Waiting { file, owner, turn },
+            waiting:
+                Waiting {
+                    file,
+                    owner,
+                    turn,
+                    trace,
+                },
             reply,
         } = request;
+        trace.note("lt_recv", 0);
         if reply.is_closed() {
+            trace.note("lt_skip", 0);
             continue;
         }
-        let answer = match file.lock() {
+        trace.note("lt_lock", 0);
+        let locked = file.lock();
+        trace.note("lt_locked", locked.is_ok() as i64);
+        let answer = match locked {
             Ok(()) => Ok(HeldLock {
                 file,
                 owner,
                 _turn: turn,
+                trace: trace.clone(),
             }),
             Err(error) => Err(Error::Io(error)),
         };
         // Should nobody be waiting for the answer any more, the send fails
         // and drops the lock, which unlocks the file.
-        let _ = reply.send(answer);
+        let sent = reply.send(answer).is_ok();
+        trace.note("lt_replied", sent as i64);
     }
 }
 impl std::fmt::Debug for StateDatabase {
@@ -411,6 +483,9 @@ pub(crate) fn sql(error: rusqlite::Error) -> Error {
 }
 impl StateDatabase {
     pub fn new(path: PathBuf) -> Self {
+        Self::traced(path, Trace::default())
+    }
+    pub(crate) fn traced(path: PathBuf, trace: Trace) -> Self {
         let (path, legacy) = if path.extension().is_some_and(|e| e == "sqlite3") {
             (path, None)
         } else {
@@ -422,6 +497,7 @@ impl StateDatabase {
         let path_for_lock = path.with_extension("write.lock");
         Self {
             inner: Arc::new(Inner {
+                trace,
                 path,
                 legacy,
                 initialized: tokio::sync::OnceCell::new(),
@@ -560,8 +636,12 @@ impl StateDatabase {
         f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         self.initialized().await?;
+        let trace = self.inner.trace.clone();
+        trace.note("begin", 0);
         let expiry = tokio::time::Instant::now() + wait;
-        let held = self.inner.lock_for_write(expiry).await?;
+        let held = self.inner.lock_for_write(expiry).await;
+        trace.note("locked", held.is_ok() as i64);
+        let held = held?;
         // A connection is taken only once the lock is held, so a wait for
         // the lock holds no slot. Readers never wait for the lock, so this
         // wait cannot deadlock.
@@ -569,26 +649,34 @@ impl StateDatabase {
             .await
             .map_err(|_| write_turn_busy())?
             .map_err(|_| Error::Storage("State worker pool closed".into()))?;
+        trace.note("permit", 0);
         let inner = self.inner.clone();
         let (outcome, finished) = tokio::sync::oneshot::channel();
+        let traced = trace.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            traced.note("f_thread", 0);
             // The caller may have stopped waiting since the lock was granted;
             // a write it no longer waits for is dropped, and `held` with it.
             if outcome.is_closed() {
+                traced.note("f_abandoned", 0);
                 return;
             }
             let result = inner.checkout().and_then(|mut connection| {
+                traced.note("f_start", 0);
                 let result = f(&mut connection);
+                traced.note("f_end", result.is_ok() as i64);
                 drop(held);
                 inner.checkin(connection);
                 result
             });
             let _ = outcome.send(result);
         });
-        finished
+        let done = finished
             .await
-            .map_err(|_| Error::Storage("State worker failed".into()))?
+            .map_err(|_| Error::Storage("State worker failed".into()))?;
+        trace.note("done", done.is_ok() as i64);
+        done
     }
     /// Run `f` on a connection of its own to the file as it stands, under
     /// the init lock, for an operator's repair of a file that does not open
@@ -716,19 +804,23 @@ impl Inner {
     /// Wait for this handle's turn, then for the write lock file, until
     /// `expiry`. Dropping the future abandons the request.
     async fn lock_for_write(&self, expiry: tokio::time::Instant) -> Result<HeldLock> {
-        let turn = tokio::time::timeout_at(expiry, self.turn.clone().lock_owned())
-            .await
-            .map_err(|_| write_turn_busy())?;
+        let turn = tokio::time::timeout_at(expiry, self.turn.clone().lock_owned()).await;
+        self.trace.note("turn", turn.is_ok() as i64);
+        let turn = turn.map_err(|_| write_turn_busy())?;
         // The lock is free more often than not, and a try for it is quick:
         // make it where a blocking task would run, so that a paused clock
         // (`tokio::time::pause`) waits for it as it does for any other.
         let owner = self.lock_file.clone();
+        let trace = self.trace.clone();
         let attempt = tokio::task::spawn_blocking(move || {
+            trace.note("try_thread", 0);
             let file = owner.open()?;
-            try_lock_file(file, Some(owner), Some(turn))
+            trace.note("opened", 0);
+            try_lock_file(file, Some(owner), Some(turn), trace)
         })
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))??;
+        self.trace.note("try_back", matches!(attempt, Attempt::Held(_)) as i64);
         match attempt {
             Attempt::Held(held) => Ok(held),
             Attempt::Busy(waiting) => self.wait_for_lock(waiting, expiry, write_turn_busy).await,
@@ -758,6 +850,7 @@ impl Inner {
                     .spawn(move || lock_thread(receiver))
                     .map_err(|error| Error::Storage(format!("State lock thread: {error}")))?;
                 *locker = Some(requests);
+                self.trace.note("thread_spawned", 0);
             }
             let request = LockRequest { waiting, reply };
             if locker.as_ref().is_some_and(|l| l.send(request).is_err()) {
@@ -766,10 +859,10 @@ impl Inner {
                 return Err(stopped());
             }
         }
-        tokio::time::timeout_at(expiry, granted)
-            .await
-            .map_err(|_| busy())?
-            .map_err(|_| stopped())?
+        self.trace.note("sent", 0);
+        let granted = tokio::time::timeout_at(expiry, granted).await;
+        self.trace.note("granted", granted.is_ok() as i64);
+        granted.map_err(|_| busy())?.map_err(|_| stopped())?
     }
     fn checkout(&self) -> Result<Connection> {
         match self.idle.lock().pop() {
@@ -805,7 +898,12 @@ impl Inner {
     async fn lock_init(&self) -> Result<HeldLock> {
         let path = self.path.clone();
         let attempt = tokio::task::spawn_blocking(move || {
-            try_lock_file(Arc::new(Self::open_init_lock(&path)?), None, None)
+            try_lock_file(
+                Arc::new(Self::open_init_lock(&path)?),
+                None,
+                None,
+                Trace::default(),
+            )
         })
         .await
         .map_err(|_| Error::Storage("State worker failed".into()))??;
@@ -830,6 +928,7 @@ impl Inner {
                         file,
                         owner: None,
                         _turn: None,
+                        trace: Trace::default(),
                     });
                 }
                 Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < wait => {
@@ -1342,12 +1441,79 @@ mod tests {
 
     /// Hold SQLite's write lock for `hold`, then commit an insert of `key`.
     fn hold_and_insert(c: &mut Connection, key: &str, hold: Duration) -> Result<()> {
+        hold_and_insert_traced(c, key, hold, &Trace::default())
+    }
+    fn hold_and_insert_traced(
+        c: &mut Connection,
+        key: &str,
+        hold: Duration,
+        trace: &Trace,
+    ) -> Result<()> {
         let tx = c
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(sql)?;
+        trace.note("tx_begun", 0);
         std::thread::sleep(hold);
+        trace.note("slept", 0);
         insert(&tx, key)?;
-        tx.commit().map_err(sql)
+        trace.note("commit", 0);
+        let committed = tx.commit().map_err(sql);
+        trace.note("committed", committed.is_ok() as i64);
+        committed
+    }
+
+    /// DIAGNOSTIC: writes the test's timeline to `DIAG_FILE` when it ends.
+    struct Report {
+        test: &'static str,
+        log: Arc<parking_lot::Mutex<Vec<TraceEvent>>>,
+        start: std::time::Instant,
+    }
+    impl Report {
+        fn new(test: &'static str) -> Self {
+            Self {
+                test,
+                log: Arc::default(),
+                start: std::time::Instant::now(),
+            }
+        }
+        fn trace(&self, tag: &'static str) -> Trace {
+            Trace::new(self.log.clone(), tag)
+        }
+    }
+    impl Drop for Report {
+        fn drop(&mut self) {
+            use std::io::Write;
+            let outcome = if std::thread::panicking() {
+                "FAIL"
+            } else {
+                "PASS"
+            };
+            let Some(path) = std::env::var_os("DIAG_FILE") else {
+                return;
+            };
+            let iter = std::env::var("DIAG_ITER").unwrap_or_default();
+            let mut text = String::new();
+            let mut threads = std::collections::HashMap::new();
+            for e in self.log.lock().iter() {
+                let next = threads.len();
+                let thread = *threads.entry(e.thread).or_insert(next);
+                text += &format!(
+                    "{iter}\t{}\t{outcome}\t{}\t{}\t{}\t{}\t{thread}\n",
+                    self.test,
+                    e.at.saturating_duration_since(self.start).as_micros(),
+                    e.tag,
+                    e.what,
+                    e.detail
+                );
+            }
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let _ = file.write_all(text.as_bytes());
+            }
+        }
     }
 
     /// Two handles on one file, as two processes would have: one writes
@@ -1357,15 +1523,19 @@ mod tests {
     /// commits and could give up after five seconds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_writer_on_another_handle_gets_a_turn_beside_a_steady_one() {
+        let report = Report::new("steady");
+        let test_trace = report.trace("test");
         let dir = tempfile::tempdir().unwrap();
-        let busy = StateDatabase::new(dir.path().join("steady.json"));
-        let other = StateDatabase::new(busy.path().to_owned());
+        let busy = StateDatabase::traced(dir.path().join("steady.json"), report.trace("busy"));
+        let other = StateDatabase::traced(busy.path().to_owned(), report.trace("other"));
         busy.run(|_| Ok(())).await.unwrap();
         other.run(|_| Ok(())).await.unwrap();
+        test_trace.note("opened", 0);
         let committed = Arc::new(AtomicUsize::new(0));
         let done = Arc::new(AtomicBool::new(false));
         let steady = {
             let (busy, committed, done) = (busy.clone(), committed.clone(), done.clone());
+            let busy_trace = report.trace("busy");
             tokio::spawn(async move {
                 // Longer than the timeout in all, should the other write
                 // have to wait for this to stop.
@@ -1374,9 +1544,16 @@ mod tests {
                         break;
                     }
                     let committed = committed.clone();
+                    let busy_trace = busy_trace.clone();
                     busy.write(move |c| {
-                        hold_and_insert(c, &format!("steady{n}"), Duration::from_millis(25))?;
-                        committed.fetch_add(1, Ordering::Relaxed);
+                        hold_and_insert_traced(
+                            c,
+                            &format!("steady{n}"),
+                            Duration::from_millis(25),
+                            &busy_trace,
+                        )?;
+                        let total = committed.fetch_add(1, Ordering::Relaxed);
+                        busy_trace.note("counted", total as i64 + 1);
                         Ok(())
                     })
                     .await
@@ -1386,8 +1563,19 @@ mod tests {
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
         let before = committed.load(Ordering::Relaxed);
-        other.write(|c| insert(c, "other")).await.unwrap();
+        test_trace.note("before", before as i64);
+        let other_trace = report.trace("other");
+        other
+            .write(move |c| {
+                other_trace.note("tx_begun", 0);
+                let inserted = insert(c, "other");
+                other_trace.note("committed", inserted.is_ok() as i64);
+                inserted
+            })
+            .await
+            .unwrap();
         let during = committed.load(Ordering::Relaxed) - before;
+        test_trace.note("during", during as i64);
         done.store(true, Ordering::Relaxed);
         steady.await.unwrap();
         assert!(during <= 3, "{during} writes went ahead of a waiting one");
@@ -1397,27 +1585,35 @@ mod tests {
     /// a second turn while another is waiting.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn writers_on_one_handle_take_turns_in_the_order_they_asked() {
+        let report = Report::new("turns");
         let dir = tempfile::tempdir().unwrap();
-        let database = StateDatabase::new(dir.path().join("turns.json"));
+        let database = StateDatabase::traced(dir.path().join("turns.json"), report.trace("db"));
         database.run(|_| Ok(())).await.unwrap();
+        report.trace("test").note("opened", 0);
         let order = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let tasks: Vec<_> = (0..4)
             .map(|task| {
                 let (database, order) = (database.clone(), order.clone());
+                let trace = report.trace("db");
                 tokio::spawn(async move {
                     for n in 0..5 {
                         let order = order.clone();
-                        database
+                        let inner = trace.clone();
+                        trace.note("ask", task * 100 + n);
+                        let wrote = database
                             .write(move |c| {
                                 order.lock().push(task);
-                                hold_and_insert(
+                                inner.note("task", task * 100 + n);
+                                hold_and_insert_traced(
                                     c,
                                     &format!("t{task}n{n}"),
                                     Duration::from_millis(25),
+                                    &inner,
                                 )
                             })
-                            .await
-                            .unwrap();
+                            .await;
+                        trace.note("answered", if wrote.is_ok() { task * 100 + n } else { -(task * 100 + n) - 1 });
+                        wrote.unwrap();
                     }
                 })
             })
