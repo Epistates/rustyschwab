@@ -3,6 +3,7 @@ use crate::{
     SchwabClient,
     client::Op,
     error::{Error, Result},
+    execution::is_broker_order_id,
     storage::{StateDatabase, audit, sql},
     types::trading::OrdersParams,
 };
@@ -71,6 +72,25 @@ const SELECT_LINKED_HELD_RESERVATIONS: &str = "SELECT r.id,r.quantity,r.notional
      WHERE r.state='held' AND s.account=?1";
 const SHRINK_HELD_RESERVATION: &str =
     "UPDATE reservations SET quantity=?1,notional=?2 WHERE id=?3 AND state='held'";
+const SELECT_ORDER_ROW: &str =
+    "SELECT observed_at,payload FROM orders WHERE account=?1 AND order_id=?2";
+/// Accepted submissions on `?1` that name broker order `?2`.
+const SELECT_ACCEPTED_FOR_ORDER: &str = "SELECT id FROM submissions WHERE account=?1 \
+     AND json_extract(outcome,'$.status')='accepted' AND json_extract(outcome,'$.order_id')=?2 \
+     ORDER BY created_at,id";
+/// Gives order `?2`'s observed activities order `?3`'s ID, keeping one of
+/// each: an activity's key is its order's ID and a digest of its content,
+/// so the same activity observed under both IDs has one key once moved.
+const MOVE_ORDER_EXECUTIONS: &str = "INSERT OR IGNORE INTO executions(account,execution_id,payload) \
+     SELECT account,?3 || substr(execution_id,length(?2)+1),payload FROM executions \
+     WHERE account=?1 AND execution_id>=?2 || ':' AND execution_id<?2 || ';'";
+/// Reservations on `?1` for a replacement of order `?2` name order `?3`.
+const RENAME_REPLACED_ORDER: &str =
+    "UPDATE reservations SET replaces=?3 WHERE account=?1 AND replaces=?2";
+/// Reservations on `?1` for a replacement of `?2`, which names no order, no
+/// longer name the order they replace.
+const FORGET_REPLACED_ORDER: &str =
+    "UPDATE reservations SET replaces=NULL WHERE account=?1 AND replaces=?2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountState {
@@ -106,6 +126,36 @@ pub struct ReconciliationReport {
     /// nothing; the stored account state is the newer one's.
     #[serde(default)]
     pub superseded: bool,
+}
+/// A stored order ID that is not a broker order ID (the store's invariant,
+/// which [`Error::NonCanonicalOrderId`] reports), and what the repair does
+/// with it: rewrites it as `canonical`, the same order in its own digits,
+/// or sets it aside when it names no order at all. Listed by
+/// [`StateDatabase::order_id_repairs`] and made by
+/// [`StateDatabase::repair_order_ids`]. Displayed as one line:
+/// `orders (account …1234): "007" -> "7"`, or `-> set aside`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct OrderIdRepair {
+    /// The table that holds it.
+    pub table: String,
+    /// Its row, as [`Error::NonCanonicalOrderId`] names it.
+    pub row: String,
+    /// The account it is stored under.
+    pub account: String,
+    /// The text as stored.
+    pub order_id: String,
+    /// The order ID it becomes; `None` when it is set aside.
+    pub canonical: Option<String>,
+}
+impl std::fmt::Display for OrderIdRepair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({}): {:?} -> ", self.table, self.row, self.order_id)?;
+        match &self.canonical {
+            Some(canonical) => write!(f, "{canonical:?}"),
+            None => f.write_str("set aside"),
+        }
+    }
 }
 impl StateDatabase {
     pub async fn invalidate_account(&self, account: &str, generation: u64) -> Result<()> {
@@ -388,6 +438,341 @@ impl StateDatabase {
         })
         .await
     }
+    /// Every change [`repair_order_ids`](Self::repair_order_ids) would make
+    /// to this file as it stands, in table and then row order. Changes
+    /// nothing. Like the repair, it reads a file that fails to open with
+    /// [`Error::NonCanonicalOrderId`]; an empty list means there is nothing
+    /// to repair.
+    pub async fn order_id_repairs(&self) -> Result<Vec<OrderIdRepair>> {
+        self.repairing(|c| stored_order_id_repairs(c)).await
+    }
+    /// Repair a file that fails to open with [`Error::NonCanonicalOrderId`]
+    /// (edited by hand or damaged after its migration), in `operator`'s
+    /// name: the migration's canonicalization, run on demand. Under the init
+    /// lock and in one transaction, every stored order ID that is not a
+    /// broker order ID is rewritten in its own digits, merging with the
+    /// records for the same order, or set aside when it names none, each
+    /// audited as the migration audits it; then `order_ids_repaired` records
+    /// the operator and the changes. Afterwards the file opens. Returns the
+    /// changes made, as [`order_id_repairs`](Self::order_id_repairs) listed
+    /// them; with nothing to repair it writes nothing.
+    ///
+    /// The file must be at this release's schema version: opening one that
+    /// is behind migrates it, which makes the same repair.
+    pub async fn repair_order_ids(&self, operator: &str) -> Result<Vec<OrderIdRepair>> {
+        if operator.trim().is_empty() {
+            return Err(Error::InvalidParameter("Operator is required".into()));
+        }
+        let operator = operator.to_owned();
+        self.repairing(move |c| {
+            let tx = c
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let repairs = stored_order_id_repairs(&tx)?;
+            if repairs.is_empty() {
+                return Ok(repairs);
+            }
+            repair_stored_order_ids(&tx, &repairs)?;
+            check_stored_order_ids(&tx)?;
+            audit(
+                &tx,
+                "order_ids_repaired",
+                &operator,
+                &serde_json::json!({ "changes": repairs }),
+            )?;
+            tx.commit().map_err(sql)?;
+            Ok(repairs)
+        })
+        .await
+    }
+}
+/// One order ID as this store holds it outside its audit trail: where it is
+/// (`table`, and the row as an error names it), its account and its text.
+struct StoredOrderId {
+    table: &'static str,
+    row: String,
+    account: String,
+    order_id: String,
+}
+/// Visit every order ID this store holds outside its audit trail (see
+/// [`check_stored_order_ids`] for what that leaves out, and why): each
+/// stored order and reference, each observed activity (keyed by its
+/// order's ID and a digest of its content), each accepted submission's
+/// order, and each reservation's replaced order, table by table in that
+/// order and each table in its key's order. Reads row by row.
+fn for_each_stored_order_id(
+    c: &rusqlite::Connection,
+    mut visit: impl FnMut(StoredOrderId) -> Result<()>,
+) -> Result<()> {
+    let masked = crate::utils::mask_account;
+    // Each query gives the account, the row's key and the order ID's text.
+    let mut scan = |table: &'static str,
+                    query: &str,
+                    describe: &dyn Fn(&str, &str, String) -> (String, String)|
+     -> Result<()> {
+        let mut statement = c.prepare(query).map_err(sql)?;
+        let mut rows = statement.query([]).map_err(sql)?;
+        while let Some(r) = rows.next().map_err(sql)? {
+            let account: String = r.get(0).map_err(sql)?;
+            let key: String = r.get(1).map_err(sql)?;
+            let (row, order_id) = describe(&account, &key, r.get(2).map_err(sql)?);
+            visit(StoredOrderId {
+                table,
+                row,
+                account,
+                order_id,
+            })?;
+        }
+        Ok(())
+    };
+    scan(
+        "orders",
+        "SELECT account,order_id,order_id FROM orders ORDER BY account,order_id",
+        &|account, _, order_id| (format!("account {}", masked(account)), order_id),
+    )?;
+    scan(
+        "executions",
+        "SELECT account,execution_id,execution_id FROM executions \
+         ORDER BY account,execution_id",
+        &|account, key, _| {
+            let order_id = key.rsplit_once(':').map_or(key, |(order_id, _)| order_id);
+            (
+                format!("account {}, activity {key}", masked(account)),
+                order_id.to_owned(),
+            )
+        },
+    )?;
+    scan(
+        "submissions",
+        "SELECT account,id,json_extract(outcome,'$.order_id') FROM submissions \
+         WHERE json_extract(outcome,'$.status')='accepted' \
+           AND json_extract(outcome,'$.order_id') IS NOT NULL ORDER BY id",
+        &|_, id, order_id| (format!("submission {id}"), order_id),
+    )?;
+    scan(
+        "reservations",
+        "SELECT account,id,replaces FROM reservations WHERE replaces IS NOT NULL ORDER BY id",
+        &|_, id, order_id| (format!("reservation {id}"), order_id),
+    )
+}
+/// The store's invariant on order IDs: every one it holds outside its audit
+/// trail is a broker order ID ([`is_broker_order_id`]), so each order has
+/// exactly one text form in every table that names it. Checked each time
+/// the store opens, after migrating (`StateDatabase`); new input is held to
+/// the same rule where it comes in. A file that breaks it was edited by
+/// hand or damaged after its migration, so this fails closed with
+/// [`Error::NonCanonicalOrderId`] rather than repair it silently.
+///
+/// What is left out, on purpose:
+/// - The audit trail. Its rows are append-only evidence, hash-chained
+///   (`audit_chain`), of what was true when each was written; an ID an
+///   earlier release stored stays in them as it was written, and the
+///   `order_id_canonicalized` entry the migration wrote records the
+///   mapping. Rewriting them would falsify that evidence and break the
+///   chain.
+/// - What was asked for rather than what this store follows: each
+///   submission's request as submitted (for an MCP principal, the input of
+///   the approval digest it consumed), the intents awaiting approval, and
+///   the activity log.
+/// - The text inside an order's payload, the broker's view as it reported
+///   it (a parent order's copies of its children's IDs, say). The migration
+///   rewrites the `orderId` of an order it moves; the rest is as reported.
+pub(crate) fn check_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
+    for_each_stored_order_id(c, |stored| {
+        if is_broker_order_id(&stored.order_id) {
+            return Ok(());
+        }
+        Err(Error::NonCanonicalOrderId {
+            table: stored.table,
+            row: stored.row,
+            order_id: stored.order_id,
+        })
+    })
+}
+/// The one-time migration to canonical order IDs (schema version 7), run in
+/// the transaction that records it: every order ID this store holds outside
+/// its audit trail, finished history included, is rewritten in its own
+/// digits when it names an order written another way, merging the records
+/// for the same order ([`canonicalize_order_id`]), and set aside when it
+/// names no order at all ([`set_aside_order_id`]). Each change is audited;
+/// the audit rows already written are not touched (see
+/// [`check_stored_order_ids`]). Afterwards the store meets its invariant.
+/// An operator's repair ([`StateDatabase::repair_order_ids`]) makes the
+/// same changes on demand.
+pub(crate) fn canonicalize_stored_order_ids(c: &rusqlite::Connection) -> Result<()> {
+    repair_stored_order_ids(c, &stored_order_id_repairs(c)?)
+}
+/// Every stored order ID that breaks the invariant
+/// ([`check_stored_order_ids`]), in the order the store holds them, and
+/// what the canonicalization makes of it: the same order in its own
+/// digits, or `None` when it names no order and is set aside.
+fn stored_order_id_repairs(c: &rusqlite::Connection) -> Result<Vec<OrderIdRepair>> {
+    let mut repairs = Vec::new();
+    for_each_stored_order_id(c, |stored| {
+        if !is_broker_order_id(&stored.order_id) {
+            repairs.push(OrderIdRepair {
+                canonical: crate::execution::canonical_order_id(&stored.order_id),
+                table: stored.table.to_owned(),
+                row: stored.row,
+                account: stored.account,
+                order_id: stored.order_id,
+            });
+        }
+        Ok(())
+    })?;
+    Ok(repairs)
+}
+/// Make `repairs`, which [`stored_order_id_repairs`] listed on `c`, once
+/// for each stored ID on each account however many rows name it: rewrite
+/// ([`canonicalize_order_id`]) or set aside ([`set_aside_order_id`]).
+fn repair_stored_order_ids(c: &rusqlite::Connection, repairs: &[OrderIdRepair]) -> Result<()> {
+    let ids: std::collections::BTreeSet<_> = repairs
+        .iter()
+        .map(|r| (&r.account, &r.order_id, &r.canonical))
+        .collect();
+    for (account, id, canonical) in ids {
+        match canonical {
+            Some(canonical) => canonicalize_order_id(c, account, id, canonical)?,
+            None => set_aside_order_id(c, account, id)?,
+        }
+    }
+    Ok(())
+}
+/// The accepted submissions on `account` that name order `id`.
+fn accepted_for_order(c: &rusqlite::Connection, account: &str, id: &str) -> Result<Vec<String>> {
+    let mut stmt = c.prepare(SELECT_ACCEPTED_FOR_ORDER).map_err(sql)?;
+    stmt.query_map(params![account, id], |r| r.get(0))
+        .map_err(sql)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(sql)
+}
+/// When order `id` was last observed and how, if this store holds it.
+fn order_row(c: &rusqlite::Connection, account: &str, id: &str) -> Result<Option<(i64, String)>> {
+    c.query_row(SELECT_ORDER_ROW, params![account, id], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .optional()
+    .map_err(sql)
+}
+/// Rewrite stored ID `stored`, which names broker order `canonical` written
+/// another way, in its own digits, merging it with whatever this store
+/// already holds under `canonical`. Both describe the same broker order,
+/// so the merge loses nothing about it:
+/// - the order's record is the later of the two observations, the
+///   broker's latest view (on a tie, the record under its own digits);
+/// - each observed activity is kept once: activities are keyed by their
+///   content, so one observed under both IDs is the same activity;
+/// - every submission accepted under `stored` is accepted under
+///   `canonical`, and a reservation for a replacement of `stored` names
+///   `canonical`, so risk and reconciliation link them to the order as
+///   before.
+///
+/// Audited as `order_id_canonicalized`, with `stored` as the subject.
+fn canonicalize_order_id(
+    tx: &rusqlite::Connection,
+    account: &str,
+    stored: &str,
+    canonical: &str,
+) -> Result<()> {
+    let existing = order_row(tx, account, canonical)?;
+    if let Some((observed_at, payload)) = order_row(tx, account, stored)? {
+        if existing
+            .as_ref()
+            .is_none_or(|(existing_at, _)| observed_at > *existing_at)
+        {
+            let mut order: Value = serde_json::from_str(&payload)?;
+            if let Some(fields) = order.as_object_mut() {
+                fields.insert("orderId".into(), Value::String(canonical.to_owned()));
+            }
+            tx.execute(
+                UPSERT_ORDER,
+                params![
+                    account,
+                    canonical,
+                    observed_at,
+                    serde_json::to_string(&order)?
+                ],
+            )
+            .map_err(sql)?;
+        }
+        tx.execute(crate::execution::DELETE_ORDER, params![account, stored])
+            .map_err(sql)?;
+        tx.execute(MOVE_ORDER_EXECUTIONS, params![account, stored, canonical])
+            .map_err(sql)?;
+        tx.execute(
+            crate::execution::DELETE_ORDER_EXECUTIONS,
+            params![account, stored],
+        )
+        .map_err(sql)?;
+    }
+    let attempts = accepted_for_order(tx, account, stored)?;
+    let accepted = serde_json::to_string(&crate::execution::SubmissionOutcome::Accepted {
+        order_id: Some(canonical.to_owned()),
+    })?;
+    for attempt in &attempts {
+        tx.execute(RESOLVE_SUBMISSION_OUTCOME, params![accepted, attempt])
+            .map_err(sql)?;
+    }
+    tx.execute(RENAME_REPLACED_ORDER, params![account, stored, canonical])
+        .map_err(sql)?;
+    tracing::warn!(
+        order_id = ?stored,
+        canonical,
+        account = %crate::utils::mask_account(account),
+        "A stored order ID was written another way; it was rewritten in its own digits \
+         (audited as order_id_canonicalized)"
+    );
+    audit(
+        tx,
+        "order_id_canonicalized",
+        stored,
+        &serde_json::json!({
+            "account": account,
+            "order_id": canonical,
+            "merged": existing.is_some(),
+            "attempts": attempts,
+        }),
+    )
+}
+/// Set aside stored ID `id`, which names no broker order at all, so nothing
+/// real is given up: the order stored under it and its observed activity
+/// are dropped, a submission accepted under it goes back to being placed by
+/// its tag (keeping its reservation), and a reservation for a replacement
+/// of it no longer names one, which can only count more against the
+/// account. Audited as `order_id_set_aside` with what was stored.
+fn set_aside_order_id(tx: &rusqlite::Connection, account: &str, id: &str) -> Result<()> {
+    let order: Option<Value> = order_row(tx, account, id)?
+        .map(|(_, payload)| serde_json::from_str(&payload))
+        .transpose()?;
+    tx.execute(crate::execution::DELETE_ORDER, params![account, id])
+        .map_err(sql)?;
+    tx.execute(
+        crate::execution::DELETE_ORDER_EXECUTIONS,
+        params![account, id],
+    )
+    .map_err(sql)?;
+    let attempts = accepted_for_order(tx, account, id)?;
+    let unplaced =
+        serde_json::to_string(&crate::execution::SubmissionOutcome::Accepted { order_id: None })?;
+    for attempt in &attempts {
+        tx.execute(RESOLVE_SUBMISSION_OUTCOME, params![unplaced, attempt])
+            .map_err(sql)?;
+    }
+    tx.execute(FORGET_REPLACED_ORDER, params![account, id])
+        .map_err(sql)?;
+    tracing::error!(
+        order_id = ?id,
+        account = %crate::utils::mask_account(account),
+        attempts = attempts.len(),
+        "A stored order ID cannot name a broker order; it was set aside \
+         (audited as order_id_set_aside)"
+    );
+    audit(
+        tx,
+        "order_id_set_aside",
+        id,
+        &serde_json::json!({"account": account, "order": order, "attempts": attempts}),
+    )
 }
 /// When the baseline of a pass that began at `started_at` counts as
 /// observed, by a store whose clock reads `now` (both in ms since the
@@ -473,12 +858,32 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
     }
     Ok(shrunk)
 }
+/// Drop the placeholder for one broker order under each text it was stored
+/// as (`stored`, one ID written one or more ways); whether any was dropped.
+async fn forget_placeholders(
+    store: &dyn crate::execution::ExecutionStore,
+    account: &str,
+    stored: &[String],
+) -> Result<bool> {
+    let mut forgot = false;
+    for id in stored {
+        if store.forget_placeholder(account, id).await? {
+            forgot = true;
+        }
+    }
+    Ok(forgot)
+}
+/// The broker order ID an order payload's `orderId` holds, as a JSON
+/// string or a JSON number: one rule ([`is_broker_order_id`]) for both, so
+/// `"7"` and `7` name the same order and neither form reaches past
+/// `u64::MAX`.
 pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
-    value.and_then(|v| match v {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) if n.is_u64() => Some(n.to_string()),
-        _ => None,
-    })
+    let id = match value? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    is_broker_order_id(&id).then_some(id)
 }
 fn matches_request(request: &Value, order: &Value) -> bool {
     // Match explicit request fields recursively, tolerating broker-added fields
@@ -741,22 +1146,32 @@ impl SchwabClient {
                 }
             }
             // A target the list just returned is already current; fetching it
-            // again would cost one request per working order per pass.
-            let targets: Vec<String> = database
-                .reconciliation_targets(account)
-                .await?
-                .into_iter()
-                .filter(|id| !orders.contains_key(id))
-                .collect();
+            // again would cost one request per working order per pass. This
+            // store holds only broker order IDs, but one that was never
+            // migrated (an authority on an earlier release, say) can return
+            // one written another way ("007"): it is read as the order it
+            // names (7), once however many ways it is stored. One that names
+            // no order at all has nothing to fetch.
+            let mut targets = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for stored in database.reconciliation_targets(account).await? {
+                match crate::execution::canonical_order_id(&stored) {
+                    Some(id) if !orders.contains_key(&id) => {
+                        targets.entry(id).or_default().push(stored);
+                    }
+                    Some(_) => {}
+                    None => tracing::warn!(
+                        order_id = ?stored,
+                        account = %crate::utils::mask_account(account),
+                        "A stored order ID cannot name a broker order; not fetched"
+                    ),
+                }
+            }
             if targets.len() > options.max_targeted_orders {
                 return Err(Error::Storage(
                     "Reconciliation targeted-order budget exhausted".into(),
                 ));
             }
-            for id in targets {
-                if !id.bytes().all(|b| b.is_ascii_digit()) || id.is_empty() {
-                    return Err(Error::Storage("Invalid stored broker order ID".into()));
-                }
+            for (id, stored) in targets {
                 let order: Value = match self
                     .request(
                         Op::recovery("reconcile_order"),
@@ -767,11 +1182,12 @@ impl SchwabClient {
                 {
                     Ok(order) => order,
                     // The broker has no such order. That ends a reference
-                    // this store never saw answered; an order it did
-                    // observe vanishing still needs an operator.
+                    // this store never saw answered, whatever text it was
+                    // stored as; an order it did observe vanishing still
+                    // needs an operator.
                     Err(error)
                         if error.http_status() == Some(reqwest::StatusCode::NOT_FOUND)
-                            && database.forget_placeholder(account, &id).await? =>
+                            && forget_placeholders(database.as_ref(), account, &stored).await? =>
                     {
                         continue;
                     }

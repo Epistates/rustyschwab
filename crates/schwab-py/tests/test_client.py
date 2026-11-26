@@ -432,6 +432,11 @@ async def test_a_placement_unanswered_within_its_timeout_is_unknown_and_not_canc
     server.on(
         "POST", f"{ACCOUNT_PATH}/orders", status=201, headers={"Location": "/orders/3"}, delay=2.0
     )
+    # The first call loads the tokens and verifies the state file, and the
+    # submission's timeout covers that too: on a slow disk it can run out
+    # before anything is sent, which is a plain Timeout. Do that work first, so
+    # that the timeout can only run out on the broker's answer.
+    await client.init()
     started = time.monotonic()
     with pytest.raises(errors.SubmissionUnknown) as caught:
         await client.place_order(ACCOUNT_HASH, limit_order(), timeout=0.5)

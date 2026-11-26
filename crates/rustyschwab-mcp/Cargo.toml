@@ -66,6 +66,8 @@ otel = ["rustyschwab/otel", "dep:metrics-util"]
 [dev-dependencies]
 # Paused-clock tests (`#[tokio::test(start_paused = true)]`).
 tokio = { workspace = true, features = ["test-util"] }
+# Writing a damaged state file directly, for `rustyschwab-admin` to repair.
+rusqlite = { workspace = true }
 wiremock = { workspace = true }
 tokio-tungstenite = { workspace = true }
 

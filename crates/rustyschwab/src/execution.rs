@@ -78,10 +78,10 @@ const SELECT_PRUNABLE_ORDERS: &str = "SELECT account,order_id FROM orders WHERE 
      AND NOT EXISTS(SELECT 1 FROM reservations r JOIN submissions s ON s.id=r.id \
        WHERE r.state='held' AND s.account=orders.account \
          AND json_extract(s.outcome,'$.order_id')=orders.order_id)";
-const DELETE_ORDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2";
+pub(crate) const DELETE_ORDER: &str = "DELETE FROM orders WHERE account=?1 AND order_id=?2";
 /// An order's observed activities are keyed `{order_id}:{digest}`; `;`
 /// sorts right after `:`, so this is exactly that order's range.
-const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
+pub(crate) const DELETE_ORDER_EXECUTIONS: &str = "DELETE FROM executions WHERE account=?1 \
      AND execution_id>=?2 || ':' AND execution_id<?2 || ';'";
 /// Released reservations whose submission is pruned or resolved before `?1`.
 const PRUNE_RELEASED_RESERVATIONS: &str = "DELETE FROM reservations WHERE state='released' \
@@ -104,7 +104,7 @@ const PRUNE_RESOLVED_SUBMISSIONS: &str = "DELETE FROM submissions \
                IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED')))";
 /// Open broker orders plus accepted submissions whose order is not yet known
 /// to be terminal.
-const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
+pub(crate) const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
      WHERE account=?1 AND COALESCE(json_extract(payload,'$.status'),'UNKNOWN') \
        NOT IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED') \
      UNION \
@@ -115,6 +115,24 @@ const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM orders \
            AND json_extract(o.payload,'$.status') \
              IN ('FILLED','CANCELED','REJECTED','EXPIRED','REPLACED'))";
 const OPERATOR_HALT_KEY: &str = "operator_halt";
+
+/// Whether `id` can name a broker order. Schwab's order IDs, and the paper
+/// venue's, are whole numbers that fit in a `u64`, and `id` must be one
+/// written exactly as it prints: digits only, with no sign, space or
+/// leading zero, so each order has one ID and every ID reads back as the
+/// number it names. The journal stores, reconciliation follows and the
+/// client sends no other.
+pub fn is_broker_order_id(id: &str) -> bool {
+    canonical_order_id(id).is_some_and(|canonical| canonical == id)
+}
+
+/// The broker order ID that stored text `id` names, in its own digits: the
+/// `u64` it reads as. An earlier release could store an ID written another
+/// way, with a leading zero or a sign (`"007"` names order 7). `None` when
+/// it names no order at all.
+pub(crate) fn canonical_order_id(id: &str) -> Option<String> {
+    id.parse::<u64>().ok().map(|n| n.to_string())
+}
 
 /// Admission check shared by every dispatch path, live and paper: fail closed
 /// while an operator halt is recorded in the same state file.
@@ -365,13 +383,23 @@ impl OrderJournal {
     /// found is counted from the broker's own order list. `Accepted` also
     /// succeeds when reconciliation already accepted the submission under
     /// the same order ID (or this call has none), and `Rejected` when
-    /// recovery already resolved it as never dispatched.
+    /// recovery already resolved it as never dispatched. An `Accepted`
+    /// order ID must be a broker order ID ([`is_broker_order_id`]).
     pub async fn finish(&self, id: &str, outcome: SubmissionOutcome) -> Result<()> {
         if let SubmissionOutcome::Reconciled { evidence } = &outcome
             && evidence.trim().is_empty()
         {
             return Err(Error::InvalidParameter(
                 "Reconciliation evidence is required".into(),
+            ));
+        }
+        if let SubmissionOutcome::Accepted {
+            order_id: Some(order_id),
+        } = &outcome
+            && !is_broker_order_id(order_id)
+        {
+            return Err(Error::InvalidParameter(
+                "Numeric broker order ID required".into(),
             ));
         }
         let id = id.to_owned();
@@ -742,6 +770,35 @@ pub enum IntentState {
     /// Its approval lapsed unused; it can be approved again.
     Lapsed,
 }
+impl IntentState {
+    /// Where an intent stands at `now` (Unix seconds), from its approval's
+    /// operator, expiry and use, if it has an approval, and whether one was
+    /// revoked.
+    fn of(
+        operator: Option<String>,
+        expires_at: Option<i64>,
+        consumed: Option<bool>,
+        revoked: bool,
+        now: i64,
+    ) -> Self {
+        match (operator, expires_at, consumed) {
+            _ if revoked => Self::Revoked,
+            (Some(_), Some(_), Some(true)) => Self::Spent,
+            (Some(operator), Some(expires_at), _) if expires_at > now => Self::Approved {
+                operator,
+                expires_at,
+            },
+            (Some(_), Some(_), _) => Self::Lapsed,
+            _ => Self::Awaiting,
+        }
+    }
+}
+/// Whether an approval granted at `now` may not expire at `expires_at`
+/// (Unix seconds): it would have lapsed already, or would outlast the hour
+/// an approval may last.
+fn approval_expiry_out_of_range(expires_at: i64, now: i64) -> bool {
+    expires_at <= now || expires_at > now + 3600
+}
 
 const UPSERT_INTENT: &str = "INSERT INTO intents(digest,principal,tool,arguments,first_seen,last_seen) \
      VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(digest) DO UPDATE SET \
@@ -808,8 +865,7 @@ impl OrderJournal {
                 "Approval requires a distinct operator and a SHA-256 intent digest".into(),
             ));
         }
-        let now = chrono::Utc::now().timestamp();
-        if expires_at <= now || expires_at > now + 3600 {
+        if approval_expiry_out_of_range(expires_at, chrono::Utc::now().timestamp()) {
             return Err(Error::InvalidParameter(
                 "Approval must expire within one hour".into(),
             ));
@@ -930,18 +986,7 @@ impl OrderJournal {
                         consumed,
                         revoked,
                     ) = row.map_err(sql)?;
-                    let state = match (operator, expires_at, consumed) {
-                        _ if revoked => IntentState::Revoked,
-                        (Some(_), Some(_), Some(true)) => IntentState::Spent,
-                        (Some(operator), Some(expires_at), _) if expires_at > now => {
-                            IntentState::Approved {
-                                operator,
-                                expires_at,
-                            }
-                        }
-                        (Some(_), Some(_), _) => IntentState::Lapsed,
-                        _ => IntentState::Awaiting,
-                    };
+                    let state = IntentState::of(operator, expires_at, consumed, revoked, now);
                     Ok(IntentRecord {
                         digest,
                         principal,
@@ -1208,9 +1253,13 @@ pub trait ExecutionStore: Send + Sync {
         self.pending_count().await
     }
     async fn reconciliation_targets(&self, account: &str) -> Result<Vec<String>>;
+    /// Keep a reference to broker order `order_id` for reconciliation to
+    /// read; refused unless it is a broker order ID ([`is_broker_order_id`]).
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
     /// Store the broker's current view of one order (its payload as
     /// `GET .../orders/{id}` returns it), as a reconciliation pass would.
+    /// Refused unless its `orderId`, a JSON string or number, is a broker
+    /// order ID ([`is_broker_order_id`]).
     async fn record_order(&self, account: &str, order: serde_json::Value) -> Result<()>;
     async fn operator_halt(&self) -> Result<Option<String>>;
     async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()>;
@@ -1230,7 +1279,7 @@ impl ExecutionStore for OrderJournal {
             .await
     }
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()> {
-        if order_id.is_empty() || !order_id.bytes().all(|b| b.is_ascii_digit()) {
+        if !is_broker_order_id(order_id) {
             return Err(Error::InvalidParameter(
                 "Numeric broker order ID required".into(),
             ));
@@ -1434,5 +1483,54 @@ impl ExecutionStore for OrderJournal {
                 tx.commit().map_err(sql)
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An approval may be granted to expire from a second after now through
+    /// exactly an hour from now, and at no other time.
+    #[test]
+    fn an_approval_may_expire_from_a_second_after_now_through_an_hour() {
+        let now = 1_764_000_000;
+        for expires_at in [now + 1, now + 3600] {
+            assert!(
+                !approval_expiry_out_of_range(expires_at, now),
+                "{expires_at}"
+            );
+        }
+        for expires_at in [now - 1, now, now + 3601] {
+            assert!(
+                approval_expiry_out_of_range(expires_at, now),
+                "{expires_at}"
+            );
+        }
+    }
+
+    /// An approval is usable through the second before it expires and has
+    /// lapsed at its expiry, as the approval's own use and `is_approved`
+    /// judge it.
+    #[test]
+    fn an_approval_lapses_at_its_expiry() {
+        let now = 1_764_000_000;
+        let unused = |expires_at| {
+            IntentState::of(
+                Some("alice".into()),
+                Some(expires_at),
+                Some(false),
+                false,
+                now,
+            )
+        };
+        assert_eq!(
+            unused(now + 1),
+            IntentState::Approved {
+                operator: "alice".into(),
+                expires_at: now + 1
+            }
+        );
+        assert_eq!(unused(now), IntentState::Lapsed);
     }
 }

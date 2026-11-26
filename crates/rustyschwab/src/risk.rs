@@ -2,7 +2,7 @@
 use crate::{
     coordination::{Lease, lease_held},
     error::{Error, Result},
-    execution::{ensure_not_halted, trip_halt},
+    execution::{ensure_not_halted, is_broker_order_id, trip_halt},
     storage::{StateDatabase, sql},
     types::{
         common::AssetType,
@@ -139,6 +139,8 @@ pub struct PortfolioLimits {
     /// The most shares of one symbol the account may hold once its working
     /// buys fill.
     pub max_position_quantity: Decimal,
+    /// How old, in milliseconds, the reconciled baseline may be when an
+    /// order is judged: 1 to 60000, and 5000 when left out.
     #[serde(default = "max_age")]
     pub max_snapshot_age_ms: i64,
     /// The most the account may lose in a day before submissions halt:
@@ -306,6 +308,12 @@ fn available_funds(account: &serde_json::Value) -> Option<Decimal> {
     decimal(account.pointer("/currentBalances/availableFunds"))
         .or_else(|| decimal(account.pointer("/currentBalances/cashAvailableForTrading")))
 }
+/// Whether a baseline reconciled at `at` is stale at `now` (Unix
+/// milliseconds) for a policy that trusts one for `max_age_ms`: older than
+/// that, or dated after now, as it is once the clock steps back.
+fn baseline_stale(at: i64, now: i64, max_age_ms: i64) -> bool {
+    now < at || now - at > max_age_ms
+}
 impl PortfolioRisk {
     async fn validate_and_reserve(
         &self,
@@ -315,6 +323,18 @@ impl PortfolioRisk {
         check: Check,
     ) -> Result<()> {
         order.validate()?;
+        if let Check::Reserve {
+            replaces: Some(replaces),
+        }
+        | Check::DryRun {
+            replaces: Some(replaces),
+        } = &check
+            && !is_broker_order_id(replaces)
+        {
+            return Err(Error::InvalidParameter(
+                "A replacement must name the order it replaces by its broker order ID".into(),
+            ));
+        }
         let limits = self
             .accounts
             .get(account)
@@ -370,7 +390,7 @@ impl PortfolioRisk {
                     }
                 }
 
-                if !valid || now < at || now - at > limits.max_snapshot_age_ms {
+                if !valid || baseline_stale(at, now, limits.max_snapshot_age_ms) {
                     return Err(stale("Account baseline is stale or unreconciled"));
                 }
                 let snapshot: serde_json::Value = serde_json::from_str(&body)?;
@@ -885,4 +905,21 @@ fn external_strategy_exposure(
         quantity: risk.contracts.checked_mul(share)?,
         notional: risk.max_loss.checked_mul(share)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A baseline is trusted from the millisecond it is dated through
+    /// exactly the policy's age: stale a millisecond later, and stale if it
+    /// is dated even a millisecond after now.
+    #[test]
+    fn a_baseline_is_trusted_from_its_date_through_exactly_the_policys_age() {
+        let at = 1_764_000_000_000;
+        assert!(!baseline_stale(at, at, 5000));
+        assert!(!baseline_stale(at, at + 5000, 5000));
+        assert!(baseline_stale(at, at + 5001, 5000));
+        assert!(baseline_stale(at, at - 1, 5000));
+    }
 }

@@ -153,14 +153,20 @@ class _LoopThread:
     def run(self, awaitable: Awaitable[_T], timeout: float | None = None) -> _T:
         """Wait for ``awaitable`` on the loop. A timeout or interrupt cancels it."""
         future = self.submit(awaitable)
+        # Waiting for the future is separate from reading its result: from
+        # Python 3.11 `concurrent.futures.TimeoutError` is the built-in
+        # `TimeoutError`, so catching it around `result` would also catch the
+        # SDK's own `Timeout` raised by the call, and replace it with an error
+        # that says nothing about why.
         try:
-            return future.result(timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            raise TimeoutError(f"no result within {timeout} seconds") from None
+            finished, _ = concurrent.futures.wait((future,), timeout)
         except BaseException:
             future.cancel()
             raise
+        if not finished:
+            future.cancel()
+            raise TimeoutError(f"no result within {timeout} seconds")
+        return future.result()
 
     def stop(self, timeout: float | None = None) -> None:
         if self._thread.is_alive():
