@@ -247,6 +247,14 @@ one. Signatures are unchanged.
   instructions now use `cargo install --locked`, which builds with the
   dependency versions the release was tested with.
 
+- Python: a blocking call (`rustyschwab.sync`) that ended in the SDK's own
+  `Timeout` raised a bare `TimeoutError("no result within None seconds")`
+  on Python 3.11 and later. The type, the message, `duration` and the
+  failure behind it were lost, and `except rustyschwab.errors.Timeout` never
+  matched. The caller now gets the `Timeout` the SDK raised, as on Python
+  3.10. A call that outlasts the client's own `timeout=` still raises a
+  plain `TimeoutError`.
+
 - Closing a stream could lose its LOGOUT on a busy machine.
   `StreamClient::disconnect` (Python `Stream.close()`, and
   `Schedule.stop()` through it) gave the LOGOUT a fixed 150 ms to go out,
