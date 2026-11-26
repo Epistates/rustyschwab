@@ -259,24 +259,26 @@ request is sent:
   `order_id` is `None`. Reconciliation places the order by its tag, as it
   does an accepted order with no `Location`.
 
-### Changed — the built-in risk provider buys only common stock
+### Changed — the built-in risk provider buys only common stock and depositary receipts
 
-`PortfolioRisk` covers buys of plain common stock, sells of what the
-account holds, and defined-risk option strategies. ETFs are not covered:
+`PortfolioRisk` covers buys of common stock and depositary receipts,
+sells of what the account holds, and defined-risk option strategies. ETFs are not covered:
 judged as a stock, a leveraged or inverse fund's risk would be
 understated, so ETF support is left to a later release on purpose.
 
 - A buy is judged by what Schwab says the symbol is. Before a buy of an
   `EQUITY` leg is journaled, the provider reads the symbol's quote and
   takes only an `assetMainType` of `EQUITY` with an `assetSubType` of
-  `COE`. Anything else is refused as `RiskDenied`, naming what it is:
-  ETFs (`Built-in portfolio risk covers long equity only; ETFs need a
-  deployment's own risk provider`), exchange-traded notes, closed-end
-  funds, unit investment trusts, preferred shares, warrants, rights,
-  depositary receipts, mutual funds and money market funds, and any
-  symbol Schwab does not classify as common stock. Depositary receipts
-  are refused because the quote does not say whether one holds common or
-  preferred shares.
+  `COE` (common stock), `ADR` or `GDR` (depositary receipts). Anything
+  else is refused as `RiskDenied`, naming what it is: ETFs (`Built-in
+  portfolio risk covers long equity only; ETFs need a deployment's own
+  risk provider`), exchange-traded notes, closed-end funds, unit
+  investment trusts, preferred shares, warrants, rights, mutual funds and
+  money market funds, and any symbol Schwab classifies as neither.
+- ETFs are refused because the limits would understate their leverage. A
+  depositary receipt carries no leverage, and its ratio is already in its
+  price, so the notional, quantity and funds limits bound it exactly as
+  they bound a stock.
 - A buy of a leg labelled `COLLECTIVE_INVESTMENT`, as Schwab lists an ETF
   position, was already refused as another asset; it is now refused as
   an ETF, without a lookup.

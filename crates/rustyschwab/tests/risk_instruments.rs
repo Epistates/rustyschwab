@@ -1,7 +1,8 @@
 //! What the built-in risk provider lets an account buy and sell, judged by
 //! what Schwab says each instrument is.
 //!
-//! A buy must be of plain common stock. One labelled `EQUITY` is looked up
+//! A buy must be of common stock or a depositary receipt. One labelled
+//! `EQUITY` is looked up
 //! in Schwab's quote (its `assetMainType` and `assetSubType`) before the
 //! order is journaled, so a refused buy leaves no trace and never reaches
 //! Schwab; one labelled `COLLECTIVE_INVESTMENT` is an ETF by its label. A
@@ -30,15 +31,15 @@ const C105: &str = "XYZ   260116C00105000";
 
 const ETFS: &str = "Built-in portfolio risk covers long equity only; ETFs need a \
     deployment's own risk provider";
-const UNCLASSIFIED: &str = "Built-in portfolio risk covers common stock only; a symbol \
-    Schwab does not classify as common stock needs a deployment's own risk provider";
+const UNCLASSIFIED: &str = "Built-in portfolio risk covers common stock and depositary \
+    receipts only; a symbol Schwab classifies as neither needs a deployment's own risk provider";
 const OVERSOLD: &str = "Sell exceeds the position less the symbol's working sells";
 
 /// The refusal for a buy of `kind`, a kind of instrument other than an ETF.
 fn not_common_stock(kind: &str) -> String {
     format!(
-        "Built-in portfolio risk covers common stock only; {kind} need a deployment's own \
-         risk provider"
+        "Built-in portfolio risk covers common stock and depositary receipts only; {kind} \
+         need a deployment's own risk provider"
     )
 }
 
@@ -199,24 +200,31 @@ fn age_instrument_type(client: &SchwabClient, symbol: &str, by_ms: i64) {
     assert_eq!(aged, 1, "{symbol} has a stored instrument type");
 }
 
-/// Plain common stock is what the provider buys: Schwab's `EQUITY` and
-/// `COE`. The order is journaled, sent and accepted.
+/// What the provider buys is common stock and depositary receipts:
+/// Schwab's `EQUITY` with `COE`, `ADR` or `GDR`. A receipt carries no
+/// leverage and its ratio is already in its price, so the limits bound it
+/// as they bound a stock. The order is journaled, sent and accepted.
 #[tokio::test]
-async fn common_stock_is_bought() {
-    let (server, client, _dir) = trader(json!([])).await;
-    quoted(&server, "AAPL", quote("AAPL", Some("EQUITY"), Some("COE"))).await;
-    accepting(&server).await;
-    let buy = order("BUY", "EQUITY", "AAPL", 10);
-    client.check_risk(ACCOUNT, &buy, None).await.unwrap();
-    let placed = client.place_order(ACCOUNT, &buy).await.unwrap();
-    assert_eq!(placed.order_id.as_deref(), Some("1001"));
-    let records = client.order_journal().records().await.unwrap();
-    assert_eq!(records.len(), 1);
-    assert!(matches!(
-        &records[0].outcome,
-        Some(SubmissionOutcome::Accepted { order_id: Some(id) }) if id == "1001"
-    ));
-    assert_eq!(orders_sent(&server).await, 1);
+async fn common_stock_and_depositary_receipts_are_bought() {
+    for (symbol, sub) in [("AAPL", "COE"), ("TSM", "ADR"), ("GDRB", "GDR")] {
+        let (server, client, _dir) = trader(json!([])).await;
+        quoted(&server, symbol, quote(symbol, Some("EQUITY"), Some(sub))).await;
+        accepting(&server).await;
+        let buy = order("BUY", "EQUITY", symbol, 10);
+        client.check_risk(ACCOUNT, &buy, None).await.unwrap();
+        let placed = client.place_order(ACCOUNT, &buy).await.unwrap();
+        assert_eq!(placed.order_id.as_deref(), Some("1001"), "{symbol}");
+        let records = client.order_journal().records().await.unwrap();
+        assert_eq!(records.len(), 1, "{symbol}");
+        assert!(
+            matches!(
+                &records[0].outcome,
+                Some(SubmissionOutcome::Accepted { order_id: Some(id) }) if id == "1001"
+            ),
+            "{symbol}"
+        );
+        assert_eq!(orders_sent(&server).await, 1, "{symbol}");
+    }
 }
 
 /// An ETF ordered as `EQUITY`, which the order alone cannot tell from a
@@ -247,8 +255,7 @@ async fn leveraged_and_inverse_etfs_are_refused() {
 }
 
 /// Every other kind of instrument Schwab names is refused by that name,
-/// never called an ETF. Depositary receipts are among them: Schwab's quote
-/// does not say whether one holds common or preferred shares.
+/// never called an ETF.
 #[tokio::test]
 async fn other_instruments_are_refused_by_their_kind() {
     let (server, client, _dir) = trader(json!([])).await;
@@ -259,8 +266,6 @@ async fn other_instruments_are_refused_by_their_kind() {
         ("PRFA", "EQUITY", "PRF", "preferred shares"),
         ("WARA", "EQUITY", "WAR", "warrants"),
         ("RGTA", "EQUITY", "RGT", "rights"),
-        ("ADRA", "EQUITY", "ADR", "depositary receipts"),
-        ("GDRA", "EQUITY", "GDR", "depositary receipts"),
         ("OEFA", "MUTUAL_FUND", "OEF", "mutual funds"),
         ("MMFA", "MUTUAL_FUND", "MMF", "money market funds"),
         ("CEFM", "MUTUAL_FUND", "CEF", "closed-end funds"),
@@ -294,10 +299,11 @@ async fn an_etf_by_main_type_is_refused() {
     }
 }
 
-/// An answer that does not say the symbol is plain common stock refuses it:
-/// no subtype, a subtype this release does not know, a main type other
-/// than `EQUITY`, no quote for the symbol, a quote for another symbol, or
-/// one that does not name its symbol. Nothing is assumed to be stock.
+/// An answer that does not say the symbol is common stock or a depositary
+/// receipt refuses it: no subtype, a subtype this release does not know, a
+/// main type other than `EQUITY` (even beside `COE` or `ADR`), no quote for
+/// the symbol, a quote for another symbol, or one that does not name its
+/// symbol. Nothing is assumed to be stock.
 #[tokio::test]
 async fn a_symbol_schwab_does_not_classify_as_common_stock_is_refused() {
     let (server, client, _dir) = trader(json!([])).await;
@@ -310,6 +316,7 @@ async fn a_symbol_schwab_does_not_classify_as_common_stock_is_refused() {
         ("UNKN", quote("UNKN", Some("EQUITY"), Some("UNKNOWN"))),
         ("NEWT", quote("NEWT", Some("EQUITY"), Some("NEWTYPE"))),
         ("IDXA", quote("IDXA", Some("INDEX"), Some("COE"))),
+        ("ADRI", quote("ADRI", Some("INDEX"), Some("ADR"))),
         ("NOMN", quote("NOMN", None, Some("COE"))),
         ("EMPT", json!({})),
         ("BADS", json!({"errors": {"invalidSymbols": ["BADS"]}})),
@@ -330,10 +337,14 @@ async fn a_symbol_schwab_does_not_classify_as_common_stock_is_refused() {
         )
         .await;
     }
-    // None of these answers is kept, so each order asks again, except the
-    // one that names two known types: it is kept, and judged as kept.
+    // None of these answers is kept, so each order asks again, except those
+    // that name two known types: they are kept, and judged as kept.
     for (symbol, _) in &answers {
-        let reads = if *symbol == "IDXA" { 1 } else { 2 };
+        let reads = if matches!(*symbol, "IDXA" | "ADRI") {
+            1
+        } else {
+            2
+        };
         assert_eq!(quote_reads(&server, symbol).await, reads, "{symbol}");
     }
 }

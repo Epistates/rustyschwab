@@ -182,7 +182,8 @@ Around the journal:
 - `risk::RiskProvider` — pre-trade checks with durable reservations;
   `PortfolioRisk` enforces per-account open-quantity/notional/position caps
   from a JSON policy and counts external open orders. It buys only what
-  Schwab's quote calls plain common stock (`EQUITY` and `COE`), read in
+  Schwab's quote calls common stock or a depositary receipt (`EQUITY`
+  with `COE`, `ADR` or `GDR`), read in
   `screen` before the intent is journaled and kept in `instrument_types`
   for an hour. Its optional
   `max_daily_loss` trips the durable operator halt (`execution::trip_halt`)

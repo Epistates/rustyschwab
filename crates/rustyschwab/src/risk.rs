@@ -58,10 +58,11 @@ const INSTRUMENT_TYPE_LIFETIME_MS: i64 = 60 * 60 * 1000;
 /// Why a buy of an ETF is refused, by its order's label or by Schwab's word.
 const ETFS: &str = "Built-in portfolio risk covers long equity only; ETFs need a \
      deployment's own risk provider";
-/// Why a buy of what Schwab does not call common stock, nor names a kind
-/// of, is refused.
-const UNCLASSIFIED: &str = "Built-in portfolio risk covers common stock only; a symbol \
-     Schwab does not classify as common stock needs a deployment's own risk provider";
+/// Why a buy of what Schwab calls neither common stock nor a depositary
+/// receipt, nor names a kind of, is refused.
+const UNCLASSIFIED: &str = "Built-in portfolio risk covers common stock and depositary \
+     receipts only; a symbol Schwab classifies as neither needs a deployment's own risk \
+     provider";
 /// Why a buy reserved or checked without being screened is refused.
 const UNSCREENED: &str = "Built-in portfolio risk has no current instrument type from \
      Schwab for this symbol; screen the order first";
@@ -199,20 +200,22 @@ fn max_age() -> i64 {
 }
 /// The built-in [`RiskProvider`]: each account's [`PortfolioLimits`]
 /// judged against its reconciled baseline, with durable reservations for
-/// working orders. It covers limit and stop-limit orders that buy plain
-/// common stock or sell what the account holds, and defined-risk option
-/// strategies.
+/// working orders. It covers limit and stop-limit orders that buy common
+/// stock or depositary receipts or sell what the account holds, and
+/// defined-risk option strategies.
 ///
-/// A buy must be of plain common stock, by Schwab's word for the symbol.
-/// [`screen`](RiskProvider::screen) reads the symbol's quote before a buy
-/// labelled `EQUITY` is journaled, and only an `assetMainType` of `EQUITY`
-/// with an `assetSubType` of `COE` passes. ETFs are refused (judged as a
-/// stock, a leveraged or inverse fund's risk would be understated, so ETF
-/// support is left to a later release on purpose), as are exchange-traded
-/// notes, closed-end funds, unit investment trusts, preferred shares,
-/// warrants, rights, depositary receipts (the quote does not say whether
-/// one holds common or preferred shares), mutual funds and any symbol
-/// Schwab does not classify as common stock; a leg labelled
+/// A buy must be of common stock or a depositary receipt, by Schwab's word
+/// for the symbol. [`screen`](RiskProvider::screen) reads the symbol's
+/// quote before a buy labelled `EQUITY` is journaled, and only an
+/// `assetMainType` of `EQUITY` with an `assetSubType` of `COE` (common
+/// stock), `ADR` or `GDR` (depositary receipts) passes. ETFs are refused
+/// because the limits would understate their leverage, so ETF support is
+/// left to a later release on purpose. A depositary receipt carries no
+/// leverage, and its ratio is already in its price, so the notional,
+/// quantity and funds limits bound it exactly as they bound a stock.
+/// Exchange-traded notes, closed-end funds, unit investment trusts,
+/// preferred shares, warrants, rights, mutual funds and any symbol Schwab
+/// classifies as neither are refused; a leg labelled
 /// `COLLECTIVE_INVESTMENT` is an ETF without a lookup. A failed lookup
 /// refuses the buy with the lookup's own error. What was read is kept in
 /// the state database for an hour, so a symbol costs one read an hour, and
@@ -627,8 +630,9 @@ impl PortfolioRisk {
                         ));
                     }
                 } else {
-                    // A buy must be of plain common stock, by the type Schwab
-                    // gave the symbol when the order was screened. The
+                    // A buy must be of common stock or a depositary receipt,
+                    // by the type Schwab gave the symbol when the order was
+                    // screened. The
                     // recheck before sending judges the baseline and the
                     // held reservation, which an expired type changes
                     // neither of.
@@ -727,8 +731,8 @@ impl Proposed {
         }
         Ok(())
     }
-    /// The symbol of a buy labelled `EQUITY`, which only plain common stock
-    /// may be, by the instrument type Schwab gives it.
+    /// The symbol of a buy labelled `EQUITY`, which only common stock or a
+    /// depositary receipt may be, by the instrument type Schwab gives it.
     fn stock_buy(&self) -> Option<&str> {
         (self.buys == Some(AssetType::Equity)).then_some(self.symbol.as_str())
     }
@@ -832,12 +836,16 @@ impl InstrumentType {
             _ => None,
         }
     }
-    /// Refuse a buy of anything but plain common stock, naming what it is.
+    /// Refuse a buy of anything but common stock or a depositary receipt,
+    /// naming what it is. A receipt, like a share of common stock, counts
+    /// only under the main type `EQUITY`: it carries no leverage, and its
+    /// ratio is already in its price, so the limits bound it as they bound
+    /// a stock.
     fn judge(self) -> Result<()> {
         use AssetMainType as Main;
         use AssetSubType as Sub;
         let kind = match (self.main, self.sub) {
-            (Some(Main::Equity), Some(Sub::Coe)) => return Ok(()),
+            (Some(Main::Equity), Some(Sub::Coe | Sub::Adr | Sub::Gdr)) => return Ok(()),
             (Some(Main::Etf), _) | (_, Some(Sub::Etf)) => {
                 return Err(Error::RiskDenied(ETFS.into()));
             }
@@ -847,16 +855,13 @@ impl InstrumentType {
             (_, Some(Sub::Prf)) => "preferred shares",
             (_, Some(Sub::War)) => "warrants",
             (_, Some(Sub::Rgt)) => "rights",
-            // The quote does not say whether a receipt holds common shares
-            // or preferred ones, so none is taken for common stock.
-            (_, Some(Sub::Adr | Sub::Gdr)) => "depositary receipts",
             (_, Some(Sub::Oef)) => "mutual funds",
             (_, Some(Sub::Mmf)) => "money market funds",
             _ => return Err(Error::RiskDenied(UNCLASSIFIED.into())),
         };
         Err(Error::RiskDenied(format!(
-            "Built-in portfolio risk covers common stock only; {kind} need a deployment's \
-             own risk provider"
+            "Built-in portfolio risk covers common stock and depositary receipts only; \
+             {kind} need a deployment's own risk provider"
         )))
     }
 }
