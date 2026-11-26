@@ -117,11 +117,13 @@ pub(crate) const SELECT_RECONCILIATION_TARGETS: &str = "SELECT order_id FROM ord
 const OPERATOR_HALT_KEY: &str = "operator_halt";
 
 /// Whether `id` can name a broker order. Schwab's order IDs, and the paper
-/// venue's, are whole numbers, written as a non-empty run of ASCII digits.
-/// The journal stores, reconciliation follows and the client sends no
-/// other.
+/// venue's, are whole numbers that fit in a `u64`, and `id` must be one
+/// written exactly as it prints: digits only, with no sign, space or
+/// leading zero, so each order has one ID and every ID reads back as the
+/// number it names. The journal stores, reconciliation follows and the
+/// client sends no other.
 pub fn is_broker_order_id(id: &str) -> bool {
-    !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())
+    id.parse::<u64>().is_ok_and(|n| n.to_string() == id)
 }
 
 /// Admission check shared by every dispatch path, live and paper: fail closed
@@ -1231,8 +1233,8 @@ pub trait ExecutionStore: Send + Sync {
     async fn track_order(&self, account: &str, order_id: &str) -> Result<()>;
     /// Store the broker's current view of one order (its payload as
     /// `GET .../orders/{id}` returns it), as a reconciliation pass would.
-    /// Refused unless its `orderId` is a broker order ID: a string of
-    /// digits or a non-negative whole number.
+    /// Refused unless its `orderId`, a JSON string or number, is a broker
+    /// order ID ([`is_broker_order_id`]).
     async fn record_order(&self, account: &str, order: serde_json::Value) -> Result<()>;
     async fn operator_halt(&self) -> Result<Option<String>>;
     async fn set_operator_halt(&self, reason: Option<String>, operator: &str) -> Result<()>;

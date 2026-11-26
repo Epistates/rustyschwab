@@ -1,8 +1,9 @@
-//! A broker order ID is a whole number: Schwab's are, and so are the paper
-//! venue's. As a JSON string it is a non-empty run of ASCII digits; as a JSON
-//! number, a non-negative integer. No other ID enters the journal or reaches
-//! Schwab in a request, and one a state file already holds (an earlier
-//! release stored them) is set aside by the next reconciliation pass.
+//! A broker order ID is a whole number that fits in a `u64`: Schwab's are,
+//! and so are the paper venue's. As a JSON string it is that number's own
+//! digits (no sign, space or leading zero); as a JSON number, that number.
+//! No other ID enters the journal or reaches Schwab in a request, and one a
+//! state file already holds (an earlier release stored them) is set aside
+//! by the next reconciliation pass.
 mod common;
 
 use common::mock_client as client;
@@ -22,6 +23,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// IDs no broker issues, each of which an earlier release could store.
 const NOT_ORDER_IDS: [&str; 3] = ["abc", "-5", ""];
+/// One past `u64::MAX`: digits that no `u64` holds.
+const PAST_U64: &str = "18446744073709551616";
+/// Strings that are not how any `u64` is written: past the largest, with a
+/// sign or a space a lenient parser skips, or with a leading zero.
+const NOT_U64_DIGITS: [&str; 4] = [PAST_U64, "+5", " 5", "007"];
 
 fn accepted(order_id: Option<&str>) -> SubmissionOutcome {
     SubmissionOutcome::Accepted {
@@ -36,15 +42,85 @@ fn limit_order() -> OrderRequest {
     )
 }
 
-/// A broker order ID is a non-empty run of ASCII digits, and nothing else.
+/// A broker order ID is a `u64` written in its own digits, up to and
+/// including the largest, and nothing else.
 #[test]
-fn a_broker_order_id_is_a_run_of_ascii_digits() {
-    for id in ["0", "7", "1004356247"] {
+fn a_broker_order_id_is_a_u64_in_its_own_digits() {
+    assert_eq!(PAST_U64, (u128::from(u64::MAX) + 1).to_string());
+    let max = u64::MAX.to_string();
+    for id in ["0", "7", "1004356247", max.as_str()] {
         assert!(is_broker_order_id(id), "{id:?}");
     }
-    for id in ["", "abc", "-5", "+5", "7.0", " 7", "7 ", "1e3", "٧", "7/8"] {
+    let thirty_digits = "9".repeat(30);
+    for id in [
+        "",
+        "abc",
+        "-5",
+        "7.0",
+        "7 ",
+        "1e3",
+        "٧",
+        "7/8",
+        "00",
+        thirty_digits.as_str(),
+    ]
+    .into_iter()
+    .chain(NOT_U64_DIGITS)
+    {
         assert!(!is_broker_order_id(id), "{id:?}");
     }
+}
+
+/// An ID means the same whether written as a JSON string or a number, up
+/// to the largest `u64` and no further: one past it is refused in both
+/// forms, and so is any string that is not exactly a `u64`'s digits.
+#[tokio::test]
+async fn string_and_number_forms_share_the_u64_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let refused =
+        |result: rustyschwab::Result<()>| matches!(result, Err(Error::InvalidParameter(_)));
+    let number = |digits: &str| serde_json::from_str::<Value>(digits).unwrap();
+    let max = u64::MAX.to_string();
+    for (account, order_id) in [("A", json!(max)), ("B", number(&max))] {
+        journal
+            .record_order(account, json!({"orderId": order_id, "status": "WORKING"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            journal.reconciliation_targets(account).await.unwrap(),
+            vec![max.clone()]
+        );
+    }
+    for order_id in NOT_U64_DIGITS
+        .into_iter()
+        .map(|id| json!(id))
+        .chain([number(PAST_U64)])
+    {
+        let order = json!({"orderId": order_id, "status": "WORKING"});
+        assert!(
+            refused(journal.record_order("C", order).await),
+            "{order_id}"
+        );
+    }
+    let attempt = journal
+        .begin("C", "place_order", json!({"tag": "t1"}))
+        .await
+        .unwrap();
+    for id in NOT_U64_DIGITS {
+        assert!(refused(journal.track_order("C", id).await), "{id:?}");
+        assert!(
+            refused(journal.finish(&attempt, accepted(Some(id))).await),
+            "{id:?}"
+        );
+    }
+    assert!(
+        journal
+            .reconciliation_targets("C")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// The journal takes a broker order ID, whether the broker's view of an
@@ -150,7 +226,11 @@ async fn reconciliation_keeps_no_order_under_an_id_that_is_not_a_whole_number() 
 async fn the_client_sends_only_whole_number_order_ids() {
     let server = MockServer::start().await;
     let (client, _dir, _) = client(&server, false);
-    for id in NOT_ORDER_IDS.into_iter().chain(["7.0"]) {
+    for id in NOT_ORDER_IDS
+        .into_iter()
+        .chain(NOT_U64_DIGITS)
+        .chain(["7.0"])
+    {
         assert!(
             matches!(
                 client.get_order("hash", id).await,

@@ -1443,7 +1443,7 @@ pub(crate) fn account_path(account_hash: &str, suffix: &str) -> Result<String> {
 pub(crate) fn order_path(account_hash: &str, order_id: &str) -> Result<String> {
     if !crate::execution::is_broker_order_id(order_id) {
         return Err(Error::InvalidParameter(
-            "order_id must be a Schwab order ID, a whole number".into(),
+            "order_id must be a Schwab order ID: a whole number in plain digits".into(),
         ));
     }
     account_path(account_hash, &format!("/orders/{order_id}"))
@@ -1589,11 +1589,21 @@ mod tests {
             Some("456789".to_string())
         );
         assert_eq!(super::order_id_from_location(""), None);
-        assert_eq!(
-            super::order_id_from_location(
-                "https://api.schwabapi.com/trader/v1/accounts/ABC123/orders/abc"
-            ),
-            None
-        );
+        let max = u64::MAX.to_string();
+        for (last, order_id) in [
+            ("abc", None),
+            (max.as_str(), Some(max.as_str())),
+            ("18446744073709551616", None),
+            ("007", None),
+        ] {
+            assert_eq!(
+                super::order_id_from_location(&format!(
+                    "https://api.schwabapi.com/trader/v1/accounts/ABC123/orders/{last}"
+                ))
+                .as_deref(),
+                order_id,
+                "{last:?}"
+            );
+        }
     }
 }

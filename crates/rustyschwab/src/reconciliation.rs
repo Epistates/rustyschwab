@@ -548,14 +548,17 @@ fn shrink_filled_reservations(tx: &rusqlite::Transaction<'_>, account: &str) -> 
     }
     Ok(shrunk)
 }
-/// The broker order ID an order payload's `orderId` holds: a string of
-/// digits ([`is_broker_order_id`]) or a non-negative whole number.
+/// The broker order ID an order payload's `orderId` holds, as a JSON
+/// string or a JSON number: one rule ([`is_broker_order_id`]) for both, so
+/// `"7"` and `7` name the same order and neither form reaches past
+/// `u64::MAX`.
 pub(crate) fn broker_id(value: Option<&Value>) -> Option<String> {
-    value.and_then(|v| match v {
-        Value::String(s) if is_broker_order_id(s) => Some(s.clone()),
-        Value::Number(n) if n.is_u64() => Some(n.to_string()),
-        _ => None,
-    })
+    let id = match value? {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    is_broker_order_id(&id).then_some(id)
 }
 fn matches_request(request: &Value, order: &Value) -> bool {
     // Match explicit request fields recursively, tolerating broker-added fields

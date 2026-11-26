@@ -236,6 +236,29 @@ build the client where blocking for a moment is acceptable; creating a new
 state file takes tens of milliseconds on most disks and longer on a slow
 one. Signatures are unchanged.
 
+### Changed — order IDs are checked before anything is sent
+
+An order ID is now a whole number from 0 to 18446744073709551615, written
+in plain digits with no sign, space or leading zero
+(`rustyschwab::execution::is_broker_order_id`). Schwab's order IDs, and the
+paper venue's, all are. Anything else is refused locally, before any
+request is sent:
+
+- `get_order`, `cancel_order` and `replace_order` return `InvalidParameter`
+  for a non-numeric or out-of-range order ID. Schwab used to answer such a
+  request with a 4xx.
+- `finish` refuses, as `InvalidParameter`, an `Accepted` outcome whose order
+  ID isn't one.
+- `PortfolioRisk` refuses, as `InvalidParameter`, a replacement (or a check
+  of one) that names the order it replaces by anything else.
+- `record_order` and `track_order` refuse such an ID, as a JSON string or a
+  JSON number, and a reconciliation pass doesn't keep an order listed under
+  one.
+- An accepted order whose `Location` header doesn't end in such an ID is
+  recorded as accepted without an order ID, and `OrderSubmitResponse`'s
+  `order_id` is `None`. Reconciliation places the order by its tag, as it
+  does an accepted order with no `Location`.
+
 ### Fixed
 
 - An order ID that isn't a whole number could leave an account unable to
@@ -244,15 +267,8 @@ one. Signatures are unchanged.
   reconciliation pass stored an order under any string ID, such as `"abc"`,
   `"-5"` or `""`. Every later pass then failed with "Invalid stored broker
   order ID", so the account stayed unreconciled and refused orders.
-  - A broker order ID is now a whole number wherever one comes in, under one
-    rule, `rustyschwab::execution::is_broker_order_id`: `record_order`,
-    `track_order`, `finish` with an accepted order ID, a pass's order list,
-    the order a `PortfolioRisk` replacement replaces, and the order ID given
-    to `get_order`, `cancel_order` and `replace_order`. These refuse
-    anything else as `InvalidParameter`, before any request is sent.
-  - An order whose `Location` header doesn't end in a whole number is
-    recorded as accepted without an order ID, and reconciliation places it
-    by its tag.
+  - Order IDs are now checked wherever they come in (see "Changed — order
+    IDs are checked before anything is sent").
   - A state file that already holds such an ID needs no edit. The next pass
     sets each one aside: it drops the order stored under it, returns a
     submission accepted under it to placement by its tag, audits it as
