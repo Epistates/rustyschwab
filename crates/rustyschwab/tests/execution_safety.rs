@@ -652,6 +652,158 @@ async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
     risk.reserve("A", "fresh", &buy).await.unwrap();
 }
 
+/// A policy whose caps are not positive, whose baseline age is outside 1
+/// to 60000 milliseconds, or whose daily-loss cap is not positive is a
+/// misconfiguration: any one of them refuses every order on the account
+/// as `Config`, a sell of what it holds included.
+#[tokio::test]
+async fn a_policy_with_any_limit_out_of_range_refuses_every_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "AAPL", "assetType": "EQUITY"}}]
+        }),
+        vec![],
+    )
+    .await;
+    let sell = order("SELL", "AAPL", 1, "10");
+    for (case, limits) in [
+        PortfolioLimits {
+            max_open_quantity: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_open_quantity: (-1).into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_open_notional: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_position_quantity: 0.into(),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_snapshot_age_ms: 0,
+            ..limits()
+        },
+        PortfolioLimits {
+            max_snapshot_age_ms: 60_001,
+            ..limits()
+        },
+        PortfolioLimits {
+            max_daily_loss: Some(0.into()),
+            ..limits()
+        },
+        PortfolioLimits {
+            max_daily_loss: Some((-1).into()),
+            ..limits()
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                risk(&journal, limits).reserve("A", "sell", &sell).await,
+                Err(rustyschwab::Error::Config(_))
+            ),
+            "case {case}"
+        );
+    }
+    // A minute is the longest a policy may trust a baseline.
+    let longest = PortfolioLimits {
+        max_snapshot_age_ms: 60_000,
+        ..limits()
+    };
+    risk(&journal, longest)
+        .reserve("A", "sell", &sell)
+        .await
+        .unwrap();
+}
+
+/// A baseline dated after now, as it is once the clock steps back after
+/// the reconciliation that wrote it, is not trusted: an order against it
+/// is refused as stale.
+#[tokio::test]
+async fn a_baseline_dated_after_now_is_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let buy = order("BUY", "AAPL", 1, "10");
+    risk.check("A", &buy, None).await.unwrap();
+    // As if the clock had stepped back a minute since the pass.
+    rusqlite::Connection::open(journal.path())
+        .unwrap()
+        .execute("UPDATE accounts SET observed_at=observed_at+60000", [])
+        .unwrap();
+    assert!(matches!(
+        risk.reserve("A", "ahead", &buy).await,
+        Err(rustyschwab::Error::BaselineStale { .. })
+    ));
+}
+
+/// The daily-loss control halts once the day's loss exceeds its cap: a
+/// loss of exactly the cap still trades, judged on reconciliation and on
+/// reservation alike, and a cent more halts.
+#[tokio::test]
+async fn a_daily_loss_of_exactly_the_cap_still_trades() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let reconciled_at = |liquidation_value: &str| {
+        let database = journal.database().clone();
+        let snapshot = json!({
+            "securitiesAccount": {
+                "initialBalances": {"liquidationValue": "10000"},
+                "currentBalances": {"liquidationValue": liquidation_value, "availableFunds": "1000"},
+                "positions": []
+            },
+            "_dayNetTransfers": "0"
+        });
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis(),
+                    snapshot,
+                    vec![],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    let risk = risk(
+        &journal,
+        PortfolioLimits {
+            max_daily_loss: Some(500.into()),
+            ..limits()
+        },
+    );
+    let buy = order("BUY", "AAPL", 1, "10");
+
+    reconciled_at("9500").await;
+    risk.observe_baseline("A").await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    risk.reserve("A", "at-the-cap", &buy).await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+
+    reconciled_at("9499.99").await;
+    assert!(matches!(
+        risk.reserve("A", "past-the-cap", &buy).await,
+        Err(rustyschwab::Error::Halted(reason))
+            if reason.starts_with("Daily loss 500.01 exceeds the 500 limit")
+    ));
+    journal.set_operator_halt(None, "operator").await.unwrap();
+    risk.observe_baseline("A").await.unwrap();
+    assert!(journal.operator_halt().await.unwrap().is_some());
+}
+
 /// Replacing a working order does not count it alongside its replacement:
 /// a protective sell of the whole position can be moved.
 #[tokio::test]
