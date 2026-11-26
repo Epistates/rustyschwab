@@ -269,12 +269,21 @@ request is sent:
   order ID", so the account stayed unreconciled and refused orders.
   - Order IDs are now checked wherever they come in (see "Changed — order
     IDs are checked before anything is sent").
-  - A state file that already holds such an ID needs no edit. The next pass
-    sets each one aside: it drops the order stored under it, returns a
-    submission accepted under it to placement by its tag, audits it as
-    `order_id_set_aside` with what was stored, logs it as an error, and lists
-    it in `ReconciliationReport::set_aside_order_ids`. No broker order has
-    such an ID, so nothing real is given up.
+  - A state file that already holds such an ID needs no edit; the next pass
+    repairs it. An ID that is a whole number written another way, such as
+    `"007"`, names a real order, so the pass reads that order as 7 and
+    rewrites the ID as `"7"`. If the order is also stored as `"7"`, the two
+    records merge: the later observation of the order is kept, each
+    observed activity is kept once, and every submission accepted under
+    either text is accepted under `"7"`. This is audited as
+    `order_id_canonicalized` with the old text and listed in
+    `ReconciliationReport::canonicalized_order_ids`.
+  - Any other ID, such as `"abc"`, `"-5"`, `""` or one past
+    18446744073709551615, is set aside: the pass drops the order stored
+    under it, returns a submission accepted under it to placement by its
+    tag, audits it as `order_id_set_aside` with what was stored, logs it as
+    an error, and lists it in `ReconciliationReport::set_aside_order_ids`.
+    No broker order has such an ID, so nothing real is given up.
 
 - Installing `rustyschwab-mcp`, `rustyschwab-console` or `rustyschwab-dash`
   0.3.0 with `cargo install` and no `--locked` fails to compile. 0.3.0

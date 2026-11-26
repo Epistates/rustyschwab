@@ -123,7 +123,15 @@ const OPERATOR_HALT_KEY: &str = "operator_halt";
 /// number it names. The journal stores, reconciliation follows and the
 /// client sends no other.
 pub fn is_broker_order_id(id: &str) -> bool {
-    id.parse::<u64>().is_ok_and(|n| n.to_string() == id)
+    canonical_order_id(id).is_some_and(|canonical| canonical == id)
+}
+
+/// The broker order ID that stored text `id` names, in its own digits: the
+/// `u64` it reads as. An earlier release could store an ID written another
+/// way, with a leading zero or a sign (`"007"` names order 7). `None` when
+/// it names no order at all.
+pub(crate) fn canonical_order_id(id: &str) -> Option<String> {
+    id.parse::<u64>().ok().map(|n| n.to_string())
 }
 
 /// Admission check shared by every dispatch path, live and paper: fail closed
