@@ -742,6 +742,35 @@ pub enum IntentState {
     /// Its approval lapsed unused; it can be approved again.
     Lapsed,
 }
+impl IntentState {
+    /// Where an intent stands at `now` (Unix seconds), from its approval's
+    /// operator, expiry and use, if it has an approval, and whether one was
+    /// revoked.
+    fn of(
+        operator: Option<String>,
+        expires_at: Option<i64>,
+        consumed: Option<bool>,
+        revoked: bool,
+        now: i64,
+    ) -> Self {
+        match (operator, expires_at, consumed) {
+            _ if revoked => Self::Revoked,
+            (Some(_), Some(_), Some(true)) => Self::Spent,
+            (Some(operator), Some(expires_at), _) if expires_at > now => Self::Approved {
+                operator,
+                expires_at,
+            },
+            (Some(_), Some(_), _) => Self::Lapsed,
+            _ => Self::Awaiting,
+        }
+    }
+}
+/// Whether an approval granted at `now` may not expire at `expires_at`
+/// (Unix seconds): it would have lapsed already, or would outlast the hour
+/// an approval may last.
+fn approval_expiry_out_of_range(expires_at: i64, now: i64) -> bool {
+    expires_at <= now || expires_at > now + 3600
+}
 
 const UPSERT_INTENT: &str = "INSERT INTO intents(digest,principal,tool,arguments,first_seen,last_seen) \
      VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(digest) DO UPDATE SET \
@@ -808,8 +837,7 @@ impl OrderJournal {
                 "Approval requires a distinct operator and a SHA-256 intent digest".into(),
             ));
         }
-        let now = chrono::Utc::now().timestamp();
-        if expires_at <= now || expires_at > now + 3600 {
+        if approval_expiry_out_of_range(expires_at, chrono::Utc::now().timestamp()) {
             return Err(Error::InvalidParameter(
                 "Approval must expire within one hour".into(),
             ));
@@ -930,18 +958,7 @@ impl OrderJournal {
                         consumed,
                         revoked,
                     ) = row.map_err(sql)?;
-                    let state = match (operator, expires_at, consumed) {
-                        _ if revoked => IntentState::Revoked,
-                        (Some(_), Some(_), Some(true)) => IntentState::Spent,
-                        (Some(operator), Some(expires_at), _) if expires_at > now => {
-                            IntentState::Approved {
-                                operator,
-                                expires_at,
-                            }
-                        }
-                        (Some(_), Some(_), _) => IntentState::Lapsed,
-                        _ => IntentState::Awaiting,
-                    };
+                    let state = IntentState::of(operator, expires_at, consumed, revoked, now);
                     Ok(IntentRecord {
                         digest,
                         principal,
