@@ -139,6 +139,8 @@ pub struct PortfolioLimits {
     /// The most shares of one symbol the account may hold once its working
     /// buys fill.
     pub max_position_quantity: Decimal,
+    /// How old, in milliseconds, the reconciled baseline may be when an
+    /// order is judged: 1 to 60000, and 5000 when left out.
     #[serde(default = "max_age")]
     pub max_snapshot_age_ms: i64,
     /// The most the account may lose in a day before submissions halt:
