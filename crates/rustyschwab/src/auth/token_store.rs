@@ -595,7 +595,9 @@ pub(crate) fn prepare_secret_directory(file: &std::path::Path) -> AuthResult<()>
 }
 
 pub(crate) fn open_lock_file(path: &std::path::Path) -> AuthResult<std::fs::File> {
+    crate::storage::diag_here("olf_start");
     prepare_secret_directory(path)?;
+    crate::storage::diag_here("olf_directory_checked");
     // Lock files hold no secret, but another account able to open one could
     // hold it and stall refreshes: create it owner-only on Windows as well.
     #[cfg(windows)]

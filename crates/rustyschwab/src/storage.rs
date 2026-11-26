@@ -280,6 +280,14 @@ impl Trace {
     }
 }
 
+thread_local! {
+    static HERE: std::cell::RefCell<Trace> = std::cell::RefCell::new(Trace::default());
+}
+/// DIAGNOSTIC: note a step on whichever trace this thread is working for.
+pub(crate) fn diag_here(what: &'static str) {
+    HERE.with(|trace| trace.borrow().note(what, 0));
+}
+
 #[derive(Clone)]
 pub struct StateDatabase {
     inner: Arc<Inner>,
@@ -814,7 +822,10 @@ impl Inner {
         let trace = self.trace.clone();
         let attempt = tokio::task::spawn_blocking(move || {
             trace.note("try_thread", 0);
-            let file = owner.open()?;
+            HERE.with(|here| *here.borrow_mut() = trace.clone());
+            let file = owner.open();
+            HERE.with(|here| *here.borrow_mut() = Trace::default());
+            let file = file?;
             trace.note("opened", 0);
             try_lock_file(file, Some(owner), Some(turn), trace)
         })
@@ -1440,6 +1451,7 @@ mod tests {
     }
 
     /// Hold SQLite's write lock for `hold`, then commit an insert of `key`.
+    #[allow(dead_code)]
     fn hold_and_insert(c: &mut Connection, key: &str, hold: Duration) -> Result<()> {
         hold_and_insert_traced(c, key, hold, &Trace::default())
     }
@@ -1460,6 +1472,48 @@ mod tests {
         let committed = tx.commit().map_err(sql);
         trace.note("committed", committed.is_ok() as i64);
         committed
+    }
+
+    /// DIAGNOSTIC: a thread and a Tokio task that note a beat every 5 ms
+    /// until dropped, to show when the process or the runtime was held up.
+    struct Heartbeat {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Heartbeat {
+        fn start(report: &Report) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let beat = report.trace("hb");
+            let stopped = stop.clone();
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    beat.note("beat", 0);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let tick = report.trace("tk");
+            let task = tokio::spawn(async move {
+                loop {
+                    tick.note("tick", 0);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+                task,
+            }
+        }
+    }
+    impl Drop for Heartbeat {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.task.abort();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
     }
 
     /// DIAGNOSTIC: writes the test's timeline to `DIAG_FILE` when it ends.
@@ -1524,6 +1578,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_writer_on_another_handle_gets_a_turn_beside_a_steady_one() {
         let report = Report::new("steady");
+        let _heartbeat = Heartbeat::start(&report);
         let test_trace = report.trace("test");
         let dir = tempfile::tempdir().unwrap();
         let busy = StateDatabase::traced(dir.path().join("steady.json"), report.trace("busy"));
@@ -1586,6 +1641,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn writers_on_one_handle_take_turns_in_the_order_they_asked() {
         let report = Report::new("turns");
+        let _heartbeat = Heartbeat::start(&report);
         let dir = tempfile::tempdir().unwrap();
         let database = StateDatabase::traced(dir.path().join("turns.json"), report.trace("db"));
         database.run(|_| Ok(())).await.unwrap();

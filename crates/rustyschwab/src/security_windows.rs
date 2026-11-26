@@ -525,7 +525,11 @@ fn create_new_with(path: &Path, descriptor: &Local) -> Result<File> {
 
 /// Create a new private file, failing if one exists.
 pub(crate) fn secure_create_new(path: &Path) -> Result<File> {
-    create_new_with(path, &private_descriptor(false)?)
+    let descriptor = private_descriptor(false)?;
+    crate::storage::diag_here("scn_descriptor");
+    let created = create_new_with(path, &descriptor);
+    crate::storage::diag_here("scn_create_new_tried");
+    created
 }
 
 /// See [`crate::security::rename_noclobber`].
@@ -624,8 +628,12 @@ fn not_regular(file: &File) -> Result<Option<&'static str>> {
 
 fn open_checked(path: &Path, write: bool) -> Result<File> {
     let file = open_regular(path, write)?.map_err(|why| insecure(path, why))?;
+    crate::storage::diag_here("ocf_opened");
     let security = security_of_handle(file.as_raw_handle() as HANDLE)?;
-    match violation(security.0, false, path)? {
+    crate::storage::diag_here("ocf_security_read");
+    let judged = violation(security.0, false, path);
+    crate::storage::diag_here("ocf_judged");
+    match judged? {
         Some(why) => Err(insecure(path, why)),
         None => Ok(file),
     }
