@@ -196,6 +196,16 @@ fn equity_orders_take_the_durations_schwab_accepts() {
     .unwrap();
 }
 
+/// An ETF leg, as positions report one (`COLLECTIVE_INVESTMENT`), is a
+/// valid order: whether to take it is the risk provider's call. The
+/// built-in provider refuses it; a deployment's own provider may not.
+#[test]
+fn an_etf_leg_is_left_to_the_risk_provider() {
+    let mut etf = OrderRequestLeg::equity(OrderInstruction::Buy, "SPY", 1);
+    etf.instrument.asset_type = rustyschwab_types::common::AssetType::CollectiveInvestment;
+    OrderRequest::limit(etf, d("500")).validate().unwrap();
+}
+
 #[test]
 fn instructions_symbols_and_quantities_fit_the_asset() {
     let equity_with_option_instruction = OrderRequest::market(OrderRequestLeg::equity(
