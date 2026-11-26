@@ -873,4 +873,44 @@ mod tests {
             assert_eq!(in_sql, status.is_terminal(), "{status:?}");
         }
     }
+
+    /// A baseline is never dated ahead of the store's clock: a pass that
+    /// began earlier keeps its start, one that began up to
+    /// `MAX_CLOCK_LEAD_MS` ahead counts from now, and one further ahead is
+    /// refused.
+    #[test]
+    fn a_baseline_is_dated_no_later_than_the_store_clock() {
+        let now = 1_764_000_000_000;
+        assert_eq!(baseline_observed_at(now - 1, now).unwrap(), now - 1);
+        assert_eq!(baseline_observed_at(now, now).unwrap(), now);
+        assert_eq!(baseline_observed_at(now + 1, now).unwrap(), now);
+        assert_eq!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS, now).unwrap(),
+            now
+        );
+        assert!(matches!(
+            baseline_observed_at(now + MAX_CLOCK_LEAD_MS + 1, now),
+            Err(Error::Storage(_))
+        ));
+    }
+
+    /// A reading of the day's transfers is reused while it is of the same
+    /// trading day and younger than `DAY_TRANSFERS_TTL`; at that age, or on
+    /// the next day, it is read again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transfers_reading_is_current_for_its_ttl_on_its_own_day() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+        let reading = DayTransfers {
+            date: day,
+            read_at: tokio::time::Instant::now(),
+            net: 7.into(),
+        };
+        assert_eq!(reading.current(day), Some(7.into()));
+        assert_eq!(reading.current(day.succ_opt().unwrap()), None);
+        let just_under = DAY_TRANSFERS_TTL - std::time::Duration::from_millis(1);
+        tokio::time::advance(just_under).await;
+        assert_eq!(reading.current(day), Some(7.into()));
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        assert_eq!(reading.current(day), None);
+    }
 }
