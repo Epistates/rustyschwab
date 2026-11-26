@@ -33,9 +33,15 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts/
 
+  # The mutants are spread over eight shards so each finishes well inside a
+  # job's six hours (one job took about six and a half).
   mutants:
-    name: mutation testing (risk and execution)
+    name: mutation testing (risk and execution, shard ${{ matrix.shard }} of 8)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
@@ -45,17 +51,19 @@ jobs:
       - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-mutants
-      # Surviving mutants in the code that decides whether an order may go
-      # are missing tests. Reported, not gating: review the output.
+      # A mutant that survives in the code deciding whether an order may go
+      # is a missing test, so a missed mutant (or a timeout) fails the shard.
+      # Round-robin gives every shard a similar share of the slow mutants.
       - run: >-
-          cargo mutants -p rustyschwab --no-shuffle --timeout 300
+          cargo mutants -p rustyschwab --no-shuffle --timeout 300 --in-place
+          --shard ${{ matrix.shard }}/8 --sharding round-robin
           --file crates/rustyschwab/src/risk.rs
           --file crates/rustyschwab/src/execution.rs
           --file crates/rustyschwab/src/reconciliation.rs
-          || true
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mutants
+          name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
 
   minimal-versions:
