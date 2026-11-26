@@ -1265,11 +1265,11 @@ impl SchwabClient {
             }
             // Only after invalidating: the assertion reports a broken
             // assumption once the store has already failed closed.
-            let stored = state.map(|state| state.generation);
+            let older = state.is_some_and(|state| state.generation < generation);
             debug_assert!(
-                stored.is_none_or(|stored| stored >= generation),
-                "the account's stored generation is older than the generation {generation} \
-                 of a pass that raised it when it began"
+                !older,
+                "a pass found its account's stored generation older than its own, \
+                 which it raised when it began"
             );
         }
         result
