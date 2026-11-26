@@ -236,6 +236,95 @@ async fn only_our_tag_resolves_an_unknown_submission() {
     assert_eq!(report.resolved_attempts, vec![id]);
 }
 
+/// Under our tag, the broker's copy of our order resolves the intent:
+/// Schwab adds fields to the order and to each leg, and writes decimals as
+/// numbers, and none of that is a difference. An order under our tag that
+/// differs from the request in anything the request said (the quantity,
+/// the side) is not one we can claim, so the intent stays unresolved for an
+/// operator.
+#[tokio::test]
+async fn only_an_order_that_fits_the_request_resolves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let mut request = serde_json::to_value(order("BUY", "AAPL", 1, "10.00")).unwrap();
+    request["tag"] = json!("rs-ours");
+    let id = journal.begin("A", "place_order", request).await.unwrap();
+    journal.arm(&id).await.unwrap();
+    let listed = |instruction: &str, quantity: f64| {
+        json!({
+            "orderId": 42, "accountNumber": 12345678, "status": "WORKING",
+            "enteredTime": "2026-11-25T15:00:00+0000", "tag": "rs-ours",
+            "session": "NORMAL", "duration": "DAY", "orderType": "LIMIT",
+            "complexOrderStrategyType": "NONE", "orderStrategyType": "SINGLE",
+            "price": 10.0, "quantity": quantity, "filledQuantity": 0.0,
+            "remainingQuantity": quantity, "cancelable": true, "editable": true,
+            "orderLegCollection": [{"orderLegType": "EQUITY", "legId": 1,
+                "instruction": instruction, "quantity": quantity,
+                "positionEffect": "OPENING",
+                "instrument": {"assetType": "EQUITY", "symbol": "AAPL",
+                    "cusip": "037833100", "instrumentId": 1973757747}}]
+        })
+    };
+    let reconcile = |orders: Vec<Value>| {
+        let database = journal.database().clone();
+        async move {
+            database
+                .reconcile_snapshot(
+                    "A",
+                    1,
+                    chrono::Utc::now().timestamp_millis(),
+                    json!({}),
+                    orders,
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    for differs in [listed("BUY", 2.0), listed("SELL", 1.0)] {
+        let report = reconcile(vec![differs.clone()]).await;
+        assert_eq!(report.unresolved_attempts, vec![id.clone()], "{differs}");
+    }
+    let report = reconcile(vec![listed("BUY", 1.0)]).await;
+    assert_eq!(report.resolved_attempts, vec![id.clone()]);
+    assert!(matches!(
+        journal.record(&id).await.unwrap().unwrap().outcome,
+        Some(SubmissionOutcome::Accepted { order_id: Some(order_id) }) if order_id == "42"
+    ));
+}
+
+/// What reconciliation last read can be shown without a request: the
+/// accounts it holds a baseline for, in order, and each account's orders
+/// as Schwab reported them, most recently observed first and at most
+/// `limit` of them.
+#[tokio::test]
+async fn reconciliation_keeps_what_it_read_for_each_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let database = journal.database();
+    assert!(database.known_accounts().await.unwrap().is_empty());
+    let now = chrono::Utc::now().timestamp_millis();
+    let filled = json!({"orderId": 1, "status": "FILLED", "tag": "first"});
+    let working = json!({"orderId": 2, "status": "WORKING", "tag": "second"});
+    for (account, started_at, orders) in [
+        ("B", now - 1000, vec![filled.clone()]),
+        ("B", now, vec![working.clone()]),
+        ("A", now, vec![]),
+    ] {
+        database
+            .reconcile_snapshot(account, 1, started_at, json!({}), orders)
+            .await
+            .unwrap();
+    }
+    assert_eq!(database.known_accounts().await.unwrap(), vec!["A", "B"]);
+    assert_eq!(
+        database.known_orders("B", 10).await.unwrap(),
+        vec![working.clone(), filled]
+    );
+    assert_eq!(database.known_orders("B", 1).await.unwrap(), vec![working]);
+    assert!(database.known_orders("A", 10).await.unwrap().is_empty());
+}
+
 /// An operator settling an unknown submission releases its reservation in
 /// the same transaction; the account's capacity does not leak.
 #[tokio::test]
