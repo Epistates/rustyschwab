@@ -41,8 +41,9 @@ pub struct RequestBudgetUsage {
 pub(crate) enum Priority {
     /// Reads and everything else: up to [`NORMAL_SHARE`] of the minute.
     Normal,
-    /// Reconciliation, which keeps the risk baseline fresh: up to
-    /// [`RECOVERY_SHARE`].
+    /// Reads the risk checks depend on (reconciliation, which keeps the risk
+    /// baseline fresh, and the built-in provider's instrument-type lookup):
+    /// up to [`RECOVERY_SHARE`].
     Recovery,
     /// Order submissions and cancels: the whole budget.
     Critical,

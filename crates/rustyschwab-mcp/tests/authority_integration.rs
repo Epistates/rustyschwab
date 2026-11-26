@@ -128,6 +128,15 @@ async fn setup() -> Setup {
         })))
         .mount(&broker)
         .await;
+    // What Schwab calls AAPL, which the risk provider reads before a buy.
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .and(query_param("symbols", "AAPL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "AAPL": {"symbol": "AAPL", "assetMainType": "EQUITY", "assetSubType": "COE"}
+        })))
+        .mount(&broker)
+        .await;
     let policy = dir.path().join("policy.json");
     std::fs::write(&policy, grants().to_string()).unwrap();
     let state = Arc::new(Authority::new(

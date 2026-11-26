@@ -2,6 +2,8 @@
 //! left resolve themselves, reservations follow the journal, tags the
 //! broker holds stay spent, and risk judges sells and replacements by what
 //! they can actually do.
+mod common;
+
 use rustyschwab::{
     coordination::Coordinator,
     execution::{ExecutionStore, OrderJournal, SubmissionOutcome, SubmissionRecord},
@@ -35,6 +37,8 @@ fn limits() -> PortfolioLimits {
     }
 }
 
+/// Reconcile account `A` with `account` and `orders`, and record the
+/// stocks these tests buy, AAPL and MSFT, as Schwab's common stock.
 async fn baseline(journal: &OrderJournal, account: Value, orders: Vec<Value>) {
     journal
         .database()
@@ -47,6 +51,7 @@ async fn baseline(journal: &OrderJournal, account: Value, orders: Vec<Value>) {
         )
         .await
         .unwrap();
+    common::common_stock(journal.database(), &["AAPL", "MSFT"]);
 }
 
 fn risk(journal: &OrderJournal, limits: PortfolioLimits) -> PortfolioRisk {
@@ -793,6 +798,7 @@ async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
     let risk = risk(&journal, limits);
     let buy = order("BUY", "AAPL", 1, "10");
     reconciled_ago(7_500).await;
+    common::common_stock(journal.database(), &["AAPL"]);
     assert!(matches!(
         risk.reserve("A", "stale", &buy).await,
         Err(rustyschwab::Error::BaselineStale { .. })
@@ -937,6 +943,7 @@ async fn a_daily_loss_of_exactly_the_cap_still_trades() {
     let buy = order("BUY", "AAPL", 1, "10");
 
     reconciled_at("9500").await;
+    common::common_stock(journal.database(), &["AAPL"]);
     risk.observe_baseline("A").await.unwrap();
     assert_eq!(journal.operator_halt().await.unwrap(), None);
     risk.reserve("A", "at-the-cap", &buy).await.unwrap();
@@ -1591,6 +1598,7 @@ async fn a_deposit_does_not_hide_a_daily_loss() {
         )
         .await
         .unwrap();
+    common::common_stock(journal.database(), &["AAPL"]);
     risk.reserve("A", "fine", &order("BUY", "AAPL", 1, "10"))
         .await
         .unwrap();

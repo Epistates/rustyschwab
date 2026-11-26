@@ -100,6 +100,7 @@ impl Account {
             risk,
         };
         account.pass(vec![]).await;
+        common::common_stock(account.journal.database(), &["AAPL"]);
         account
     }
 

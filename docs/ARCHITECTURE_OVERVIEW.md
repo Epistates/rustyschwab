@@ -148,7 +148,9 @@ Schwab's `201` + `Location` order responses.
 ### Order submission and durable state
 
 `submit_order_request` (behind `place_order`, `replace_order` and their
-`_fenced` variants) validates the request, assigns a `tag` if absent, and
+`_fenced` variants) validates the request, assigns a `tag` if absent, has
+the risk provider screen it (`RiskProvider::screen`, where the built-in
+provider reads a buy's instrument type, outside every transaction), and
 walks the execution journal:
 
 ```
@@ -166,7 +168,8 @@ WAL mode (`<tokens_file>.orders.store/state.sqlite3`; a pre-0.2 JSON journal
 at `<tokens_file>.orders.json` is imported once). Tables: `submissions`,
 `audit`, `consumed_approvals`, `used_order_tags`, `accounts`, `orders`,
 `executions`, `leases`, `quota`, `quota_config`, `approvals`,
-`reservations`, `intents`, `audit_anchor`, `meta`, `schema_migrations`.
+`reservations`, `intents`, `audit_anchor`, `instrument_types`, `meta`,
+`schema_migrations`.
 Migrations, online backup and restore live in `storage.rs`, as does the turn order its writers keep (`state.write.lock`). `audit` rows
 form a SHA-256 hash chain (`audit_chain.rs`, checked by
 `OrderJournal::verify_audit` and `rustyschwab-admin verify-audit`).
@@ -178,7 +181,10 @@ Around the journal:
   file, so several processes on one host share limits and fences.
 - `risk::RiskProvider` — pre-trade checks with durable reservations;
   `PortfolioRisk` enforces per-account open-quantity/notional/position caps
-  from a JSON policy and counts external open orders. Its optional
+  from a JSON policy and counts external open orders. It buys only what
+  Schwab's quote calls plain common stock (`EQUITY` and `COE`), read in
+  `screen` before the intent is journaled and kept in `instrument_types`
+  for an hour. Its optional
   `max_daily_loss` trips the durable operator halt (`execution::trip_halt`)
   once the reconciled baseline's day loss exceeds it, at the next
   reservation and, through `observe_baseline`, at each reconciliation; the

@@ -6,13 +6,14 @@ use crate::{
     execution::{ensure_not_halted, is_broker_order_id, trip_halt},
     storage::{StateDatabase, sql},
     types::{
-        common::AssetType,
+        common::{AssetMainType, AssetSubType, AssetType},
+        market_data::QuotesResponse,
         trading::{OrderInstruction, OrderRequest, OrderStrategyType, OrderType},
     },
 };
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 
 const SELECT_ACCOUNT_BASELINE: &str =
@@ -42,6 +43,28 @@ const SELECT_UNRESERVED_BROKER_ORDERS: &str = "SELECT o.payload FROM orders o \
 const INSERT_HELD_RESERVATION: &str = "INSERT INTO \
      reservations(id,account,quantity,notional,state,symbol,side,replaces) \
      VALUES(?1,?2,?3,?4,'held',?5,?6,?7)";
+const SELECT_INSTRUMENT_TYPE: &str = "SELECT asset_main_type,asset_sub_type,observed_at \
+     FROM instrument_types WHERE symbol=?1";
+const UPSERT_INSTRUMENT_TYPE: &str = "INSERT INTO \
+     instrument_types(symbol,asset_main_type,asset_sub_type,observed_at) VALUES(?1,?2,?3,?4) \
+     ON CONFLICT(symbol) DO UPDATE SET asset_main_type=excluded.asset_main_type, \
+       asset_sub_type=excluded.asset_sub_type, observed_at=excluded.observed_at";
+/// How long the built-in provider trusts a symbol's instrument type as it
+/// read it from Schwab: an hour. Symbols are reused and reclassified rarely,
+/// and at no hour Schwab documents, so a reading is kept for an hour from
+/// when it was taken rather than for a trading day: a change reaches orders
+/// within the hour, and a symbol bought all day costs one read an hour.
+const INSTRUMENT_TYPE_LIFETIME_MS: i64 = 60 * 60 * 1000;
+/// Why a buy of an ETF is refused, by its order's label or by Schwab's word.
+const ETFS: &str = "Built-in portfolio risk covers long equity only; ETFs need a \
+     deployment's own risk provider";
+/// Why a buy of what Schwab does not call common stock, nor names a kind
+/// of, is refused.
+const UNCLASSIFIED: &str = "Built-in portfolio risk covers common stock only; a symbol \
+     Schwab does not classify as common stock needs a deployment's own risk provider";
+/// Why a buy reserved or checked without being screened is refused.
+const UNSCREENED: &str = "Built-in portfolio risk has no current instrument type from \
+     Schwab for this symbol; screen the order first";
 /// Audit subject of a halt the daily-loss control trips, live or paper.
 pub const DAILY_LOSS_CONTROL: &str = "daily-loss-control";
 
@@ -176,14 +199,30 @@ fn max_age() -> i64 {
 }
 /// The built-in [`RiskProvider`]: each account's [`PortfolioLimits`]
 /// judged against its reconciled baseline, with durable reservations for
-/// working orders. It covers long equity limit and stop-limit orders and
-/// defined-risk option strategies.
+/// working orders. It covers limit and stop-limit orders that buy plain
+/// common stock or sell what the account holds, and defined-risk option
+/// strategies.
 ///
-/// ETFs are not covered: judged as a stock, a leveraged or inverse fund's
-/// risk would be understated, so ETF support is left to a later release on
-/// purpose. An order whose leg is `COLLECTIVE_INVESTMENT` is refused. The
-/// provider cannot tell an ETF ordered as `EQUITY` from a stock and judges
-/// it as one, so a deployment that trades ETFs needs its own provider.
+/// A buy must be of plain common stock, by Schwab's word for the symbol.
+/// [`screen`](RiskProvider::screen) reads the symbol's quote before a buy
+/// labelled `EQUITY` is journaled, and only an `assetMainType` of `EQUITY`
+/// with an `assetSubType` of `COE` passes. ETFs are refused (judged as a
+/// stock, a leveraged or inverse fund's risk would be understated, so ETF
+/// support is left to a later release on purpose), as are exchange-traded
+/// notes, closed-end funds, unit investment trusts, preferred shares,
+/// warrants, rights, depositary receipts (the quote does not say whether
+/// one holds common or preferred shares), mutual funds and any symbol
+/// Schwab does not classify as common stock; a leg labelled
+/// `COLLECTIVE_INVESTMENT` is an ETF without a lookup. A failed lookup
+/// refuses the buy with the lookup's own error. What was read is kept in
+/// the state database for an hour, so a symbol costs one read an hour, and
+/// a buy reserved or checked without being screened is refused.
+///
+/// A sell can only reduce what the account holds, so it is bounded by the
+/// position whatever the instrument, and nothing is looked up for it;
+/// neither is an option strategy's underlying, since the strategy's legs
+/// bound what it can lose. A deployment that buys anything else needs its
+/// own provider.
 #[derive(Debug)]
 pub struct PortfolioRisk {
     database: StateDatabase,
@@ -349,6 +388,38 @@ impl PortfolioRisk {
     pub fn new(database: StateDatabase, accounts: HashMap<String, PortfolioLimits>) -> Self {
         Self { database, accounts }
     }
+    /// What Schwab says `symbol` is: the type kept from an earlier read
+    /// while it is current, or else the quote's, read through `market` and
+    /// kept if it names both types. A read that fails returns its own error
+    /// and keeps nothing.
+    async fn instrument_type(&self, symbol: &str, market: &SchwabClient) -> Result<InstrumentType> {
+        // The cache's one reading of the clock: it judges what is kept and
+        // dates what is read.
+        let now = chrono::Utc::now().timestamp_millis();
+        let key = symbol.to_owned();
+        let kept = self
+            .database
+            .run(move |c| stored_instrument_type(c, &key, now))
+            .await?;
+        if let Some(kept) = kept {
+            return Ok(kept);
+        }
+        let read = InstrumentType::quoted(&market.risk_quote(symbol).await?, symbol);
+        if let Some((main, sub)) = read.named() {
+            let row = (symbol.to_owned(), wire(&main)?, wire(&sub)?);
+            self.database
+                .write(move |c| {
+                    c.execute(
+                        UPSERT_INSTRUMENT_TYPE,
+                        rusqlite::params![row.0, row.1, row.2, now],
+                    )
+                    .map_err(sql)?;
+                    Ok(())
+                })
+                .await?;
+        }
+        Ok(read)
+    }
     async fn validate_and_reserve(
         &self,
         account: &str,
@@ -384,13 +455,17 @@ impl PortfolioRisk {
         {
             return Err(Error::Config("Invalid portfolio risk limits".into()));
         }
+        let proposed = Proposed::of(order, &limits)?;
+        proposed.refuse_labelled_etf()?;
+        let stock_buy = proposed.stock_buy().is_some();
         let Proposed {
             symbol,
             sell,
             quantity,
             notional,
             strategy,
-        } = Proposed::of(order, &limits)?;
+            ..
+        } = proposed;
         let side = if sell { "SELL" } else { "BUY" };
         let account = account.to_owned();
         let id = attempt_id.to_owned();
@@ -552,6 +627,16 @@ impl PortfolioRisk {
                         ));
                     }
                 } else {
+                    // A buy must be of plain common stock, by the type Schwab
+                    // gave the symbol when the order was screened. The
+                    // recheck before sending judges the baseline and the
+                    // held reservation, which an expired type changes
+                    // neither of.
+                    if stock_buy && !revalidate {
+                        stored_instrument_type(&tx, &symbol, now)?
+                            .ok_or_else(|| Error::RiskDenied(UNSCREENED.into()))?
+                            .judge()?;
+                    }
                     let funds = available_funds(account_value)
                         .ok_or_else(|| stale("Available funds missing from risk baseline"))?;
                     let buy_quantity = outstanding
@@ -627,8 +712,26 @@ struct Proposed {
     notional: Decimal,
     /// An option strategy, bounded by its defined risk.
     strategy: bool,
+    /// What a buy of one leg is labelled: `EQUITY` or
+    /// `COLLECTIVE_INVESTMENT`. `None` for a sell, which can only reduce
+    /// what the account holds, and for a strategy, which its legs bound,
+    /// whatever either holds.
+    buys: Option<AssetType>,
 }
 impl Proposed {
+    /// Refuse a buy labelled an ETF. ETFs are left out on purpose: judged as
+    /// a stock, a leveraged or inverse fund's risk would be understated.
+    fn refuse_labelled_etf(&self) -> Result<()> {
+        if self.buys == Some(AssetType::CollectiveInvestment) {
+            return Err(Error::RiskDenied(ETFS.into()));
+        }
+        Ok(())
+    }
+    /// The symbol of a buy labelled `EQUITY`, which only plain common stock
+    /// may be, by the instrument type Schwab gives it.
+    fn stock_buy(&self) -> Option<&str> {
+        (self.buys == Some(AssetType::Equity)).then_some(self.symbol.as_str())
+    }
     fn of(order: &OrderRequest, limits: &PortfolioLimits) -> Result<Self> {
         if order.order_strategy_type != OrderStrategyType::Single {
             return Err(Error::RiskDenied(
@@ -648,6 +751,7 @@ impl Proposed {
                 quantity: risk.contracts,
                 notional: risk.max_loss,
                 strategy: true,
+                buys: None,
             });
         }
         if order.order_leg_collection.len() != 1
@@ -676,18 +780,10 @@ impl Proposed {
                     .into(),
             ));
         }
-        let sell = leg.instruction == OrderInstruction::Sell;
         // A sell can only reduce what the account holds, so the sell rule
-        // bounds it whatever it sells, an ETF included. A buy of an ETF is
-        // left out on purpose: judged as a stock, a leveraged or inverse
-        // fund's risk would be understated.
-        if !sell && leg.instrument.asset_type == AssetType::CollectiveInvestment {
-            return Err(Error::RiskDenied(
-                "Built-in portfolio risk covers long equity only; ETFs need a \
-                 deployment's own risk provider"
-                    .into(),
-            ));
-        }
+        // bounds it whatever it sells, an ETF included; a buy's instrument
+        // is judged apart (see `refuse_labelled_etf` and `stock_buy`).
+        let sell = leg.instruction == OrderInstruction::Sell;
         let price = order
             .price
             .ok_or_else(|| Error::InvalidParameter("Limit price is required".into()))?;
@@ -700,7 +796,103 @@ impl Proposed {
                 .checked_mul(price)
                 .ok_or_else(|| Error::InvalidParameter("Risk arithmetic overflow".into()))?,
             strategy: false,
+            buys: (!sell).then_some(leg.instrument.asset_type),
         })
+    }
+}
+/// What Schwab's quote calls a symbol: its `assetMainType` and
+/// `assetSubType`, each `None` when the quote names none.
+#[derive(Clone, Copy, Debug, Default)]
+struct InstrumentType {
+    main: Option<AssetMainType>,
+    sub: Option<AssetSubType>,
+}
+impl InstrumentType {
+    /// What `quotes`, asked for `symbol` alone, say it is: nothing, unless
+    /// they hold a quote that is for exactly that symbol.
+    fn quoted(quotes: &QuotesResponse, symbol: &str) -> Self {
+        quotes
+            .quotes
+            .get(symbol)
+            .filter(|quote| quote.symbol.as_deref() == Some(symbol))
+            .map_or_else(Self::default, |quote| Self {
+                main: quote.asset_main_type,
+                sub: quote.asset_sub_type,
+            })
+    }
+    /// Both types, when the quote names each with a value this release
+    /// knows: an answer worth keeping. Anything less is asked for again.
+    fn named(self) -> Option<(AssetMainType, AssetSubType)> {
+        match (self.main, self.sub) {
+            (Some(main), Some(sub))
+                if main != AssetMainType::Unknown && sub != AssetSubType::Unknown =>
+            {
+                Some((main, sub))
+            }
+            _ => None,
+        }
+    }
+    /// Refuse a buy of anything but plain common stock, naming what it is.
+    fn judge(self) -> Result<()> {
+        use AssetMainType as Main;
+        use AssetSubType as Sub;
+        let kind = match (self.main, self.sub) {
+            (Some(Main::Equity), Some(Sub::Coe)) => return Ok(()),
+            (Some(Main::Etf), _) | (_, Some(Sub::Etf)) => {
+                return Err(Error::RiskDenied(ETFS.into()));
+            }
+            (_, Some(Sub::Etn)) => "exchange-traded notes",
+            (_, Some(Sub::Cef)) => "closed-end funds",
+            (_, Some(Sub::Uit)) => "unit investment trusts",
+            (_, Some(Sub::Prf)) => "preferred shares",
+            (_, Some(Sub::War)) => "warrants",
+            (_, Some(Sub::Rgt)) => "rights",
+            // The quote does not say whether a receipt holds common shares
+            // or preferred ones, so none is taken for common stock.
+            (_, Some(Sub::Adr | Sub::Gdr)) => "depositary receipts",
+            (_, Some(Sub::Oef)) => "mutual funds",
+            (_, Some(Sub::Mmf)) => "money market funds",
+            _ => return Err(Error::RiskDenied(UNCLASSIFIED.into())),
+        };
+        Err(Error::RiskDenied(format!(
+            "Built-in portfolio risk covers common stock only; {kind} need a deployment's \
+             own risk provider"
+        )))
+    }
+}
+/// The text Schwab spells `value` with, as the state database keeps it.
+fn wire<T: Serialize>(value: &T) -> Result<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::Storage("Instrument type is not text".into()))
+}
+/// A type kept as [`wire`] spelled it.
+fn unwire<T: DeserializeOwned>(text: String) -> Result<T> {
+    Ok(serde_json::from_value(serde_json::Value::String(text))?)
+}
+/// `symbol`'s kept instrument type, if one is current at `now`: read no
+/// more than [`INSTRUMENT_TYPE_LIFETIME_MS`] before it.
+fn stored_instrument_type(
+    connection: &rusqlite::Connection,
+    symbol: &str,
+    now: i64,
+) -> Result<Option<InstrumentType>> {
+    use rusqlite::OptionalExtension;
+    let kept: Option<(String, String, i64)> = connection
+        .query_row(SELECT_INSTRUMENT_TYPE, [symbol], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(sql)?;
+    match kept {
+        Some((main, sub, at)) if !expired(at, now, INSTRUMENT_TYPE_LIFETIME_MS) => {
+            Ok(Some(InstrumentType {
+                main: Some(unwire(main)?),
+                sub: Some(unwire(sub)?),
+            }))
+        }
+        _ => Ok(None),
     }
 }
 /// What [`PortfolioRisk::validate_and_reserve`] is asked to do.
@@ -716,6 +908,32 @@ enum Check {
 }
 #[async_trait]
 impl RiskProvider for PortfolioRisk {
+    /// Refuses a buy labelled an ETF, and reads a buy labelled `EQUITY`'s
+    /// instrument type (see [`PortfolioRisk`]). Whatever else `reserve`
+    /// would refuse, it is left to report, as it does for an order it is
+    /// given unscreened.
+    async fn screen(
+        &self,
+        account: &str,
+        order: &OrderRequest,
+        market: &SchwabClient,
+    ) -> Result<()> {
+        let Some(limits) = self.accounts.get(account) else {
+            return Ok(());
+        };
+        let Ok(proposed) = order
+            .validate()
+            .map_err(Error::from)
+            .and_then(|()| Proposed::of(order, limits))
+        else {
+            return Ok(());
+        };
+        proposed.refuse_labelled_etf()?;
+        match proposed.stock_buy() {
+            Some(symbol) => self.instrument_type(symbol, market).await?.judge(),
+            None => Ok(()),
+        }
+    }
     async fn reserve(&self, account: &str, attempt_id: &str, order: &OrderRequest) -> Result<()> {
         self.validate_and_reserve(
             account,
@@ -970,5 +1188,42 @@ mod tests {
         assert!(!expired(at, at + 5000, 5000));
         assert!(expired(at, at + 5001, 5000));
         assert!(expired(at, at - 1, 5000));
+    }
+
+    /// A symbol's kept instrument type is current from the millisecond it
+    /// was read through exactly an hour, and not once the clock is back
+    /// before it; a symbol never read has none.
+    #[tokio::test]
+    async fn an_instrument_type_is_kept_from_its_reading_through_exactly_an_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("state.json"));
+        let at: i64 = 1_764_000_000_000;
+        let kept = |now: i64| {
+            let database = database.clone();
+            async move {
+                database
+                    .run(move |c| stored_instrument_type(c, "AAPL", now))
+                    .await
+                    .unwrap()
+                    .map(|kept| (kept.main, kept.sub))
+            }
+        };
+        assert_eq!(kept(at).await, None);
+        database
+            .write(move |c| {
+                c.execute(
+                    UPSERT_INSTRUMENT_TYPE,
+                    rusqlite::params!["AAPL", "EQUITY", "COE", at],
+                )
+                .map_err(sql)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let common = Some((Some(AssetMainType::Equity), Some(AssetSubType::Coe)));
+        assert_eq!(kept(at).await, common);
+        assert_eq!(kept(at + 3_600_000).await, common);
+        assert_eq!(kept(at + 3_600_001).await, None);
+        assert_eq!(kept(at - 1).await, None);
     }
 }

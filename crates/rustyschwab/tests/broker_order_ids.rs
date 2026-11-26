@@ -297,13 +297,15 @@ async fn a_location_without_an_order_id_leaves_the_order_to_its_tag() {
 
 /// Wind the state file at `path` back to schema version 6, the last release
 /// before order IDs were canonical, as that release left it: the canonical
-/// ID migration changes no tables, so this is exactly such a file. Returns
-/// a connection to write what that release could store.
+/// ID migration changes no tables, and the table the one after it adds is
+/// dropped, so this is exactly such a file. Returns a connection to write
+/// what that release could store.
 fn as_left_by_an_earlier_release(path: &Path) -> rusqlite::Connection {
     let state = rusqlite::Connection::open(path).unwrap();
     state
         .execute_batch(
-            "DELETE FROM schema_migrations WHERE version>6;
+            "DROP TABLE instrument_types;
+             DELETE FROM schema_migrations WHERE version>6;
              UPDATE meta SET value='6' WHERE key='schema';",
         )
         .unwrap();
@@ -836,7 +838,7 @@ async fn opening_an_earlier_state_file_canonicalizes_every_order_id() {
     upgraded.records().await.unwrap();
     assert_eq!(
         rows(&state, "SELECT value FROM meta WHERE key='schema'"),
-        vec!["7"]
+        vec!["8"]
     );
     // Every table that links to orders holds only their own IDs.
     assert_eq!(

@@ -1411,6 +1411,14 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
             HashMap::from([("hash".into(), limits)]),
         )))
         .unwrap();
+    // What Schwab calls AAPL, which the provider reads before the buy.
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "AAPL": {"symbol": "AAPL", "assetMainType": "EQUITY", "assetSubType": "COE"}
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/trader/v1/accounts/hash/orders/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

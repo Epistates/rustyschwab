@@ -83,8 +83,10 @@ pub(crate) enum OpClass {
     /// Changes nothing at Schwab: retried within its deadline, refused by an
     /// open breaker.
     Read,
-    /// A read that keeps the risk baseline fresh: as [`Read`](Self::Read),
-    /// from the share of the budget reads cannot take.
+    /// A read the risk checks depend on (reconciliation, which keeps the
+    /// risk baseline fresh, and the built-in provider's instrument-type
+    /// lookup): as [`Read`](Self::Read), from the share of the budget reads
+    /// cannot take.
     Recovery,
     /// Places or replaces an order: sent once under the execution lease and
     /// never retried; an ambiguous failure is `SubmissionUnknown`.
@@ -928,6 +930,15 @@ impl SchwabClient {
             indicative,
         )
         .await
+    }
+
+    /// The quote the built-in risk provider reads a symbol's instrument
+    /// type from: as [`get_quotes`](Self::get_quotes) for that one symbol,
+    /// but from the share of the request budget reads cannot take, so other
+    /// reads cannot hold up an order behind it.
+    pub(crate) async fn risk_quote(&self, symbol: &str) -> Result<QuotesResponse> {
+        self.quotes(Op::recovery("risk_instrument_type"), &[symbol], &[], None)
+            .await
     }
 
     /// `GET /quotes` for `symbols`, sent as `op`.

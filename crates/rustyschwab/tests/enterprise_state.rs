@@ -1,3 +1,5 @@
+mod common;
+
 use rustyschwab::{
     coordination::Coordinator,
     execution::{ExecutionStore, OrderJournal, SubmissionOutcome},
@@ -229,6 +231,7 @@ async fn risk_reserves_pending_exposure_and_releases_only_after_terminal_evidenc
         max_daily_loss: None,
         option_multipliers: Default::default(),
     };
+    common::common_stock(&db, &["AAPL"]);
     let risk = PortfolioRisk::new(db, HashMap::from([("A".into(), limits)]));
     let order=serde_json::from_value(json!({"orderStrategyType":"SINGLE","session":"NORMAL","duration":"DAY","orderType":"LIMIT","price":"60","orderLegCollection":[{"quantity":"1","instruction":"BUY","instrument":{"symbol":"AAPL","assetType":"EQUITY"}}]})).unwrap();
     risk.reserve("A", "first", &order).await.unwrap();
@@ -254,6 +257,7 @@ async fn daily_loss_past_the_cap_halts_at_reservation_and_on_reconciliation() {
     db.reconcile_snapshot("A", 1, now, baseline("10000", "9990"), vec![])
         .await
         .unwrap();
+    common::common_stock(&db, &["AAPL"]);
     let risk = PortfolioRisk::new(
         db.clone(),
         HashMap::from([(
@@ -612,6 +616,7 @@ async fn external_partial_orders_count_toward_risk_and_dispatch_rechecks_freshne
     )
     .await
     .unwrap();
+    common::common_stock(&db, &["AAPL"]);
     let risk = PortfolioRisk::new(
         db.clone(),
         HashMap::from([(
@@ -663,6 +668,7 @@ async fn fenced_risk_revalidation_rejects_released_ownership_and_operator_halt()
     )
     .await
     .unwrap();
+    common::common_stock(&db, &["AAPL"]);
     let risk = PortfolioRisk::new(
         db.clone(),
         HashMap::from([(
@@ -845,10 +851,11 @@ async fn fresh_state_records_every_migration_and_refuses_newer_files() {
             (4, "pending_intents".into()),
             (5, "audit_hash_chain".into()),
             (6, "activity".into()),
-            (7, "canonical_order_ids".into())
+            (7, "canonical_order_ids".into()),
+            (8, "instrument_types".into())
         ]
     );
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("7"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("8"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     connection
         .execute("UPDATE meta SET value='99' WHERE key='schema'", [])
@@ -904,7 +911,7 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
     // Rows written before the marker existed read as armed.
     assert!(upgraded.records().await.unwrap()[0].armed);
     let connection = rusqlite::Connection::open(&path).unwrap();
-    assert_eq!(meta(&connection, "schema").as_deref(), Some("7"));
+    assert_eq!(meta(&connection, "schema").as_deref(), Some("8"));
     assert_eq!(meta(&connection, "tags_imported"), None);
     let history: Vec<u32> = connection
         .prepare("SELECT version FROM schema_migrations ORDER BY version")
@@ -913,7 +920,7 @@ async fn version_one_state_upgrades_in_place_and_keeps_its_data() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert_eq!(history, vec![2, 3, 4, 5, 6, 7]);
+    assert_eq!(history, vec![2, 3, 4, 5, 6, 7, 8]);
 }
 
 #[tokio::test]
@@ -957,7 +964,7 @@ async fn concurrent_first_use_initializes_once() {
     let migrations: i64 = connection
         .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(migrations, 7);
+    assert_eq!(migrations, 8);
 }
 
 /// A partial fill shrinks the order's held reservation to what can still
@@ -973,6 +980,7 @@ async fn partial_fills_shrink_held_reservations() {
     db.reconcile_snapshot("A", 1, now(), baseline.clone(), vec![])
         .await
         .unwrap();
+    common::common_stock(&db, &["AAPL"]);
     let risk = PortfolioRisk::new(
         db.clone(),
         HashMap::from([(
