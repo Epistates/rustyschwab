@@ -684,21 +684,21 @@ impl SchwabClient {
             let mut windows = vec![(from, started)];
             let mut orders = std::collections::BTreeMap::new();
             let mut pages = 0;
+            // Each turn reads one page and counts it against the budget, so
+            // the loop ends within the budget however its windows are cut.
             while let Some((from, to)) = windows.pop() {
-                // One day inside Schwab's 60-day order list horizon. A wider
-                // window is answered with what it holds, so splitting keeps
-                // each request's span meaningful rather than silently short.
-                if to - from > chrono::Duration::days(59) {
-                    let split = from + chrono::Duration::days(59);
-                    windows.push((split, to));
-                    windows.push((from, split));
-                    continue;
-                }
                 pages += 1;
                 if pages > options.max_pages {
                     return Err(Error::Storage(
                         "Reconciliation page budget exhausted".into(),
                     ));
+                }
+                // One day inside Schwab's 60-day order list horizon. A wider
+                // window is answered with what it holds, so the rest of it is
+                // read next rather than silently missed.
+                let end = to.min(from + chrono::Duration::days(59));
+                if end < to {
+                    windows.push((end, to));
                 }
                 let page: Vec<Value> = self
                     .request_with_query(
@@ -707,18 +707,18 @@ impl SchwabClient {
                         &crate::client::account_path(account, "/orders")?,
                         &OrdersParams {
                             max_results: Some(3000),
-                            ..OrdersParams::new(from, to)
+                            ..OrdersParams::new(from, end)
                         },
                     )
                     .await?;
                 if page.len() >= 3000 {
-                    if (to - from).num_milliseconds() <= 1000 {
+                    if (end - from).num_milliseconds() <= 1000 {
                         return Err(Error::Storage(
                             "Order history remains truncated at minimum interval".into(),
                         ));
                     }
-                    let mid = from + (to - from) / 2;
-                    windows.push((mid, to));
+                    let mid = from + (end - from) / 2;
+                    windows.push((mid, end));
                     windows.push((from, mid));
                     continue;
                 }
