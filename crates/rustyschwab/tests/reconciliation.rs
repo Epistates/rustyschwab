@@ -568,7 +568,7 @@ async fn the_lookback_is_read_in_consecutive_windows_inside_the_horizon() {
         let server = MockServer::start().await;
         let (client, _dir, _) = mock_client(&server, false);
         mount_empty_account(&server).await;
-        let report = client
+        let pass = client
             .reconcile_account_with_options(
                 "hash",
                 1,
@@ -577,11 +577,15 @@ async fn the_lookback_is_read_in_consecutive_windows_inside_the_horizon() {
                     ..Default::default()
                 },
             )
-            .await
-            .unwrap();
-        assert!(report.reconciled);
-        let before = |days: i64| report.started_at - days * DAY_MS;
+            .await;
+        // The windows asked for come first: a wrong cut shows as the
+        // windows it asked for, whatever it did to the pass.
         let listed = listed_windows(&server).await;
+        let Some(((lookback_start, _), _)) = listed.first() else {
+            panic!("a lookback of {lookback_days} days read no orders: {pass:?}");
+        };
+        let start = lookback_start + i64::from(lookback_days) * DAY_MS;
+        let before = |days: i64| start - days * DAY_MS;
         assert_eq!(
             listed.iter().map(|(window, _)| *window).collect::<Vec<_>>(),
             windows
@@ -593,6 +597,9 @@ async fn the_lookback_is_read_in_consecutive_windows_inside_the_horizon() {
         for (window, page) in &listed {
             assert_eq!(page.as_deref(), Some("3000"), "{window:?}");
         }
+        let report = pass.unwrap();
+        assert!(report.reconciled);
+        assert_eq!(report.started_at, start);
     }
 }
 
