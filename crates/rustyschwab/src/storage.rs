@@ -49,18 +49,19 @@
 //! An existing file that is behind (it needs a migration, or the import of a
 //! legacy journal) is prepared under a second lock file, `state.init.lock`, so
 //! that two openers, in this process or another, cannot race the migration. A
-//! file that is already current is opened without it. An opener that finds the
-//! lock taken waits for it like a writer waits for its turn: in the operating
-//! system, on the handle's lock thread, for at most five seconds from when the
-//! wait starts, and the wait ends sooner if its caller drops the future (a
-//! caller's deadline, `tokio::time::timeout` around the call, does that). The
-//! lock thread gives the lock back as soon as it is granted to a request that
-//! was dropped. When the five seconds run out the call fails with
-//! [`Error::StateBusy`] and nothing has been written. The wait for the turn to
-//! write starts only once opening is done, with its own five seconds. The
-//! constructor (`StateDatabase::open`, which `SchwabClient::new` calls) has no
-//! future to drop: it polls for the lock on the calling thread for at most
-//! five seconds.
+//! file that is already current is opened without it. An operator's repair of a
+//! file that does not open (`repair_order_ids`) takes the lock as an opener
+//! does. An opener that finds the lock taken waits for it like a writer waits
+//! for its turn: in the operating system, on the handle's lock thread, for at
+//! most five seconds from when the wait starts, and the wait ends sooner if its
+//! caller drops the future (a caller's deadline, `tokio::time::timeout` around
+//! the call, does that). The lock thread gives the lock back as soon as it is
+//! granted to a request that was dropped. When the five seconds run out the
+//! call fails with [`Error::StateBusy`] and nothing has been written. The wait
+//! for the turn to write starts only once opening is done, with its own five
+//! seconds. The constructor (`StateDatabase::open`, which `SchwabClient::new`
+//! calls) has no future to drop: it polls for the lock on the calling thread
+//! for at most five seconds.
 //!
 //! These waits are for locks that may not be released, such as one another
 //! process holds. An opener that finds another on its own handle already
@@ -204,6 +205,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "activity",
         sql: "CREATE TABLE IF NOT EXISTS activity(sequence INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, subject TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL);",
         backfill: None,
+    },
+    // Every order ID is a broker order ID, one text form per order (see
+    // `execution::is_broker_order_id`). An earlier release could store one
+    // written another way ("007"), which names a real order and is
+    // rewritten, merging with any records for the same number, or one that
+    // names no order at all, which is set aside. The audit trail keeps what
+    // it recorded. Opening the store checks the result every time
+    // (`reconciliation::check_stored_order_ids`).
+    Migration {
+        version: 7,
+        name: "canonical_order_ids",
+        sql: "",
+        backfill: Some(crate::reconciliation::canonicalize_stored_order_ids),
     },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
@@ -576,6 +590,45 @@ impl StateDatabase {
             .await
             .map_err(|_| Error::Storage("State worker failed".into()))?
     }
+    /// Run `f` on a connection of its own to the file as it stands, under
+    /// the init lock, for an operator's repair of a file that does not open
+    /// (`repair_order_ids`): the file is validated as it is when opened,
+    /// but its invariants are not checked, and it is neither created nor
+    /// migrated. It must exist and be at this release's schema version; one
+    /// that is behind is for opening, which migrates it.
+    pub(crate) async fn repairing<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        // Taking the init lock creates the state directory: check first that
+        // there is a file to repair.
+        let path = self.inner.path.clone();
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(Error::InvalidParameter(format!(
+                "No state file at {}",
+                path.display()
+            )));
+        }
+        let held = self.inner.lock_init().await?;
+        tokio::task::spawn_blocking(move || {
+            let _held = held;
+            crate::security::verify_file_permissions(&path)?;
+            let mut connection = open_connection(&path)?;
+            validate_existing(&connection)?;
+            if !table_exists(&connection, "meta")?
+                || schema_version(&connection)? != Some(SCHEMA_VERSION)
+            {
+                return Err(Error::InvalidParameter(
+                    "The state file is not at this release's schema version; opening it \
+                     migrates it, which makes the same repair"
+                        .into(),
+                ));
+            }
+            f(&mut connection)
+        })
+        .await
+        .map_err(|_| Error::Storage("State worker failed".into()))?
+    }
     /// Online SQLite backup. Destination must be a new file in a private directory.
     pub async fn backup(&self, destination: PathBuf) -> Result<()> {
         self.run(move |conn| {
@@ -789,7 +842,9 @@ impl Inner {
     }
     /// Open the state file, building it first if it does not exist, and say
     /// whether it is current. Takes no lock: a new file is moved into place
-    /// whole or not at all (see the module documentation).
+    /// whole or not at all (see the module documentation). A current file
+    /// must meet the store's invariants; one that is behind is checked once
+    /// it is migrated ([`prepare`](Self::prepare)).
     fn open_unlocked(&self) -> Result<Opened> {
         let parent = self
             .path
@@ -803,6 +858,7 @@ impl Inner {
         let connection = open_connection(&self.path)?;
         remove_stale_builds(&self.path, STALE_BUILD_AGE);
         Ok(if self.is_current(&connection) {
+            crate::reconciliation::check_stored_order_ids(&connection)?;
             Opened::Ready(connection)
         } else {
             Opened::Behind(connection)
@@ -877,6 +933,7 @@ impl Inner {
         if let Some(legacy) = self.legacy.as_deref().filter(|p| p.exists()) {
             import_legacy(&mut connection, legacy)?;
         }
+        crate::reconciliation::check_stored_order_ids(&connection)?;
         drop(held);
         Ok(connection)
     }
@@ -1105,7 +1162,9 @@ fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
         .map_err(sql)
 }
 /// One-time import of the pre-SQLite JSON journal, recorded in `meta` so a
-/// retained legacy file is never replayed.
+/// retained legacy file is never replayed. It runs after the migrations, so
+/// the order IDs it brings in are made canonical here, as the migration
+/// does for those already stored.
 fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
     if meta::exists(connection, "legacy_imported")? {
         return Ok(());
@@ -1151,6 +1210,7 @@ fn import_legacy(connection: &mut Connection, legacy: &Path) -> Result<()> {
                 .map_err(sql)?;
         }
     }
+    crate::reconciliation::canonicalize_stored_order_ids(&tx)?;
     meta::put(&tx, "legacy_imported", "1")?;
     tx.commit().map_err(sql)?;
     Ok(())
@@ -1516,9 +1576,8 @@ mod tests {
         Connection::open(first.path())
             .unwrap()
             .execute_batch(
-                "DROP TABLE activity;
-                 DELETE FROM schema_migrations WHERE version=6;
-                 UPDATE meta SET value='5' WHERE key='schema'",
+                "DELETE FROM schema_migrations WHERE version=7;
+                 UPDATE meta SET value='6' WHERE key='schema'",
             )
             .unwrap();
         StateDatabase::new(first.path().to_owned())
@@ -1608,6 +1667,34 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(290));
         released.join().unwrap();
         assert!(database.run(|c| meta::exists(c, "patient")).await.unwrap());
+    }
+
+    /// A repair is one of the openers that take turns at the init lock:
+    /// while another holds it, the repair waits and does not run, and once
+    /// it lets go, the repair goes ahead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repair_waits_for_a_busy_opener_that_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = StateDatabase::new(dir.path().join("repair.json"));
+        database.open().unwrap();
+        let held = hold_init_lock(&database);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let waited = tokio::time::timeout(
+            Duration::from_millis(300),
+            database.repairing(move |c| {
+                flag.store(true, Ordering::Relaxed);
+                insert(c, "early")
+            }),
+        )
+        .await;
+        assert!(waited.is_err(), "the lock was held: {waited:?}");
+        held.unlock().unwrap();
+        assert_lock_given_back(&database).await;
+        assert!(!ran.load(Ordering::Relaxed));
+        database.repairing(|c| insert(c, "repaired")).await.unwrap();
+        assert!(database.run(|c| meta::exists(c, "repaired")).await.unwrap());
+        assert!(!database.run(|c| meta::exists(c, "early")).await.unwrap());
     }
 
     /// The turn to write has its own wait, counted from when the file is

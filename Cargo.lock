@@ -4147,6 +4147,7 @@ dependencies = [
  "parking_lot 0.13.0",
  "reqwest",
  "ring",
+ "rusqlite",
  "rust_decimal",
  "rustyschwab",
  "rustyschwab-types",

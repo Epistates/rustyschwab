@@ -719,7 +719,7 @@ async fn order(
                 ),
             };
             if let Some(id) = args.get("order_id").and_then(Value::as_str)
-                && (id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()))
+                && !rustyschwab::execution::is_broker_order_id(id)
             {
                 return Err(StatusCode::BAD_REQUEST.into());
             }
