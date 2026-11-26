@@ -1589,6 +1589,159 @@ async fn option_strategies_reserve_their_defined_risk() {
     assert!(refused.to_string().contains("no bound"), "{refused}");
 }
 
+/// `base` with each field of `change` set to its value, or removed where
+/// the value is null.
+fn changed(mut base: Value, change: Value) -> Value {
+    for (field, value) in change.as_object().unwrap() {
+        if value.is_null() {
+            base.as_object_mut().unwrap().remove(field);
+        } else {
+            base[field] = value.clone();
+        }
+    }
+    base
+}
+
+/// How the provider judges a sell of one of the 100 MSFT shares the
+/// account holds, with `working` at the broker and `limits`: a sell draws
+/// on no buy capacity, so only a working order it cannot bound stops it.
+async fn sell_beside(working: Value, limits: PortfolioLimits) -> rustyschwab::Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 100, "instrument": {"symbol": "MSFT", "assetType": "EQUITY"}}]
+        }),
+        vec![working],
+    )
+    .await;
+    risk(&journal, limits)
+        .check("A", &order("SELL", "MSFT", 1, "10"), None)
+        .await
+}
+
+/// Whether `result` refuses an order because a working order at the
+/// broker cannot be bounded.
+fn unbounded(result: &rustyschwab::Result<()>) -> bool {
+    matches!(result, Err(rustyschwab::Error::RiskDenied(reason))
+        if reason == "External open order needs a supported, bounded risk model")
+}
+
+/// A working order at the broker counts what its unfilled remainder could
+/// still buy or sell, nothing once it is filled in full. One the provider
+/// cannot bound stops every order on the account, even a sell of another
+/// symbol: one with no status, that is not a single order, that no limit
+/// price bounds, with no legs or a leg that is not a long equity buy or
+/// sell, without a positive price, or whose figures do not hold together.
+/// Each figure is checked on its own, so a negative quantity is refused
+/// even where it is too small to change a sum of very large ones.
+#[tokio::test]
+async fn a_working_order_the_provider_cannot_bound_stops_every_order() {
+    let working = |change: Value| {
+        changed(
+            json!({"orderId": 7, "status": "WORKING", "orderStrategyType": "SINGLE",
+                "orderType": "LIMIT", "quantity": 5, "filledQuantity": 0, "remainingQuantity": 5,
+                "price": 10, "orderLegCollection": [{"instruction": "BUY", "quantity": 5,
+                    "instrument": {"assetType": "EQUITY", "symbol": "AAPL"}}]}),
+            change,
+        )
+    };
+    let leg = |instruction: &str, asset: &str, symbol: &str| {
+        json!([{"instruction": instruction, "quantity": 5,
+            "instrument": {"assetType": asset, "symbol": symbol}}])
+    };
+    // Shares past what a decimal holds to the billionth, so that a billionth
+    // more or less rounds away in a sum.
+    let huge = "100000000000000000000";
+    for (case, change) in [
+        json!({"status": null}),
+        json!({"orderStrategyType": "TRIGGER"}),
+        json!({"orderType": "MARKET", "price": null}),
+        json!({"orderType": "TRAILING_STOP_LIMIT"}),
+        json!({"orderLegCollection": []}),
+        json!({"orderLegCollection": leg("BUY", "MUTUAL_FUND", "VFIAX")}),
+        json!({"orderLegCollection": leg("SELL_SHORT", "EQUITY", "AAPL")}),
+        json!({"price": 0}),
+        json!({"filledQuantity": null}),
+        // Filled past the order, or a negative fill or remainder.
+        json!({"filledQuantity": 6, "remainingQuantity": -1}),
+        json!({"filledQuantity": -1, "remainingQuantity": 6}),
+        json!({"quantity": -5, "remainingQuantity": -5}),
+        // A remainder past the order, or parts that miss the total.
+        json!({"remainingQuantity": 6}),
+        json!({"filledQuantity": 2, "remainingQuantity": 2}),
+        json!({"quantity": huge, "filledQuantity": "-0.000000001", "remainingQuantity": huge}),
+        json!({"quantity": huge, "filledQuantity": huge, "remainingQuantity": "-0.000000001"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), limits()).await;
+        assert!(unbounded(&judged), "case {case}: {judged:?}");
+    }
+    for (case, change) in [
+        json!({}),
+        json!({"orderType": "STOP_LIMIT", "stopPrice": 9}),
+        json!({"filledQuantity": 2, "remainingQuantity": null}),
+        json!({"filledQuantity": 5, "remainingQuantity": 0}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), limits()).await;
+        assert!(judged.is_ok(), "case {case}: {judged:?}");
+    }
+}
+
+/// A working option strategy at the broker counts the unfilled share of
+/// its defined risk, from all of it while unfilled to none once filled in
+/// full. One the provider cannot bound stops every order on the account:
+/// one with no status, that is not a single order, or whose unfilled
+/// count is below zero or above the order's.
+#[tokio::test]
+async fn a_working_strategy_counts_its_unfilled_share_or_stops_every_order() {
+    let working = |change: Value| {
+        changed(
+            json!({"orderId": 8, "status": "WORKING", "orderStrategyType": "SINGLE",
+                "orderType": "NET_DEBIT", "session": "NORMAL", "duration": "DAY", "price": 2,
+                "quantity": 2, "filledQuantity": 1, "remainingQuantity": 1,
+                "orderLegCollection": [
+                    {"orderLegType": "OPTION", "instruction": "BUY_TO_OPEN", "quantity": 2,
+                     "instrument": {"assetType": "OPTION", "symbol": C100}},
+                    {"orderLegType": "OPTION", "instruction": "SELL_TO_OPEN", "quantity": 2,
+                     "instrument": {"assetType": "OPTION", "symbol": C105}}]}),
+            change,
+        )
+    };
+    for (case, change) in [
+        json!({"status": null}),
+        json!({"orderStrategyType": "TRIGGER"}),
+        json!({"filledQuantity": 3, "remainingQuantity": -1}),
+        json!({"filledQuantity": 0, "remainingQuantity": 3}),
+        json!({"quantity": 0, "filledQuantity": 0, "remainingQuantity": 0}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), verified()).await;
+        assert!(unbounded(&judged), "case {case}: {judged:?}");
+    }
+    for (case, change) in [
+        json!({}),
+        json!({"filledQuantity": 0, "remainingQuantity": 2}),
+        json!({"filledQuantity": 2, "remainingQuantity": 0}),
+        json!({"remainingQuantity": null}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let judged = sell_beside(working(change), verified()).await;
+        assert!(judged.is_ok(), "case {case}: {judged:?}");
+    }
+}
+
 /// A store that implements only what [`ExecutionStore`] requires, over a
 /// journal, so that the trait's own defaults answer everything else.
 struct RequiredOnly(OrderJournal);
