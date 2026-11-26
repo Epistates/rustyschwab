@@ -460,6 +460,100 @@ async fn an_operator_releases_a_reservation_only_for_a_resolved_submission() {
     );
 }
 
+/// A refusal or an operator's resolution frees the reservation held for
+/// the intent and audits the release as `risk_released`; an acceptance
+/// keeps it, and an intent that holds none releases nothing and audits no
+/// release.
+#[tokio::test]
+async fn a_resolution_audits_the_release_of_the_reservation_it_frees() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(&journal, funded()["securitiesAccount"].clone(), vec![]).await;
+    let risk = risk(&journal, limits());
+    let buy = order("BUY", "AAPL", 1, "10");
+    let resolve = |reserved: bool, outcome: SubmissionOutcome| {
+        let (journal, risk, buy) = (&journal, &risk, &buy);
+        async move {
+            let id = journal
+                .begin("A", "place_order", serde_json::to_value(buy).unwrap())
+                .await
+                .unwrap();
+            if reserved {
+                risk.reserve("A", &id, buy).await.unwrap();
+            }
+            journal.finish(&id, outcome).await.unwrap();
+            id
+        }
+    };
+    let refused = resolve(true, SubmissionOutcome::Rejected).await;
+    resolve(false, SubmissionOutcome::Rejected).await;
+    let accepted = SubmissionOutcome::Accepted {
+        order_id: Some("42".into()),
+    };
+    resolve(true, accepted).await;
+    let evidence = "broker shows no such order".into();
+    let settled = resolve(true, SubmissionOutcome::Reconciled { evidence }).await;
+    let released: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "risk_released")
+        .map(|e| e.subject)
+        .collect();
+    assert_eq!(released, vec![refused, settled]);
+}
+
+/// A dispatcher that comes back late to an intent recovery already
+/// resolved as never sent may still report it refused: the same answer is
+/// not a conflict. Any other answer for it is.
+#[tokio::test]
+async fn a_late_refusal_of_an_intent_recovery_resolved_is_not_a_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let id = journal
+        .begin("A", "place_order", json!({"tag": "t1"}))
+        .await
+        .unwrap();
+    age_submissions(&journal, Duration::from_secs(11 * 60));
+    let report = journal
+        .database()
+        .reconcile_snapshot(
+            "A",
+            1,
+            chrono::Utc::now().timestamp_millis(),
+            funded(),
+            vec![],
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.never_dispatched_attempts, vec![id.clone()]);
+    journal
+        .finish(&id, SubmissionOutcome::Rejected)
+        .await
+        .unwrap();
+    for (case, outcome) in [
+        SubmissionOutcome::Accepted {
+            order_id: Some("42".into()),
+        },
+        SubmissionOutcome::Accepted { order_id: None },
+        SubmissionOutcome::Reconciled {
+            evidence: "broker shows order 42".into(),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                journal.finish(&id, outcome).await,
+                Err(rustyschwab::Error::Duplicate(_))
+            ),
+            "case {case}"
+        );
+    }
+}
+
 /// A cash account has `cashAvailableForTrading`, not `availableFunds`:
 /// it can buy within its cash and sell what it holds.
 #[tokio::test]
@@ -1467,6 +1561,47 @@ async fn an_approval_names_the_operator_who_granted_it() {
     );
 }
 
+/// An approval needs an operator who is not the principal, by name, for
+/// the intent's SHA-256 digest: exactly 64 hexadecimal digits. It must
+/// expire after now and at most an hour from now. Anything else is refused
+/// and grants nothing.
+#[tokio::test]
+async fn an_approval_needs_another_operator_a_digest_and_an_expiry_within_the_hour() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let digest = "d".repeat(64);
+    let (short, long, not_hex) = ("d".repeat(63), "d".repeat(65), "g".repeat(64));
+    let now = chrono::Utc::now().timestamp();
+    for (case, (operator, digest, expires_at)) in [
+        ("desk", &digest, now + 600),
+        (" ", &digest, now + 600),
+        ("operator", &short, now + 600),
+        ("operator", &long, now + 600),
+        ("operator", &not_hex, now + 600),
+        ("operator", &digest, now - 1),
+        ("operator", &digest, now),
+        ("operator", &digest, now + 7200),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(
+                journal.approve("desk", digest, operator, expires_at).await,
+                Err(rustyschwab::Error::InvalidParameter(_))
+            ),
+            "case {case}"
+        );
+    }
+    assert_eq!(journal.approval_operator(&digest).await.unwrap(), None);
+    // An hour from now is the longest an approval may last.
+    journal
+        .approve("desk", &digest, "operator", now + 3600)
+        .await
+        .unwrap();
+    assert!(journal.is_approved("desk", &digest).await.unwrap());
+}
+
 /// An intent awaiting approval is recorded with its arguments, and its
 /// state follows the approval through grant, use and lapse.
 #[tokio::test]
@@ -1516,6 +1651,99 @@ async fn intents_awaiting_approval_are_recorded_with_their_state() {
         .await
         .unwrap();
     assert_eq!(state(&journal).await.state, IntentState::Spent);
+}
+
+/// An intent reads as lapsed once its approval expires unused, and as
+/// revoked once an operator revokes it, whether it was approved, spent, or
+/// never approved at all.
+#[tokio::test]
+async fn an_intent_reads_as_lapsed_or_revoked() {
+    use rustyschwab::execution::IntentState;
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("audit.json"));
+    let state = |digest: &str| {
+        let (journal, digest) = (journal.clone(), digest.to_owned());
+        async move {
+            journal
+                .intents(Some(&digest), 0, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .state
+        }
+    };
+    let (lapsed, spent, unapproved) = ("e".repeat(64), "f".repeat(64), "0".repeat(64));
+    for digest in [&lapsed, &spent, &unapproved] {
+        journal
+            .record_intent("desk", digest, "place_order", &json!({}))
+            .await
+            .unwrap();
+    }
+    let later = chrono::Utc::now().timestamp() + 600;
+    for digest in [&lapsed, &spent] {
+        journal
+            .approve("desk", digest, "operator", later)
+            .await
+            .unwrap();
+    }
+    let lapse = lapsed.clone();
+    journal
+        .database()
+        .run(move |c| {
+            c.execute("UPDATE approvals SET expires_at=1 WHERE digest=?1", [lapse])
+                .map_err(|e| rustyschwab::Error::Storage(e.to_string()))
+        })
+        .await
+        .unwrap();
+    assert_eq!(state(&lapsed).await, IntentState::Lapsed);
+    journal
+        .begin_once("desk", "place_order", json!({}), Some(spent.clone()))
+        .await
+        .unwrap();
+    assert_eq!(state(&spent).await, IntentState::Spent);
+    for digest in [&lapsed, &spent, &unapproved] {
+        journal.revoke_approval(digest, "operator").await.unwrap();
+        assert_eq!(state(digest).await, IntentState::Revoked, "{digest}");
+    }
+}
+
+/// Setting or clearing the operator halt names who did it, and a halt
+/// gives its reason: a blank operator or reason is refused and changes
+/// nothing. Each change is audited under its operator.
+#[tokio::test]
+async fn the_operator_halt_is_set_and_cleared_by_name_and_with_a_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let refused = |result: rustyschwab::Result<()>| {
+        matches!(result, Err(rustyschwab::Error::InvalidParameter(_)))
+    };
+    let review = || Some("review".to_owned());
+    assert!(refused(journal.set_operator_halt(review(), " ").await));
+    assert!(refused(
+        journal.set_operator_halt(Some(" ".into()), "alice").await
+    ));
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    journal.set_operator_halt(review(), "alice").await.unwrap();
+    assert!(refused(journal.set_operator_halt(None, "").await));
+    assert_eq!(journal.operator_halt().await.unwrap(), review());
+    journal.set_operator_halt(None, "bob").await.unwrap();
+    assert_eq!(journal.operator_halt().await.unwrap(), None);
+    let changes: Vec<_> = journal
+        .audit_page(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "operator_halt_changed")
+        .map(|e| (e.subject, e.payload))
+        .collect();
+    assert_eq!(
+        changes,
+        vec![
+            ("alice".to_owned(), json!({"reason": "review"})),
+            ("bob".to_owned(), json!({"reason": null})),
+        ]
+    );
 }
 
 /// An option strategy counts the most it can lose at expiration against the
