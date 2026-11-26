@@ -704,9 +704,9 @@ async fn only_unobserved_placeholders_are_forgotten() {
 /// The broker's view of one order, recorded outside a reconciliation pass
 /// (a replacement reads the order it replaces), is kept as a pass keeps
 /// it: among the account's known orders as Schwab reported it, a target
-/// of the next pass while it works, and its tag spent. A broker order ID
-/// is a whole number; a payload without one is refused and leaves nothing
-/// behind.
+/// of the next pass while it works, and its tag spent. A payload with no
+/// order ID, or with a number that is not a whole, non-negative one, is
+/// refused and leaves nothing behind.
 #[tokio::test]
 async fn a_recorded_order_is_kept_as_reconciliation_keeps_it() {
     let dir = tempfile::tempdir().unwrap();
