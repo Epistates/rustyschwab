@@ -37,10 +37,10 @@ impl Recorder for UntaggedMatches {
 }
 
 /// An unresolved submission is counted once per pass when the broker lists
-/// an order that fits its request under another tag or none. Nothing that
-/// fits is nothing to count, and orders under our tag that leave the
-/// submission ambiguous are the evidence themselves: an untagged twin
-/// beside them is not counted.
+/// an order that fits its request under another tag or none. Orders that
+/// do not fit it, under any tag, are nothing to count, and orders under our
+/// tag that leave the submission ambiguous are the evidence themselves: an
+/// untagged twin beside them is not counted.
 #[tokio::test]
 async fn an_order_that_fits_without_our_tag_is_counted_for_an_operator() {
     let untagged = Arc::new(AtomicU64::new(0));
@@ -97,6 +97,11 @@ async fn an_order_that_fits_without_our_tag_is_counted_for_an_operator() {
     );
     assert_eq!(counted(vec![listed(None, 42)]).await, 1);
     assert_eq!(counted(vec![]).await, 0);
+    let mut larger = listed(None, 45);
+    larger["orderLegCollection"][0]["quantity"] = json!(2);
+    let mut opposite = listed(Some("API_TOS:TraderAPI"), 46);
+    opposite["orderLegCollection"][0]["instruction"] = json!("SELL");
+    assert_eq!(counted(vec![larger, opposite]).await, 0);
     assert_eq!(
         counted(vec![
             listed(Some("rs-ours"), 42),

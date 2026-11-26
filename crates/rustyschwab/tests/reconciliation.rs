@@ -9,7 +9,7 @@ use common::mock_client;
 use rustyschwab::{
     Error,
     execution::{OrderJournal, SubmissionOutcome},
-    reconciliation::{ReconciliationOptions, ReconciliationReport},
+    reconciliation::{NEVER_DISPATCHED_AFTER, ReconciliationOptions, ReconciliationReport},
     risk::{PortfolioLimits, PortfolioRisk, RiskProvider},
     types::{Decimal, trading::OrderRequest},
 };
@@ -272,6 +272,43 @@ async fn a_pass_that_releases_a_terminal_order_is_audited() {
     assert_eq!(report.terminal_attempts, vec![id]);
     assert!(report.reconciled);
     assert_eq!(audited, 1);
+}
+
+/// An unarmed intent is resolved as never dispatched only once it is older
+/// than `NEVER_DISPATCHED_AFTER` when the pass begins. At exactly that age
+/// its dispatcher may still be about to arm it, so it is left alone.
+#[tokio::test]
+async fn an_unarmed_intent_is_never_dispatched_only_past_the_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    let id = journal
+        .begin("A", "place_order", tagged(&buy(1), "unsent"))
+        .await
+        .unwrap();
+    age_submissions(&journal, Duration::from_secs(20 * 60));
+    let created_at = journal.record(&id).await.unwrap().unwrap().created_at;
+    let deadline = created_at + NEVER_DISPATCHED_AFTER.num_milliseconds();
+    let pass = |started_at: i64| {
+        journal
+            .database()
+            .reconcile_snapshot("A", 1, started_at, funded(), vec![])
+    };
+
+    let at_deadline = pass(deadline).await.unwrap();
+    assert!(at_deadline.never_dispatched_attempts.is_empty());
+    assert!(at_deadline.reconciled);
+    assert!(
+        journal
+            .record(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .outcome
+            .is_none()
+    );
+
+    let past_deadline = pass(deadline + 1).await.unwrap();
+    assert_eq!(past_deadline.never_dispatched_attempts, vec![id]);
 }
 
 /// A pass that resolves an intent as never dispatched is audited.
@@ -746,6 +783,58 @@ async fn a_reference_the_broker_cannot_account_for_fails_the_pass() {
             store.reconciliation_targets("hash").await.unwrap(),
             [order_id]
         );
+    }
+}
+
+/// Orders this store still follows that the list did not return are
+/// fetched one by one, at most `max_targeted_orders` of them: a pass with
+/// more fails before fetching any, and one with exactly that many fetches
+/// them all.
+#[tokio::test]
+async fn one_by_one_fetches_are_bounded_by_their_budget() {
+    for (max_targeted_orders, completes) in [(1, false), (2, true)] {
+        let server = MockServer::start().await;
+        let (client, _dir, _) = mock_client(&server, false);
+        let store = client.execution_store();
+        mount_empty_account(&server).await;
+        for order_id in [77, 78] {
+            store
+                .track_order("hash", &order_id.to_string())
+                .await
+                .unwrap();
+            Mock::given(method("GET"))
+                .and(path(format!("/trader/v1/accounts/hash/orders/{order_id}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"orderId": order_id, "status": "CANCELED"})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let pass = client
+            .reconcile_account_with_options(
+                "hash",
+                1,
+                ReconciliationOptions {
+                    max_targeted_orders,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(pass.is_ok(), completes, "{max_targeted_orders}: {pass:?}");
+        let fetched = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request
+                    .url
+                    .path()
+                    .starts_with("/trader/v1/accounts/hash/orders/")
+            })
+            .count();
+        assert_eq!(fetched, if completes { 2 } else { 0 });
     }
 }
 
