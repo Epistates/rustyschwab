@@ -2,6 +2,8 @@
 //! left resolve themselves, reservations follow the journal, tags the
 //! broker holds stay spent, and risk judges sells and replacements by what
 //! they can actually do.
+mod common;
+
 use rustyschwab::{
     coordination::Coordinator,
     execution::{ExecutionStore, OrderJournal, SubmissionOutcome, SubmissionRecord},
@@ -35,6 +37,8 @@ fn limits() -> PortfolioLimits {
     }
 }
 
+/// Reconcile account `A` with `account` and `orders`, and record the
+/// stocks these tests buy, AAPL and MSFT, as Schwab's common stock.
 async fn baseline(journal: &OrderJournal, account: Value, orders: Vec<Value>) {
     journal
         .database()
@@ -47,13 +51,14 @@ async fn baseline(journal: &OrderJournal, account: Value, orders: Vec<Value>) {
         )
         .await
         .unwrap();
+    common::common_stock(journal.database(), &["AAPL", "MSFT"]);
 }
 
 fn risk(journal: &OrderJournal, limits: PortfolioLimits) -> PortfolioRisk {
-    PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::from([("A".into(), limits)]),
-    }
+    PortfolioRisk::new(
+        journal.database().clone(),
+        HashMap::from([("A".into(), limits)]),
+    )
 }
 
 fn funded() -> Value {
@@ -630,6 +635,61 @@ async fn sells_are_judged_per_symbol() {
     ));
 }
 
+/// A sell only reduces what the account holds, whatever it holds, so the
+/// sell rule alone judges it: an ETF, labelled as Schwab lists the position
+/// (`COLLECTIVE_INVESTMENT`) or as `EQUITY`, sells up to the position less
+/// its other working sells, and no further. A buy of one is still refused,
+/// so the provider can trap no one in a fund it would not let them buy.
+#[tokio::test]
+async fn a_held_etf_sells_down_to_nothing_and_no_further() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = OrderJournal::new(dir.path().join("orders.json"));
+    baseline(
+        &journal,
+        json!({
+            "currentBalances": {"availableFunds": 1000},
+            "positions": [{"longQuantity": 10,
+                "instrument": {"symbol": "TQQQ", "assetType": "COLLECTIVE_INVESTMENT"}}]
+        }),
+        vec![],
+    )
+    .await;
+    let risk = risk(&journal, limits());
+    let leg = |instruction: &str, asset: &str, quantity: u32| -> OrderRequest {
+        let mut order = order(instruction, "TQQQ", quantity, "50");
+        order.order_leg_collection[0].instrument.asset_type =
+            serde_json::from_value(json!(asset)).unwrap();
+        order
+    };
+    for asset in ["COLLECTIVE_INVESTMENT", "EQUITY"] {
+        risk.check("A", &leg("SELL", asset, 10), None)
+            .await
+            .unwrap();
+    }
+    risk.reserve("A", "most", &leg("SELL", "COLLECTIVE_INVESTMENT", 6))
+        .await
+        .unwrap();
+    risk.reserve("A", "rest", &leg("SELL", "EQUITY", 4))
+        .await
+        .unwrap();
+    for asset in ["COLLECTIVE_INVESTMENT", "EQUITY"] {
+        let oversold = risk.reserve("A", "more", &leg("SELL", asset, 1)).await;
+        assert!(
+            matches!(&oversold, Err(rustyschwab::Error::RiskDenied(r))
+                if r == "Sell exceeds the position less the symbol's working sells"),
+            "{asset}: {oversold:?}"
+        );
+    }
+    let buy = risk
+        .check("A", &leg("BUY", "COLLECTIVE_INVESTMENT", 1), None)
+        .await;
+    assert!(
+        matches!(&buy, Err(rustyschwab::Error::RiskDenied(r))
+            if r.starts_with("Built-in portfolio risk covers long equity only; ETFs")),
+        "{buy:?}"
+    );
+}
+
 /// Working buys of a symbol, ours or at the broker, add to the position
 /// rather than offer any of it: the whole position may still be sold, and
 /// only a working sell takes shares out of what may be.
@@ -738,6 +798,7 @@ async fn a_policy_without_a_baseline_age_trusts_a_baseline_for_five_seconds() {
     let risk = risk(&journal, limits);
     let buy = order("BUY", "AAPL", 1, "10");
     reconciled_ago(7_500).await;
+    common::common_stock(journal.database(), &["AAPL"]);
     assert!(matches!(
         risk.reserve("A", "stale", &buy).await,
         Err(rustyschwab::Error::BaselineStale { .. })
@@ -882,6 +943,7 @@ async fn a_daily_loss_of_exactly_the_cap_still_trades() {
     let buy = order("BUY", "AAPL", 1, "10");
 
     reconciled_at("9500").await;
+    common::common_stock(journal.database(), &["AAPL"]);
     risk.observe_baseline("A").await.unwrap();
     assert_eq!(journal.operator_halt().await.unwrap(), None);
     risk.reserve("A", "at-the-cap", &buy).await.unwrap();
@@ -978,10 +1040,10 @@ fn only_an_account_with_a_daily_loss_cap_needs_the_days_transfers() {
         max_daily_loss: Some(500.into()),
         ..limits()
     };
-    let risk = PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
-    };
+    let risk = PortfolioRisk::new(
+        journal.database().clone(),
+        HashMap::from([("capped".into(), capped), ("uncapped".into(), limits())]),
+    );
     assert!(risk.needs_day_transfers("capped"));
     assert!(!risk.needs_day_transfers("uncapped"));
     assert!(!risk.needs_day_transfers("unknown"));
@@ -1536,6 +1598,7 @@ async fn a_deposit_does_not_hide_a_daily_loss() {
         )
         .await
         .unwrap();
+    common::common_stock(journal.database(), &["AAPL"]);
     risk.reserve("A", "fine", &order("BUY", "AAPL", 1, "10"))
         .await
         .unwrap();

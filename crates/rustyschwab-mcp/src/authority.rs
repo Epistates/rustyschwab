@@ -79,6 +79,9 @@ pub struct Authority {
     probe_capacity: Arc<tokio::sync::Semaphore>,
     pub required_accounts: Vec<String>,
     notifier: Option<crate::approvals::Notifier>,
+    /// The live client, through which a worker's order is screened before
+    /// `risk` judges it; paper has none.
+    market: Option<Arc<SchwabClient>>,
 }
 impl std::fmt::Debug for Authority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -98,6 +101,7 @@ impl Authority {
         required_accounts: Vec<String>,
     ) -> Self {
         Self {
+            market: Some(client.clone()),
             client,
             risk: Some(risk),
             identity,
@@ -126,6 +130,7 @@ impl Authority {
             operator_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             probe_capacity: Arc::new(tokio::sync::Semaphore::new(4)),
             notifier: None,
+            market: None,
         }
     }
     /// Tell operators through `notifier` when a trader's intent first
@@ -432,14 +437,21 @@ async fn backend(
                 }
                 *operator = identity.subject.clone();
             }
-            let value = tokio::time::timeout(
-                allowance(&identity),
-                request.execute(
-                    state.client.execution_store().as_ref(),
-                    state.client.coordinator().as_ref(),
-                    state.risk.as_deref().ok_or(StatusCode::FORBIDDEN)?,
-                ),
-            )
+            let risk = state.risk.as_deref().ok_or(StatusCode::FORBIDDEN)?;
+            let value = tokio::time::timeout(allowance(&identity), async {
+                // A worker's order reaches the provider here, not through
+                // the client that owns it, so it is screened here.
+                if let Some(market) = &state.market {
+                    request.screen(risk, market).await?;
+                }
+                request
+                    .execute(
+                        state.client.execution_store().as_ref(),
+                        state.client.coordinator().as_ref(),
+                        risk,
+                    )
+                    .await
+            })
             .await
             .map_err(|_| StatusCode::GATEWAY_TIMEOUT)??;
             if serde_json::to_vec(&value)

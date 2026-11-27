@@ -80,9 +80,9 @@ impl Account {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let journal = OrderJournal::new(dir.path().join("orders.json"));
-        let risk = PortfolioRisk {
-            database: journal.database().clone(),
-            accounts: HashMap::from([(
+        let risk = PortfolioRisk::new(
+            journal.database().clone(),
+            HashMap::from([(
                 "A".into(),
                 PortfolioLimits {
                     max_open_quantity: 100.into(),
@@ -93,13 +93,14 @@ impl Account {
                     option_multipliers: Default::default(),
                 },
             )]),
-        };
+        );
         let account = Self {
             _dir: dir,
             journal,
             risk,
         };
         account.pass(vec![]).await;
+        common::common_stock(account.journal.database(), &["AAPL"]);
         account
     }
 

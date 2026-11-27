@@ -83,8 +83,10 @@ pub(crate) enum OpClass {
     /// Changes nothing at Schwab: retried within its deadline, refused by an
     /// open breaker.
     Read,
-    /// A read that keeps the risk baseline fresh: as [`Read`](Self::Read),
-    /// from the share of the budget reads cannot take.
+    /// A read the risk checks depend on (reconciliation, which keeps the
+    /// risk baseline fresh, and the built-in provider's instrument-type
+    /// lookup): as [`Read`](Self::Read), from the share of the budget reads
+    /// cannot take.
     Recovery,
     /// Places or replaces an order: sent once under the execution lease and
     /// never retried; an ambiguous failure is `SubmissionUnknown`.
@@ -582,6 +584,12 @@ impl SchwabClient {
             replaces,
         } = submission;
         let (op, account, replaces) = (*op, account.as_str(), replaces.as_deref());
+        if let Some(risk) = &self.inner.risk {
+            // What the provider reads from the market it reads here, before
+            // the intent is journaled: no account waits behind a pending
+            // intent while it does, and an order it refuses leaves no trace.
+            risk.screen(account, order, self).await?;
+        }
         if let Some(order_id) = replaces {
             // Risk judges a replacement against the order it replaces, and
             // one this client has not reconciled yet has no exposure it can
@@ -915,6 +923,32 @@ impl SchwabClient {
         fields: &[QuoteField],
         indicative: Option<bool>,
     ) -> Result<QuotesResponse> {
+        self.quotes(
+            Op::read("get_quotes_with_options"),
+            symbols,
+            fields,
+            indicative,
+        )
+        .await
+    }
+
+    /// The quote the built-in risk provider reads a symbol's instrument
+    /// type from: as [`get_quotes`](Self::get_quotes) for that one symbol,
+    /// but from the share of the request budget reads cannot take, so other
+    /// reads cannot hold up an order behind it.
+    pub(crate) async fn risk_quote(&self, symbol: &str) -> Result<QuotesResponse> {
+        self.quotes(Op::recovery("risk_instrument_type"), &[symbol], &[], None)
+            .await
+    }
+
+    /// `GET /quotes` for `symbols`, sent as `op`.
+    async fn quotes(
+        &self,
+        op: Op,
+        symbols: &[&str],
+        fields: &[QuoteField],
+        indicative: Option<bool>,
+    ) -> Result<QuotesResponse> {
         if symbols.is_empty() {
             return Err(Error::InvalidParameter("No symbols provided".to_string()));
         }
@@ -930,13 +964,8 @@ impl SchwabClient {
         if let Some(i) = indicative {
             params.push(("indicative", i.to_string()));
         }
-        self.request_with_query(
-            Op::read("get_quotes_with_options"),
-            Method::GET,
-            "/marketdata/v1/quotes",
-            &params,
-        )
-        .await
+        self.request_with_query(op, Method::GET, "/marketdata/v1/quotes", &params)
+            .await
     }
 
     /// Get quote for a single symbol.
