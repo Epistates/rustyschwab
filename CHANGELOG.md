@@ -312,6 +312,10 @@ understated, so ETF support is left to a later release on purpose.
   its workers' requests.
 - `OrderRequest::validate` still accepts `COLLECTIVE_INVESTMENT` legs,
   for providers that take ETFs and for clients without a risk provider.
+- To see what the provider will read for a symbol, run the `auth_test`
+  example's `test-api` with the symbols to check (SPY when none are
+  given). It prints each one's `assetMainType` and `assetSubType`, then
+  the whole quote response.
 
 ### Fixed
 
