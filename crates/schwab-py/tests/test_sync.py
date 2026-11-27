@@ -6,9 +6,12 @@ import ast
 import asyncio
 import inspect
 import json
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -188,6 +191,72 @@ def test_a_call_timeout_cancels_and_the_client_stays_usable(
     assert time.monotonic() - started < 1.2
     server.on("GET", "/marketdata/v1/quotes", {"AAPL": {"symbol": "AAPL"}})
     assert client.quotes(["AAPL"])["AAPL"]["symbol"] == "AAPL"
+
+
+#: One connection to the SQLite file named by its argument: each line of input
+#: is a statement, and each line of output the first column of its first row.
+SQL_SHELL = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], isolation_level=None)
+for statement in sys.stdin:
+    row = connection.execute(statement).fetchone()
+    print("" if row is None else row[0], flush=True)
+"""
+
+
+@contextmanager
+def other_process(path: Path) -> Iterator[Callable[[str], str]]:
+    """Statements on the SQLite file at ``path``, run by a process of its own.
+
+    Python's ``sqlite3`` is another copy of SQLite than the SDK's, and on POSIX
+    SQLite's file locks belong to the process: a connection in this process
+    would not keep the SDK's out, and closing it could release the SDK's locks.
+    """
+    with subprocess.Popen(
+        [sys.executable, "-c", SQL_SHELL, str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as shell:
+        assert shell.stdin is not None and shell.stdout is not None
+        stdin, stdout = shell.stdin, shell.stdout
+
+        def execute(statement: str) -> str:
+            stdin.write(statement + "\n")
+            stdin.flush()
+            answer = stdout.readline()
+            assert answer, f"the SQL shell stopped at {statement!r}"
+            return answer.rstrip("\n")
+
+        try:
+            yield execute
+        finally:
+            # The end of its input ends the shell, which rolls back.
+            stdin.close()
+
+
+def test_a_call_cancelled_during_setup_leaves_the_setup_to_finish(
+    server: MockSchwab, tokens: Path
+) -> None:
+    server.on("GET", "/marketdata/v1/quotes", {"AAPL": {"symbol": "AAPL"}})
+    client = sync.Client(client_config(server, tokens), timeout=0.2)
+    # The first call sets the client up, which writes to the state file,
+    # `tokens.orders.store/state.sqlite3` beside the token file. Another
+    # process holding the file's write lock holds that write up, as a slow
+    # disk holds a commit.
+    with other_process(tokens.with_suffix(".orders.store") / "state.sqlite3") as execute:
+        execute("BEGIN IMMEDIATE")
+        with pytest.raises(TimeoutError):
+            client.quotes(["AAPL"])
+        execute("ROLLBACK")
+        # Nobody is waiting for the setup now, and it finishes all the same.
+        marked = "SELECT COUNT(*) FROM meta WHERE key='execution_mode'"
+        wait_for(lambda: execute(marked) == "1")
+        # It is kept: the next call needs no write, so another writer holding
+        # the file does not hold it up.
+        execute("BEGIN IMMEDIATE")
+        assert client.quotes(["AAPL"])["AAPL"]["symbol"] == "AAPL"
+        execute("ROLLBACK")
 
 
 def test_a_timeout_raised_by_the_sdk_keeps_its_type_and_its_cause(
