@@ -297,13 +297,15 @@ async fn a_location_without_an_order_id_leaves_the_order_to_its_tag() {
 
 /// Wind the state file at `path` back to schema version 6, the last release
 /// before order IDs were canonical, as that release left it: the canonical
-/// ID migration changes no tables, so this is exactly such a file. Returns
-/// a connection to write what that release could store.
+/// ID migration changes no tables, and the table the one after it adds is
+/// dropped, so this is exactly such a file. Returns a connection to write
+/// what that release could store.
 fn as_left_by_an_earlier_release(path: &Path) -> rusqlite::Connection {
     let state = rusqlite::Connection::open(path).unwrap();
     state
         .execute_batch(
-            "DELETE FROM schema_migrations WHERE version>6;
+            "DROP TABLE instrument_types;
+             DELETE FROM schema_migrations WHERE version>6;
              UPDATE meta SET value='6' WHERE key='schema';",
         )
         .unwrap();
@@ -836,7 +838,7 @@ async fn opening_an_earlier_state_file_canonicalizes_every_order_id() {
     upgraded.records().await.unwrap();
     assert_eq!(
         rows(&state, "SELECT value FROM meta WHERE key='schema'"),
-        vec!["7"]
+        vec!["8"]
     );
     // Every table that links to orders holds only their own IDs.
     assert_eq!(
@@ -1007,10 +1009,7 @@ async fn a_state_file_that_breaks_the_order_id_invariant_does_not_open() {
 async fn a_replacement_names_the_order_it_replaces_by_a_whole_number() {
     let dir = tempfile::tempdir().unwrap();
     let journal = OrderJournal::new(dir.path().join("orders.json"));
-    let risk = PortfolioRisk {
-        database: journal.database().clone(),
-        accounts: HashMap::new(),
-    };
+    let risk = PortfolioRisk::new(journal.database().clone(), HashMap::new());
     for id in NOT_ORDER_IDS {
         assert!(
             matches!(

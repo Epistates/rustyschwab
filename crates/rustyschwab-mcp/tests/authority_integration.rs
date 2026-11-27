@@ -1,17 +1,18 @@
 use rustyschwab::{
-    SchwabClient, SchwabConfig,
+    Error, SchwabClient, SchwabConfig,
     auth::{FileTokenStore, TokenSet, TokenStore, TokenStoreKind},
     coordination::Coordinator,
     execution::{ExecutionStore, SubmissionOutcome},
     remote::RemoteBackend,
-    risk::{PortfolioLimits, PortfolioRisk},
+    risk::{PortfolioLimits, PortfolioRisk, RiskProvider},
+    types::trading::OrderRequest,
 };
 use rustyschwab_mcp::authority::{Authority, IdentityVerifier, ServiceIdentity, router};
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
+    matchers::{method, path, query_param},
 };
 struct TestIdentity;
 #[async_trait::async_trait]
@@ -104,9 +105,9 @@ async fn setup() -> Setup {
     )
     .await
     .unwrap();
-    let risk = Arc::new(PortfolioRisk {
-        database: db,
-        accounts: HashMap::from([(
+    let risk = Arc::new(PortfolioRisk::new(
+        db,
+        HashMap::from([(
             "A".into(),
             PortfolioLimits {
                 max_open_quantity: 2.into(),
@@ -117,13 +118,22 @@ async fn setup() -> Setup {
                 option_multipliers: Default::default(),
             },
         )]),
-    });
+    ));
     let client = Arc::new(client.with_risk_provider(risk.clone()).unwrap());
     // The market every trader's price collar judges an AAPL limit against.
     Mock::given(method("GET"))
         .and(path("/marketdata/v1/AAPL/quotes"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "AAPL": {"symbol": "AAPL", "quote": {"bidPrice": 9.9, "askPrice": 10.0}}
+        })))
+        .mount(&broker)
+        .await;
+    // What Schwab calls AAPL, which the risk provider reads before a buy.
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .and(query_param("symbols", "AAPL"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "AAPL": {"symbol": "AAPL", "assetMainType": "EQUITY", "assetSubType": "COE"}
         })))
         .mount(&broker)
         .await;
@@ -644,4 +654,45 @@ async fn gateway_enforces_the_price_collar_and_the_daily_budget() {
         "{over}"
     );
     s.broker.verify().await;
+}
+
+/// A worker's order reaches the authority's risk provider through the
+/// backend route rather than through the client that owns the provider, so
+/// the authority screens it with its own client: a buy of an ETF ordered as
+/// `EQUITY` is refused by Schwab's word for it, at a reservation, a
+/// replacement and a check alike, and a buy of common stock is reserved.
+#[tokio::test]
+async fn a_workers_buy_is_screened_by_the_authority() {
+    let s = setup().await;
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .and(query_param("symbols", "SPY"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "SPY": {"symbol": "SPY", "assetMainType": "EQUITY", "assetSubType": "ETF"}
+        })))
+        .mount(&s.broker)
+        .await;
+    let worker =
+        RemoteBackend::new(&format!("{}/v1/backend", s.url), "b".repeat(32).into()).unwrap();
+    let buy = |symbol: &str| -> OrderRequest {
+        let mut order = order("worker");
+        order["orderLegCollection"][0]["instrument"]["symbol"] = symbol.into();
+        serde_json::from_value(order).unwrap()
+    };
+    let etfs = "Built-in portfolio risk covers long equity only; ETFs need a deployment's \
+        own risk provider";
+    for refused in [
+        worker.reserve("A", "etf", &buy("SPY")).await,
+        worker
+            .reserve_replacement("A", "etf-replacement", &buy("SPY"), "123")
+            .await,
+        worker.check("A", &buy("SPY"), None).await,
+    ] {
+        assert!(
+            matches!(&refused, Err(Error::RiskDenied(r)) if r == etfs),
+            "{refused:?}"
+        );
+    }
+    worker.check("A", &buy("AAPL"), None).await.unwrap();
+    worker.reserve("A", "stock", &buy("AAPL")).await.unwrap();
 }

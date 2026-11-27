@@ -318,6 +318,68 @@ async fn an_abandoned_submission_still_records_its_outcome() {
     server.verify().await;
 }
 
+/// A caller that stops waiting during the client's first-use setup abandons
+/// only its wait: the setup runs to its end and is kept, so the next call
+/// does not start it again.
+#[tokio::test]
+async fn an_abandoned_first_call_still_finishes_the_setup() {
+    let server = MockServer::start().await;
+    let (client, _dir, _) = client(&server, false);
+    // Another connection holds the state file's write lock, as a slow disk
+    // holds a commit: the setup's write starts and waits inside SQLite.
+    let blocker = rusqlite::Connection::open(client.order_journal().database().path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), client.init())
+            .await
+            .is_err()
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    // Nobody is waiting for the setup now, and it finishes all the same.
+    let marked = || {
+        blocker
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key='execution_mode'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marked() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the abandoned setup never finished");
+    // It is kept: the client is ready without writing again, so another
+    // writer holding the file does not hold it up.
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ready = client.init().await;
+    blocker.execute_batch("ROLLBACK").unwrap();
+    ready.unwrap();
+}
+
+/// A live client refuses a state file that belongs to the paper venue,
+/// whether the file says so by its mode or by holding a paper configuration.
+#[tokio::test]
+async fn a_live_client_refuses_a_paper_state_file() {
+    let server = MockServer::start().await;
+    for (key, value) in [("execution_mode", "paper"), ("paper_config", "{}")] {
+        let (client, _dir, _) = client(&server, false);
+        rusqlite::Connection::open(client.order_journal().database().path())
+            .unwrap()
+            .execute("INSERT INTO meta VALUES(?1,?2)", [key, value])
+            .unwrap();
+        let error = client.init().await.unwrap_err();
+        assert!(
+            matches!(&error, Error::Config(message) if message.contains("paper execution state")),
+            "{key}: {error:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cancelled_submission_remains_pending_on_restart() {
     let server = MockServer::start().await;
@@ -1306,9 +1368,9 @@ async fn the_daily_loss_limit_refuses_orders_until_transfers_can_be_read() {
     use wiremock::matchers::query_param;
     let server = MockServer::start().await;
     let (base, _dir, _) = client(&server, false);
-    let risk = Arc::new(PortfolioRisk {
-        database: base.order_journal().database().clone(),
-        accounts: HashMap::from([(
+    let risk = Arc::new(PortfolioRisk::new(
+        base.order_journal().database().clone(),
+        HashMap::from([(
             "hash".into(),
             PortfolioLimits {
                 max_open_quantity: 10.into(),
@@ -1319,7 +1381,7 @@ async fn the_daily_loss_limit_refuses_orders_until_transfers_can_be_read() {
                 option_multipliers: Default::default(),
             },
         )]),
-    });
+    ));
     let client = base.with_risk_provider(risk.clone()).unwrap();
     Mock::given(path("/trader/v1/accounts/hash/orders"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
@@ -1406,11 +1468,19 @@ async fn replacing_an_unreconciled_order_reads_it_before_the_risk_check() {
         option_multipliers: Default::default(),
     };
     let client = base
-        .with_risk_provider(Arc::new(PortfolioRisk {
-            database: db,
-            accounts: HashMap::from([("hash".into(), limits)]),
-        }))
+        .with_risk_provider(Arc::new(PortfolioRisk::new(
+            db,
+            HashMap::from([("hash".into(), limits)]),
+        )))
         .unwrap();
+    // What Schwab calls AAPL, which the provider reads before the buy.
+    Mock::given(method("GET"))
+        .and(path("/marketdata/v1/quotes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "AAPL": {"symbol": "AAPL", "assetMainType": "EQUITY", "assetSubType": "COE"}
+        })))
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path("/trader/v1/accounts/hash/orders/77"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

@@ -89,10 +89,10 @@ async fn main() -> anyhow::Result<()> {
         rustyschwab_mcp::status::check_risk_freshness(interval, baseline_max_age, &limits)
             .map_err(anyhow::Error::msg)?;
         let accounts: Vec<String> = limits.keys().cloned().collect();
-        let risk = Arc::new(PortfolioRisk {
-            database: live.order_journal().database().clone(),
-            accounts: limits,
-        });
+        let risk = Arc::new(PortfolioRisk::new(
+            live.order_journal().database().clone(),
+            limits,
+        ));
         let live = Arc::new(live.with_risk_provider(risk.clone())?);
         authority = Arc::new(
             rustyschwab_mcp::authority::Authority::new(

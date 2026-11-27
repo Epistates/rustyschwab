@@ -121,7 +121,7 @@ added or removed without updating it.
 | `get_trade_journal` | Orders (read) | Your own write dispatches with their rationale and outcome. |
 | `get_performance` | Orders (read) | Round trips, realized and unrealized P&L, win rate, drawdown, Sharpe and Sortino from the account's fills. |
 | `build_order` | Orders (write) | Expand a compact spec (`limit`, `bracket`, `oco`, …) into order JSON, locally. |
-| `check_order` | Orders (write) | Every local reason a submission would fail, and the intent digest to approve, without contacting Schwab. |
+| `check_order` | Orders (write) | Every local reason a submission would fail, and the intent digest to approve, without sending anything to Schwab. |
 | `preview_order` | Orders (write) | Schwab's dry run: fees, buying-power impact, validation. |
 | `place_order` | Orders (write) | Submit an order. Gated. |
 | `cancel_order` | Orders (write) | Cancel a working order. Gated. |
@@ -361,8 +361,9 @@ keeps Schwab's full shape, and is read-only and not audited.
 
 `check_order(account_hash, order, order_id?, rationale?)` evaluates a
 `place_order` (or, with `order_id`, a `replace_order`) intent against
-everything this server enforces locally and answers without contacting
-Schwab:
+everything this server enforces locally and answers without sending
+anything to Schwab (it may read quotes: the venue's for a price collar
+and, for a buy of stock, the symbol's instrument type):
 
 ```json
 {"allowed": false,

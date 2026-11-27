@@ -59,3 +59,18 @@ pub fn mock_client_with(
     adjust(&mut config);
     (SchwabClient::new(config).unwrap(), dir, tokens)
 }
+
+/// Record in `database` that Schwab calls each of `symbols` plain common
+/// stock, as the built-in risk provider's screen of a buy of it would have,
+/// for tests that reserve or check through the provider directly.
+pub fn common_stock(database: &rustyschwab::storage::StateDatabase, symbols: &[&str]) {
+    let connection = rusqlite::Connection::open(database.path()).unwrap();
+    for symbol in symbols {
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO instrument_types VALUES(?1,'EQUITY','COE',?2)",
+                rusqlite::params![symbol, Utc::now().timestamp_millis()],
+            )
+            .unwrap();
+    }
+}

@@ -239,6 +239,7 @@ async fn upgrading_a_pre_chain_database_backfills_a_valid_chain() {
                  ALTER TABLE audit DROP COLUMN prev_hash;
                  ALTER TABLE audit DROP COLUMN hash;
                  DROP TABLE activity;
+                 DROP TABLE instrument_types;
                  DELETE FROM schema_migrations WHERE version>=5;
                  UPDATE meta SET value='4' WHERE key='schema';",
             )

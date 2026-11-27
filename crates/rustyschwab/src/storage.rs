@@ -219,6 +219,15 @@ const MIGRATIONS: &[Migration] = &[
         sql: "",
         backfill: Some(crate::reconciliation::canonicalize_stored_order_ids),
     },
+    // What Schwab's quote calls each symbol the built-in risk provider has
+    // been asked to buy, and when it was read, so a symbol is looked up
+    // once an hour rather than once an order (see `risk::PortfolioRisk`).
+    Migration {
+        version: 8,
+        name: "instrument_types",
+        sql: "CREATE TABLE IF NOT EXISTS instrument_types(symbol TEXT PRIMARY KEY, asset_main_type TEXT NOT NULL, asset_sub_type TEXT NOT NULL, observed_at INTEGER NOT NULL);",
+        backfill: None,
+    },
 ];
 const SCHEMA_VERSION: u32 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
@@ -1575,10 +1584,11 @@ mod tests {
         first.open().unwrap();
         Connection::open(first.path())
             .unwrap()
-            .execute_batch(
-                "DELETE FROM schema_migrations WHERE version=7;
-                 UPDATE meta SET value='6' WHERE key='schema'",
-            )
+            .execute_batch(&format!(
+                "DELETE FROM schema_migrations WHERE version={SCHEMA_VERSION};
+                 UPDATE meta SET value='{}' WHERE key='schema'",
+                SCHEMA_VERSION - 1
+            ))
             .unwrap();
         StateDatabase::new(first.path().to_owned())
     }

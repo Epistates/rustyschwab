@@ -288,24 +288,88 @@ request is sent:
   `order_id` is `None`. Reconciliation places the order by its tag, as it
   does an accepted order with no `Location`.
 
-### Changed — the built-in risk provider leaves ETFs out on purpose
+### Changed — the built-in risk provider buys only common stock and depositary receipts
 
-`PortfolioRisk` covers long equity and defined-risk option strategies.
-ETFs are not covered: judged as a stock, a leveraged or inverse fund's
-risk would be understated, so ETF support is left to a later release on
-purpose.
+`PortfolioRisk` covers buys of common stock and depositary receipts,
+sells of what the account holds, and defined-risk option strategies. ETFs are not covered:
+judged as a stock, a leveraged or inverse fund's risk would be
+understated, so ETF support is left to a later release on purpose.
 
-- An order whose leg is `COLLECTIVE_INVESTMENT` was already refused as
-  another asset; it is now refused with a `RiskDenied` that names ETFs
-  and the remedy, a deployment's own risk provider.
-- The provider cannot tell an ETF ordered as `EQUITY` from a stock, and
-  judges it as one. A deployment that trades ETFs should use its own
-  provider.
+- A buy is judged by what Schwab says the symbol is. Before a buy of an
+  `EQUITY` leg is journaled, the provider reads the symbol's quote and
+  takes only an `assetMainType` of `EQUITY` with an `assetSubType` of
+  `COE` (common stock), `ADR` or `GDR` (depositary receipts). Anything
+  else is refused as `RiskDenied`, naming what it is: ETFs (`Built-in
+  portfolio risk covers long equity only; ETFs need a deployment's own
+  risk provider`), exchange-traded notes, closed-end funds, unit
+  investment trusts, preferred shares, warrants, rights, mutual funds and
+  money market funds, and any symbol Schwab classifies as neither.
+- ETFs are refused because the limits would understate their leverage. A
+  depositary receipt carries no leverage, and its ratio is already in its
+  price, so the notional, quantity and funds limits bound it exactly as
+  they bound a stock.
+- A buy of a leg labelled `COLLECTIVE_INVESTMENT`, as Schwab lists an ETF
+  position, was already refused as another asset; it is now refused as
+  an ETF, without a lookup.
+- A refused buy leaves no trace: through a client or the authority's
+  gateway it is refused before it is journaled, and nothing reaches
+  Schwab. `check_risk` (MCP `check_order`) screens the order first, so it
+  gives the same reason. A remote worker has journaled its intent before
+  the authority judges it, so a refusal there is recorded as a rejection,
+  as any risk refusal is.
+- When the lookup fails the buy is refused with the lookup's own error,
+  retryable when the failure is (a timeout or a 5xx). No symbol is
+  assumed to be stock.
+- The lookup is one request, on the first buy of a symbol in an hour,
+  drawn from the share of the request budget reconciliation uses. What it
+  read is kept for an hour in a new `instrument_types` table in the state
+  file, shared by every process using it.
+- Nothing is looked up for a sell (see Fixed) or for an option strategy's
+  underlying: a sell can only reduce what the account holds, and a
+  strategy's legs bound what it can lose.
+- **Breaking (Rust):** `PortfolioRisk`'s fields are private. Migration:
+  build it with `PortfolioRisk::new(database, accounts)` where you wrote
+  `PortfolioRisk { database, accounts }`.
+- `RiskProvider` has a new method, `screen`, which does nothing by
+  default. The client calls it with itself, outside every transaction,
+  before it journals or checks an order, so a provider can read the
+  market through the client's own auth, request budget and timeouts. Code
+  that calls a provider's `reserve` or `check` itself should call `screen`
+  first: the built-in provider refuses a buy whose instrument type it has
+  not read in the last hour. `BackendRequest::screen` does this for a
+  request an authority serves, and `rustyschwab-authority` calls it for
+  its workers' requests.
 - `OrderRequest::validate` still accepts `COLLECTIVE_INVESTMENT` legs,
   for providers that take ETFs and for clients without a risk provider.
+- To see what the provider will read for a symbol, run the `auth_test`
+  example's `test-api` with the symbols to check (SPY when none are
+  given). It prints each one's `assetMainType` and `assetSubType`, then
+  the whole quote response.
 
 ### Fixed
 
+- A call that timed out or was cancelled during the client's first-use setup
+  threw the setup away. The setup checks that the state file belongs to a
+  live client, which writes to the file, and a slow disk can hold that write
+  for seconds. The next call started the setup again, queued behind the
+  write still in progress, and could time out in turn; if the first call had
+  been cut off before its write began, the write never happened. The setup
+  now runs to its end once a call starts it, and later calls wait for it or
+  find it done. This applies to any deadline around a call: Rust's
+  `tokio::time::timeout`, Python's `asyncio.wait_for` and
+  `sync.Client(timeout=...)`.
+- With automatic token refresh on, two `SchwabClient::init()` (or
+  `AuthManager::start()`) calls at the same moment could each start a
+  refresh task. One of the two was never stopped: it kept refreshing the
+  tokens, and sending token notifications, until the runtime shut down,
+  even after the client was dropped. Racing calls now leave one refresh
+  task, which stops when the last handle to the client is dropped.
+- The built-in risk provider (`PortfolioRisk`) refused every sell of a leg
+  labelled `COLLECTIVE_INVESTMENT`, as Schwab lists an ETF position, so a
+  fund bought elsewhere or transferred in could not be sold through it. A
+  sell can only reduce what the account holds, so the sell rule alone now
+  judges it, whatever the instrument: up to the symbol's long position
+  less its other working sells, and no further.
 - An order ID that isn't a whole number could leave an account unable to
   trade until its state file was edited by hand. `record_order` (used by
   `replace_order` and by the authority's `RecordOrder` request) and a

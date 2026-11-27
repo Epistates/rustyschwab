@@ -43,8 +43,12 @@ enum Commands {
     Refresh,
     /// Check token status
     Status,
-    /// Test API access
-    TestApi,
+    /// Quote symbols and print what Schwab calls each one
+    TestApi {
+        /// Symbols to quote
+        #[arg(default_value = "SPY")]
+        symbols: Vec<String>,
+    },
     /// Mark saved tokens as expired
     SimulateExpiry {
         /// Also expire the refresh token (forces a new OAuth flow)
@@ -180,20 +184,27 @@ async fn main() -> Result<()> {
             println!("{rule}");
         }
 
-        Commands::TestApi => {
+        Commands::TestApi { symbols } => {
             info!("Creating Schwab client...");
             let client = SchwabClient::new(config)?;
-            info!("Testing API access with a simple request...");
-            match client.get_quotes(&["SPY"]).await {
+            let symbols: Vec<&str> = symbols.iter().map(String::as_str).collect();
+            let listed = symbols.join(", ");
+            info!("Requesting quotes for {listed}...");
+            match client.get_quotes(&symbols).await {
                 Ok(quotes) => {
-                    println!("\n{rule}\nAPI access successful! Retrieved quotes for SPY");
-                    if let Ok(json) = serde_json::to_string_pretty(&quotes) {
-                        println!("Response (truncated):");
-                        for line in json.lines().take(10) {
-                            println!("{line}");
+                    println!("\n{rule}\nAPI access successful! Retrieved quotes for {listed}");
+                    // The instrument types the built-in risk provider screens buys by.
+                    for symbol in &symbols {
+                        match quotes.quotes.get(*symbol) {
+                            Some(quote) => println!(
+                                "{symbol}: assetMainType {}, assetSubType {}",
+                                serde_json::to_value(quote.asset_main_type)?,
+                                serde_json::to_value(quote.asset_sub_type)?
+                            ),
+                            None => println!("{symbol}: no quote in the response"),
                         }
-                        println!("...");
                     }
+                    println!("Response:\n{}", serde_json::to_string_pretty(&quotes)?);
                     println!("{rule}");
                 }
                 Err(e) => {
@@ -231,4 +242,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    fn symbols(args: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(args)
+            .expect("the arguments parse")
+            .command
+        {
+            Commands::TestApi { symbols } => symbols,
+            _ => panic!("not test-api"),
+        }
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_api_quotes_spy_when_given_no_symbols() {
+        assert_eq!(symbols(&["auth_test", "test-api"]), ["SPY"]);
+    }
+
+    #[test]
+    fn test_api_quotes_each_symbol_it_is_given() {
+        assert_eq!(
+            symbols(&["auth_test", "test-api", "CNSWF", "TOITF", "MVEN", "SOBS"]),
+            ["CNSWF", "TOITF", "MVEN", "SOBS"]
+        );
+    }
 }

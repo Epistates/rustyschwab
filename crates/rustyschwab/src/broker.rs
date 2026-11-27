@@ -209,8 +209,13 @@ impl TradingBackend for SchwabClient {
         order: &OrderRequest,
         replaces: Option<&str>,
     ) -> Result<()> {
+        // Screened first, as a submission is, so the check finds the same
+        // reason the submission would.
         match self.risk_provider() {
-            Some(risk) => risk.check(account, order, replaces).await,
+            Some(risk) => {
+                risk.screen(account, order, self).await?;
+                risk.check(account, order, replaces).await
+            }
             None => Ok(()),
         }
     }

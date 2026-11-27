@@ -369,10 +369,10 @@ async fn live_backend(
                 &accounts,
             )
             .map_err(anyhow::Error::msg)?;
-            let risk = rustyschwab::risk::PortfolioRisk {
-                database: client.order_journal().database().clone(),
+            let risk = rustyschwab::risk::PortfolioRisk::new(
+                client.order_journal().database().clone(),
                 accounts,
-            };
+            );
             client = client.with_risk_provider(Arc::new(risk))?;
         }
         Err(_) if switches.trading => anyhow::bail!(
