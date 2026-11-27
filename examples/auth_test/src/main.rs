@@ -232,3 +232,34 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::{CommandFactory, Parser};
+
+    fn symbols(args: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(args).expect("the arguments parse").command {
+            Commands::TestApi { symbols } => symbols,
+            _ => panic!("not test-api"),
+        }
+    }
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_api_quotes_spy_when_given_no_symbols() {
+        assert_eq!(symbols(&["auth_test", "test-api"]), ["SPY"]);
+    }
+
+    #[test]
+    fn test_api_quotes_each_symbol_it_is_given() {
+        assert_eq!(
+            symbols(&["auth_test", "test-api", "CNSWF", "TOITF", "MVEN", "SOBS"]),
+            ["CNSWF", "TOITF", "MVEN", "SOBS"]
+        );
+    }
+}
