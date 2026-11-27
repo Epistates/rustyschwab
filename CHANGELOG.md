@@ -325,6 +325,12 @@ understated, so ETF support is left to a later release on purpose.
   find it done. This applies to any deadline around a call: Rust's
   `tokio::time::timeout`, Python's `asyncio.wait_for` and
   `sync.Client(timeout=...)`.
+- With automatic token refresh on, two `SchwabClient::init()` (or
+  `AuthManager::start()`) calls at the same moment could each start a
+  refresh task. One of the two was never stopped: it kept refreshing the
+  tokens, and sending token notifications, until the runtime shut down,
+  even after the client was dropped. Racing calls now leave one refresh
+  task, which stops when the last handle to the client is dropped.
 - The built-in risk provider (`PortfolioRisk`) refused every sell of a leg
   labelled `COLLECTIVE_INVESTMENT`, as Schwab lists an ETF position, so a
   fund bought elsewhere or transferred in could not be sold through it. A

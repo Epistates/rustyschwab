@@ -635,19 +635,23 @@ impl AuthManager {
             *self.tokens.write() = Some(tokens);
         }
 
-        // Start auto-refresh task if enabled. Guard with a finished()
-        // check so multiple `start()` calls (e.g. re-inits from an
-        // embedding server) don't stack extra refresh tasks; prior
-        // versions silently leaked the previous one.
+        // Start the auto-refresh task if enabled and none is running. The
+        // check and the task's registration are one step under the write
+        // lock, so `start()` calls that race (re-inits from an embedding
+        // server, say) leave one task, which the last handle's drop stops;
+        // a task started between another call's check and its registration
+        // was never stopped.
         if self.config.auto_refresh {
-            let already_running = self
-                .refresh_task
-                .read()
-                .as_ref()
-                .map(|h| !h.is_finished())
-                .unwrap_or(false);
-            if !already_running {
-                self.start_refresh_task().await;
+            let started = {
+                let mut task = self.refresh_task.write();
+                let running = task.as_ref().is_some_and(|h| !h.is_finished());
+                if !running {
+                    *task = Some(self.spawn_refresh_task());
+                }
+                !running
+            };
+            if started {
+                after_refresh_decision();
             }
         }
 
@@ -1043,11 +1047,12 @@ impl AuthManager {
         Ok(tokens)
     }
 
-    async fn start_refresh_task(&self) {
+    /// Spawn the auto-refresh task, for `start` to register.
+    fn spawn_refresh_task(&self) -> tokio::task::JoinHandle<()> {
         // The worker must not own the handle that controls its own lifetime.
         let mut manager = self.clone();
         manager.refresh_task = Arc::new(RwLock::new(None));
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             // The last refresh failure logged, so a lasting one is logged
             // once rather than every tick.
@@ -1098,8 +1103,7 @@ impl AuthManager {
                     }
                 }
             }
-        });
-        *self.refresh_task.write() = Some(task);
+        })
     }
 
     #[cfg(feature = "callback-server")]
@@ -1382,8 +1386,89 @@ impl Drop for AuthManager {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// A unit test's code to run once, on this thread, at
+    /// [`after_refresh_decision`]: a test of what another caller can do then.
+    static AFTER_REFRESH_DECISION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+/// The first point at which another caller can run once `start` has decided
+/// to start the refresh task: the decision and the task's registration are one
+/// step under the write lock, so it is the end of that step. Runs the hook a
+/// unit test set on this thread (`AFTER_REFRESH_DECISION`); does nothing
+/// outside the unit tests.
+#[cfg(test)]
+fn after_refresh_decision() {
+    if let Some(hook) = AFTER_REFRESH_DECISION.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn after_refresh_decision() {}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Another `start` that runs as soon as it can after this one decided to
+    /// start the refresh task leaves that task alone, and the one task stops
+    /// with the last handle: none is left running, and refreshing tokens, for
+    /// a client that is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_starts_leave_one_refresh_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = OAuthConfig {
+            app_key: "k".repeat(32),
+            app_secret: "s".repeat(16),
+            token_store_kind: TokenStoreKind::File,
+            tokens_file: dir.path().join("tokens.json"),
+            // Nothing is listening: no request can leave the machine.
+            token_url: "http://127.0.0.1:9/oauth/token".into(),
+            capture_callback: false,
+            auto_refresh: true,
+            ..Default::default()
+        };
+        // Fresh for half an hour, so the refresh task has nothing to refresh.
+        let fresh = TokenSet::new(
+            "access".into(),
+            "refresh".into(),
+            "".into(),
+            "Bearer".into(),
+            1800,
+            "".into(),
+            Utc::now(),
+        );
+        FileTokenStore::new(config.tokens_file.clone())
+            .save(&fresh)
+            .unwrap();
+        let manager = AuthManager::new(config).unwrap();
+        // Every refresh task holds the manager's tokens.
+        let tokens = Arc::downgrade(&manager.tokens);
+        let other = manager.clone();
+        let runtime = tokio::runtime::Handle::current();
+        AFTER_REFRESH_DECISION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::thread::scope(|scope| scope.spawn(|| runtime.block_on(other.start())).join())
+                    .unwrap()
+                    .unwrap();
+            }));
+        });
+        manager.start().await.unwrap();
+        assert_eq!(
+            Arc::strong_count(&manager.tokens),
+            2,
+            "the manager and one refresh task hold the tokens"
+        );
+        drop(manager);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tokens.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a refresh task outlived the manager");
+    }
 
     fn config_with_creds(key_len: usize, secret_len: usize) -> OAuthConfig {
         OAuthConfig {
