@@ -175,7 +175,13 @@ def test_a_call_timeout_cancels_and_the_client_stays_usable(
     server: MockSchwab, tokens: Path
 ) -> None:
     server.on("GET", "/marketdata/v1/quotes", {"AAPL": {}}, delay=1.5)
-    client = sync.Client(client_config(server, tokens), timeout=0.2)
+    client = sync.Client(client_config(server, tokens))
+    # The first call sets the client up, which writes to the state file, and
+    # the timeout covers that too: on a slow disk the write can outlast the
+    # first call and hold up the next. Do it first, so that both timeouts run
+    # on the broker's answer alone.
+    client.init()
+    client.timeout = 0.2
     started = time.monotonic()
     with pytest.raises(TimeoutError):
         client.quotes(["AAPL"])
