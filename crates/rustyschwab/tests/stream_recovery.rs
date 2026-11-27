@@ -2,10 +2,12 @@ use futures_util::{SinkExt, StreamExt};
 use rustyschwab::{
     auth::{AuthManager, FileTokenStore, OAuthConfig, TokenSet, TokenStore, TokenStoreKind},
     config::{ChannelKind, StreamConfig},
+    coordination::{Coordinator, Lease},
     streaming::{StreamClient, StreamerIdentity},
     types::streaming::{StreamEnd, StreamMessage, StreamService},
 };
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -238,22 +240,80 @@ async fn queue_overflow_is_visible_to_a_slow_receiver() {
     server.await.unwrap();
 }
 
+/// A coordinator with no state file: every lease is granted, renewed and
+/// released at once, for tests of the stream's own deadlines that a disk
+/// would otherwise add to.
+#[derive(Debug)]
+struct NoDisk;
+#[async_trait::async_trait]
+impl Coordinator for NoDisk {
+    async fn quota(&self, _: &str, _: u32, _: u32) -> rustyschwab::Result<Duration> {
+        Ok(Duration::ZERO)
+    }
+    async fn acquire(
+        &self,
+        resource: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> rustyschwab::Result<Lease> {
+        Ok(Lease {
+            resource: resource.into(),
+            owner: owner.into(),
+            epoch: 1,
+            expires_at: chrono::Utc::now().timestamp_millis() + ttl.as_millis() as i64,
+        })
+    }
+    async fn renew(&self, lease: &Lease, _: Duration) -> rustyschwab::Result<Lease> {
+        Ok(lease.clone())
+    }
+    async fn release(&self, _: &Lease) -> rustyschwab::Result<()> {
+        Ok(())
+    }
+    async fn valid(&self, _: &Lease) -> rustyschwab::Result<bool> {
+        Ok(true)
+    }
+}
+
+/// A login the streamer never answers is ended by the login's own deadline,
+/// not by the longer one `connect()` keeps for a connection that hangs, and
+/// the connection task stops.
 #[tokio::test]
 async fn silent_login_times_out_and_stops_connection_task() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let (client, _dir) = client(format!("ws://{}", listener.local_addr().unwrap()), 16);
+    // The stream's lease is written to its state file, which on a slow disk
+    // takes seconds: no disk here, so the login's deadline is all that counts.
+    let client = client.with_coordinator(Arc::new(NoDisk)).unwrap();
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let _ = request(&mut ws).await;
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        // The socket stays open, and the login is never answered.
+        std::future::pending::<()>().await;
     });
-    assert!(
-        tokio::time::timeout(Duration::from_secs(7), client.connect())
-            .await
-            .unwrap()
-            .is_err()
-    );
+    let mut rx = client.get_receiver().unwrap();
+    assert!(client.connect().await.is_err());
+    // The end says which deadline fell: the login's ends the attempt with
+    // "Login timeout", `connect()`'s with "connect() did not complete".
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(StreamMessage::State(status)) if status.ended.is_some() => {
+                    return status.ended.unwrap();
+                }
+                Some(_) => continue,
+                None => panic!("the end is reported before the receiver ends"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    match ended {
+        StreamEnd::ConnectFailed { message } => {
+            assert!(message.contains("Login timeout"), "{message}")
+        }
+        other => panic!("the login's deadline should end the attempt, not {other:?}"),
+    }
     assert!(!client.is_running());
     assert!(!client.status().ready);
     server.abort();
