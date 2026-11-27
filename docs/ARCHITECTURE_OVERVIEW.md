@@ -8,7 +8,7 @@ describes the code as it is; for how to run it see the [README](../README.md),
 ## Workspace
 
 Five published crates plus example packages, all on the workspace version
-(`0.3.0`, Rust 2024 edition, MSRV 1.95, `MIT OR Apache-2.0`). The Python
+(`0.4.0`, Rust 2024 edition, MSRV 1.95, `MIT OR Apache-2.0`). The Python
 bindings (`crates/schwab-py`) are outside the workspace, with their own
 lockfile:
 
