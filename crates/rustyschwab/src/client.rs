@@ -388,7 +388,23 @@ impl SchwabClient {
         self.inner.coordinator.clone()
     }
 
+    /// Check, once, that the state file belongs to a live client and not to
+    /// a paper venue. The check runs on a task of its own, as a submission
+    /// does: a caller that stops waiting (a deadline, a dropped future)
+    /// abandons only its wait, and the next caller finds the check done, or
+    /// waits for the one under way, instead of starting another behind the
+    /// write the first one left running. A check that fails is made again by
+    /// the next caller.
     async fn ensure_live_state(&self) -> Result<()> {
+        if self.inner.mode_verified.initialized() {
+            return Ok(());
+        }
+        let client = self.clone();
+        tokio::spawn(async move { client.verify_live_state().await })
+            .await
+            .map_err(|e| Error::Storage(format!("Live state check failed: {e}")))?
+    }
+    async fn verify_live_state(&self) -> Result<()> {
         self.inner
             .mode_verified
             .get_or_try_init(|| async {

@@ -319,6 +319,16 @@ understated, so ETF support is left to a later release on purpose.
 
 ### Fixed
 
+- A call that timed out or was cancelled during the client's first-use setup
+  threw the setup away. The setup checks that the state file belongs to a
+  live client, which writes to the file, and a slow disk can hold that write
+  for seconds. The next call started the setup again, queued behind the
+  write still in progress, and could time out in turn; if the first call had
+  been cut off before its write began, the write never happened. The setup
+  now runs to its end once a call starts it, and later calls wait for it or
+  find it done. This applies to any deadline around a call: Rust's
+  `tokio::time::timeout`, Python's `asyncio.wait_for` and
+  `sync.Client(timeout=...)`.
 - With automatic token refresh on, two `SchwabClient::init()` (or
   `AuthManager::start()`) calls at the same moment could each start a
   refresh task. One of the two was never stopped: it kept refreshing the
